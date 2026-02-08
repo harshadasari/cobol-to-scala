@@ -1,0 +1,12 @@
+{
+  "name": "@thyraa/cobol-to-scala",
+  "version": "1.0.0",
+  "description": "COBOL to Scala conversion engine",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./parser": "./parser/index.js",
+    "./generator": "./generator/index.js"
+  }
+}

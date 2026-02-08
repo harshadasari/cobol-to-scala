@@ -1,0 +1,26 @@
+{
+  "name": "thyraa-cobol-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "@octokit/rest": "^20.0.2",
+    "@octokit/graphql": "^7.0.1",
+    "bull": "^4.12.0",
+    "ioredis": "^5.3.2",
+    "zod": "^3.22.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3"
+  }
+}
+

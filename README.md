@@ -117,10 +117,12 @@ npm run dev
 
 ## 📖 Documentation
 
+- **[Documentation Index](docs/)** - Complete documentation hub
 - **[COBOL Reference Guide](cobol-reference/)** - Complete COBOL language reference
-- **[Architecture Overview](UNIFIED_PLATFORM_ARCHITECTURE.md)** - System design and technical decisions
+- **[Architecture Overview](docs/UNIFIED_PLATFORM_ARCHITECTURE.md)** - System design and technical decisions
 - **[Integration Guide](Thyraa-COBOL-main/INTEGRATION.md)** - API endpoints and integration patterns
 - **[Efficiency Configuration](claude-efficiency-config/)** - Optimize Claude Code usage
+- **[Examples](examples/)** - Sample COBOL programs and conversions
 
 ---
 
@@ -140,10 +142,20 @@ cobol-to-scala/
 │       ├── components/             # UI components
 │       └── lib/
 │           └── conversion-api.ts   # API client
+├── docs/                           # Documentation
+│   ├── UNIFIED_PLATFORM_ARCHITECTURE.md
+│   ├── CODEBASE_ANALYSIS.md
+│   ├── MVP_SPRINT_PLAN.md
+│   └── SPRINT_PLAN_FOCUSED.md
+├── examples/                       # Sample conversions
+│   └── basic-conversion/           # Simple example with test script
 ├── cobol-reference/                # COBOL language documentation
 ├── claude-efficiency-config/       # Claude Code optimization tools
-├── examples/                       # Sample COBOL programs
-└── docs/                           # Additional documentation
+├── prototypes/                     # Early prototypes
+│   └── scala-prototype/            # Scala-based prototype
+├── README.md                       # This file
+├── CONTRIBUTING.md                 # Contribution guidelines
+└── LICENSE                         # MIT License
 ```
 
 ---
@@ -239,8 +251,9 @@ object CustomerRecord:
 cd Thyraa-COBOL-main/backend
 npm test
 
-# Run a quick conversion test
-node test-converter.js
+# Run example conversion
+cd examples/basic-conversion
+node run-conversion.js
 ```
 
 ---

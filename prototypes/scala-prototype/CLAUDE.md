@@ -2,9 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚠️ Note: Prototype Archive
+
+**This is an early Scala-based prototype.** The current production implementation is in:
+- `../../Thyraa-COBOL-main/backend/packages/cobol-to-scala/` (JavaScript/TypeScript)
+
+This prototype remains for architectural reference and exploration of alternative approaches.
+
 ## Project Overview
 
-COBOL-to-Scala conversion platform. Parses COBOL copybooks and programs, generates idiomatic Scala 3 case classes with runtime support for COBOL data types (COMP-3, packed decimal, fixed-width records).
+COBOL-to-Scala conversion platform (Scala implementation). Parses COBOL copybooks and programs, generates idiomatic Scala 3 case classes with runtime support for COBOL data types (COMP-3, packed decimal, fixed-width records).
 
 ## Build Commands
 

@@ -187,9 +187,11 @@ Current focus areas where contributions are especially welcome:
 
 ## 📚 Resources
 
+- **Documentation**: See `docs/` folder for all technical documentation
 - **COBOL Reference**: See `cobol-reference/` folder
-- **Architecture**: Read `UNIFIED_PLATFORM_ARCHITECTURE.md`
+- **Architecture**: Read `docs/UNIFIED_PLATFORM_ARCHITECTURE.md`
 - **API Docs**: Check `Thyraa-COBOL-main/INTEGRATION.md`
+- **Examples**: Check `examples/` folder for sample conversions
 
 ## 🤔 Questions?
 

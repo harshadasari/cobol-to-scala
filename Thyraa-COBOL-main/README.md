@@ -1,73 +1,112 @@
-# Welcome to your Lovable project
+# Thyraa-COBOL-main
 
-## Project info
+Main application for the COBOL-to-Scala conversion platform.
 
-**URL**: https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID
+## Overview
 
-## How can I edit this code?
+This directory contains the complete web application including:
+- **Backend**: Node.js/Express server with COBOL-to-Scala conversion engine
+- **Frontend**: React/TypeScript web interface with Monaco editor
 
-There are several ways of editing your application.
+## Project Structure
 
-**Use Lovable**
+```
+Thyraa-COBOL-main/
+├── backend/                    # Node.js backend
+│   ├── packages/
+│   │   └── cobol-to-scala/     # Core conversion engine
+│   ├── routes/                 # API routes
+│   ├── server.ts               # Express server
+│   └── package.json
+├── src/                        # React frontend
+│   ├── pages/
+│   │   └── ScalaConverter.tsx  # Conversion UI
+│   ├── components/             # UI components
+│   ├── lib/
+│   │   └── conversion-api.ts   # API client
+│   └── App.tsx
+└── package.json
+```
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and start prompting.
+## Quick Start
 
-Changes made via Lovable will be committed automatically to this repo.
+### Prerequisites
 
-**Use your preferred IDE**
+- Node.js 18+
+- npm or bun
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
+### Backend Setup
 
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
+```bash
+cd backend
+npm install
+npm start
+# Server runs on http://localhost:3000
+```
 
-Follow these steps:
+### Frontend Setup
 
-```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
+```bash
+npm install
+npm run dev
+# App runs on http://localhost:5173
+```
 
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
+## Technologies Used
 
-# Step 3: Install the necessary dependencies.
-npm i
+**Backend:**
+- Node.js + Express
+- TypeScript
+- Custom COBOL parser and Scala code generator
 
-# Step 4: Start the development server with auto-reloading and an instant preview.
+**Frontend:**
+- React 18
+- TypeScript
+- Vite
+- Monaco Editor (code editor)
+- shadcn/ui components
+- Tailwind CSS
+
+## API Endpoints
+
+See [INTEGRATION.md](INTEGRATION.md) for complete API documentation.
+
+**Main Conversion Endpoint:**
+```
+POST /api/convert/scala
+Body: { source: string, options: {...} }
+Response: { scala: string, metadata: {...} }
+```
+
+## Development
+
+**Run Backend Tests:**
+```bash
+cd backend
+npm test
+```
+
+**Run Frontend in Development:**
+```bash
 npm run dev
 ```
 
-**Edit a file directly in GitHub**
+**Build for Production:**
+```bash
+npm run build
+```
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+## Documentation
 
-**Use GitHub Codespaces**
+- **[Integration Guide](INTEGRATION.md)** - API endpoints and integration
+- **[Main README](../README.md)** - Project overview
+- **[Architecture](../docs/UNIFIED_PLATFORM_ARCHITECTURE.md)** - System design
+- **[Examples](../examples/)** - Sample conversions
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+## Contributing
 
-## What technologies are used for this project?
+See the main [CONTRIBUTING.md](../CONTRIBUTING.md) for guidelines.
 
-This project is built with:
+## License
 
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
-
-## How can I deploy this project?
-
-Simply open [Lovable](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and click on Share -> Publish.
-
-## Can I connect a custom domain to my Lovable project?
-
-Yes, you can!
-
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
-
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
+MIT License - see [LICENSE](../LICENSE)

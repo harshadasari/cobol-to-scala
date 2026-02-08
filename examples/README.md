@@ -81,6 +81,7 @@ These are being worked on in upcoming releases.
 
 ## 📚 Learn More
 
-- See `cobol-reference/` for complete COBOL language documentation
-- See `UNIFIED_PLATFORM_ARCHITECTURE.md` for technical details
-- See main `README.md` for full project documentation
+- See `../cobol-reference/` for complete COBOL language documentation
+- See `../docs/UNIFIED_PLATFORM_ARCHITECTURE.md` for technical details
+- See main `../README.md` for full project documentation
+- See `../docs/` for all technical documentation

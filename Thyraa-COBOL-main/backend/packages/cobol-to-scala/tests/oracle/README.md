@@ -176,33 +176,34 @@ through this data-driven suite.
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 198 corpus programs found
-(19 under `data/`, 179 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+**cobc oracle capture / expected-vs-oracle check** - 209 corpus programs found
+(19 under `data/`, 190 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
 excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
 precompiler, see `tests/sql.test.js` instead; two round-9 repros, `w09`/`w12`, are
 deliberately excluded entirely - see the round-9 table below - since cobc itself
-rejects them), all 198 compiled and ran cleanly under cobc (exit 0). 28 of the 198
+rejects them), all 209 compiled and ran cleanly under cobc (exit 0). 28 of the 209
 (19 `data/` + 9 `proc/` baseline programs) already have a hand-written `.expected.txt`
 that matches the captured `.oracle.txt` exactly - 0 mismatches. The 20 `r01`-`r14*`,
 15 `n01`-`n16*`, 16 `q01`-`q12*`, 14 `s01`-`s12*`, 11 `t01`-`t12*` (`t09` excluded),
 14 `u01`-`u13*`, 12 `v01`-`v12*`, 12 `w01`-`w14*` (`w09`/`w12` excluded), 12
 `x01`-`x12`, 16 `y01`-`y17*` (see the round-11 table below for the exact subset),
-15 `z01`-`z15*` (see the round-12 table below for the exact subset), and 11
-`aa01`-`aa10*` (see the round-13 table above for the exact subset) programs
-have no hand-written `.expected.txt` by design (they're verified directly against
-cobc via `oracleCompare()` below, not a separately hand-authored expectation) and
-show up here as a diagnostic-only capture ("no `<name>.expected.txt` alongside ...
-yet").
+15 `z01`-`z15*` (see the round-12 table below for the exact subset), 11
+`aa01`-`aa10*` (see the round-13 table above for the exact subset), and 11
+`b1`-`b6`/`c1`/`c3`/`c4b`/`c5`/`c6` (see the round-14 table above for the exact
+subset) programs have no hand-written `.expected.txt` by design (they're verified
+directly against cobc via `oracleCompare()` below, not a separately hand-authored
+expectation) and show up here as a diagnostic-only capture ("no `<name>.expected.txt`
+alongside ... yet").
 
 **Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
 end-to-end (0 todo).
 
-**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 179/179 programs
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 190/190 programs
 match end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
 `q01`-`q12*`, all 14 `s01`-`s12*`, all 11 `t01`-`t12*` (`t09` excluded), all 14
 `u01`-`u13*`, all 12 `v01`-`v12*`, all 12 `w01`-`w14*` (`w09`/`w12` excluded), all
-12 `x01`-`x12`, all 16 `y01`-`y17*`, all 15 `z01`-`z15*`, and all 11 `aa01`-`aa10*`
-adversarial-refutation programs below.
+12 `x01`-`x12`, all 16 `y01`-`y17*`, all 15 `z01`-`z15*`, all 11 `aa01`-`aa10*`, and
+all 11 `b1`-`b6`/`c1`/`c3`/`c4b`/`c5`/`c6` adversarial-refutation programs below.
 
 ### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
@@ -674,6 +675,68 @@ finding 3 (a self-retriggering handler resolves to itself instead of an
 empty registry; a two-handler reentrancy case resolves the second handler
 regardless of declaration order).
 
+### Round-14 adversarial-refutation findings (b1-b6, c1/c3/c4b/c5/c6) and their fixes
+
+A round-14 refutation reported 4 dishonest findings, all now fixed in full;
+every promoted program hard-passes `oracleCompare()`. Finding 3 (sentence-
+scope termination) is the most consequential: it is a **general parser
+flaw**, not a narrow statement-specific gap - `parseStatementBlock` is the
+single shared block-parsing routine every conditional-clause form (IF/ELSE,
+READ AT END/INVALID KEY, ON SIZE ERROR/OVERFLOW/EXCEPTION, EVALUATE WHEN,
+...) is built on, so the bug silently affected all of them at once whenever
+a program used the (perfectly legal) sentence-scope form - an implicit
+scope terminated by a bare period - instead of an explicit `END-*` keyword.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 3 (MOST IMPORTANT - general parser flaw) | `parseStatementBlock` (`parser/procedure-parser.js`) treated a PERIOD as "skip it and keep collecting into THIS block" - so ANY conditional clause lacking its own explicit `END-*` terminator (`IF` without `END-IF`, `READ AT END` without `END-READ`, `ON SIZE ERROR`/`ON OVERFLOW`/`INVALID KEY` without their own `END-*`, `EVALUATE WHEN` without `END-EVALUATE`, ...) silently absorbed every statement written AFTER it in the same paragraph into its own implicit scope - real COBOL's actual rule is the opposite: a PERIOD ends the whole SENTENCE, closing every open implicit scope at once, however many are nested | `parseStatementBlock` now treats a period exactly like any other terminator - it stops the block WITHOUT consuming the period, leaving it in place so it propagates upward through every nested `parseStatementBlock` call (each one also stops without consuming) until it reaches whichever sentence-level loop actually owns period consumption - `parseProcedureDivision`'s and `parseDeclaratives`' own per-paragraph loops, both of which already explicitly skip a period exactly once at their own level. No other line changed - this is a single, surgical fix to one shared routine. Verified against installed GnuCOBOL: `c4b` (IF condition false, no END-IF) - "NEXT"/"THIRD" print as top-level statements, "POS" never prints; `c3` (READ AT END with no END-READ) - the DISPLAY and CLOSE *after* the bare READ run as normal top-level statements, not swallowed into the AT END arm. Ran the FULL 198+11-program suite with ONLY this fix applied before layering findings 1/2/4 (per this round's own instructions) - 828/828 pass, 0 regressions, confirming no existing corpus program was accidentally relying on the old (wrong) absorption behavior | c3, c4b |
+| 1 | Qualified `PERFORM x OF/IN secA THRU y OF/IN secB` (`generatePerformThruMethod`, `generator/method-gen.js`) matched THRU endpoints by BARE NAME ONLY (`units.findIndex(u => u.name === fromParagraph)`), ignoring `targetSection`/`throughSection` entirely - so it always resolved the FIRST program-order paragraph pair sharing those bare names, regardless of which section the PERFORM statement actually qualified. A separate bug compounded this: the THRU-range collection `Set` was also keyed by bare name only, so two DIFFERENT qualified THRU ranges sharing both bare endpoint names (legal COBOL, different sections) would collapse onto one entry | Threaded `fromSection`/`toSection` through `generatePerformThruMethod`'s own unit lookup (`units.findIndex` now also requires `u.sectionName === fromSection`/`toSection` when a qualifier is present) and through the forward-range `rangeUnits` slice (which had its OWN separate, still-bare-name-only re-scan loop - fixed by slicing directly from the already-resolved `startIndex`/`endIndex` instead of re-deriving the range via a second unqualified lookup). New shared `performThruWrapperName(from, fromSection, to, toSection)` helper builds the wrapper method's own composite name, folding in a section qualifier when present (`paraOneInSectionBToParaTwoInSectionB`, not the previous, always-bare `paraOneToParaTwo`) so two qualified ranges sharing bare endpoint names in different sections get two DIFFERENT wrapper methods, never colliding; `generatePerformFromAST`'s own qualified-THRU call site (previously explicitly documented as an unfixed limitation - "a THRU range's own composite wrapper-method name is untouched/still built from the plain unqualified name... no corpus program combines THRU with an explicit qualifier, so that combination is deliberately left as-is") now calls the SAME shared helper, so the call site and the declaration can never drift apart. The THRU-range collection Set is now keyed by the full `(from, fromSection, to, toSection)` tuple. Reduces byte-for-byte to the pre-existing unqualified scheme whenever neither endpoint carries a qualifier (every pre-round-14 corpus program, and SORT's own `INPUT`/`OUTPUT PROCEDURE ... THRU` clause, which has no qualifier grammar of its own). Verified against installed GnuCOBOL (b3): `PERFORM PARA-ONE OF SECTION-B THRU PARA-TWO OF SECTION-B` prints `B-ONE`/`B-TWO` (SECTION-B's own paragraphs), never `A-ONE`/`A-TWO` (an unrelated, textually-identical pair in SECTION-A, declared earlier in the program) | b3 |
+| 2 | `INSPECT ... REPLACING` with MULTIPLE clauses in ONE statement (`generateInspect`, `generator/expression-gen.js`) cascaded: each clause's own codegen (`applyInspectRegion`/`buildOperation`) wrapped the *previous* clause's own resulting Scala expression as its input, so a later clause's comparand could match text an EARLIER clause in the SAME statement had just written - `INSPECT WS-STR REPLACING ALL "A" BY "B" ALL "B" BY "A"` against `"AAAABBBB"` produced `"AAAAAAAA"` (first pass turns every A into B, second pass then turns ALL of those - including the ones the first pass just wrote - into A) instead of cobc's actual single left-to-right-scan result, `"BBBBAAAA"` | New `CobolInspect.replaceMultiClause` runtime helper (embedded alongside the existing single-clause helpers) evaluates every REPLACING clause in ONE left-to-right scan of the untouched original string - at each position, the FIRST clause (in the order written) whose comparand matches wins, matched characters are skipped over (never re-examined by a later clause), mirroring real COBOL's own documented rule exactly; each clause's own BEFORE/AFTER INITIAL region (if any) is honored independently. `generateInspect` now routes any statement with 2+ REPLACING clauses through this helper; a single clause (the overwhelmingly common case, and the only shape any pre-round-14 corpus program used) is completely untouched - identical, byte-for-byte codegen to before, calling the pre-existing per-clause-type helper (`replaceAll`/`replaceFirst`/`replaceLeading`/`replaceCharacters`) directly. Verified against installed GnuCOBOL (c1): `STR=[BBBBAAAA]` | c1 |
+| 4 | `SYNCHRONIZED`/`SYNC` was parsed (`item.sync`, `parser/data-division-parser.js`) but had ZERO consumers anywhere in the generator - silently accepted and then completely ignored, so `FUNCTION LENGTH` of a record containing a SYNC binary item, and any real file-record byte layout (`parse`/`format`) built from one, were simply wrong (missing the alignment padding real COBOL inserts) | New `layout.js` `syncPadBytes(item, offset)`: a SYNC binary item (`COMP`/`COMP-4`/`COMP-5`/`BINARY`/`COMPUTATIONAL[-4/-5]`) of N bytes (2/4/8, the same sizing `elementaryByteLength` already uses) aligns to the next multiple of N, inserting pad bytes immediately before it; `itemByteLength` now accounts for this when summing a group's children (feeding `FUNCTION LENGTH`/`groupByteLengthRegistry` automatically), and `case-class-gen.js`'s field-offset computation/`parse`/`format` codegen do too (an explicit `offset += N // SYNC alignment padding` line in both, skipping - never reading or writing - the pad region; `format`'s output buffer is already zero-filled by default, matching the pad byte's own value with no extra code needed). Compiler-verified via direct file-write probes (not assumed): a COMP-3/PACKED-DECIMAL item carrying SYNC is completely UNAFFECTED (cobc's SYNCHRONIZED clause only concerns binary-word alignment) - probed by comparing a SYNC COMP-3 record's total length against the identical PICTURE with no SYNC clause at all (identical); the pad byte's own value is `0x00`, never a space - probed via a REDEFINES-as-flat-PIC-X view tallying `X"00"` vs `X"20"` occurrences; alignment verified for 2-byte (SIGN present), 4-byte, and 8-byte binary sizes (offset advances to the next even/multiple-of-4/multiple-of-8 position respectively; an already-aligned item gets zero padding). Verified against installed GnuCOBOL (c6): `LEN=5` for `X(1)` + `S9(4) COMP SYNC` + `X(1)` (1 pad byte inserted before the 2-byte COMP field) - a pre-fix engine reported `LEN=4`, silently ignoring the SYNC clause entirely | c6 |
+
+11 valid round-14 probes were promoted: 5 files backing the 4 fixed findings
+(`b3` finding 1, `c1` finding 2, `c4b`/`c3` finding 3's IF/READ-AT-END
+shapes, `c6` finding 4) plus 6 survivors that already passed unmodified
+before this round, locking in existing behavior as regression guards: `b1`
+a level-66 RENAMES spanning a REDEFINES sibling, `b2` a level-66 RENAMES
+passed BY REFERENCE across a CALL boundary, `b4` a SORT INPUT/OUTPUT
+PROCEDURE combined with a DECLARATIVES error handler on an unrelated file,
+`b5` a CALL whose CALLEE (not the caller) has its own DECLARATIVES section,
+`b6` an EVALUATE used directly inside a DECLARATIVES handler body, and `c5`
+`SIGN IS TRAILING` on a signed DISPLAY numeric (including after an ADD that
+crosses back through zero).
+
+`method-gen.js`'s own previously-undocumented comment gap - `generatePerformFromAST`'s
+doc comment explicitly stated "a THRU range's own composite wrapper-method
+name is untouched/still built from the plain unqualified name... no corpus
+program combines THRU with an explicit qualifier, so that combination is
+deliberately left as-is rather than guessed at" - is now fully closed by
+finding 1's fix; no part of qualified-THRU remains unfixed, so nothing new
+was added to "Known gaps" for it (the existing "bare, UNQUALIFIED PERFORM"
+note below has been updated instead to reflect that THRU is now covered by
+the qualified form too).
+
+A parallel state-isolation audit (round-14, "angle A" - 13 adversarial
+same-process-vs-fresh-process scenarios covering every module-level
+registry this generator maintains) found 0 divergences: every registry this
+generator relies on is already correctly reinstalled at the top of every
+`generateScala()`/`generateMultiProgramScala()` call. `tests/state-isolation.test.js`
+was extended with 6 more permanent regression tests for scenarios it didn't
+already cover (GROUP_REGISTRY/TABLE_REGISTRY in reverse order,
+AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM, ADVANCING_FILES, and CALL_RET_SEQ's
+same-source-repeated-3x determinism) alongside its 5 pre-existing ones - the
+13 scratch-only node scripts themselves are not promoted (same reasoning as
+every other adversarial-refutation scratch script: the permanent, data-
+driven regression coverage lives in the test suite, not the scratch
+history).
+
+See `tests/round14-fixes.test.js` for focused, toolchain-independent unit
+tests of all 4 findings above, including a battery over finding 3 covering
+IF/READ AT END/COMPUTE ON SIZE ERROR/STRING ON OVERFLOW/WRITE INVALID
+KEY/EVALUATE WHEN, each with AND without its own explicit `END-*`
+terminator, plus a doubly-nested-IF-with-no-END-IF case (one period closing
+two levels of implicit scope at once).
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -700,21 +763,25 @@ regardless of declaration order).
   (`generator/expression-gen.js`) route it through the same collision-aware
   `resolveParagraphMethodName` resolver `generateAllMethods`/
   `generateSectionMethod` already use to *declare* a qualified method (see the
-  round-12 table above, `z12`) - what remains unaddressed is only a **bare,
-  UNQUALIFIED** reference to a paragraph name that happens to collide: real
-  COBOL requires qualification whenever it would otherwise be ambiguous - a
-  program using a bare, would-be-ambiguous reference is *already invalid
-  COBOL* without qualifying it - so this narrower residual gap only matters
-  for a program that is itself not valid COBOL, which no corpus program (old
-  or new) is; `sect01`/`q09`'s own only cross-paragraph reference is a
-  `PERFORM` of the (never-ambiguous) *section* name, not one of its colliding
-  paragraphs, and `z12` itself uses the (legally required) qualified form.
-  `GO TO`'s own qualification is unaffected by the round-12 fix (only
-  `PERFORM` was addressed) and remains exactly as unqualified/bare as before.
-  Revisit by threading the calling paragraph's own enclosing section through
-  `generateExpression`/nested-PERFORM resolution (for the bare-unqualified
-  case) and by extending `GO TO`'s own parsing/codegen the same way `PERFORM`
-  was, if a future program needs either.
+  round-12 table above, `z12`) - **round-14 finding 1 extended this to the
+  THRU form too** (`PERFORM x OF secA THRU y OF secB` - previously
+  unaddressed, and explicitly documented as such, until this round's fix; see
+  the round-14 table above, `b3`) - what remains unaddressed is only a
+  **bare, UNQUALIFIED** reference (single-target OR THRU) to a paragraph name
+  that happens to collide: real COBOL requires qualification whenever it
+  would otherwise be ambiguous - a program using a bare, would-be-ambiguous
+  reference is *already invalid COBOL* without qualifying it - so this
+  narrower residual gap only matters for a program that is itself not valid
+  COBOL, which no corpus program (old or new) is; `sect01`/`q09`'s own only
+  cross-paragraph reference is a `PERFORM` of the (never-ambiguous) *section*
+  name, not one of its colliding paragraphs, and `z12`/`b3` themselves use
+  the (legally required) qualified form. `GO TO`'s own qualification is
+  unaffected by either fix (only `PERFORM` was addressed) and remains
+  exactly as unqualified/bare as before. Revisit by threading the calling
+  paragraph's own enclosing section through `generateExpression`/nested-
+  PERFORM resolution (for the bare-unqualified case) and by extending `GO
+  TO`'s own parsing/codegen the same way `PERFORM` was, if a future program
+  needs either.
 
 - **GO TO (or a nested PERFORM) into a paragraph that must then *itself* keep
   falling through, within a SECTION wrapper or the whole-program flow (round-4
@@ -963,3 +1030,23 @@ regardless of declaration order).
   byte codecs (`generator/codecs.js`, already used for genuine COMP-3/BINARY
   file-record storage elsewhere) through a per-element byte-slice view over
   the target's own underlying storage, if a future pass has time.
+
+- **SYNCHRONIZED/SYNC alignment (round-14 finding 4) combined with a NESTED
+  sub-group, or with OCCURS, on the SYNC item's own enclosing structure** -
+  `layout.js`'s `syncPadBytes`/`itemByteLength` compute alignment padding
+  relative to the immediately-enclosing group's own start (offset 0) - fully
+  correct and compiler-verified for a flat, non-repeating group (c6's own
+  shape: a single 01-level record with SYNC binary children directly under
+  it). Two combinations are NOT independently handled/verified: (a) a SYNC
+  binary item nested two or more group-levels deep, where the OUTER group
+  itself starts at a non-zero *absolute* offset within some further
+  enclosing record - alignment is computed relative to the immediate parent
+  group's own start, not threaded through as a true whole-record absolute
+  offset; (b) a SYNC binary item combined with OCCURS on some enclosing
+  item - each occurrence's own internal padding is computed as if that
+  occurrence starts fresh at relative offset 0, which is not independently
+  verified against cobc for a case where that assumption might not hold.
+  Neither combination is exercised by any corpus program (c6 is deliberately
+  a single flat record). Revisit by threading a true absolute offset through
+  `itemByteLength`'s own recursion (a `startOffset` parameter, rather than
+  always assuming 0) if a future program needs either combination.

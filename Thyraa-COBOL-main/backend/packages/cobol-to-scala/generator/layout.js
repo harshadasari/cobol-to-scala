@@ -123,9 +123,58 @@ export function elementaryByteLength(item) {
 }
 
 /**
+ * SYNCHRONIZED/SYNC padding bytes (round-14 finding 4) needed immediately
+ * BEFORE `item`, given the running byte offset of the next position within
+ * its own enclosing group. `item.sync` was parsed (parser/data-division-
+ * parser.js) but had no consumer anywhere in the generator before this fix -
+ * every SYNC clause was silently accepted and then completely ignored.
+ *
+ * Compiler-verified (installed GnuCOBOL, file-write probes - see this
+ * module's own history/round-14 notes):
+ *   - SYNC only has an observable effect on a binary item (COMP/COMP-4/
+ *     COMP-5/BINARY/COMPUTATIONAL[-4/-5]) - a COMP-3/PACKED-DECIMAL item
+ *     carrying SYNC is untouched (its record's total length exactly matches
+ *     the unpadded sum, identical to the same PICTURE with no SYNC clause
+ *     at all) - real COBOL's SYNCHRONIZED clause is specifically about
+ *     binary-word alignment, which packed/zoned-decimal storage has no
+ *     concept of.
+ *   - A binary item of N bytes (2 for 1-4 digits, 4 for 5-9, 8 for 10-18 -
+ *     the exact same sizing elementaryByteLength already uses) aligns to
+ *     the next multiple of N: a 1-byte PIC X(1) followed by a SYNC PIC
+ *     S9(4) COMP inserts 1 pad byte (offset 1 -> 2); a SYNC PIC S9(8) COMP
+ *     (4 bytes) after the same 1-byte field inserts 3 pad bytes (offset 1
+ *     -> 4); a SYNC PIC S9(16) COMP (8 bytes) inserts 7 (offset 1 -> 8). An
+ *     already-aligned item needs no padding at all.
+ *   - The pad byte's own value is 0x00 (a redefined flat-PIC-X view of a
+ *     padded record, INSPECT TALLYING FOR ALL X"00" vs X"20", tallies the
+ *     pad position(s) as X"00" - never a space).
+ *
+ * Scoped to a group's own DIRECT children, offset relative to that group's
+ * own start (0) - not threaded through nested sub-groups' own internal
+ * layout or combined with OCCURS (neither combination is exercised by any
+ * corpus program); see tests/oracle/README.md's Known Gaps for the
+ * documented narrower edge this leaves.
+ */
+export function syncPadBytes(item, offset) {
+  if (!item || !item.sync) return 0;
+  const usage = (item.usage || '').toUpperCase();
+  const isBinary = usage === 'COMP' || usage === 'COMP-4' || usage === 'COMP-5' ||
+    usage === 'COMPUTATIONAL' || usage === 'COMPUTATIONAL-4' ||
+    usage === 'COMPUTATIONAL-5' || usage === 'BINARY';
+  if (!isBinary) return 0;
+
+  const size = elementaryByteLength(item);
+  if (size <= 1) return 0;
+  const rem = offset % size;
+  return rem === 0 ? 0 : size - rem;
+}
+
+/**
  * Total storage bytes of a data item including all occurrences.
- * Group items sum their children recursively. Level-88 condition entries
- * and REDEFINES entries occupy no additional storage.
+ * Group items sum their children recursively (honoring each child's own
+ * SYNC alignment padding - round-14 finding 4 - relative to this group's own
+ * start). Level-88 condition entries and REDEFINES entries occupy no
+ * additional storage.
  */
 export function itemByteLength(item) {
   if (!item) return 0;
@@ -135,9 +184,17 @@ export function itemByteLength(item) {
     child => child.level !== 88 && !child.redefines
   );
 
-  const single = realChildren.length > 0
-    ? realChildren.reduce((sum, child) => sum + itemByteLength(child), 0)
-    : elementaryByteLength(item);
+  let single;
+  if (realChildren.length > 0) {
+    let offset = 0;
+    for (const child of realChildren) {
+      offset += syncPadBytes(child, offset);
+      offset += itemByteLength(child);
+    }
+    single = offset;
+  } else {
+    single = elementaryByteLength(item);
+  }
 
   return single * occursCount(item);
 }
@@ -179,6 +236,7 @@ export default {
   hasOccurs,
   elementaryByteLength,
   itemByteLength,
+  syncPadBytes,
   scalaBaseType,
   picDigits,
 };

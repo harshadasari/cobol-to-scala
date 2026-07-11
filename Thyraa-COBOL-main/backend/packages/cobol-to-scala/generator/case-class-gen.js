@@ -74,6 +74,7 @@ import {
   hasOccurs,
   elementaryByteLength,
   itemByteLength,
+  syncPadBytes,
   scalaBaseType,
   picDigits,
 } from './layout.js';
@@ -399,6 +400,14 @@ export function generateCaseClass(dataItem, indent = 0, options = {}, context = 
       ? itemByteLength({ ...child, occurs: null })
       : elementaryByteLength(child);
 
+    // round-14 finding 4: SYNCHRONIZED/SYNC alignment padding (layout.js's
+    // syncPadBytes - a no-op for anything but a SYNC binary/COMP item) goes
+    // immediately BEFORE this field, advancing the running offset first -
+    // parse/format both need to skip exactly this many bytes ahead of the
+    // field's own bytes (see the padBefore consumers below).
+    const padBefore = syncPadBytes(child, totalLength);
+    totalLength += padBefore;
+
     const fieldOffset = totalLength;
     totalLength += elementLength * count;
 
@@ -413,6 +422,7 @@ export function generateCaseClass(dataItem, indent = 0, options = {}, context = 
       cobolName: child.name,
       length: elementLength,
       offset: fieldOffset,
+      padBefore,
       occurs: count,
       isTable,
       isGroup: hasRealChildren,
@@ -459,6 +469,11 @@ export function generateCaseClass(dataItem, indent = 0, options = {}, context = 
   lines.push(`${indentStr}    var offset = 0`);
 
   for (const field of realFields) {
+    if (field.padBefore) {
+      // round-14 finding 4: SYNCHRONIZED/SYNC alignment padding - skip these
+      // bytes (never any field's own data) before reading the field itself.
+      lines.push(`${indentStr}    offset += ${field.padBefore} // SYNC alignment padding`);
+    }
     if (field.dependingOn) {
       lines.push(
         `${indentStr}    // TODO(ODO): '${field.name}' is OCCURS ... DEPENDING ON ${field.dependingOn} - ` +
@@ -498,6 +513,13 @@ export function generateCaseClass(dataItem, indent = 0, options = {}, context = 
   lines.push(`${indentStr}    var offset = 0`);
 
   for (const field of realFields) {
+    if (field.padBefore) {
+      // round-14 finding 4: leave these bytes at the buffer's own default
+      // zero-fill (`new Array[Byte](recordLength)` above is already all
+      // 0x00) - matching cobc's own observed SYNC pad-byte value exactly -
+      // by simply advancing past them without writing anything.
+      lines.push(`${indentStr}    offset += ${field.padBefore} // SYNC alignment padding`);
+    }
     if (field.isTable && field.isGroup) {
       const innerType = field.type.replace('Vector[', '').replace(']', '');
       lines.push(`${indentStr}    record.${field.name}.foreach { elem =>`);

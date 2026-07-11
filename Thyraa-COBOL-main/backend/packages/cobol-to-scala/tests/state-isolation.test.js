@@ -53,11 +53,21 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { convertToScala } from '../index.js';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CORPUS = path.join(__dirname, 'corpus', 'proc');
+
 function scalaOf(source, opts = {}) {
   return convertToScala(source, { generateMain: true, ...opts }).scala;
+}
+
+function corpusSource(name) {
+  return fs.readFileSync(path.join(CORPUS, name), 'utf-8');
 }
 
 // ---------------------------------------------------------------------------
@@ -261,4 +271,77 @@ test('GROUP_REGISTRY/TABLE_REGISTRY do not leak a table-shaped record into a lat
   // instead of a plain String var, because GROUP_REGISTRY/TABLE_REGISTRY
   // still had TABLEA's WS-REC entry installed.
   assert.match(b, /var wsRec\s*:\s*String/, 'BUG: TABLEB\'s WS-REC must be a plain String var, not leaked table/group structure from TABLEA');
+});
+
+test('GROUP_REGISTRY/TABLE_REGISTRY: reverse order (plain program FIRST, table-bearing program SECOND) leaves the table-bearing program\'s own registrations fully intact', () => {
+  // Mirrors round-14's own state-isolation scenario A1-reverse: a prior
+  // plain-record conversion must never suppress or corrupt the NEXT,
+  // unrelated program's own legitimate table registration.
+  const b = scalaOf(TABLE_B_SOURCE);
+  assert.match(b, /var wsRec\s*:\s*String/);
+  const a = scalaOf(TABLE_A_SOURCE);
+  assert.match(a, /Vector|Array/, 'BUG: TABLEA\'s own table registration must not be affected by a preceding unrelated plain-record conversion');
+});
+
+// ---------------------------------------------------------------------------
+// AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM (method-gen.js/expression-gen.js) -
+// round-14's own state-isolation scenario A6: an ambiguous-bare-paragraph-
+// name program must not leave its ambiguity set installed for a later,
+// unrelated program whose own (non-ambiguous) paragraph name happens to be
+// textually similar.
+// ---------------------------------------------------------------------------
+
+test('AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM does not leak into a later, unrelated program - its own unambiguous paragraph stays unqualified', () => {
+  // z12: two SECTIONS each declare a same-named bare paragraph (PARA-ONE) -
+  // MAIN-PARA's qualified PERFORM resolves to SECTION-B's own copy.
+  const z12 = scalaOf(corpusSource('z12-qualified-perform.cbl'));
+  assert.match(z12, /sectionBParaOne/, 'sanity: z12 itself must qualify its own genuinely-ambiguous paragraph');
+
+  // n02: SUB-PARA is declared exactly once - never ambiguous anywhere in
+  // ITS OWN source - so it must generate/resolve as a bare, unqualified
+  // method regardless of what z12's own ambiguity set contained.
+  const n02 = scalaOf(corpusSource('n02-exitparagraph.cbl'));
+  assert.match(n02, /def subPara\(\): Unit =/, 'BUG: n02\'s own unique SUB-PARA must generate as a bare, unqualified method');
+  assert.doesNotMatch(n02, /\bsectionSubPara\b/, 'BUG: n02\'s SUB-PARA must not be leaked-qualified using a section name that only exists in the PREVIOUS, unrelated z12 program');
+});
+
+// ---------------------------------------------------------------------------
+// ADVANCING_FILES (expression-gen.js/file-io-gen.js) - round-14's own
+// state-isolation scenario A7: a file that used WRITE ... ADVANCING in one
+// program must not leave CLOSE's deferred-newline-flush behavior wired up
+// for a LATER, unrelated program's file of the identical name that never
+// uses ADVANCING at all.
+// ---------------------------------------------------------------------------
+
+test('ADVANCING_FILES does not leak into a later, unrelated program\'s same-named file that never uses ADVANCING', () => {
+  // t01 and s01 both SELECT a file literally named OUT-FILE (assigned to
+  // different physical paths) - t01 uses WRITE ... AFTER ADVANCING on it,
+  // s01 never uses ADVANCING at all. Converted in that order in one
+  // process, s01's own CLOSE must not inherit t01's deferred-flush.
+  const t01 = scalaOf(corpusSource('t01-write-advancing-lines.cbl'));
+  assert.match(t01, /outFileWriter\.print\("\\n"\)/, 'sanity: t01 itself must defer-flush a final newline at CLOSE for its own ADVANCING-using OUT-FILE');
+
+  const s01 = scalaOf(corpusSource('s01-fileio-roundtrip.cbl'));
+  assert.doesNotMatch(
+    s01,
+    /outFileWriter\.print\("\\n"\)/,
+    'BUG: s01\'s own OUT-FILE (no ADVANCING anywhere in ITS OWN source) must not inherit the deferred-newline-flush from the previous, unrelated t01 program'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// CALL_RET_SEQ (expression-gen.js) - round-14's own state-isolation
+// scenario A9: converting the SAME source repeatedly in one process must be
+// byte-identical every time (the per-call `_callRetN` counter must reset to
+// 0 at the top of every generateScala() call, not keep incrementing across
+// unrelated - or even identical - conversions).
+// ---------------------------------------------------------------------------
+
+test('CALL_RET_SEQ resets every call - converting the same source 3x in one process is byte-identical each time', () => {
+  const source = corpusSource('z09-call-goback-stoprun.cbl');
+  const first = scalaOf(source);
+  const second = scalaOf(source);
+  const third = scalaOf(source);
+  assert.equal(first, second, 'BUG: a second conversion of the identical source produced different Scala (a leaking counter/sequence)');
+  assert.equal(second, third);
 });

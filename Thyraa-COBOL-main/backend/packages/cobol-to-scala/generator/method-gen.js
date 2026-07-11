@@ -183,21 +183,20 @@ function generatePerformFromAST(stmt, indent = 0) {
   const indentStr = '  '.repeat(indent);
   // round-12 bonus finding (z12): an explicit OF/IN qualifier
   // (stmt.targetSection) routes through the collision-aware resolver instead
-  // of a plain unqualified name - but only for the single-target (no THRU)
-  // form; a THRU range's own composite wrapper-method name
-  // (generatePerformThruMethod) is untouched/still built from the plain
-  // unqualified name below (no corpus program combines THRU with an
-  // explicit qualifier, so that combination is deliberately left as-is
-  // rather than guessed at).
-  const target = stmt.throughParagraph
-    ? toMethodName(stmt.targetParagraph || '')
-    : resolvePerformTargetMethodName(stmt.targetParagraph || '', stmt.targetSection);
+  // of a plain unqualified name, for the single-target (no THRU) form.
+  //
+  // round-14 finding 1: a THRU range's own composite wrapper-method name
+  // (generatePerformThruMethod) now ALSO threads targetSection/throughSection
+  // through - via the shared performThruWrapperName helper - so a qualified
+  // `PERFORM x OF secA THRU y OF secB` calls the wrapper actually generated
+  // for this exact qualified pair, not an unrelated bare-name-identical
+  // range resolved elsewhere in program order.
+  const target = resolvePerformTargetMethodName(stmt.targetParagraph || '', stmt.targetSection);
 
   // Simple PERFORM
   if (stmt.performType === 'simple') {
     if (stmt.throughParagraph) {
-      const thruTarget = toMethodName(stmt.throughParagraph);
-      return `${indentStr}${target}To${toPascalCase(stmt.throughParagraph.replace(/^\d+[-_]?/, ''))}()`;
+      return `${indentStr}${performThruWrapperName(stmt.targetParagraph || '', stmt.targetSection, stmt.throughParagraph, stmt.throughSection)}()`;
     }
     return `${indentStr}${target}()`;
   }
@@ -549,6 +548,36 @@ function resolvePerformTargetMethodName(paragraphName, sectionName) {
 }
 
 /**
+ * The composite wrapper-method name for a `PERFORM x [OF/IN secX] THRU y
+ * [OF/IN secY]` range (round-14 finding 1) - shared by generatePerformThruMethod
+ * (which declares the wrapper `def`) and generatePerformFromAST's own
+ * simple-THRU call site (which must call the exact same name), so the two
+ * never drift apart.
+ *
+ * When neither endpoint carries a qualifier (the overwhelmingly common case,
+ * and every pre-round-14 corpus program), this reduces byte-for-byte to the
+ * pre-existing unqualified scheme (`<from>To<To>`) - expression-gen.js's
+ * procedureCallExpr (SORT INPUT/OUTPUT PROCEDURE ... THRU, which never
+ * carries a qualifier at all) keeps computing that same unqualified form
+ * independently and still matches.
+ *
+ * When a qualifier IS present, it's folded into the name too
+ * (`<from>In<SecX>To<To>In<SecY>`) - without this, two *different* qualified
+ * THRU ranges that happen to share both bare endpoint names (legal COBOL:
+ * `PERFORM PARA-ONE OF SEC-A THRU PARA-TWO OF SEC-A` and `... OF SEC-B THRU
+ * ... OF SEC-B` in the same program) would collapse onto the identical
+ * wrapper-method name - a hard duplicate-def compile error, or worse, one
+ * silently shadowing/serving the other.
+ */
+export function performThruWrapperName(fromParagraph, fromSection, toParagraph, toSection) {
+  const fromBase = toMethodName(fromParagraph);
+  const toBase = toPascalCase(String(toParagraph || '').replace(/^\d+[-_]?/, ''));
+  const fromQualifier = fromSection ? 'In' + toPascalCase(String(fromSection).replace(/^\d+[-_]?/, '')) : '';
+  const toQualifier = toSection ? 'In' + toPascalCase(String(toSection).replace(/^\d+[-_]?/, '')) : '';
+  return `${fromBase}${fromQualifier}To${toBase}${toQualifier}`;
+}
+
+/**
  * Flatten the whole PROCEDURE DIVISION into one ordered list of paragraph-like
  * units - `{ name, statements, sectionName }` - in true source order: any
  * genuinely top-level (pre-first-SECTION) paragraphs first, then each
@@ -647,14 +676,20 @@ function statementEndsInUnconditionalTransfer(statements) {
  * resolveParagraphMethodName qualifies only the genuinely-colliding ones by
  * their own enclosing section, leaving every unique name exactly as before.
  */
-export function generatePerformThruMethod(fromParagraph, toParagraph, units, ambiguousNames, indent = 0) {
+export function generatePerformThruMethod(fromParagraph, toParagraph, units, ambiguousNames, indent = 0, fromSection = null, toSection = null) {
   const indentStr = '  '.repeat(indent);
-  const fromName = toMethodName(fromParagraph);
-  const methodName = `${fromName}To${toPascalCase(toParagraph.replace(/^\d+[-_]?/, ''))}`;
+  const methodName = performThruWrapperName(fromParagraph, fromSection, toParagraph, toSection);
   const nameFor = (u) => resolveParagraphMethodName(u.name, u.sectionName, ambiguousNames);
 
-  const startIndex = units.findIndex(u => u.name === fromParagraph);
-  const endIndex = units.findIndex(u => u.name === toParagraph);
+  // round-14 finding 1: an explicit `OF`/`IN` qualifier on either endpoint
+  // (stmt.targetSection/throughSection) must narrow the lookup to the unit
+  // actually named in THAT section - matching by bare name alone always
+  // resolved the FIRST program-order occurrence, silently picking the wrong
+  // paragraph whenever the same bare name is declared in more than one
+  // section (see performThruWrapperName's doc comment for the matching
+  // wrapper-name-collision half of this fix).
+  const startIndex = units.findIndex(u => u.name === fromParagraph && (!fromSection || u.sectionName === fromSection));
+  const endIndex = units.findIndex(u => u.name === toParagraph && (!toSection || u.sectionName === toSection));
 
   // round-9 finding 5: a *backward* THRU range - `toParagraph` precedes
   // `fromParagraph` in physical program order, e.g. `PERFORM PARA-C THRU
@@ -689,15 +724,17 @@ export function generatePerformThruMethod(fromParagraph, toParagraph, units, amb
   let rangeUnits;
   if (isBackward) {
     rangeUnits = units.slice(startIndex);
+  } else if (startIndex !== -1 && endIndex !== -1) {
+    // round-14 finding 1: slice using the already-resolved (section-aware)
+    // startIndex/endIndex directly, rather than re-scanning `units` by bare
+    // name alone (the previous implementation's own separate `inRange` loop
+    // below re-did this lookup with a second, unqualified bare-name
+    // comparison - so even after startIndex/endIndex above were fixed to
+    // respect an explicit OF/IN qualifier, THIS loop silently overrode that
+    // fix by re-matching the first bare-name occurrence again).
+    rangeUnits = units.slice(startIndex, endIndex + 1);
   } else {
-    // Find all units in the range (inclusive), in program order.
-    let inRange = false;
     rangeUnits = [];
-    for (const u of units) {
-      if (u.name === fromParagraph) inRange = true;
-      if (inRange) rangeUnits.push(u);
-      if (u.name === toParagraph) break;
-    }
   }
 
   if (rangeUnits.length === 0) {
@@ -941,7 +978,23 @@ export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
   }
 
   const methods = [];
-  const performThrus = new Set();
+  // round-14 finding 1: keyed by (fromParagraph, fromSection, toParagraph,
+  // toSection) - not just the bare paragraph names - so two qualified THRU
+  // ranges that happen to share both bare endpoint names in DIFFERENT
+  // sections (`PERFORM PARA-ONE OF SEC-A THRU PARA-TWO OF SEC-A` vs `... OF
+  // SEC-B THRU ... OF SEC-B`) are collected as two distinct wrapper methods,
+  // not collapsed into a single Set entry (which previously resolved to
+  // whichever range `generatePerformThruMethod`'s own bare-name unit lookup
+  // happened to find first in program order, regardless of which one - or
+  // both - callers actually asked for).
+  const performThrus = new Map();
+  function addPerformThru(from, fromSection, to, toSection) {
+    if (!from || !to) return;
+    const key = JSON.stringify([from, fromSection || null, to, toSection || null]);
+    if (!performThrus.has(key)) {
+      performThrus.set(key, { from, fromSection: fromSection || null, to, toSection: toSection || null });
+    }
+  }
 
   // First pass - collect PERFORM THRU targets (PerformStatement AST nodes
   // use .targetParagraph/.throughParagraph - see parser/ast.js - not
@@ -970,14 +1023,17 @@ export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
   for (const unit of units) {
     for (const stmt of unit.statements || []) {
       if (stmt.type === 'PerformStatement' && stmt.throughParagraph) {
-        performThrus.add(`${stmt.targetParagraph}:${stmt.throughParagraph}`);
+        addPerformThru(stmt.targetParagraph, stmt.targetSection, stmt.throughParagraph, stmt.throughSection);
       }
       if (stmt.type === 'SortStatement') {
+        // SORT's own INPUT/OUTPUT PROCEDURE ... THRU clause has no OF/IN
+        // qualifier grammar of its own (parseSortProcedureClause never
+        // parses one) - always unqualified (null sections).
         if (stmt.inputProcedure?.procedure && stmt.inputProcedure.through) {
-          performThrus.add(`${stmt.inputProcedure.procedure}:${stmt.inputProcedure.through}`);
+          addPerformThru(stmt.inputProcedure.procedure, null, stmt.inputProcedure.through, null);
         }
         if (stmt.outputProcedure?.procedure && stmt.outputProcedure.through) {
-          performThrus.add(`${stmt.outputProcedure.procedure}:${stmt.outputProcedure.through}`);
+          addPerformThru(stmt.outputProcedure.procedure, null, stmt.outputProcedure.through, null);
         }
       }
     }
@@ -1004,9 +1060,8 @@ export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
   // (not just its bare paragraph list) so generatePerformThruMethod can
   // resolve collision-safe nested-def names via resolveParagraphMethodName,
   // exactly like the flat top-level methods above already do.
-  for (const thru of performThrus) {
-    const [from, to] = thru.split(':');
-    methods.push(generatePerformThruMethod(from, to, units, ambiguousNames, indent));
+  for (const thru of performThrus.values()) {
+    methods.push(generatePerformThruMethod(thru.from, thru.to, units, ambiguousNames, indent, thru.fromSection, thru.toSection));
   }
 
   return methods.join('\n\n');

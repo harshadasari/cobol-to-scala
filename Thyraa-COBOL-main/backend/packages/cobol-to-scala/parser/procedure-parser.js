@@ -2683,7 +2683,30 @@ function parseUnknownStatement(ctx, terminators = []) {
 }
 
 /**
- * Parse a block of statements until terminator keywords
+ * Parse a block of statements until terminator keywords OR a period.
+ *
+ * COBOL rule (round-14 finding 3): a PERIOD ends the *sentence*, which
+ * terminates ALL open conditional scopes at once - not just the innermost
+ * one. Every caller of this function represents one such implicit scope
+ * (an IF's THEN/ELSE arm, a READ's AT END/INVALID KEY arm, an EVALUATE
+ * WHEN arm, ON SIZE ERROR/OVERFLOW/EXCEPTION arms, ...) that COBOL lets end
+ * either explicitly (its own END-IF/END-READ/WHEN/END-EVALUATE/... keyword,
+ * already in `terminators`) or implicitly via a bare period when no
+ * explicit terminator is present in the source at all.
+ *
+ * The previous implementation treated a period as "skip and keep collecting
+ * into THIS block" - so an IF with no END-IF (or a READ AT END with no
+ * END-READ, etc.) silently absorbed every following statement in the
+ * paragraph into its own THEN-arm/AT-END-arm, rather than ending there.
+ *
+ * The fix: a period is just another terminator, except it must NOT be
+ * consumed here - the token is left in place so it propagates upward
+ * through every nested parseStatementBlock call (each one also stops
+ * without consuming it) until it reaches whichever sentence-level loop
+ * owns period consumption: parseProcedureDivision's/parseDeclaratives'
+ * own top-level per-paragraph loops, which each explicitly skip a period
+ * exactly once. This guarantees the period is consumed exactly once,
+ * regardless of how many scopes it closes on the way up.
  */
 function parseStatementBlock(ctx, terminators) {
   const statements = [];
@@ -2696,10 +2719,11 @@ function parseStatementBlock(ctx, terminators) {
       }
     }
 
-    // Check for period (end of sentence)
+    // A period ends the whole sentence - close this (and every enclosing)
+    // implicit scope WITHOUT consuming it; leave it for the sentence-level
+    // loop (parseProcedureDivision/parseDeclaratives) to consume once.
     if (ctx.check(TokenType.PERIOD)) {
-      ctx.advance();
-      continue;
+      return statements;
     }
 
     // Parse statement

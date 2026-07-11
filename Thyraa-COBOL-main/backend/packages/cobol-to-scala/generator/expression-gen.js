@@ -1170,6 +1170,111 @@ export function generateCobolInspectHelper() {
     '    else',
     '      val i = s.indexOf(boundary)',
     '      if i < 0 then (s, "") else (s.substring(0, i + boundary.length), s.substring(i + boundary.length))',
+    '',
+    '  // round-14 finding 2: a SINGLE INSPECT statement carrying MULTIPLE',
+    '  // REPLACING clauses (e.g. `REPLACING ALL "A" BY "B" ALL "B" BY "A"`) must',
+    '  // have every clause match against the PRE-STATEMENT snapshot of the',
+    '  // subject, in ONE left-to-right scan - not a cascade where each clause\'s',
+    '  // own textual output feeds the next clause\'s input (`AAAABBBB` with the',
+    '  // two clauses above must become `BBBBAAAA`, not `AAAAAAAA` - a naive',
+    '  // sequential .replace/.replace would first turn every `A` into `B`',
+    '  // (`BBBBBBBB`), then every `B` - including the ones the first pass just',
+    '  // wrote - into `A` (`AAAAAAAA`)). Mirrors real COBOL\'s own rule: scanning',
+    '  // left to right one position at a time, the FIRST clause (in the order',
+    '  // written) whose comparand matches at that position wins; matched',
+    '  // characters are then skipped over (not re-examined by a later clause).',
+    '  case class ReplClause(kind: String, from: String, to: String, regionType: String, regionBoundary: String)',
+    '',
+    '  private def replRegion(s: String, c: ReplClause): (Int, Int) =',
+    '    val n = s.length',
+    '    c.regionType match',
+    '      case "BEFORE" =>',
+    '        if c.regionBoundary.isEmpty then (0, n)',
+    '        else',
+    '          val i = s.indexOf(c.regionBoundary)',
+    '          if i < 0 then (0, n) else (0, i)',
+    '      case "AFTER" =>',
+    '        if c.regionBoundary.isEmpty then (0, n)',
+    '        else',
+    '          val i = s.indexOf(c.regionBoundary)',
+    '          if i < 0 then (n, n) else (i + c.regionBoundary.length, n)',
+    '      case _ => (0, n)',
+    '',
+    '  // TRAILING\'s own contiguous run is anchored at the END of its region -',
+    '  // precomputed here (non-destructively, against the original text) exactly',
+    '  // like the single-clause replaceTrailing helper\'s own backward scan.',
+    '  private def replTrailingZoneStart(s: String, c: ReplClause, start: Int, end: Int): Int =',
+    '    if c.from.isEmpty then end',
+    '    else',
+    '      var i = end - c.from.length',
+    '      while i >= start && s.regionMatches(i, c.from, 0, c.from.length) do i -= c.from.length',
+    '      i + c.from.length',
+    '',
+    '  // Position-preserving overwrite (LEADING/TRAILING/CHARACTERS convention -',
+    '  // matches replaceLeading/replaceTrailing\'s own setCharAt-based partial',
+    '  // overwrite): only the first min(from.length, to.length) characters of',
+    '  // the matched span actually change; any remaining positions keep their',
+    '  // original text.',
+    '  private def replPadded(s: String, start: Int, spanLen: Int, to: String): String =',
+    '    val sb = new StringBuilder',
+    '    var j = 0',
+    '    while j < spanLen do',
+    '      sb.append(if j < to.length then to(j) else s.charAt(start + j))',
+    '      j += 1',
+    '    sb.toString',
+    '',
+    '  def replaceMultiClause(s: String, clauses: Seq[ReplClause]): String =',
+    '    val n = s.length',
+    '    val regions = clauses.map(c => replRegion(s, c))',
+    '    val trailingStarts = clauses.zip(regions).map { case (c, (start, end)) =>',
+    '      if c.kind == "TRAILING" then replTrailingZoneStart(s, c, start, end) else -1',
+    '    }',
+    '    val leadingActive = Array.fill(clauses.length)(true)',
+    '    val firstDone = Array.fill(clauses.length)(false)',
+    '    val out = new StringBuilder',
+    '    var i = 0',
+    '    while i < n do',
+    '      var consumed = false',
+    '      var ci = 0',
+    '      while !consumed && ci < clauses.length do',
+    '        val c = clauses(ci)',
+    '        val (rStart, rEnd) = regions(ci)',
+    '        if i >= rStart && i < rEnd then',
+    '          c.kind match',
+    '            case "CHARACTERS" =>',
+    '              out.append(if c.to.nonEmpty then c.to.head else s.charAt(i))',
+    '              i += 1',
+    '              consumed = true',
+    '            case "ALL" =>',
+    '              if c.from.nonEmpty && i + c.from.length <= rEnd && s.regionMatches(i, c.from, 0, c.from.length) then',
+    '                out.append(c.to)',
+    '                i += c.from.length',
+    '                consumed = true',
+    '            case "FIRST" =>',
+    '              if !firstDone(ci) && c.from.nonEmpty && i + c.from.length <= rEnd && s.regionMatches(i, c.from, 0, c.from.length) then',
+    '                out.append(c.to)',
+    '                i += c.from.length',
+    '                firstDone(ci) = true',
+    '                consumed = true',
+    '            case "LEADING" =>',
+    '              if leadingActive(ci) then',
+    '                if c.from.nonEmpty && i + c.from.length <= rEnd && s.regionMatches(i, c.from, 0, c.from.length) then',
+    '                  out.append(replPadded(s, i, c.from.length, c.to))',
+    '                  i += c.from.length',
+    '                  consumed = true',
+    '                else',
+    '                  leadingActive(ci) = false',
+    '            case "TRAILING" =>',
+    '              if c.from.nonEmpty && i >= trailingStarts(ci) && ((i - trailingStarts(ci)) % c.from.length == 0) && i + c.from.length <= rEnd then',
+    '                out.append(replPadded(s, i, c.from.length, c.to))',
+    '                i += c.from.length',
+    '                consumed = true',
+    '            case _ => ()',
+    '        ci += 1',
+    '      if !consumed then',
+    '        out.append(s.charAt(i))',
+    '        i += 1',
+    '    out.toString',
   ].join('\n');
 }
 
@@ -3886,25 +3991,43 @@ export function generateInspect(statement, indent = 0) {
     }
   }
 
-  if (Array.isArray(statement.replacing) && statement.replacing.length > 0) {
-    let expr = target;
-    for (const r of statement.replacing) {
-      const buildOperation = (scanExpr) => {
-        if (r.type === 'CHARACTERS') {
-          const to = convertArithmeticExpression(r.to);
-          return `CobolInspect.replaceCharacters(${scanExpr}, ${to})`;
-        }
-        const from = convertArithmeticExpression(r.from);
+  if (Array.isArray(statement.replacing) && statement.replacing.length === 1) {
+    // Single REPLACING clause: no cascading concern (there is only one
+    // clause to apply), so this keeps the pre-existing, already
+    // oracle-verified per-clause-type codegen byte-for-byte.
+    const r = statement.replacing[0];
+    const buildOperation = (scanExpr) => {
+      if (r.type === 'CHARACTERS') {
         const to = convertArithmeticExpression(r.to);
-        if (r.type === 'FIRST') return `CobolInspect.replaceFirst(${scanExpr}, ${from}, ${to})`;
-        if (r.type === 'LEADING') return `CobolInspect.replaceLeading(${scanExpr}, ${from}, ${to})`;
-        if (r.type === 'TRAILING') return `CobolInspect.replaceTrailing(${scanExpr}, ${from}, ${to})`;
-        // ALL (default)
-        return `CobolInspect.replaceAll(${scanExpr}, ${from}, ${to})`;
-      };
-      expr = applyInspectRegion(r.region, expr, buildOperation);
-    }
+        return `CobolInspect.replaceCharacters(${scanExpr}, ${to})`;
+      }
+      const from = convertArithmeticExpression(r.from);
+      const to = convertArithmeticExpression(r.to);
+      if (r.type === 'FIRST') return `CobolInspect.replaceFirst(${scanExpr}, ${from}, ${to})`;
+      if (r.type === 'LEADING') return `CobolInspect.replaceLeading(${scanExpr}, ${from}, ${to})`;
+      if (r.type === 'TRAILING') return `CobolInspect.replaceTrailing(${scanExpr}, ${from}, ${to})`;
+      // ALL (default)
+      return `CobolInspect.replaceAll(${scanExpr}, ${from}, ${to})`;
+    };
+    const expr = applyInspectRegion(r.region, target, buildOperation);
     lines.push(`${indentStr}${target} = ${expr}`);
+  } else if (Array.isArray(statement.replacing) && statement.replacing.length > 1) {
+    // round-14 finding 2: multiple REPLACING clauses in ONE INSPECT
+    // statement must all match against the PRE-STATEMENT snapshot of the
+    // target, in a single left-to-right pass (see CobolInspect.replaceMultiClause's
+    // own doc comment) - not the previous cascade, where each clause's
+    // `applyInspectRegion` wrapped the *previous* clause's own resulting
+    // expression, so a later clause's comparand could match text an
+    // earlier clause in the SAME statement had just written.
+    const clauseExprs = statement.replacing.map((r) => {
+      const kind = r.type || 'ALL';
+      const from = r.type === 'CHARACTERS' ? '""' : convertArithmeticExpression(r.from);
+      const to = convertArithmeticExpression(r.to);
+      const regionType = r.region ? r.region.type : '';
+      const regionBoundary = r.region ? inspectRegionBoundaryExpr(r.region) : '""';
+      return `CobolInspect.ReplClause("${kind}", ${from}, ${to}, "${regionType}", ${regionBoundary})`;
+    });
+    lines.push(`${indentStr}${target} = CobolInspect.replaceMultiClause(${target}, Seq(${clauseExprs.join(', ')}))`);
   }
 
   if (statement.converting) {

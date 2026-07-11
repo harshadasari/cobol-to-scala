@@ -12,6 +12,13 @@ _(none currently open - all prior pins resolved; see cycle entries. Tracked-OPEN
 
 ## Activity
 
+### 2026-07-11 21:50 — Cycle: round-13 committed (1469d23, 828/828, 198 programs); round-14 verdict + fix in flight
+- Round-13 + state-leak fix committed after independent full-suite verification (828/0/0 - the leak fix also eliminated the 5 'flaky' todos, confirming the leak was their root cause, not scala-cli races). Dashboard synced (e47034a).
+- Round-14 refutation: NOT CONVERGED at 4. Finding 3 is the most consequential in many rounds: parseStatementBlock treats a PERIOD as skip-and-continue, so ANY conditional clause without an explicit END-* terminator silently swallows all following statements in the paragraph (classic period-terminated COBOL style - affects IF, READ AT END, ON SIZE ERROR, ON OVERFLOW, INVALID KEY across the board). Also: qualified PERFORM THRU resolves wrong section on bare-name collision (a code comment admitted this but it was never in the Known Gaps doc), INSPECT REPLACING multi-clause cascades instead of snapshot-matching, SYNC alignment parsed but dead.
+- Major positive: ALL 13 state-isolation probes clean - the round-13 leak class is confirmed closed by code audit + behavioral diffing against fresh-process baselines.
+- Round-14 fix agent dispatched with sentence-scope fix prioritized and staged (full suite after that change alone before layering others, given its blast radius across the shared parsing path).
+- Trend: 11,16,15,16,6,6,8,4,6,6,3,4,5,4. Wall ~20.5h/48h.
+
 ### 2026-07-11 20:55 — Cycle: round-13 self-verification caught a real cross-conversion state-leak bug
 - User re-engaged mid-loop (asked status, then said keep hunting + wanted a dashboard file - both done: docs/PROGRESS_STATUS.md created and kept in sync).
 - Round-13 fix agent's own verification run showed 1 fail + 5 todo (not clean). Orchestrator investigation (not the fix agent) found: the 1 failing unit test was NOT stale - it exposed a genuine bug. The round-13 DECLARATIVES two-pass registry fix left module-level handler-registry state unreset between separate convertToScala() calls in the same process: converting program A (with a DECLARATIVES handler for file IN-FILE) then program B (unrelated, also names a file IN-FILE, no handler) causes B to incorrectly call A's handler method, which doesn't exist in B's own generated code. Reproduced deterministically via direct two-call script.

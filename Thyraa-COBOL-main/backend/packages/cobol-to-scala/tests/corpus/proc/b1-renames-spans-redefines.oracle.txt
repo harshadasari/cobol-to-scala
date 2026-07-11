@@ -1,0 +1,3 @@
+BC=[123CCC]
+BNUM=123
+A=[AAA] B=[XXX] C=[XXX]

@@ -1,0 +1,22 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. THRUQUAL.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           DISPLAY "START".
+           PERFORM PARA-ONE OF SECTION-B THRU PARA-TWO OF SECTION-B.
+           DISPLAY "END".
+           STOP RUN.
+
+       SECTION-A SECTION.
+       PARA-ONE.
+           DISPLAY "A-ONE".
+       PARA-TWO.
+           DISPLAY "A-TWO".
+
+       SECTION-B SECTION.
+       PARA-ONE.
+           DISPLAY "B-ONE".
+       PARA-TWO.
+           DISPLAY "B-TWO".

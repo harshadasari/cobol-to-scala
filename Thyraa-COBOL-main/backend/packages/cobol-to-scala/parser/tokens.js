@@ -244,9 +244,18 @@ export const TokenType = {
   EXIT: 'EXIT',
   PROGRAM: 'PROGRAM',
   RETURN: 'RETURN',
+  END_RETURN: 'END-RETURN',
   ACCEPT: 'ACCEPT',
   DISPLAY: 'DISPLAY',
   UPON: 'UPON',
+
+  // SEARCH / SORT / MERGE / RELEASE and intrinsic FUNCTION calls
+  SEARCH: 'SEARCH',
+  END_SEARCH: 'END-SEARCH',
+  SORT: 'SORT',
+  MERGE: 'MERGE',
+  RELEASE: 'RELEASE',
+  FUNCTION: 'FUNCTION',
 
   // EXEC SQL/CICS
   EXEC: 'EXEC',
@@ -550,8 +559,17 @@ export const Keywords = new Map([
   ['EXIT', TokenType.EXIT],
   ['PROGRAM', TokenType.PROGRAM],
   ['RETURN', TokenType.RETURN],
+  ['END-RETURN', TokenType.END_RETURN],
   ['ACCEPT', TokenType.ACCEPT],
   ['UPON', TokenType.UPON],
+
+  // SEARCH / SORT / MERGE / RELEASE and intrinsic FUNCTION calls
+  ['SEARCH', TokenType.SEARCH],
+  ['END-SEARCH', TokenType.END_SEARCH],
+  ['SORT', TokenType.SORT],
+  ['MERGE', TokenType.MERGE],
+  ['RELEASE', TokenType.RELEASE],
+  ['FUNCTION', TokenType.FUNCTION],
 
   // EXEC SQL/CICS
   ['EXEC', TokenType.EXEC],

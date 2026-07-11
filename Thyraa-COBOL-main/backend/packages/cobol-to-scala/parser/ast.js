@@ -317,7 +317,21 @@ export class ArithmeticExpression extends ASTNode {
     this.right = options.right || null;
     this.value = options.value || null;             // For literals
     this.variable = options.variable || null;       // For variable references
+    this.functionCall = options.functionCall || null; // FUNCTION intrinsic call
     this.unaryMinus = options.unaryMinus || false;
+  }
+}
+
+/**
+ * FUNCTION intrinsic call, e.g. FUNCTION UPPER-CASE(WS-TEXT),
+ * FUNCTION MOD(17, 5). Appears anywhere an operand/expression is legal
+ * (MOVE source, COMPUTE expression, DISPLAY operand, condition subject).
+ */
+export class FunctionCall extends ASTNode {
+  constructor(options = {}) {
+    super('FunctionCall', options.location);
+    this.name = options.name || '';
+    this.arguments = options.arguments || [];
   }
 }
 
@@ -426,6 +440,90 @@ export class InspectStatement extends Statement {
     this.tallying = options.tallying || [];
     this.replacing = options.replacing || [];
     this.converting = options.converting || null;
+  }
+}
+
+/**
+ * SEARCH / SEARCH ALL statement
+ */
+export class SearchStatement extends Statement {
+  constructor(options = {}) {
+    super('SearchStatement', options);
+    this.searchAll = options.searchAll || false;    // true for SEARCH ALL (binary search)
+    this.target = options.target || null;           // VariableReference to the OCCURS table/index-name
+    this.varying = options.varying || null;         // VARYING identifier (linear SEARCH only)
+    this.atEnd = options.atEnd || [];               // AT END imperative statements
+    this.whenClauses = options.whenClauses || [];   // Array of SearchWhenClause
+  }
+}
+
+/**
+ * WHEN clause for SEARCH / SEARCH ALL
+ */
+export class SearchWhenClause extends ASTNode {
+  constructor(options = {}) {
+    super('SearchWhenClause', options.location);
+    this.condition = options.condition || null;
+    this.statements = options.statements || [];
+  }
+}
+
+/**
+ * SORT statement (table sort or file sort with
+ * USING/GIVING/INPUT PROCEDURE/OUTPUT PROCEDURE)
+ */
+export class SortStatement extends Statement {
+  constructor(options = {}) {
+    super('SortStatement', options);
+    this.fileName = options.fileName || null;       // Table name or SD file name
+    this.keys = options.keys || [];                 // Array of { order, fields }
+    this.duplicates = options.duplicates || false;  // WITH DUPLICATES IN ORDER
+    this.collatingSequence = options.collatingSequence || null;
+    this.using = options.using || [];               // Array of file names (USING form)
+    this.inputProcedure = options.inputProcedure || null;   // { procedure, through }
+    this.giving = options.giving || [];              // Array of file names (GIVING form)
+    this.outputProcedure = options.outputProcedure || null; // { procedure, through }
+  }
+}
+
+/**
+ * MERGE statement
+ */
+export class MergeStatement extends Statement {
+  constructor(options = {}) {
+    super('MergeStatement', options);
+    this.fileName = options.fileName || null;
+    this.keys = options.keys || [];
+    this.collatingSequence = options.collatingSequence || null;
+    this.using = options.using || [];
+    this.giving = options.giving || [];
+    this.outputProcedure = options.outputProcedure || null; // { procedure, through }
+  }
+}
+
+/**
+ * RELEASE statement (writes a record to a SORT work file from an
+ * INPUT PROCEDURE)
+ */
+export class ReleaseStatement extends Statement {
+  constructor(options = {}) {
+    super('ReleaseStatement', options);
+    this.recordName = options.recordName || null;
+    this.from = options.from || null;
+  }
+}
+
+/**
+ * RETURN statement (reads the next sorted/merged record inside an
+ * OUTPUT PROCEDURE)
+ */
+export class ReturnStatement extends Statement {
+  constructor(options = {}) {
+    super('ReturnStatement', options);
+    this.fileName = options.fileName || null;
+    this.into = options.into || null;
+    this.atEnd = options.atEnd || [];
+    this.notAtEnd = options.notAtEnd || [];
   }
 }
 
@@ -613,6 +711,22 @@ export class ContinueStatement extends Statement {
 export class NextSentenceStatement extends Statement {
   constructor(options = {}) {
     super('NextSentenceStatement', options);
+  }
+}
+
+/**
+ * Placeholder for a statement the parser does not (yet) recognize.
+ * Captures its raw token values verbatim, up to a safe boundary (period,
+ * next recognized statement keyword, an enclosing block's terminator, or
+ * a paragraph/section name) so that unsupported verbs are visible in the
+ * AST instead of silently vanishing or corrupting a neighboring
+ * statement's operand list (see tests/corpus/README.md).
+ */
+export class UnknownStatement extends Statement {
+  constructor(options = {}) {
+    super('UnknownStatement', options);
+    this.keyword = options.keyword || '';           // First token's raw value
+    this.tokens = options.tokens || [];              // All captured raw token values
   }
 }
 
@@ -894,6 +1008,13 @@ export default {
   InspectStatement,
   CallStatement,
   CallParameter,
+  FunctionCall,
+  SearchStatement,
+  SearchWhenClause,
+  SortStatement,
+  MergeStatement,
+  ReleaseStatement,
+  ReturnStatement,
 
   // File I/O
   OpenStatement,
@@ -911,6 +1032,7 @@ export default {
   ExitStatement,
   ContinueStatement,
   NextSentenceStatement,
+  UnknownStatement,
 
   // Other Statements
   InitializeStatement,

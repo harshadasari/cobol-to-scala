@@ -215,6 +215,36 @@ function generateMethodBody(statements, indent = 1) {
 }
 
 /**
+ * Render the body of a PERFORM (paragraph call, or the inline statement
+ * block for a `PERFORM ... END-PERFORM` form) at the given indent. Mirrors
+ * generateMethodBody's own empty-body fallback so a loop with neither a
+ * target paragraph nor inline statements still produces valid Scala.
+ */
+function performBodyLines(stmt, indent) {
+  if (stmt.targetParagraph) {
+    return `${'  '.repeat(indent)}${toMethodName(stmt.targetParagraph)}()`;
+  }
+  if (stmt.statements && stmt.statements.length > 0) {
+    return generateMethodBody(stmt.statements, indent);
+  }
+  return `${'  '.repeat(indent)}()`;
+}
+
+/**
+ * Scala expression for a PERFORM VARYING FROM/BY operand (a Literal or
+ * VariableReference AST node, per parser/procedure-parser.js's
+ * parseVaryingClause -> parseOperand). Falls back to `fallback` when absent.
+ */
+function varyingOperandExpr(operand, fallback) {
+  if (operand == null) return String(fallback);
+  if (typeof operand === 'object') {
+    if (operand.type === 'Literal') return String(operand.value);
+    if (operand.name) return toCamelCase(operand.name);
+  }
+  return String(operand);
+}
+
+/**
  * Generate PERFORM from AST PerformStatement object
  */
 function generatePerformFromAST(stmt, indent = 0) {
@@ -234,7 +264,7 @@ function generatePerformFromAST(stmt, indent = 0) {
   if (stmt.performType === 'times') {
     const times = stmt.times?.value || stmt.times || 1;
     return `${indentStr}(1 to ${times}).foreach { _ =>
-${indentStr}  ${target}()
+${performBodyLines(stmt, indent + 1)}
 ${indentStr}}`;
   }
 
@@ -242,13 +272,14 @@ ${indentStr}}`;
   if (stmt.performType === 'until') {
     const condition = convertConditionToScala(stmt.until);
     const testBefore = stmt.testBefore !== false;
+    const body = performBodyLines(stmt, indent + 1);
 
     if (testBefore) {
       return `${indentStr}while !(${condition}) do
-${indentStr}  ${target}()`;
+${body}`;
     } else {
       return `${indentStr}do
-${indentStr}  ${target}()
+${body}
 ${indentStr}while !(${condition})`;
     }
   }
@@ -256,23 +287,25 @@ ${indentStr}while !(${condition})`;
   // PERFORM VARYING
   if (stmt.performType === 'varying' && stmt.varying) {
     const varName = toCamelCase(stmt.varying.variable || 'i');
-    const from = stmt.varying.from?.value || stmt.varying.from || 1;
-    const by = stmt.varying.by?.value || stmt.varying.by || 1;
+    const from = varyingOperandExpr(stmt.varying.from, 1);
+    const by = varyingOperandExpr(stmt.varying.by, 1);
     const until = convertConditionToScala(stmt.varying.until);
+    const body = performBodyLines(stmt, indent + 1);
 
-    return `${indentStr}var ${varName} = ${from}
+    // The loop-control variable is a WORKING-STORAGE item (declared once as
+    // a flat var by scala-generator.js's buildFieldRegistry) - assign it
+    // rather than redeclaring with `var`, so a second PERFORM VARYING over
+    // the same variable in the same method body doesn't fail to compile
+    // with "... is already defined as variable ...".
+    return `${indentStr}${varName} = ${from}
 ${indentStr}while !(${until}) do
-${indentStr}  ${target}()
+${body}
 ${indentStr}  ${varName} = ${varName} + ${by}`;
   }
 
-  // Inline PERFORM with statements
+  // Inline PERFORM with statements (no VARYING/UNTIL/TIMES clause)
   if (stmt.statements && stmt.statements.length > 0) {
-    const bodyLines = [];
-    for (const innerStmt of stmt.statements) {
-      bodyLines.push(generateMethodBody([innerStmt], indent));
-    }
-    return bodyLines.join('\n');
+    return generateMethodBody(stmt.statements, indent);
   }
 
   return `${indentStr}${target}()`;

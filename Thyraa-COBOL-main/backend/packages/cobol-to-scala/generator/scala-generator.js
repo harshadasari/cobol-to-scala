@@ -3,10 +3,14 @@
  * Main generator that coordinates full COBOL to Scala conversion
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { toPascalCase, toCamelCase, generateCaseClass } from './case-class-gen.js';
-import { getPicPattern, scalaBaseType } from './layout.js';
+import { getPicPattern, scalaBaseType, occursCount, hasOccurs } from './layout.js';
 import { generateAllEnums, groupLevel88sByParent } from './enum-gen.js';
-import { generateExpression } from './expression-gen.js';
+import { generateExpression, setFieldRegistry, generateCobolFmtHelper } from './expression-gen.js';
 import { generateMethod, generateAllMethods, toMethodName } from './method-gen.js';
 import { generateFileIO, generateFileStatusCheck } from './file-io-gen.js';
 import { generateSql, generateDoobieImports, generateTransactorSetup } from './sql-gen.js';
@@ -24,8 +28,32 @@ const DEFAULT_OPTIONS = {
   maxLineLength: 120,
   useDoobie: false,
   useCatsEffect: false,
-  generateMain: false
+  generateMain: false,
+  // Phase 1 byte-level record I/O options (see case-class-gen.js file header
+  // for the full design rationale):
+  charset: 'ascii', // 'ascii' | 'ebcdic' - drives PIC X/A string codecs and
+                     // the codePage passed to zoned-decimal (DISPLAY numeric)
+                     // codecs generated for every record's parse/format.
+  embedRuntime: true, // true: inline the CobolCodecs object source into the
+                       // generated file so `scala-cli run <file>.scala` is
+                       // single-file/self-contained (the default - matches
+                       // how the round-trip tests and the oracle harness
+                       // invoke scala-cli). false: emit
+                       // `import com.thyraa.cobol.runtime.CobolCodecs`
+                       // instead, for callers who compile runtime/ once and
+                       // share it across a multi-file classpath.
 };
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Read once at module load; stripped of its `package` line so it can be
+// embedded verbatim as a top-level object in whatever package the generated
+// file declares (Scala doesn't care which file an object's source lives in,
+// only which package it's compiled into).
+const COBOL_CODECS_SOURCE = fs
+  .readFileSync(path.join(__dirname, '..', 'runtime', 'CobolCodecs.scala'), 'utf-8')
+  .replace(/^package [^\n]*\n/, '')
+  .trim();
 
 /**
  * Extract program name from COBOL AST
@@ -83,6 +111,13 @@ function generateImports(ast, options) {
 
   // Standard imports
   imports.add('import scala.util.{Try, Success, Failure}');
+
+  // When the CobolCodecs runtime isn't embedded inline (embedRuntime: false),
+  // generated case classes' parse/format still reference it unqualified, so
+  // an explicit import is required.
+  if (!options.embedRuntime) {
+    imports.add('import com.thyraa.cobol.runtime.CobolCodecs');
+  }
 
   // Check if file I/O is used
   if (hasFileOperations(ast)) {
@@ -317,90 +352,241 @@ function generateFileConstants(ast, indent = 1) {
 }
 
 /**
- * Generate working storage as class fields
- * Handles multiple parser output formats
+ * Collect the top-level WORKING-STORAGE items regardless of which AST shape
+ * this parser run produced (mirrors the fallback chain used elsewhere in
+ * this file, e.g. generateAllCaseClasses).
  */
-function generateWorkingStorageFields(ast, indent = 1) {
-  const indentStr = '  '.repeat(indent);
+function getWorkingStorageItems(ast) {
+  if (ast.dataItems?.workingStorageSection?.items) {
+    return ast.dataItems.workingStorageSection.items;
+  }
+  if (ast.data?.workingStorageSection?.items) {
+    return ast.data.workingStorageSection.items;
+  }
+  if (ast.data?.workingStorageSection && Array.isArray(ast.data.workingStorageSection)) {
+    return ast.data.workingStorageSection;
+  }
+  if (ast.workingStorage && Array.isArray(ast.workingStorage)) {
+    return ast.workingStorage;
+  }
+  return [];
+}
+
+function isLevel(item, n) {
+  return item.level === n || item.level === String(n).padStart(2, '0') || item.level === String(n);
+}
+
+function escapeScalaString(text) {
+  return String(text ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+/**
+ * Scala literal for an elementary item's initial value: honors the VALUE
+ * clause (numeric/string/figurative-ZERO/figurative-SPACE) when present,
+ * otherwise falls back to the COBOL default-initialization value for the
+ * type (numeric 0, alphanumeric empty/spaces).
+ */
+function defaultElementaryValue(item, scalaType) {
+  const raw = item.value;
+  let literalKind = null; // 'numeric' | 'string'
+  let literalText = null;
+
+  if (raw && typeof raw === 'object') {
+    if (raw.type === 'numeric') {
+      literalKind = 'numeric';
+      literalText = String(raw.value);
+    } else if (raw.type === 'string') {
+      literalKind = 'string';
+      literalText = String(raw.value ?? '');
+    } else if (raw.type === 'figurative') {
+      if (raw.value === 'ZERO') {
+        literalKind = 'numeric';
+        literalText = '0';
+      } else if (raw.value === 'SPACE') {
+        literalKind = 'string';
+        literalText = '';
+      }
+    }
+  }
+
+  if (scalaType === 'String') {
+    if (literalKind === 'string') return `"${escapeScalaString(literalText)}"`;
+    if (literalKind === 'numeric') return `"${escapeScalaString(literalText)}"`;
+    return '""';
+  }
+  if (scalaType === 'BigDecimal') {
+    if (literalKind === 'numeric') return `BigDecimal("${literalText}")`;
+    return 'BigDecimal(0)';
+  }
+  if (scalaType === 'Long') {
+    if (literalKind === 'numeric') return `${normalizeIntLiteralText(literalText)}L`;
+    return '0L';
+  }
+  if (scalaType === 'Float') {
+    if (literalKind === 'numeric') return `${literalText}f`;
+    return '0.0f';
+  }
+  if (scalaType === 'Double') {
+    if (literalKind === 'numeric') return `${literalText}d`;
+    return '0.0';
+  }
+  // Int (default)
+  if (literalKind === 'numeric') return normalizeIntLiteralText(literalText);
+  return '0';
+}
+
+function normalizeIntLiteralText(raw) {
+  const m = /^-?\d+/.exec(String(raw));
+  return m ? m[0] : '0';
+}
+
+/**
+ * Generate the accessor (`def`/`def_=`) pairs for a REDEFINES entry.
+ *
+ * - Elementary REDEFINES (no children): a plain pass-through alias onto the
+ *   redefined target's flat var.
+ * - Group REDEFINES (children): each child slices a fixed-width run of
+ *   decimal digits out of the target's numeric value (e.g. WS-YEAR/MONTH/DAY
+ *   REDEFINES a PIC 9(8) WS-DATE-NUMERIC) - reading/writing a child reads or
+ *   rewrites just its digit-slice of the shared target var, so a write
+ *   through either view is visible through the other, matching COBOL
+ *   REDEFINES storage-sharing semantics without needing real byte-level
+ *   aliasing in Scala.
+ */
+function redefinesAccessorLines(item, registry) {
+  const targetUpper = String(item.redefines || '').toUpperCase();
+  const targetInfo = registry.get(targetUpper);
   const lines = [];
 
-  // Collect working storage items from various formats
-  let workingStorage = [];
-
-  // Format 1: ast.dataItems.workingStorageSection.items
-  if (ast.dataItems?.workingStorageSection?.items) {
-    workingStorage = ast.dataItems.workingStorageSection.items;
-  }
-  // Format 2: ast.data.workingStorageSection.items
-  else if (ast.data?.workingStorageSection?.items) {
-    workingStorage = ast.data.workingStorageSection.items;
-  }
-  // Format 3: ast.data.workingStorageSection as array
-  else if (ast.data?.workingStorageSection && Array.isArray(ast.data.workingStorageSection)) {
-    workingStorage = ast.data.workingStorageSection;
-  }
-  // Format 4: ast.workingStorage as array
-  else if (ast.workingStorage && Array.isArray(ast.workingStorage)) {
-    workingStorage = ast.workingStorage;
+  if (!targetInfo) {
+    lines.push(`  // REDEFINES ${item.redefines}: target not found - ${item.name} not accessible`);
+    return lines;
   }
 
-  for (const item of workingStorage) {
-    // Skip 01 level records (they become case classes)
-    if (item.level === 1 || item.level === '01') {
-      continue;
-    }
+  const targetCamel = targetInfo.camel;
+  const realChildren = (item.children || []).filter(c => !isLevel(c, 88));
 
-    // Handle 77 level items (standalone working storage variables)
-    if (item.level === 77 || item.level === '77') {
-      const fieldName = toCamelCase(item.name);
-      const fieldType = mapSimpleType(item);
-      const defaultValue = getDefaultValue(item);
-      lines.push(`${indentStr}var ${fieldName}: ${fieldType} = ${defaultValue}`);
-    }
+  if (realChildren.length === 0) {
+    // Elementary REDEFINES: direct alias onto the target's storage.
+    const camel = toCamelCase(item.name);
+    lines.push(`  def ${camel}: ${targetInfo.scalaType} = ${targetCamel}`);
+    lines.push(`  def ${camel}_=(v: ${targetInfo.scalaType}): Unit = ${targetCamel} = v`);
+    registry.set((item.name || '').toUpperCase(), { ...targetInfo, camel });
+    return lines;
   }
 
-  return lines.join('\n');
+  // Group REDEFINES: children slice the target's decimal digits left-to-right.
+  const widths = realChildren.map(c => (c.pic && c.pic.integerDigits) || 0);
+  for (let i = 0; i < realChildren.length; i++) {
+    const child = realChildren[i];
+    const camel = toCamelCase(child.name);
+    const w = widths[i];
+    const r = widths.slice(i + 1).reduce((a, b) => a + b, 0);
+    const modBase = 10 ** w;
+    const divBase = 10 ** r;
+    lines.push(`  def ${camel}: Int = ((${targetCamel} / ${divBase}) % ${modBase}).toInt`);
+    lines.push(
+      `  def ${camel}_=(v: Int): Unit = ${targetCamel} = ${targetCamel} - (((${targetCamel} / ${divBase}) % ${modBase}) * ${divBase}) + (v * ${divBase})`
+    );
+
+    const childPic = child.pic && typeof child.pic === 'object' ? child.pic : null;
+    registry.set((child.name || '').toUpperCase(), {
+      camel,
+      scalaType: 'Int',
+      dataType: 'numeric',
+      integerDigits: w,
+      decimalDigits: 0,
+      signed: !!(childPic && childPic.signed),
+      editPattern: null,
+      occursDepth: 0,
+    });
+  }
+
+  return lines;
 }
 
 /**
- * Map simple COBOL type to Scala type
+ * Flatten every WORKING-STORAGE item (at any nesting depth) into:
+ *   - `lines`: Scala `var`/accessor declarations for the object body, and
+ *   - `registry`: COBOL name (uppercased) -> field metadata, used by
+ *     expression-gen.js to render subscripted references, MOVE/DISPLAY
+ *     numeric-edit formatting, and DIVIDE decimal coercion.
+ *
+ * COBOL's flat namespace means every addressable item - whether a top-level
+ * 01/77 elementary item or a child nested inside a group - gets its own
+ * Scala identifier named after itself (not qualified by its parent group);
+ * OCCURS at any ancestor level (including the item's own OCCURS, for
+ * multi-dimensional tables like OCCURS-within-OCCURS) wraps the type in one
+ * Vector[...] layer per occurs-bearing level, outer dimension first, so
+ * `WS-COL(WS-I, WS-J)` becomes `wsCol(wsI - 1)(wsJ - 1)` against a flat
+ * `var wsCol: Vector[Vector[Int]]`. FILLER items are skipped (COBOL forbids
+ * referencing them from the PROCEDURE DIVISION). Case classes are still
+ * generated separately (generateAllCaseClasses) for record-layout purposes;
+ * they are independent of - and never referenced by - these flat vars.
  */
-function mapSimpleType(item) {
-  return scalaBaseType(item);
-}
+function buildFieldRegistry(ast) {
+  const items = getWorkingStorageItems(ast);
+  const registry = new Map();
+  const lines = [];
 
-/**
- * Get default value for a type
- */
-function getDefaultValue(item) {
-  const type = mapSimpleType(item);
-  const value = item.value;
+  function walk(list, occursChain) {
+    for (const item of list) {
+      if (isLevel(item, 88)) continue;
 
-  if (value !== undefined && value !== null) {
-    if (type === 'String') return `"${value}"`;
-    if (type === 'Int' || type === 'Long') return value.toString();
-    if (type === 'BigDecimal') return `BigDecimal("${value}")`;
-    if (type === 'Float') return `${value}f`;
-    if (type === 'Double') return `${value}d`;
-    return value.toString();
+      if (item.redefines) {
+        const accessorLines = redefinesAccessorLines(item, registry);
+        if (accessorLines.length) lines.push(...accessorLines);
+        continue;
+      }
+
+      const realChildren = (item.children || []).filter(c => !isLevel(c, 88));
+      if (realChildren.length > 0) {
+        const ownCount = hasOccurs(item) && occursCount(item) > 1 ? occursCount(item) : null;
+        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain);
+        continue;
+      }
+
+      if (item.isFiller || !item.name) continue;
+
+      const ownCount = hasOccurs(item) && occursCount(item) > 1 ? occursCount(item) : null;
+      const fullChain = ownCount ? [...occursChain, ownCount] : occursChain;
+
+      const camel = toCamelCase(item.name);
+      const baseType = scalaBaseType(item);
+      let scalaType = baseType;
+      for (let i = 0; i < fullChain.length; i++) scalaType = `Vector[${scalaType}]`;
+
+      let defaultExpr = defaultElementaryValue(item, baseType);
+      for (let i = fullChain.length - 1; i >= 0; i--) {
+        defaultExpr = `Vector.fill(${fullChain[i]})(${defaultExpr})`;
+      }
+
+      lines.push(`  var ${camel}: ${scalaType} = ${defaultExpr}`);
+
+      const pic = item.pic && typeof item.pic === 'object' ? item.pic : null;
+      registry.set((item.name || '').toUpperCase(), {
+        camel,
+        scalaType: baseType,
+        dataType: pic?.dataType || (baseType === 'String' ? 'alphanumeric' : 'numeric'),
+        integerDigits: pic?.integerDigits || 0,
+        decimalDigits: pic?.decimalDigits || 0,
+        signed: !!(pic && pic.signed),
+        editPattern: pic?.editPattern || null,
+        occursDepth: fullChain.length,
+      });
+    }
   }
 
-  switch (type) {
-    case 'String': return '""';
-    case 'Int': return '0';
-    case 'Long': return '0L';
-    case 'Float': return '0.0f';
-    case 'Double': return '0.0';
-    case 'BigDecimal': return 'BigDecimal(0)';
-    default: return 'null';
-  }
+  walk(items, []);
+
+  return { lines: lines.join('\n'), registry };
 }
 
 /**
  * Generate case classes from COBOL records
  * Handles multiple parser output formats
  */
-function generateAllCaseClasses(ast, indent = 0) {
+function generateAllCaseClasses(ast, indent = 0, options = {}) {
   const classes = [];
 
   function processItems(items) {
@@ -408,7 +594,7 @@ function generateAllCaseClasses(ast, indent = 0) {
     for (const item of items) {
       if ((item.level === 1 || item.level === '01' || item.level === 1) &&
           item.children && item.children.length > 0) {
-        classes.push(generateCaseClass(item, indent));
+        classes.push(generateCaseClass(item, indent, options));
       }
     }
   }
@@ -420,11 +606,11 @@ function generateAllCaseClasses(ast, indent = 0) {
 
     for (const fd of files) {
       if (fd.record) {
-        classes.push(generateCaseClass(fd.record, indent));
+        classes.push(generateCaseClass(fd.record, indent, options));
       }
       if (fd.records) {
         for (const record of fd.records) {
-          classes.push(generateCaseClass(record, indent));
+          classes.push(generateCaseClass(record, indent, options));
         }
       }
     }
@@ -575,6 +761,15 @@ export function generateScala(ast, options = {}) {
 
   const sections = [];
 
+  // Flatten WORKING-STORAGE into Scala var/accessor declarations plus a
+  // name -> metadata registry, and hand the registry to expression-gen.js
+  // so subscripted references, MOVE/DISPLAY numeric-edit formatting, and
+  // DIVIDE decimal coercion can all look field info up by COBOL name. Must
+  // happen before generateMethods()/generateMainMethod() below, since those
+  // generate the statements that consult the registry.
+  const { lines: workingFields, registry: fieldRegistry } = buildFieldRegistry(ast);
+  setFieldRegistry(fieldRegistry);
+
   // Package declaration
   sections.push(generatePackageDeclaration(opts.packageName));
   sections.push('');
@@ -586,8 +781,24 @@ export function generateScala(ast, options = {}) {
     sections.push('');
   }
 
+  // Embedded CobolCodecs runtime (see DEFAULT_OPTIONS.embedRuntime above).
+  if (opts.embedRuntime) {
+    sections.push('// --- Embedded runtime: CobolCodecs (see runtime/CobolCodecs.scala) ---');
+    sections.push('// Inlined because embedRuntime: true (the default), so this file is a');
+    sections.push('// self-contained `scala-cli run` script. Pass embedRuntime: false to instead');
+    sections.push('// `import com.thyraa.cobol.runtime.CobolCodecs` from a shared multi-file build.');
+    sections.push(COBOL_CODECS_SOURCE);
+    sections.push('');
+  }
+
+  // CobolFmt: numeric DISPLAY formatting helper (sign + zero-padding per
+  // PIC integer/decimal digit counts) used by generated DISPLAY statements.
+  sections.push('// CobolFmt: numeric DISPLAY formatting (sign + zero-padding per PIC)');
+  sections.push(generateCobolFmtHelper());
+  sections.push('');
+
   // Generate case classes (outside the object for better organization)
-  const caseClasses = generateAllCaseClasses(ast, 0);
+  const caseClasses = generateAllCaseClasses(ast, 0, { charset: opts.charset });
   if (caseClasses) {
     sections.push('// Data structures');
     sections.push(caseClasses);
@@ -613,8 +824,7 @@ export function generateScala(ast, options = {}) {
     sections.push(fileConstants);
   }
 
-  // Working storage fields (77-level items)
-  const workingFields = generateWorkingStorageFields(ast, 1);
+  // Working storage fields (flattened elementary vars + REDEFINES accessors)
   if (workingFields) {
     sections.push('');
     sections.push('  // Working storage');

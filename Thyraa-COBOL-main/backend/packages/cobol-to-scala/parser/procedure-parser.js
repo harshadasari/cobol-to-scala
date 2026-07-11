@@ -45,6 +45,14 @@ import {
   RelationalCondition,
   VariableReference,
   Literal,
+  FunctionCall,
+  SearchStatement,
+  SearchWhenClause,
+  SortStatement,
+  MergeStatement,
+  ReleaseStatement,
+  ReturnStatement,
+  UnknownStatement,
 } from './ast.js';
 
 /**
@@ -130,22 +138,58 @@ function isParagraphName(ctx) {
 }
 
 /**
+ * Statement-starting reserved words (implemented or not). Used to find a
+ * safe stopping point when capturing an UnknownStatement's tokens -
+ * without this, an unrecognized-verb scan would run past the *next*
+ * legitimate statement (or past the enclosing block's own terminator) and
+ * swallow it too. Also doubles as the general "is this the start of a new
+ * statement" check that used to be dead code (`isStatementStart`).
+ */
+const STATEMENT_KEYWORDS = new Set([
+  'PERFORM', 'IF', 'EVALUATE', 'MOVE', 'COMPUTE', 'ADD', 'SUBTRACT',
+  'MULTIPLY', 'DIVIDE', 'STRING', 'UNSTRING', 'INSPECT', 'CALL',
+  'OPEN', 'CLOSE', 'READ', 'WRITE', 'REWRITE', 'DELETE', 'START',
+  'GO', 'STOP', 'GOBACK', 'EXIT', 'CONTINUE', 'NEXT', 'INITIALIZE',
+  'SET', 'ACCEPT', 'DISPLAY', 'EXEC', 'RETURN', 'SEARCH', 'SORT',
+  'MERGE', 'RELEASE', 'GENERATE', 'INITIATE', 'TERMINATE',
+]);
+
+/**
  * Check if current position is at a statement start keyword
  */
 function isStatementStart(ctx) {
-  const statementKeywords = [
-    'PERFORM', 'IF', 'EVALUATE', 'MOVE', 'COMPUTE', 'ADD', 'SUBTRACT',
-    'MULTIPLY', 'DIVIDE', 'STRING', 'UNSTRING', 'INSPECT', 'CALL',
-    'OPEN', 'CLOSE', 'READ', 'WRITE', 'REWRITE', 'DELETE', 'START',
-    'GO', 'STOP', 'GOBACK', 'EXIT', 'CONTINUE', 'NEXT', 'INITIALIZE',
-    'SET', 'ACCEPT', 'DISPLAY', 'EXEC', 'RETURN', 'SEARCH', 'SORT',
-    'MERGE', 'RELEASE', 'GENERATE', 'INITIATE', 'TERMINATE',
-  ];
-
   const current = ctx.current();
   if (!current) return false;
 
-  return statementKeywords.includes(current.value?.toUpperCase());
+  return STATEMENT_KEYWORDS.has(current.value?.toUpperCase());
+}
+
+/**
+ * True when the current token is a genuine identifier operand - i.e. an
+ * IDENTIFIER token whose value isn't itself a statement-starting reserved
+ * word. Guards the entry condition of target-list loops (MOVE ... TO
+ * target-1 target-2 ..., SET target-1 target-2 ... TO, INITIALIZE
+ * target-1 target-2 ...) so that a following statement's verb - which the
+ * lexer may still emit as a plain IDENTIFIER token if this parser doesn't
+ * register it as a keyword (e.g. GENERATE) - can never be swallowed as one
+ * more bogus operand when there is no period between the two statements
+ * (this corpus's one-period-per-paragraph style; see tests/corpus/README.md's
+ * MOVE-target-pollution finding). Must only be used as a *loop entry*
+ * check, never inside the callee itself (parseVariableReference/
+ * parseOperand always consume a token once called, and several loops rely
+ * on that to make progress).
+ */
+function isIdentifierOperand(ctx) {
+  return ctx.check(TokenType.IDENTIFIER) &&
+    !STATEMENT_KEYWORDS.has(ctx.current().value?.toUpperCase());
+}
+
+/**
+ * Same idea as isIdentifierOperand, but for the mixed identifier-or-numeric-
+ * literal operand lists used by ADD/SUBTRACT/MULTIPLY/DIVIDE.
+ */
+function isOperandStart(ctx) {
+  return ctx.check(TokenType.NUMERIC_LITERAL) || isIdentifierOperand(ctx);
 }
 
 /**
@@ -254,12 +298,57 @@ function parseOperand(ctx) {
     return literal;
   }
 
+  // FUNCTION intrinsic call, e.g. FUNCTION UPPER-CASE(WS-TEXT)
+  if (ctx.checkValue('FUNCTION')) {
+    return parseFunctionCall(ctx);
+  }
+
   // Variable reference
   if (ctx.check(TokenType.IDENTIFIER)) {
     return parseVariableReference(ctx);
   }
 
   return null;
+}
+
+/**
+ * Parse a FUNCTION intrinsic call: FUNCTION name [ ( argument [, argument]... ) ]
+ */
+function parseFunctionCall(ctx) {
+  ctx.advance(); // Skip FUNCTION
+
+  const nameToken = ctx.advance();
+  const call = new FunctionCall({ name: nameToken ? nameToken.value : '' });
+
+  if (ctx.check(TokenType.OP_LPAREN)) {
+    ctx.advance();
+    while (!ctx.isAtEnd() && !ctx.check(TokenType.OP_RPAREN)) {
+      if (ctx.check(TokenType.COMMA)) {
+        ctx.advance();
+        continue;
+      }
+      const arg = parseFunctionArgument(ctx);
+      if (arg) {
+        call.arguments.push(arg);
+      } else {
+        break;
+      }
+    }
+    ctx.match(TokenType.OP_RPAREN);
+  }
+
+  return call;
+}
+
+/**
+ * Parse a single FUNCTION argument (literal, variable reference, or a
+ * nested FUNCTION call).
+ */
+function parseFunctionArgument(ctx) {
+  if (ctx.checkValue('FUNCTION')) {
+    return parseFunctionCall(ctx);
+  }
+  return parseOperand(ctx);
 }
 
 /**
@@ -347,6 +436,13 @@ function parsePrimary(ctx) {
   if (ctx.check(TokenType.NUMERIC_LITERAL)) {
     return new ArithmeticExpression({
       value: ctx.advance().value,
+    });
+  }
+
+  // FUNCTION intrinsic call, e.g. COMPUTE X = FUNCTION MOD(17, 5)
+  if (ctx.checkValue('FUNCTION')) {
+    return new ArithmeticExpression({
+      functionCall: parseFunctionCall(ctx),
     });
   }
 
@@ -554,85 +650,79 @@ function parsePrimaryCondition(ctx) {
 
 /**
  * Parse PERFORM statement
+ *
+ * COBOL's PERFORM has an out-of-line form (PERFORM procedure-name-1
+ * [THRU procedure-name-2] ...) and an inline form (PERFORM ... statements
+ * ... END-PERFORM), and a repeat clause (TIMES / UNTIL / VARYING) that can
+ * attach to *either* form. The only token that tells the two forms apart
+ * is whether an IDENTIFIER immediately following PERFORM is a target
+ * procedure-name or is itself the TIMES-count operand (e.g. `PERFORM
+ * WS-COUNT TIMES` has no target paragraph even though WS-COUNT is an
+ * IDENTIFIER token) - so that must be checked with one token of lookahead
+ * *before* deciding whether a target paragraph is present. The previous
+ * implementation used `!ctx.check(TokenType.IDENTIFIER)` as its inline/
+ * out-of-line dispatch, which is also true for a numeric TIMES count
+ * (`PERFORM 3 TIMES`), routing it into the bare-inline branch where TIMES
+ * was never detected - see tests/corpus/README.md finding #1.
  */
 function parsePerformStatement(ctx) {
   ctx.advance(); // Skip PERFORM
 
   const stmt = new PerformStatement();
 
-  // Check for inline PERFORM (followed by statements and END-PERFORM)
-  if (!ctx.check(TokenType.IDENTIFIER) ||
-      ctx.checkValue('UNTIL') ||
-      ctx.checkValue('VARYING') ||
-      ctx.checkValue('WITH')) {
+  // A target procedure-name is present only when the current token is an
+  // IDENTIFIER that is *not* itself the operand of an inline "<count>
+  // TIMES" clause.
+  const nextIsTimes = ctx.peek(1)?.value?.toUpperCase() === 'TIMES';
+  const hasTarget = ctx.check(TokenType.IDENTIFIER) && !nextIsTimes;
 
-    // Inline PERFORM with UNTIL or VARYING
+  if (hasTarget) {
+    stmt.targetParagraph = ctx.advance().value;
+
+    if (ctx.matchValue('THRU', 'THROUGH')) {
+      if (ctx.check(TokenType.IDENTIFIER)) {
+        stmt.throughParagraph = ctx.advance().value;
+      }
+    }
+  }
+
+  // TIMES clause: <numeric-literal | identifier> TIMES. Applies to both
+  // the out-of-line form (repeats the target paragraph) and the inline
+  // form (repeats the bodied statements).
+  if ((ctx.check(TokenType.NUMERIC_LITERAL) || ctx.check(TokenType.IDENTIFIER)) &&
+      ctx.peek(1)?.value?.toUpperCase() === 'TIMES') {
+    stmt.performType = 'times';
+    stmt.times = parseOperand(ctx);
+    ctx.matchValue('TIMES');
+  } else {
+    // WITH TEST BEFORE/AFTER may precede UNTIL or VARYING, for either form.
+    if (ctx.matchValue('WITH')) {
+      ctx.matchValue('TEST');
+      if (ctx.matchValue('BEFORE')) {
+        stmt.testBefore = true;
+      } else if (ctx.matchValue('AFTER')) {
+        stmt.testBefore = false;
+      }
+    }
+
     if (ctx.matchValue('UNTIL')) {
       stmt.performType = 'until';
       stmt.until = parseCondition(ctx);
-      stmt.statements = parseStatementBlock(ctx, ['END-PERFORM']);
-      ctx.matchValue('END-PERFORM');
-      return stmt;
-    }
-
-    if (ctx.matchValue('VARYING')) {
+    } else if (ctx.matchValue('VARYING')) {
       stmt.performType = 'varying';
       stmt.varying = parseVaryingClause(ctx);
-      stmt.statements = parseStatementBlock(ctx, ['END-PERFORM']);
-      ctx.matchValue('END-PERFORM');
-      return stmt;
+    } else {
+      stmt.performType = hasTarget ? 'simple' : 'inline';
     }
+  }
 
-    // Inline PERFORM without clause
-    stmt.performType = 'inline';
+  // Only the form with no out-of-line target carries an inline statement
+  // body terminated by END-PERFORM.
+  if (!hasTarget) {
     stmt.statements = parseStatementBlock(ctx, ['END-PERFORM']);
     ctx.matchValue('END-PERFORM');
-    return stmt;
   }
 
-  // Get target paragraph/section name
-  stmt.targetParagraph = ctx.advance().value;
-
-  // Check for THRU/THROUGH
-  if (ctx.matchValue('THRU', 'THROUGH')) {
-    if (ctx.check(TokenType.IDENTIFIER)) {
-      stmt.throughParagraph = ctx.advance().value;
-    }
-  }
-
-  // Check for TIMES, UNTIL, or VARYING
-  if (ctx.check(TokenType.NUMERIC_LITERAL) || ctx.check(TokenType.IDENTIFIER)) {
-    const next = ctx.peek(1);
-    if (next && next.value?.toUpperCase() === 'TIMES') {
-      stmt.performType = 'times';
-      stmt.times = parseOperand(ctx);
-      ctx.matchValue('TIMES');
-      return stmt;
-    }
-  }
-
-  if (ctx.matchValue('WITH')) {
-    ctx.matchValue('TEST');
-    if (ctx.matchValue('BEFORE')) {
-      stmt.testBefore = true;
-    } else if (ctx.matchValue('AFTER')) {
-      stmt.testBefore = false;
-    }
-  }
-
-  if (ctx.matchValue('UNTIL')) {
-    stmt.performType = 'until';
-    stmt.until = parseCondition(ctx);
-    return stmt;
-  }
-
-  if (ctx.matchValue('VARYING')) {
-    stmt.performType = 'varying';
-    stmt.varying = parseVaryingClause(ctx);
-    return stmt;
-  }
-
-  stmt.performType = 'simple';
   return stmt;
 }
 
@@ -792,7 +882,7 @@ function parseMoveStatement(ctx) {
   ctx.matchValue('TO');
 
   // Parse targets
-  while (ctx.check(TokenType.IDENTIFIER)) {
+  while (isIdentifierOperand(ctx)) {
     const target = parseVariableReference(ctx);
     if (target) {
       stmt.targets.push(target);
@@ -871,7 +961,7 @@ function parseAddStatement(ctx) {
   }
 
   // Parse addends
-  while (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.NUMERIC_LITERAL)) {
+  while (isOperandStart(ctx)) {
     const addend = parseOperand(ctx);
     if (addend) {
       stmt.addends.push(addend);
@@ -881,7 +971,7 @@ function parseAddStatement(ctx) {
 
   // Parse TO or GIVING
   if (ctx.matchValue('TO')) {
-    while (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.NUMERIC_LITERAL)) {
+    while (isOperandStart(ctx)) {
       const target = parseOperand(ctx);
       if (target) {
         stmt.to.push(target);
@@ -894,7 +984,7 @@ function parseAddStatement(ctx) {
   }
 
   if (ctx.matchValue('GIVING')) {
-    while (ctx.check(TokenType.IDENTIFIER)) {
+    while (isIdentifierOperand(ctx)) {
       const target = parseVariableReference(ctx);
       if (target) {
         stmt.giving.push(target);
@@ -945,7 +1035,7 @@ function parseSubtractStatement(ctx) {
   }
 
   // Parse subtrahends
-  while (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.NUMERIC_LITERAL)) {
+  while (isOperandStart(ctx)) {
     const subtrahend = parseOperand(ctx);
     if (subtrahend) {
       stmt.subtrahends.push(subtrahend);
@@ -955,7 +1045,7 @@ function parseSubtractStatement(ctx) {
 
   // Parse FROM
   ctx.matchValue('FROM');
-  while (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.NUMERIC_LITERAL)) {
+  while (isOperandStart(ctx)) {
     const from = parseOperand(ctx);
     if (from) {
       stmt.from.push(from);
@@ -968,7 +1058,7 @@ function parseSubtractStatement(ctx) {
 
   // Parse GIVING
   if (ctx.matchValue('GIVING')) {
-    while (ctx.check(TokenType.IDENTIFIER)) {
+    while (isIdentifierOperand(ctx)) {
       const target = parseVariableReference(ctx);
       if (target) {
         stmt.giving.push(target);
@@ -998,7 +1088,7 @@ function parseMultiplyStatement(ctx) {
 
   // Parse BY
   ctx.matchValue('BY');
-  while (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.NUMERIC_LITERAL)) {
+  while (isOperandStart(ctx)) {
     const by = parseOperand(ctx);
     if (by) {
       stmt.by.push(by);
@@ -1011,7 +1101,7 @@ function parseMultiplyStatement(ctx) {
 
   // Parse GIVING
   if (ctx.matchValue('GIVING')) {
-    while (ctx.check(TokenType.IDENTIFIER)) {
+    while (isIdentifierOperand(ctx)) {
       const target = parseVariableReference(ctx);
       if (target) {
         stmt.giving.push(target);
@@ -1042,7 +1132,7 @@ function parseDivideStatement(ctx) {
   // Check for INTO or BY
   if (ctx.matchValue('INTO')) {
     stmt.divisor = first;
-    while (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.NUMERIC_LITERAL)) {
+    while (isOperandStart(ctx)) {
       const into = parseOperand(ctx);
       if (into) {
         stmt.into.push(into);
@@ -1060,7 +1150,7 @@ function parseDivideStatement(ctx) {
 
   // Parse GIVING
   if (ctx.matchValue('GIVING')) {
-    while (ctx.check(TokenType.IDENTIFIER)) {
+    while (isIdentifierOperand(ctx)) {
       const target = parseVariableReference(ctx);
       if (target) {
         stmt.giving.push(target);
@@ -1359,6 +1449,239 @@ function parseCallStatement(ctx) {
   }
 
   ctx.matchValue('END-CALL');
+
+  return stmt;
+}
+
+/**
+ * Parse SEARCH / SEARCH ALL statement
+ */
+function parseSearchStatement(ctx) {
+  ctx.advance(); // Skip SEARCH
+
+  const stmt = new SearchStatement();
+  stmt.searchAll = ctx.matchValue('ALL');
+
+  stmt.target = parseVariableReference(ctx);
+
+  if (ctx.matchValue('VARYING')) {
+    stmt.varying = parseVariableReference(ctx);
+  }
+
+  if (ctx.matchValue('AT')) {
+    ctx.matchValue('END');
+    stmt.atEnd = parseStatementBlock(ctx, ['WHEN', 'END-SEARCH']);
+  }
+
+  while (ctx.checkValue('WHEN')) {
+    ctx.advance(); // Skip WHEN
+
+    const when = new SearchWhenClause();
+    when.condition = parseCondition(ctx);
+    when.statements = parseStatementBlock(ctx, ['WHEN', 'END-SEARCH']);
+    stmt.whenClauses.push(when);
+  }
+
+  ctx.matchValue('END-SEARCH');
+
+  return stmt;
+}
+
+/**
+ * Parse the shared ON ASCENDING/DESCENDING KEY clause(s) for SORT/MERGE.
+ * Grammar: { [ON] {ASCENDING|DESCENDING} [KEY] {data-name}... }...
+ */
+function parseSortKeys(ctx) {
+  const keys = [];
+
+  while (true) {
+    ctx.matchValue('ON'); // optional, but conventionally present each time
+
+    let order = null;
+    if (ctx.matchValue('ASCENDING')) {
+      order = 'ASCENDING';
+    } else if (ctx.matchValue('DESCENDING')) {
+      order = 'DESCENDING';
+    } else {
+      break;
+    }
+
+    ctx.matchValue('KEY');
+    ctx.matchValue('IS');
+
+    const fields = [];
+    while (ctx.check(TokenType.IDENTIFIER)) {
+      fields.push(parseVariableReference(ctx));
+    }
+
+    keys.push({ order, fields });
+  }
+
+  return keys;
+}
+
+/**
+ * Parse an INPUT/OUTPUT PROCEDURE clause: PROCEDURE [IS] name [THRU name]
+ */
+function parseSortProcedureClause(ctx) {
+  ctx.matchValue('PROCEDURE');
+  ctx.matchValue('IS');
+
+  const proc = { procedure: null, through: null };
+  if (ctx.check(TokenType.IDENTIFIER)) {
+    proc.procedure = ctx.advance().value;
+  }
+  if (ctx.matchValue('THRU', 'THROUGH')) {
+    if (ctx.check(TokenType.IDENTIFIER)) {
+      proc.through = ctx.advance().value;
+    }
+  }
+  return proc;
+}
+
+/**
+ * Parse SORT statement (table sort, or file sort with
+ * USING/GIVING/INPUT PROCEDURE/OUTPUT PROCEDURE)
+ */
+function parseSortStatement(ctx) {
+  ctx.advance(); // Skip SORT
+
+  const stmt = new SortStatement();
+
+  if (ctx.check(TokenType.IDENTIFIER)) {
+    stmt.fileName = ctx.advance().value;
+  }
+
+  stmt.keys = parseSortKeys(ctx);
+
+  if (ctx.matchValue('WITH')) {
+    ctx.matchValue('DUPLICATES');
+    ctx.matchValue('IN');
+    ctx.matchValue('ORDER');
+    stmt.duplicates = true;
+  } else if (ctx.matchValue('DUPLICATES')) {
+    ctx.matchValue('IN');
+    ctx.matchValue('ORDER');
+    stmt.duplicates = true;
+  }
+
+  if (ctx.matchValue('COLLATING')) {
+    ctx.matchValue('SEQUENCE');
+    ctx.matchValue('IS');
+    if (ctx.check(TokenType.IDENTIFIER)) {
+      stmt.collatingSequence = ctx.advance().value;
+    }
+  }
+
+  if (ctx.matchValue('INPUT')) {
+    stmt.inputProcedure = parseSortProcedureClause(ctx);
+  } else if (ctx.matchValue('USING')) {
+    while (ctx.check(TokenType.IDENTIFIER)) {
+      stmt.using.push(ctx.advance().value);
+    }
+  }
+
+  if (ctx.matchValue('OUTPUT')) {
+    stmt.outputProcedure = parseSortProcedureClause(ctx);
+  } else if (ctx.matchValue('GIVING')) {
+    while (ctx.check(TokenType.IDENTIFIER)) {
+      stmt.giving.push(ctx.advance().value);
+    }
+  }
+
+  return stmt;
+}
+
+/**
+ * Parse MERGE statement
+ */
+function parseMergeStatement(ctx) {
+  ctx.advance(); // Skip MERGE
+
+  const stmt = new MergeStatement();
+
+  if (ctx.check(TokenType.IDENTIFIER)) {
+    stmt.fileName = ctx.advance().value;
+  }
+
+  stmt.keys = parseSortKeys(ctx);
+
+  if (ctx.matchValue('COLLATING')) {
+    ctx.matchValue('SEQUENCE');
+    ctx.matchValue('IS');
+    if (ctx.check(TokenType.IDENTIFIER)) {
+      stmt.collatingSequence = ctx.advance().value;
+    }
+  }
+
+  if (ctx.matchValue('USING')) {
+    while (ctx.check(TokenType.IDENTIFIER)) {
+      stmt.using.push(ctx.advance().value);
+    }
+  }
+
+  if (ctx.matchValue('OUTPUT')) {
+    stmt.outputProcedure = parseSortProcedureClause(ctx);
+  } else if (ctx.matchValue('GIVING')) {
+    while (ctx.check(TokenType.IDENTIFIER)) {
+      stmt.giving.push(ctx.advance().value);
+    }
+  }
+
+  return stmt;
+}
+
+/**
+ * Parse RELEASE statement (writes a record to a SORT work file from
+ * within an INPUT PROCEDURE)
+ */
+function parseReleaseStatement(ctx) {
+  ctx.advance(); // Skip RELEASE
+
+  const stmt = new ReleaseStatement();
+
+  if (ctx.check(TokenType.IDENTIFIER)) {
+    stmt.recordName = ctx.advance().value;
+  }
+
+  if (ctx.matchValue('FROM')) {
+    stmt.from = parseVariableReference(ctx);
+  }
+
+  return stmt;
+}
+
+/**
+ * Parse RETURN statement (reads the next sorted/merged record from
+ * within an OUTPUT PROCEDURE)
+ */
+function parseReturnStatement(ctx) {
+  ctx.advance(); // Skip RETURN
+
+  const stmt = new ReturnStatement();
+
+  if (ctx.check(TokenType.IDENTIFIER)) {
+    stmt.fileName = ctx.advance().value;
+  }
+
+  ctx.matchValue('RECORD');
+
+  if (ctx.matchValue('INTO')) {
+    stmt.into = parseVariableReference(ctx);
+  }
+
+  if (ctx.matchValue('AT')) {
+    ctx.matchValue('END');
+    stmt.atEnd = parseStatementBlock(ctx, ['NOT', 'END-RETURN']);
+  }
+
+  if (ctx.matchValue('NOT')) {
+    ctx.matchValue('AT');
+    ctx.matchValue('END');
+    stmt.notAtEnd = parseStatementBlock(ctx, ['END-RETURN']);
+  }
+
+  ctx.matchValue('END-RETURN');
 
   return stmt;
 }
@@ -1720,7 +2043,7 @@ function parseInitializeStatement(ctx) {
   const stmt = new InitializeStatement();
 
   // Parse targets
-  while (ctx.check(TokenType.IDENTIFIER)) {
+  while (isIdentifierOperand(ctx)) {
     stmt.targets.push(parseVariableReference(ctx));
     if (ctx.checkValue('REPLACING') || ctx.check(TokenType.PERIOD)) break;
   }
@@ -1750,7 +2073,7 @@ function parseSetStatement(ctx) {
   const stmt = new SetStatement();
 
   // Parse targets
-  while (ctx.check(TokenType.IDENTIFIER)) {
+  while (isIdentifierOperand(ctx)) {
     stmt.targets.push(parseVariableReference(ctx));
     if (ctx.checkValue('TO') || ctx.checkValue('UP') || ctx.checkValue('DOWN')) break;
   }
@@ -1811,6 +2134,10 @@ function parseDisplayStatement(ctx) {
   while (!ctx.isAtEnd()) {
     if (ctx.checkValue('UPON') || ctx.checkValue('WITH') ||
         ctx.checkValue('NO') || ctx.check(TokenType.PERIOD)) break;
+    // Don't swallow the next statement's verb as a bogus DISPLAY operand
+    // when there's no period between them (e.g. a DISPLAY as the last
+    // statement in a WHEN/AT END block, immediately followed by END-SEARCH).
+    if (ctx.check(TokenType.IDENTIFIER) && !isIdentifierOperand(ctx)) break;
 
     const value = parseOperand(ctx);
     if (value) {
@@ -1841,6 +2168,39 @@ function parseDisplayStatement(ctx) {
 }
 
 /**
+ * Parse an unrecognized statement: capture its tokens verbatim, up to a
+ * safe boundary (a period, a recognized statement-start keyword, one of
+ * the caller's own block terminators, a paragraph/section name, or EOF),
+ * as an UnknownStatement node. This replaces two previous failure modes:
+ * silently dropping the tokens (old top-level fallback) and aborting the
+ * rest of the enclosing block the moment an unsupported verb was seen
+ * (old parseStatementBlock fallback - see tests/corpus/README.md finding
+ * #3, where an unimplemented RETURN inside an inline PERFORM truncated
+ * everything after it).
+ */
+function parseUnknownStatement(ctx, terminators = []) {
+  const startToken = ctx.current();
+  const keyword = startToken ? startToken.value : '';
+  const tokens = [];
+
+  // Always make forward progress by consuming at least the offending token.
+  tokens.push(ctx.advance().value);
+
+  while (!ctx.isAtEnd()) {
+    if (ctx.check(TokenType.PERIOD)) break;
+    if (isParagraphName(ctx)) break;
+
+    const value = ctx.current().value?.toUpperCase();
+    if (terminators.some((term) => term.toUpperCase() === value)) break;
+    if (STATEMENT_KEYWORDS.has(value)) break;
+
+    tokens.push(ctx.advance().value);
+  }
+
+  return new UnknownStatement({ keyword, tokens });
+}
+
+/**
  * Parse a block of statements until terminator keywords
  */
 function parseStatementBlock(ctx, terminators) {
@@ -1865,11 +2225,9 @@ function parseStatementBlock(ctx, terminators) {
     if (stmt) {
       statements.push(stmt);
     } else {
-      // Unknown token, skip
-      if (!ctx.isAtEnd() && !ctx.check(TokenType.PERIOD)) {
-        ctx.advance();
-      }
-      break;
+      // Unrecognized verb: capture it as an UnknownStatement instead of
+      // dropping its tokens or truncating the rest of this block.
+      statements.push(parseUnknownStatement(ctx, terminators));
     }
   }
 
@@ -1899,6 +2257,11 @@ function parseStatement(ctx) {
     case 'UNSTRING': return parseUnstringStatement(ctx);
     case 'INSPECT': return parseInspectStatement(ctx);
     case 'CALL': return parseCallStatement(ctx);
+    case 'SEARCH': return parseSearchStatement(ctx);
+    case 'SORT': return parseSortStatement(ctx);
+    case 'MERGE': return parseMergeStatement(ctx);
+    case 'RELEASE': return parseReleaseStatement(ctx);
+    case 'RETURN': return parseReturnStatement(ctx);
     case 'OPEN': return parseOpenStatement(ctx);
     case 'CLOSE': return parseCloseStatement(ctx);
     case 'READ': return parseReadStatement(ctx);
@@ -2040,8 +2403,15 @@ export function parseProcedureDivision(tokens) {
         currentSection.statements.push(stmt);
       }
     } else if (!ctx.isAtEnd()) {
-      // Skip unknown token
-      ctx.advance();
+      // Unrecognized verb: capture it as an UnknownStatement (instead of
+      // silently discarding one token at a time) so it is visible in the
+      // AST rather than vanishing without a trace.
+      const unknown = parseUnknownStatement(ctx, []);
+      if (currentParagraph) {
+        currentParagraph.statements.push(unknown);
+      } else if (currentSection) {
+        currentSection.statements.push(unknown);
+      }
     }
   }
 

@@ -63,6 +63,89 @@ const LOGICAL_OPERATORS = {
   'NOT': '!'
 };
 
+// ============================================================================
+// WORKING-STORAGE field registry
+//
+// Built once per conversion by scala-generator.js's buildFieldRegistry() and
+// installed here via setFieldRegistry() before any method bodies are
+// generated. Keyed by uppercased COBOL name -> { camel, scalaType, dataType,
+// integerDigits, decimalDigits, signed, editPattern, occursDepth }. Used for:
+//   - DISPLAY numeric formatting (sign + zero-padding per PIC digit counts)
+//   - MOVE literal coercion to the target's declared Scala type
+//   - numeric-edited PICTURE formatting (Z/9/$/+/-/CR/DB) at MOVE time
+//   - decimal-aware DIVIDE when the GIVING target is a BigDecimal field
+// Subscript rendering itself needs no registry lookup - it is derived
+// entirely from the VariableReference node's own `.subscripts`.
+// ============================================================================
+
+let FIELD_REGISTRY = new Map();
+
+/** Install the field registry built for the program currently being generated. */
+export function setFieldRegistry(registry) {
+  FIELD_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+function lookupField(name) {
+  if (!name) return null;
+  return FIELD_REGISTRY.get(String(name).toUpperCase()) || null;
+}
+
+/** Look up field metadata for a MOVE/arithmetic target/operand reference. */
+function lookupFieldForRef(ref) {
+  if (!ref) return null;
+  const name = typeof ref === 'string' ? ref : ref.name;
+  return lookupField(name);
+}
+
+/**
+ * Scala expression for one subscript, 1-based COBOL -> 0-based Scala.
+ * Literal subscripts are folded at generation time (`WS-QTY(1)` -> `0`);
+ * variable subscripts render as `<camelName> - 1`.
+ */
+function subscriptIndexExpr(sub) {
+  if (sub && typeof sub === 'object') {
+    if (sub.type === 'literal') {
+      const n = parseInt(sub.value, 10);
+      return String(Number.isFinite(n) ? n - 1 : 0);
+    }
+    if (sub.type === 'variable') {
+      return `${toCamelCase(sub.value)} - 1`;
+    }
+  }
+  return `${convertArithmeticExpression(sub)} - 1`;
+}
+
+/**
+ * Render an assignment to a (possibly subscripted) target as a Scala
+ * statement. WORKING-STORAGE OCCURS tables are represented as flat
+ * `var name: Vector[...]` fields (one Vector layer per occurs-bearing
+ * ancestor level, see scala-generator.js's buildFieldRegistry), so a
+ * subscripted write can't use `name(idx) = value` - Vector has no index
+ * setter - it must rebuild the vector with `.updated(idx, value)`, nested
+ * once per subscript dimension for multi-dimensional OCCURS.
+ */
+function renderAssignment(targetRef, valueExpr) {
+  if (!targetRef) return `/* no assignment target */ = ${valueExpr}`;
+  if (typeof targetRef === 'string') {
+    return `${toCamelCase(targetRef)} = ${valueExpr}`;
+  }
+
+  const camel = toCamelCase(targetRef.name || '');
+  const subscripts = Array.isArray(targetRef.subscripts) ? targetRef.subscripts : [];
+  if (subscripts.length === 0) {
+    return `${camel} = ${valueExpr}`;
+  }
+
+  const idxs = subscripts.map(subscriptIndexExpr);
+  function rec(depth, baseExpr) {
+    if (depth === idxs.length - 1) {
+      return `${baseExpr}.updated(${idxs[depth]}, ${valueExpr})`;
+    }
+    return `${baseExpr}.updated(${idxs[depth]}, ${rec(depth + 1, `${baseExpr}(${idxs[depth]})`)})`;
+  }
+  return `${camel} = ${rec(0, camel)}`;
+}
+
 /**
  * Convert a COBOL identifier to Scala camelCase
  * Handles strings, VariableReference objects, and other AST nodes
@@ -78,6 +161,11 @@ function convertIdentifier(cobolId) {
   // Handle VariableReference objects
   if (cobolId.type === 'VariableReference' || cobolId.name) {
     const name = cobolId.name || '';
+    const subscripts = Array.isArray(cobolId.subscripts) ? cobolId.subscripts : [];
+    if (subscripts.length > 0) {
+      const idxChain = subscripts.map(s => `(${subscriptIndexExpr(s)})`).join('');
+      return `${toCamelCase(name)}${idxChain}`;
+    }
     if (cobolId.qualifiers && cobolId.qualifiers.length > 0) {
       const qualPath = cobolId.qualifiers.map(q => toCamelCase(q)).join('.');
       return `${qualPath}.${toCamelCase(name)}`;
@@ -155,6 +243,166 @@ function convertLiteral(value) {
   }
 
   return String(value);
+}
+
+/**
+ * Scala source for the CobolFmt runtime helper embedded in every generated
+ * program. DISPLAY of a non-edited numeric PIC item prints a fixed-width,
+ * zero-padded representation with a leading sign character for signed items
+ * (always '+' or '-', including for zero - COBOL treats zero as
+ * non-negative) and no sign character at all for unsigned items; the
+ * decimal point (if any) is inserted per the PIC's integer/decimal digit
+ * counts, and an all-decimal PIC (0 integer digits, e.g. `SV9(5)`) omits the
+ * leading zero entirely (`-.54321`, not `-0.54321`).
+ */
+export function generateCobolFmtHelper() {
+  return [
+    'object CobolFmt:',
+    '  def num(v: BigDecimal, intDigits: Int, decDigits: Int, signed: Boolean): String =',
+    '    val neg = v.signum < 0',
+    '    val absVal = v.abs',
+    '    val totalDigits = intDigits + decDigits',
+    '    val unscaled = (absVal * BigDecimal(10).pow(decDigits)).setScale(0, BigDecimal.RoundingMode.HALF_UP).toBigInt.toString',
+    '    val digits = if unscaled.length < totalDigits then ("0" * (totalDigits - unscaled.length)) + unscaled else unscaled',
+    '    val intPart = if intDigits > 0 then digits.dropRight(decDigits) else ""',
+    '    val decPart = if decDigits > 0 then digits.takeRight(decDigits) else ""',
+    '    val signStr = if signed then (if neg then "-" else "+") else ""',
+    '    val body = if decDigits > 0 then intPart + "." + decPart else intPart',
+    '    signStr + body',
+  ].join('\n');
+}
+
+/**
+ * Numeric-edited PICTURE formatting (Z/9/* zero-suppression, $/+/- fixed and
+ * floating insertion, comma/decimal-point insertion, CR/DB trailing sign).
+ * Evaluated at Scala-generation time against a COBOL literal's raw text -
+ * every numeric-edited MOVE source in the Phase 1 corpus is a literal, so
+ * the formatted result is embedded directly as a Scala string literal
+ * (the numeric-edited item is a receiving-only field: COBOL performs the
+ * editing at MOVE time, DISPLAY simply prints the stored characters).
+ *
+ * @param {string} editPattern - the parser's fully-expanded PicClause.editPattern
+ *   (repeat counts already expanded, CR/DB already appended as a literal
+ *   2-char suffix - see parser/data-division-parser.js parsePicPattern).
+ * @param {string} rawValue - the literal's raw text, e.g. "-987654321.99".
+ */
+export function formatEditedPicture(editPattern, rawValue) {
+  let corePattern = editPattern;
+  let trailingSign = null;
+  if (/CR$/.test(corePattern) || /DB$/.test(corePattern)) {
+    trailingSign = corePattern.slice(-2);
+    corePattern = corePattern.slice(0, -2);
+  }
+
+  const raw = String(rawValue).trim();
+  const neg = raw.startsWith('-');
+  const unsignedRaw = raw.replace(/^[+-]/, '');
+  const dotIdx = unsignedRaw.indexOf('.');
+  const intRaw = dotIdx === -1 ? unsignedRaw : unsignedRaw.slice(0, dotIdx);
+  const decRaw = dotIdx === -1 ? '' : unsignedRaw.slice(dotIdx + 1);
+
+  const chars = corePattern.split('');
+
+  const symbolCounts = { '$': 0, '+': 0, '-': 0 };
+  for (const ch of chars) if (ch in symbolCounts) symbolCounts[ch] += 1;
+
+  let seenDecimalPoint = false;
+  const digitPositions = []; // { idx, kind: 'fixed' | 'suppress', isDecimal }
+  let floatingChar = null;
+  const floatingIndices = [];
+  let fixedSymbolIdx = null;
+  let fixedSymbolChar = null;
+
+  chars.forEach((ch, idx) => {
+    if (ch === '.') {
+      seenDecimalPoint = true;
+      return;
+    }
+    if (ch === '9' || ch === 'Z' || ch === '*') {
+      digitPositions.push({ idx, kind: ch === '9' ? 'fixed' : 'suppress', isDecimal: seenDecimalPoint });
+      return;
+    }
+    if (ch === '$' || ch === '+' || ch === '-') {
+      if (symbolCounts[ch] >= 2) {
+        digitPositions.push({ idx, kind: 'suppress', isDecimal: seenDecimalPoint, isSymbol: true });
+        floatingChar = ch;
+        floatingIndices.push(idx);
+      } else {
+        fixedSymbolIdx = idx;
+        fixedSymbolChar = ch;
+      }
+    }
+    // Other insertion characters (',', 'B', '0', '/') need no classification
+    // here - they're handled purely positionally at render time below.
+  });
+
+  const intDigitCount = digitPositions.filter(d => !d.isDecimal).length;
+  const decDigitCount = digitPositions.filter(d => d.isDecimal).length;
+
+  const intDigits = intDigitCount === 0 ? '' : intRaw.padStart(intDigitCount, '0').slice(-intDigitCount);
+  const decDigits = decDigitCount === 0 ? '' : decRaw.padEnd(decDigitCount, '0').slice(0, decDigitCount);
+  const digitsStr = intDigits + decDigits;
+  digitPositions.forEach((d, i) => { d.digit = digitsStr[i]; });
+
+  let firstShownArrIdx = digitPositions.findIndex(d => d.kind === 'fixed' || (d.kind === 'suppress' && d.digit !== '0'));
+  if (firstShownArrIdx === -1) firstShownArrIdx = Math.max(digitPositions.length - 1, 0);
+
+  let boundaryPatternIdx = null;
+  let symbolChar = null;
+  if (floatingIndices.length >= 2) {
+    symbolChar = floatingChar;
+    boundaryPatternIdx = firstShownArrIdx > 0
+      ? digitPositions[firstShownArrIdx - 1].idx
+      : floatingIndices[0];
+  }
+
+  let floatingSignChar = '';
+  if (symbolChar === '+') floatingSignChar = neg ? '-' : '+';
+  else if (symbolChar === '-') floatingSignChar = neg ? '-' : ' ';
+  else if (symbolChar === '$') floatingSignChar = '$';
+
+  let fixedSignChar = '';
+  if (fixedSymbolChar === '+') fixedSignChar = neg ? '-' : '+';
+  else if (fixedSymbolChar === '-') fixedSignChar = neg ? '-' : ' ';
+  else if (fixedSymbolChar === '$') fixedSignChar = '$';
+
+  const shownFromPatternIdx = boundaryPatternIdx !== null
+    ? boundaryPatternIdx
+    : (digitPositions[firstShownArrIdx] ? digitPositions[firstShownArrIdx].idx : 0);
+
+  let out = '';
+  chars.forEach((ch, idx) => {
+    if (ch === '.') {
+      out += idx >= shownFromPatternIdx ? '.' : ' ';
+      return;
+    }
+    if (ch === '9' || ch === 'Z' || ch === '*') {
+      const arrIdx = digitPositions.findIndex(d => d.idx === idx);
+      out += arrIdx >= firstShownArrIdx ? digitPositions[arrIdx].digit : ' ';
+      return;
+    }
+    if (ch === '$' || ch === '+' || ch === '-') {
+      if (idx === fixedSymbolIdx) {
+        out += fixedSignChar;
+      } else if (idx === boundaryPatternIdx) {
+        out += floatingSignChar;
+      } else {
+        // A floating symbol position past the boundary is a shown digit
+        // slot (e.g. the '1' of 1,234.50 falls on a '$' in $$$,$$9.99), not
+        // blank - only positions strictly before the boundary are blanked.
+        const arrIdx = digitPositions.findIndex(d => d.idx === idx);
+        out += arrIdx !== -1 && arrIdx >= firstShownArrIdx ? digitPositions[arrIdx].digit : ' ';
+      }
+      return;
+    }
+    out += idx >= shownFromPatternIdx ? ch : ' ';
+  });
+
+  if (trailingSign) {
+    out += neg ? trailingSign : '  ';
+  }
+
+  return out;
 }
 
 /**
@@ -287,8 +535,105 @@ export function generateCompute(statement, indent = 0) {
   const rounded = statement.rounded ? ' // ROUNDED' : '';
 
   return targets
-    .map(target => `${indentStr}${keyword}${convertIdentifier(target)} = ${expression}${rounded}`)
+    .map(target => `${indentStr}${keyword}${renderAssignment(target, expression)}${rounded}`)
     .join('\n');
+}
+
+/**
+ * Scala literal for a figurative/numeric ZERO MOVEd into a field, honoring
+ * the target's declared Scala type (0 / 0L / BigDecimal(0) / "").
+ */
+function zeroLiteralFor(info) {
+  if (!info) return '0';
+  if (info.scalaType === 'BigDecimal') return 'BigDecimal(0)';
+  if (info.scalaType === 'Long') return '0L';
+  if (info.scalaType === 'String') return '""';
+  return '0';
+}
+
+/**
+ * Render a MOVE source (Literal AST node or figurative-constant string)
+ * against the target field's registry info, coercing to the target's
+ * declared Scala type:
+ *   - BigDecimal target: `BigDecimal("<exact literal text>")` (never routed
+ *     through a Scala Double literal - avoids any binary floating-point
+ *     round-tripping of decimal text like "-987654321.99").
+ *   - Long target: literal text with an `L` suffix (bare integer literals
+ *     wider than Int overflow Scala's default Int literal type otherwise).
+ *   - Int target: literal text as-is (truncated to its integer prefix,
+ *     defensively, since COBOL MOVE truncates a fractional source moved to
+ *     an integer receiver).
+ *   - String target with an edited PIC (dataType 'edited'): the fully
+ *     PICTURE-formatted string, computed by formatEditedPicture() - COBOL
+ *     performs numeric-edit formatting at MOVE time, not at DISPLAY time.
+ *   - String target (plain alphanumeric): quoted as-is.
+ * Falls back to the pre-existing untyped behavior when no registry info is
+ * available (e.g. a program with no matching WORKING-STORAGE entry).
+ */
+function renderMoveSource(source, info) {
+  if (source && typeof source === 'object' && source.type === 'Literal') {
+    return renderLiteralForTarget(source, info);
+  }
+
+  if (typeof source === 'string') {
+    const upper = source.toUpperCase();
+    if (upper === 'SPACES' || upper === 'SPACE') return '""';
+    if (upper === 'ZEROS' || upper === 'ZEROES' || upper === 'ZERO') return zeroLiteralFor(info);
+    if (upper === 'HIGH-VALUES' || upper === 'HIGH-VALUE') return 'Char.MaxValue.toString';
+    if (upper === 'LOW-VALUES' || upper === 'LOW-VALUE') return 'Char.MinValue.toString';
+    return convertIdentifier(source);
+  }
+
+  if (source && source.type === 'VariableReference') {
+    return convertIdentifier(source);
+  }
+
+  return convertArithmeticExpression(source);
+}
+
+function renderLiteralForTarget(lit, info) {
+  if (lit.literalType === 'figurative') {
+    switch (String(lit.value).toUpperCase()) {
+      case 'ZERO': return zeroLiteralFor(info);
+      case 'SPACE': return '""';
+      case 'HIGH-VALUE': return 'Char.MaxValue.toString';
+      case 'LOW-VALUE': return 'Char.MinValue.toString';
+      default: return '""';
+    }
+  }
+
+  if (lit.literalType === 'string') {
+    const text = lit.value ?? '';
+    if (info?.dataType === 'edited' && info.editPattern) {
+      return `"${escapeScalaStringLiteral(formatEditedPicture(info.editPattern, text))}"`;
+    }
+    return `"${escapeScalaStringLiteral(text)}"`;
+  }
+
+  // Numeric literal (raw text, sign already included by the lexer, e.g. "-50").
+  const raw = String(lit.value);
+  if (info?.dataType === 'edited' && info.editPattern) {
+    return `"${escapeScalaStringLiteral(formatEditedPicture(info.editPattern, raw))}"`;
+  }
+  if (info?.scalaType === 'BigDecimal') {
+    return `BigDecimal("${raw}")`;
+  }
+  if (info?.scalaType === 'Long') {
+    return `${normalizeIntLiteralText(raw)}L`;
+  }
+  if (info?.scalaType === 'Int') {
+    return normalizeIntLiteralText(raw);
+  }
+  return convertLiteral(raw);
+}
+
+function normalizeIntLiteralText(raw) {
+  const m = /^-?\d+/.exec(String(raw));
+  return m ? m[0] : '0';
+}
+
+function escapeScalaStringLiteral(text) {
+  return String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 /**
@@ -302,29 +647,9 @@ export function generateMove(statement, indent = 0) {
   const lines = [];
 
   for (const target of targets) {
-    const targetName = convertIdentifier(target);
-    let sourceExpr;
-
-    if (typeof source === 'object' && source.type === 'literal') {
-      sourceExpr = convertLiteral(source.value);
-    } else if (typeof source === 'string') {
-      // Check for special values
-      if (source.toUpperCase() === 'SPACES') {
-        sourceExpr = '""';
-      } else if (source.toUpperCase() === 'ZEROS' || source.toUpperCase() === 'ZEROES') {
-        sourceExpr = '0';
-      } else if (source.toUpperCase() === 'HIGH-VALUES') {
-        sourceExpr = 'Char.MaxValue.toString';
-      } else if (source.toUpperCase() === 'LOW-VALUES') {
-        sourceExpr = 'Char.MinValue.toString';
-      } else {
-        sourceExpr = convertIdentifier(source);
-      }
-    } else {
-      sourceExpr = convertArithmeticExpression(source);
-    }
-
-    lines.push(`${indentStr}${targetName} = ${sourceExpr}`);
+    const info = lookupFieldForRef(target);
+    const sourceExpr = renderMoveSource(source, info);
+    lines.push(`${indentStr}${renderAssignment(target, sourceExpr)}`);
   }
 
   return lines.join('\n');
@@ -718,33 +1043,36 @@ function generateAdd(statement, indent = 0) {
     convertArithmeticExpression(a)
   );
 
-  // Get TO targets
-  const toTargets = (statement.to || []).map(t => convertIdentifier(t));
-
-  // Get GIVING targets
-  const givingTargets = (statement.giving || []).map(g => convertIdentifier(g));
+  // TO/GIVING targets (raw refs - kept unstringified so renderAssignment can
+  // see their subscripts; convertIdentifier is used separately for reading
+  // a target's current value on the ADD ... TO path).
+  const toTargets = statement.to || [];
+  const givingTargets = statement.giving || [];
 
   const lines = [];
 
   if (givingTargets.length > 0) {
     // ADD ... GIVING - result goes to giving targets
-    const sum = [...addends, ...toTargets].join(' + ');
+    const toExprs = toTargets.map(t => convertIdentifier(t));
+    const sum = [...addends, ...toExprs].join(' + ');
     for (const target of givingTargets) {
-      lines.push(`${indentStr}${target} = ${sum}`);
+      lines.push(`${indentStr}${renderAssignment(target, sum)}`);
     }
   } else if (toTargets.length > 0) {
     // ADD ... TO - adds to each TO target
     const addendSum = addends.join(' + ');
     for (const target of toTargets) {
       if (addends.length > 0) {
-        lines.push(`${indentStr}${target} = ${target} + ${addendSum}`);
+        const current = convertIdentifier(target);
+        lines.push(`${indentStr}${renderAssignment(target, `${current} + ${addendSum}`)}`);
       }
     }
   } else {
     // Fallback
-    const target = convertIdentifier(statement.target);
-    if (target && addends.length > 0) {
-      lines.push(`${indentStr}${target} = ${target} + ${addends.join(' + ')}`);
+    const target = statement.target;
+    const current = convertIdentifier(target);
+    if (current && addends.length > 0) {
+      lines.push(`${indentStr}${renderAssignment(target, `${current} + ${addends.join(' + ')}`)}`);
     }
   }
 
@@ -764,26 +1092,25 @@ function generateSubtract(statement, indent = 0) {
     convertArithmeticExpression(s)
   );
 
-  // Get FROM targets
-  const fromTargets = (statement.from || []).map(f => convertIdentifier(f));
-
-  // Get GIVING targets
-  const givingTargets = (statement.giving || []).map(g => convertIdentifier(g));
+  const fromTargets = statement.from || [];
+  const givingTargets = statement.giving || [];
 
   const lines = [];
 
   if (givingTargets.length > 0) {
     // SUBTRACT ... GIVING
-    const fromExpr = fromTargets.join(' + ');
+    const fromExprs = fromTargets.map(f => convertIdentifier(f));
+    const fromExpr = fromExprs.join(' + ');
     const subExpr = subtrahends.join(' + ');
     for (const target of givingTargets) {
-      lines.push(`${indentStr}${target} = ${fromExpr} - (${subExpr})`);
+      lines.push(`${indentStr}${renderAssignment(target, `${fromExpr} - (${subExpr})`)}`);
     }
   } else if (fromTargets.length > 0) {
     // SUBTRACT ... FROM - subtracts from each FROM target
     const subExpr = subtrahends.join(' + ');
     for (const target of fromTargets) {
-      lines.push(`${indentStr}${target} = ${target} - (${subExpr})`);
+      const current = convertIdentifier(target);
+      lines.push(`${indentStr}${renderAssignment(target, `${current} - (${subExpr})`)}`);
     }
   }
 
@@ -813,23 +1140,23 @@ function generateMultiply(statement, indent = 0) {
       : convertArithmeticExpression(statement.right);
 
     for (const target of statement.giving) {
-      const targetName = convertIdentifier(target.name || target);
-      lines.push(`${indentStr}${targetName} = ${multiplicand} * ${byExpr}`);
+      lines.push(`${indentStr}${renderAssignment(target, `${multiplicand} * ${byExpr}`)}`);
     }
   } else if (byOperands.length > 0) {
     // MULTIPLY A BY B - result stored in B
     for (const by of byOperands) {
-      const byName = convertIdentifier(by.name || by);
-      lines.push(`${indentStr}${byName} = ${multiplicand} * ${byName}`);
+      const byExpr = convertIdentifier(by);
+      lines.push(`${indentStr}${renderAssignment(by, `${multiplicand} * ${byExpr}`)}`);
     }
   } else {
     // Fallback for simple format
     const right = convertArithmeticExpression(statement.right);
-    const target = convertIdentifier(statement.target || statement.giving);
+    const target = statement.target || statement.giving;
+    const targetExpr = convertIdentifier(target);
     if (statement.giving) {
-      lines.push(`${indentStr}${target} = ${multiplicand} * ${right}`);
+      lines.push(`${indentStr}${renderAssignment(target, `${multiplicand} * ${right}`)}`);
     } else {
-      lines.push(`${indentStr}${target} = ${target} * ${multiplicand}`);
+      lines.push(`${indentStr}${renderAssignment(target, `${targetExpr} * ${multiplicand}`)}`);
     }
   }
 
@@ -855,17 +1182,25 @@ function generateDivide(statement, indent = 0) {
     const divisor = convertArithmeticExpression(statement.divisor);
 
     for (const target of giving) {
-      lines.push(`${indentStr}${convertIdentifier(target)} = ${dividend} / ${divisor}`);
+      const info = lookupFieldForRef(target);
+      // A BigDecimal GIVING target needs decimal-precision division - plain
+      // Scala Int/Int division truncates (COBOL's DIVIDE ... GIVING into a
+      // field with decimal places does not), so both operands are coerced
+      // to BigDecimal before dividing whenever the target calls for it.
+      const valueExpr = info?.scalaType === 'BigDecimal'
+        ? `(${toBigDecimalExpr(dividend)} / ${toBigDecimalExpr(divisor)})`
+        : `${dividend} / ${divisor}`;
+      lines.push(`${indentStr}${renderAssignment(target, valueExpr)}`);
     }
     if (statement.remainder) {
-      lines.push(`${indentStr}${convertIdentifier(statement.remainder)} = ${dividend} % ${divisor}`);
+      lines.push(`${indentStr}${renderAssignment(statement.remainder, `${dividend} % ${divisor}`)}`);
     }
   } else if (into.length > 0) {
     // DIVIDE A INTO B  -> b = b / a
     const divisor = convertArithmeticExpression(statement.divisor || statement.dividend);
     for (const target of into) {
       const name = convertIdentifier(target);
-      lines.push(`${indentStr}${name} = ${name} / ${divisor}`);
+      lines.push(`${indentStr}${renderAssignment(target, `${name} / ${divisor}`)}`);
     }
   } else {
     const dividend = convertArithmeticExpression(statement.dividend);
@@ -874,6 +1209,32 @@ function generateDivide(statement, indent = 0) {
   }
 
   return lines.join('\n');
+}
+
+/**
+ * Wrap an already-rendered Scala expression in a BigDecimal conversion,
+ * unless it's already producing one.
+ */
+function toBigDecimalExpr(expr) {
+  return /^BigDecimal\(/.test(expr) ? expr : `BigDecimal(${expr})`;
+}
+
+/**
+ * Render one DISPLAYed operand. Plain numeric (non-edited) PIC items print
+ * through CobolFmt.num() so the output matches cobc's zero-padded,
+ * leading-sign DISPLAY format (e.g. PIC S9(5) value 100 -> "+00100");
+ * numeric-edited and alphanumeric fields already hold their final display
+ * string (numeric-edited items are formatted at MOVE time - see
+ * renderLiteralForTarget/formatEditedPicture) and print as-is.
+ */
+function renderDisplayOperand(ref) {
+  const expr = convertIdentifier(ref);
+  const info = lookupFieldForRef(ref);
+  if (info && info.dataType === 'numeric') {
+    const asBigDecimal = info.scalaType === 'BigDecimal' ? expr : `BigDecimal(${expr})`;
+    return `CobolFmt.num(${asBigDecimal}, ${info.integerDigits}, ${info.decimalDigits}, ${info.signed})`;
+  }
+  return expr;
 }
 
 /**
@@ -898,9 +1259,10 @@ function generateDisplay(statement, indent = 0) {
       }
       return item.value;
     }
-    // Handle VariableReference objects
+    // Handle VariableReference objects (pass the whole node, not just
+    // item.name, so subscripts are preserved - see convertIdentifier)
     if (item.type === 'VariableReference') {
-      return convertIdentifier(item.name);
+      return renderDisplayOperand(item);
     }
     return convertArithmeticExpression(item);
   });
@@ -1056,7 +1418,11 @@ function generatePerform(statement, indent = 0) {
     const by = varying?.by?.value || varying?.by || '1';
     const until = convertCondition(varying?.until);
 
-    lines.push(`${indentStr}var ${varName} = ${from}`);
+    // The loop-control variable is a WORKING-STORAGE item (declared once as
+    // a flat var elsewhere) - assign it here rather than redeclaring with
+    // `var`, so repeated PERFORM VARYING over the same variable in one
+    // method body doesn't produce a duplicate-declaration compile error.
+    lines.push(`${indentStr}${varName} = ${from}`);
     lines.push(`${indentStr}while !(${until}) do`);
     if (statement.targetParagraph) {
       lines.push(`${indentStr}  ${toCamelCase(statement.targetParagraph)}()`);
@@ -1178,22 +1544,18 @@ function generateSet(statement, indent = 0) {
   const targets = statement.targets || [statement.target];
 
   for (const target of targets) {
-    const targetName = toCamelCase(target.name || target);
-
     if (statement.value?.type === 'TRUE') {
-      lines.push(`${indentStr}${targetName} = true`);
+      lines.push(`${indentStr}${renderAssignment(target, 'true')}`);
     } else if (statement.value?.type === 'FALSE') {
-      lines.push(`${indentStr}${targetName} = false`);
+      lines.push(`${indentStr}${renderAssignment(target, 'false')}`);
     } else if (statement.setType === 'index') {
       const amount = convertArithmeticExpression(statement.value);
-      if (statement.upDown === 'UP') {
-        lines.push(`${indentStr}${targetName} = ${targetName} + ${amount}`);
-      } else {
-        lines.push(`${indentStr}${targetName} = ${targetName} - ${amount}`);
-      }
+      const current = convertIdentifier(target);
+      const expr = statement.upDown === 'UP' ? `${current} + ${amount}` : `${current} - ${amount}`;
+      lines.push(`${indentStr}${renderAssignment(target, expr)}`);
     } else {
       const value = convertArithmeticExpression(statement.value);
-      lines.push(`${indentStr}${targetName} = ${value}`);
+      lines.push(`${indentStr}${renderAssignment(target, value)}`);
     }
   }
 
@@ -1230,5 +1592,8 @@ export default {
   generateUnstring,
   generateInspect,
   generatePerform,
-  generateCall
+  generateCall,
+  setFieldRegistry,
+  generateCobolFmtHelper,
+  formatEditedPicture,
 };

@@ -14,6 +14,11 @@
 
 ## Activity
 
+### 2026-07-11 11:35 — Cycles 19-20: round-5 committed (eded5a3); round-6 verdict + fix dispatched
+- Round-5 fixes committed and pushed after independent suite verification (511/0/0): file I/O end-to-end (ENVIRONMENT DIVISION finally wired into main API), INITIALIZE, group DISPLAY, ACCEPT date sources, edited-source MOVE de-editing, THRU-across-sections. 93 corpus programs.
+- Round-6 refutation: NOT CONVERGED - 6 dishonest across 3 of 12 programs (trend: 11 -> 16 -> 15 -> 16 -> 6 -> 6, and increasingly narrow corners): WRITE ADVANCING ignored (live path never reads it; a correct handler was dead code), quoted digit-content literals ("10") render as Int breaking every FILE STATUS comparison (systemic), STRING ON OVERFLOW dropped + unguarded copy crash, UNSTRING ON OVERFLOW not parsed (statement-stream corruption class). 7 hard survivals to be locked into the corpus (multi-file, WRITE FROM, empty-file read, FD REDEFINES, OCCURS VALUE, level-77, BLANK WHEN ZERO COMP-3).
+- Round-6 fix agent dispatched (also promotes the 7 survivors). SORT USING/GIVING remains documented-TODO.
+
 ### 2026-07-11 10:20 — Cycles 17-18: container restart survived; round-4 committed (852a711); round-5 verdict
 - Container restarted mid-round-4 verification; toolchain and working tree survived; orchestrator re-ran the full suite itself (472/0/0) and committed+pushed round-4 fixes (SECTION cluster, UNSTRING cluster, figurative comparisons, INSPECT BEFORE/AFTER, qualified reads, VARYING AFTER). 79 corpus programs.
 - Round-5 refutation: NOT CONVERGED but strongly converging - dishonest findings 11 -> 16 -> 15(13) -> 16(13) -> 6. New failure area is the never-exercised I/O/environment layer: main API never parses ENVIRONMENT DIVISION (all file OPEN/WRITE/READ broken - roadmap overclaimed), INITIALIZE 100% non-functional, DISPLAY of bare groups, ACCEPT FROM date sources type-broken, edited-source MOVE crash, THRU-across-sections collision. 6 hard survivals incl. unary/exponent precedence and negative division sign rules.

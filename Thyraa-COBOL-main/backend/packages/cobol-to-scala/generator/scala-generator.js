@@ -21,6 +21,8 @@ import {
   setConditionRegistry,
   setAmbiguousGroupClassNames,
   setRecordFileRegistry,
+  setAdvancingFiles as setAdvancingFilesExpr,
+  setFileStatusRegistry as setFileStatusRegistryExpr,
   generateCobolFmtHelper,
   generateCobolInspectHelper,
   generateCobolUnstringHelper,
@@ -34,7 +36,13 @@ import {
   collectAmbiguousParagraphNames,
   generateProgramFlowLines,
 } from './method-gen.js';
-import { generateFileIO, generateFileStatusCheck, generateFileHandleDeclarations } from './file-io-gen.js';
+import {
+  generateFileIO,
+  generateFileStatusCheck,
+  generateFileHandleDeclarations,
+  setAdvancingFiles as setAdvancingFilesFileIO,
+  setFileStatusRegistry as setFileStatusRegistryFileIO,
+} from './file-io-gen.js';
 import { generateSql, generateDoobieImports, generateTransactorSetup } from './sql-gen.js';
 
 /**
@@ -1340,6 +1348,59 @@ function buildRecordFileRegistries(ast) {
 }
 
 /**
+ * FD file names (upper) that have at least one `WriteStatement` anywhere in
+ * the whole PROCEDURE DIVISION with a non-null `.advancing` clause - round-6
+ * finding 1 (see expression-gen.js's ADVANCING_FILES/setAdvancingFiles and
+ * file-io-gen.js's own copy for the full rationale: a file's WRITE behavior
+ * switches wholesale to a deferred-terminator model the moment ANY WRITE for
+ * it uses ADVANCING, compiler-verified against installed GnuCOBOL).
+ *
+ * Walks the *entire* AST (not just a specific procedure-statement shape) via
+ * a generic deep traversal rather than mirroring every nested-statement field
+ * name (thenStatements/elseStatements/whenClauses/loop bodies/...) the way
+ * containsStatementType's checkStatements does above - the AST here is small
+ * (one program), so correctness (never missing a WRITE buried in an IF/
+ * EVALUATE/PERFORM/SECTION of whatever shape) is worth more than the
+ * micro-optimization of only walking known statement-container fields. A
+ * `seen` guard defends against any accidental reference cycle (none of
+ * parser/ast.js's node shapes are known to have one, but this is cheap
+ * insurance either way).
+ */
+function collectAdvancingFileNames(ast, recordToFile) {
+  const fileNames = new Set();
+  const seen = new Set();
+
+  function fileNameFor(recordName) {
+    if (!recordName) return null;
+    return recordToFile.get(String(recordName).toUpperCase()) || recordName;
+  }
+
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    if (seen.has(node)) return;
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+
+    if (node.type === 'WriteStatement' && node.advancing) {
+      const fname = fileNameFor(node.recordName || node.record);
+      if (fname) fileNames.add(String(fname).toUpperCase());
+    }
+
+    for (const key of Object.keys(node)) {
+      if (key === 'location') continue;
+      walk(node[key]);
+    }
+  }
+
+  walk(ast);
+  return fileNames;
+}
+
+/**
  * Build a registry of SD ("sort") work files -> the in-memory buffer support
  * a generated SORT/RELEASE/RETURN needs: a dedicated row case class (one
  * field per record child, independent of the byte-level case class
@@ -1647,6 +1708,29 @@ export function generateScala(ast, options = {}) {
   // statement mentions.
   const { recordToFile, fileToRecord } = buildRecordFileRegistries(ast);
   setRecordFileRegistry(recordToFile, fileToRecord);
+
+  // ADVANCING file set (round-6 finding 1) - fed to both expression-gen.js
+  // (generateWriteStatement's model switch) and file-io-gen.js (generateClose's
+  // final-newline flush), which each keep their own copy (see their doc
+  // comments) since they're independent modules.
+  const advancingFiles = collectAdvancingFileNames(ast, recordToFile);
+  setAdvancingFilesExpr(advancingFiles);
+  setAdvancingFilesFileIO(advancingFiles);
+
+  // FILE STATUS registry (round-6 finding 2/3 companion) - FD file name
+  // (upper) -> its `FILE STATUS IS <field>` field's camelCase flat-var name,
+  // for whichever FILE-CONTROL entries actually declared one. Fed to both
+  // expression-gen.js (READ/WRITE) and file-io-gen.js (OPEN/CLOSE), which
+  // each keep their own copy (see their doc comments).
+  const fileStatusRegistry = new Map();
+  for (const fc of getFileControls(ast)) {
+    const fname = fc.name || fc.fileName;
+    if (fname && fc.status) {
+      fileStatusRegistry.set(String(fname).toUpperCase(), toCamelCase(fc.status));
+    }
+  }
+  setFileStatusRegistryExpr(fileStatusRegistry);
+  setFileStatusRegistryFileIO(fileStatusRegistry);
 
   // Package declaration
   sections.push(generatePackageDeclaration(opts.packageName));

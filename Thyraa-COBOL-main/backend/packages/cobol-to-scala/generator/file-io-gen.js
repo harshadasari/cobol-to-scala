@@ -77,6 +77,38 @@ export function fileHandleVarNames(fileName) {
 }
 
 /**
+ * FD file names (upper) using the ADVANCING "deferred terminator" WRITE
+ * model - round-6 finding 1. Mirrors expression-gen.js's own
+ * ADVANCING_FILES/setAdvancingFiles exactly (see its doc comment there for
+ * the full rationale); this module needs its own copy because generateClose
+ * (below) has to know, independently of expression-gen.js, whether this
+ * file's very last physical line was left unterminated by the deferred
+ * model and needs one final newline flushed before the file handle closes.
+ */
+let ADVANCING_FILES = new Set();
+
+export function setAdvancingFiles(fileNames) {
+  ADVANCING_FILES = fileNames instanceof Set ? fileNames : new Set();
+}
+
+/**
+ * FD file name (upper) -> its `FILE STATUS IS <field>` field's camelCase
+ * flat-var name - round-6 finding 2/3's t04 companion gap. See
+ * expression-gen.js's own identical copy (FILE_STATUS_REGISTRY) for the full
+ * rationale; this module needs its own copy because OPEN/CLOSE (below) are
+ * generated here, independently of expression-gen.js's READ/WRITE.
+ */
+let FILE_STATUS_REGISTRY = new Map();
+
+export function setFileStatusRegistry(registry) {
+  FILE_STATUS_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+function fileStatusVarFor(fileName) {
+  return FILE_STATUS_REGISTRY.get(String(fileName || '').toUpperCase()) || null;
+}
+
+/**
  * Generate OPEN statement
  */
 export function generateOpen(statement, indent = 0) {
@@ -116,6 +148,15 @@ export function generateOpen(statement, indent = 0) {
       default:
         lines.push(`${indentStr}// OPEN ${mode} ${fileName}`);
     }
+
+    // round-6 finding 2/3 companion: this generator never models an OPEN
+    // failure (missing file, permission error, etc. all surface as a raw
+    // Java exception, not a FILE STATUS code) - a registered FILE STATUS
+    // field always goes to "00" (successful open) here.
+    const statusVar = fileStatusVarFor(fileName);
+    if (statusVar) {
+      lines.push(`${indentStr}${statusVar} = "00"`);
+    }
   }
 
   return lines.join('\n');
@@ -134,6 +175,16 @@ export function generateClose(statement, indent = 0) {
     const fileName = extractFileName(file);
     const { readerVar, writerVar, randomVar } = fileHandleVarNames(fileName);
 
+    // Round-6 finding 1: a file using the ADVANCING deferred-terminator
+    // WRITE model (see expression-gen.js's generateWriteStatement) leaves
+    // its last physical line unterminated - flush the final newline here,
+    // before the writer actually closes. A file that never uses ADVANCING
+    // is untouched (ADVANCING_FILES empty/absent for it), so this is a
+    // pure addition with zero effect on any pre-round-6 program.
+    if (ADVANCING_FILES.has(String(fileName || '').toUpperCase())) {
+      lines.push(`${indentStr}if ${writerVar} != null then { try ${writerVar}.print("\\n") catch case _: Exception => () }`);
+    }
+
     // Only whichever handle OPEN actually assigned for this file is
     // non-null; guard each close so CLOSE-ing a file that was never opened
     // in this mode (or already closed) is a harmless no-op instead of a
@@ -141,6 +192,13 @@ export function generateClose(statement, indent = 0) {
     lines.push(`${indentStr}if ${readerVar} != null then { try ${readerVar}.close() catch case _: Exception => (); ${readerVar} = null }`);
     lines.push(`${indentStr}if ${writerVar} != null then { try ${writerVar}.close() catch case _: Exception => (); ${writerVar} = null }`);
     lines.push(`${indentStr}if ${randomVar} != null then { try ${randomVar}.close() catch case _: Exception => (); ${randomVar} = null }`);
+
+    // round-6 finding 2/3 companion: CLOSE failures aren't modeled either -
+    // a registered FILE STATUS field always goes to "00" here.
+    const statusVar = fileStatusVarFor(fileName);
+    if (statusVar) {
+      lines.push(`${indentStr}${statusVar} = "00"`);
+    }
   }
 
   return lines.join('\n');
@@ -223,7 +281,23 @@ export function generateRead(statement, indent = 0) {
 }
 
 /**
- * Generate WRITE statement
+ * Generate WRITE statement.
+ *
+ * DEAD CODE (round-6 finding 1): the live WRITE dispatch (expression-gen.js's
+ * generateExpression, case 'WRITE') always calls that module's own
+ * generateWriteStatement instead - this function (and generateFileIO's
+ * 'WRITE' case below, and generateFileIOWithResource) are never invoked from
+ * the real conversion path (confirmed: no import of generateFileIO/
+ * generateWrite from scala-generator.js's WRITE handling, no test exercises
+ * this function directly). Its own ADVANCING handling below is ALSO stale
+ * relative to the real, compiler-verified GnuCOBOL model (a deferred-
+ * terminator/carriage-control model - n newlines emitted BEFORE the record
+ * for `n LINES`, not "N blank println() calls"; see expression-gen.js's
+ * generateWriteStatement doc comment for the verified semantics). Left as-is
+ * rather than deleted (out of scope for this fix - the live path is what
+ * matters) or "fixed" in place (which would misrepresent live/dead status by
+ * making dead code look current); do not treat this function's presence as
+ * evidence that ADVANCING is handled here.
  */
 export function generateWrite(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);

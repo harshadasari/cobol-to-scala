@@ -1633,6 +1633,26 @@ function parseUnstringStatement(ctx) {
     stmt.tallying = parseVariableReference(ctx);
   }
 
+  // Parse ON OVERFLOW / NOT ON OVERFLOW (round-6 finding 6) - mirrors
+  // parseStringStatement's identical clause exactly. Previously entirely
+  // unconsumed: the ON OVERFLOW/NOT ON OVERFLOW keyword and its statement
+  // block were left sitting in the token stream after UNSTRING's own
+  // recognized clauses ran out, so the *next* parse step (whatever follows
+  // in the paragraph) tried to parse "ON OVERFLOW ... END-UNSTRING" itself
+  // as a fresh, unrelated statement - corrupting the statement stream (the
+  // overflow branch's body leaked out as unconditional top-level siblings,
+  // and a dangling END-UNSTRING confused whatever came after).
+  if (ctx.matchValue('ON')) {
+    ctx.matchValue('OVERFLOW');
+    stmt.onOverflow = parseStatementBlock(ctx, ['NOT', 'END-UNSTRING']);
+  }
+
+  if (ctx.matchValue('NOT')) {
+    ctx.matchValue('ON');
+    ctx.matchValue('OVERFLOW');
+    stmt.notOnOverflow = parseStatementBlock(ctx, ['END-UNSTRING']);
+  }
+
   ctx.matchValue('END-UNSTRING');
 
   return stmt;

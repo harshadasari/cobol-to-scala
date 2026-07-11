@@ -244,7 +244,10 @@ test('Finding 13: multiple UNSTRING statements in one paragraph are each their o
   // run()'s whole-program fall-through nest - see finding 9 - which would
   // double this count for an unrelated reason).
   const code = convertToScala(source, {}).scala;
-  const declCount = (code.match(/val \(_parts, _delims, _newPtr\) =/g) || []).length;
+  // round-6 finding 6 added a 4th (_overflow) element to this destructure -
+  // see tests/round6-fixes.test.js - so this now matches
+  // `(_parts, _delims, _newPtr, _overflow)`, not the pre-round-6 3-tuple.
+  const declCount = (code.match(/val \(_parts, _delims, _newPtr, _overflow\) =/g) || []).length;
   assert.equal(declCount, 2);
   // Each UNSTRING's generated statement opens its own `{` block.
   const openBraces = (code.match(/\{\s*\n\s*val \(_parts,/g) || []).length;

@@ -131,34 +131,48 @@ adversarial refuter that found 13 more root-cause dishonest divergences -
 SECTION handling (PERFORM of a section name, same-stripped-name paragraph
 collisions across sections, and the program's true entry point), UNSTRING
 (WITH POINTER, DELIMITED BY ALL, DELIMITER IN, multi-UNSTRING scoping), and
-six further expression/statement gaps - see "Round-4 findings" below. All of
-these were promoted into this directory (not kept as a separate corpus)
-specifically so this same data-driven suite picks them up automatically: no
-test-registration code changes were needed to add them, only the
-generator/parser fixes each one's mismatch pointed at.
+six further expression/statement gaps - see "Round-4 findings" below. The
+`s01`-`s12` programs (including `*b` isolation follow-ups) were added the same
+way by a **round-5** adversarial refuter that found 6 more root-cause dishonest
+divergences concentrated in FILE I/O and INITIALIZE - see "Round-5 findings"
+below. The `t01`-`t12` programs (`t09` deliberately excluded - see "Known
+gaps") were added the same way by a **round-6** adversarial refuter that found
+6 more root-cause dishonest divergences: `WRITE ... ADVANCING` (parsed but
+completely ignored at codegen), a `convertLiteral` text-shape guess that
+silently discarded a quoted string literal's own identity whenever its text
+happened to look like digits, STRING `ON OVERFLOW`/`NOT ON OVERFLOW` (parsed
+but dropped at codegen) plus an unguarded STRING copy loop
+(`StringIndexOutOfBoundsException` on overflow), and UNSTRING `ON OVERFLOW`/
+`NOT ON OVERFLOW` (not parsed at all - the unconsumed clause corrupted the
+statement stream) - see "Round-6 findings" below. All of these were promoted
+into this directory (not kept as a separate corpus) specifically so this same
+data-driven suite picks them up automatically: no test-registration code
+changes were needed to add them, only the generator/parser fixes each one's
+mismatch pointed at.
 
 ## Current inventory (last recorded run: 2026-07-11)
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 93 corpus programs found (19
-under `data/`, 74 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+**cobc oracle capture / expected-vs-oracle check** - 104 corpus programs found
+(19 under `data/`, 85 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
 excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
-precompiler, see `tests/sql.test.js` instead), all 93 compiled and ran cleanly under
-cobc (exit 0). 28 of the 93 (19 `data/` + 9 `proc/` baseline programs) already have a
+precompiler, see `tests/sql.test.js` instead), all 104 compiled and ran cleanly under
+cobc (exit 0). 28 of the 104 (19 `data/` + 9 `proc/` baseline programs) already have a
 hand-written `.expected.txt` that matches the captured `.oracle.txt` exactly - 0
-mismatches. The 20 `r01`-`r14*`, 15 `n01`-`n16*`, 16 `q01`-`q12*`, and 14
-`s01`-`s12*` programs have no hand-written `.expected.txt` by design (they're
-verified directly against cobc via `oracleCompare()` below, not a separately
-hand-authored expectation) and show up here as a diagnostic-only capture ("no
-`<name>.expected.txt` alongside ... yet").
+mismatches. The 20 `r01`-`r14*`, 15 `n01`-`n16*`, 16 `q01`-`q12*`, 14
+`s01`-`s12*`, and 11 `t01`-`t12*` (`t09` excluded) programs have no hand-written
+`.expected.txt` by design (they're verified directly against cobc via
+`oracleCompare()` below, not a separately hand-authored expectation) and show up
+here as a diagnostic-only capture ("no `<name>.expected.txt` alongside ... yet").
 
 **Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
 end-to-end (0 todo).
 
-**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 74/74 programs match
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 85/85 programs match
 end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
-`q01`-`q12*`, and all 14 `s01`-`s12*` adversarial-refutation programs below.
+`q01`-`q12*`, all 14 `s01`-`s12*`, and all 11 `t01`-`t12*` (`t09` excluded)
+adversarial-refutation programs below.
 
 ### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
@@ -274,6 +288,39 @@ found and fixed - the "how to run" commands are the source of truth, this table 
 only a snapshot. See also `tests/round5-fixes.test.js` for focused,
 toolchain-independent unit tests of each fix above.
 
+### Round-6 adversarial-refutation findings (t01-t12) and their fixes
+
+A round-6 refuter found 6 more root-cause dishonest divergences across 3
+programs: `WRITE ... ADVANCING` (parsed but completely ignored by the live
+codegen path - a correct-looking handler existed in `file-io-gen.js`'s
+`generateWrite`, but that function is dead code, never called from the real
+conversion path), a `convertLiteral` text-shape guess that silently discarded
+a quoted string literal's own parser-known identity whenever its characters
+happened to look like digits (breaking both `FILE STATUS = "10"`-style
+comparisons and any runtime helper call expecting a String argument), STRING
+`ON OVERFLOW`/`NOT ON OVERFLOW` (parsed but dropped at codegen) together with
+an entirely unguarded STRING character-copy loop (a guaranteed
+`StringIndexOutOfBoundsException` on overflow, with or without an ON OVERFLOW
+clause present), and UNSTRING `ON OVERFLOW`/`NOT ON OVERFLOW` (not parsed at
+all - the unconsumed clause corrupted the statement stream, its branch bodies
+leaking out as unconditional top-level siblings after the UNSTRING). All 6 are
+now fixed; every promoted program hard-passes `oracleCompare()`.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | `WRITE ... AFTER/BEFORE ADVANCING n LINES/PAGE` on a file was silently ignored - the parser captured `statement.advancing` correctly, but the live `generateWriteStatement` (`generator/expression-gen.js`) never read it at all, always emitting a plain `println` regardless of any ADVANCING clause | Compiler-verified against installed GnuCOBOL (t01) that the real model is a deferred-terminator, carriage-control-style one - `AFTER ADVANCING n LINES` emits exactly n newlines THEN the record text (no trailing terminator of its own; the next WRITE's own leading separator, or CLOSE, terminates it), `ADVANCING 0 LINES` emits a bare `\r`, `BEFORE ADVANCING` self-terminates (text first, then its own separator immediately after). New `CobolFmt.advanceSep` runtime helper renders the separator; `ADVANCING_FILES` (built once by `scala-generator.js`'s `collectAdvancingFileNames`, fed to both `expression-gen.js` and `file-io-gen.js`) switches a *whole file's* WRITE/CLOSE codegen to this model only when at least one WRITE for that file uses ADVANCING anywhere (matches cobc's own observed mixed-usage behavior) - every other file's WRITE is the byte-for-byte pre-round-6 `println`, which is what keeps all 93 pre-existing corpus programs unchanged | t01 |
+| 2 | `convertLiteral` (`generator/expression-gen.js`) inferred string-vs-numeric from the literal's own *text shape* (`/^-?\d+(\.\d+)?$/`) instead of the parser's own `Literal.literalType` tag - a quoted digit-shaped string literal (`FILE STATUS IS WS-STATUS` compared `= "10"`) rendered as a bare Scala `Int`, a hard type-mismatch against the String-typed field | `convertLiteral` now takes an explicit `literalType` parameter and honors `'string'`/`'numeric'` definitively when supplied, falling back to the old text-shape guess only for the few call sites with no AST node to carry the tag from; every call site that has a `Literal` node in scope (`convertIdentifier`, `safeNodeString`, both `convertArithmeticExpression` Literal branches, `renderLiteralForTarget`'s fallback) now passes it through. MOVE's own literal rendering (`renderLiteralForTarget`) already branched on `literalType` correctly before this fix - only the comparison/general-expression path was broken | t04, t11 |
+| 3 | Same root cause as finding 2, different call site: `INSPECT ... REPLACING CHARACTERS BY "0"` passed its quoted replacement literal through the same broken `convertLiteral` path (via `convertArithmeticExpression`), rendering `CobolInspect.replaceCharacters(_reg, 0)` - an Int argument where the runtime helper expects a String | Same fix as finding 2 (single shared root cause) | t11 |
+| 3 (companion, found while making t04 hard-pass) | `SELECT ... FILE STATUS IS ws-status` was parsed into `environmentDivision.fileControls[i].status` but never consumed by codegen at all - OPEN/READ/WRITE/CLOSE never assigned that field, so it silently kept its default (typically spaces) forever; worse than a wrong comparison result, a *bare* `READ file-name` with no AT END clause (t04's own idiom, and the single most common real-world reason a program declares FILE STATUS to begin with) has no other way to detect EOF, so the read loop never terminated - a silent, total hang | New `FILE_STATUS_REGISTRY` (file name -> its FILE STATUS field's camelCase var, built once in `scala-generator.js`, fed to both `expression-gen.js` and `file-io-gen.js`) assigns `"00"` after every successful OPEN/WRITE/CLOSE and a successful READ, and `"10"` when a READ's iterator is exhausted - including rewriting the bare-READ-with-no-AT-END branch to actually branch on `.hasNext` instead of silently no-op-ing past EOF. A file with no FILE STATUS clause is completely unaffected (pure addition) | t04 |
+| 4 | `STRING ... ON OVERFLOW` / `NOT ON OVERFLOW` were parsed into `statement.onOverflow`/`notOnOverflow` but `generateString` never read either - the branches were silently dropped at codegen, with no compile error and no visible marker | `generateString` (`generator/expression-gen.js`) now tracks an `_overflow` boolean (set whenever a source character can't be stored because the target ran out of room) and emits an `if _overflow then ... else ...` using the statement's own ON OVERFLOW/NOT ON OVERFLOW bodies - only when the statement actually has one of these clauses (a STRING with neither generates the same shape as before, now overflow-safe, with no unused branch) | t12 |
+| 5 | The STRING character-copy loop (`_sb.setCharAt(_ptr - 1 + _i, ...)`) had no bounds check against the target's declared width at all - a guaranteed `StringIndexOutOfBoundsException` the instant the combined source segments exceeded the target, regardless of whether an ON OVERFLOW clause was even present | The copy loop now bounds-checks each character position against the target's width before calling `setCharAt`, setting `_overflow = true` (and simply dropping the character, never storing it) instead of throwing - compiler-verified against installed GnuCOBOL (t12) that this matches cobc's own truncate-and-signal behavior exactly (`STRING "HELLO" "WORLD" INTO PIC X(6)` stores `"HELLOW"`, not a crash) | t12 |
+| 6 | `UNSTRING ... ON OVERFLOW` / `NOT ON OVERFLOW` were not parsed AT ALL (`parseUnstringStatement` had no handling for either clause) - the unconsumed `ON OVERFLOW ... DISPLAY ... NOT ON OVERFLOW ... DISPLAY ... END-UNSTRING` tokens were left sitting in the stream, so the *next* parse step tried to parse them as fresh, unrelated statements, corrupting the statement stream (the overflow branch's own body leaked out as unconditional top-level siblings) | `parseUnstringStatement` (`parser/procedure-parser.js`) now parses both clauses, mirroring `parseStringStatement`'s identical pattern exactly. Codegen: `CobolUnstring.unstring`'s runtime helper now returns a 4th element, `overflow` (true exactly when the source held more delimited fields than there were INTO targets to receive them - compiler-verified against installed GnuCOBOL, t12, that an *exact* fit - the last field consuming the source right up to its end - is NOT overflow); `generateUnstring` destructures it and emits the same `if _overflow then ... else ...` pattern as STRING's finding 4, only when the statement has one of these clauses | t12 |
+
+Re-run `npm test` after generator changes; the table above will drift as new gaps are
+found and fixed - the "how to run" commands are the source of truth, this table is
+only a snapshot. See also `tests/round6-fixes.test.js` for focused,
+toolchain-independent unit tests of each fix above.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -356,3 +403,35 @@ toolchain-independent unit tests of each fix above.
   Not promoted as its own corpus program - no test asserts a specific outcome for
   it. Revisit by threading the anchor width through before computing
   `relationalOperandDescriptor` for the figurative side, if a future pass has time.
+
+- **`SORT ... USING <file> GIVING <file>` (whole-file form, round-6 t09)** - only
+  `SORT ... INPUT PROCEDURE ... OUTPUT PROCEDURE ...` (with RELEASE/RETURN) is
+  implemented (`generateSort`, `generator/expression-gen.js`); the file-driven
+  `USING`/`GIVING` form (no procedural hook at all - reads straight from one file,
+  sorts, writes straight to another) generates a visible `() // TODO: SORT ...
+  USING <file> not yet supported` marker instead. Deliberately **not promoted**
+  into `tests/corpus/proc/` (t09 stays out by design - same reasoning as every
+  other documented gap here: a program that actually exercises a known,
+  intentional gap would fail `oracleCompare()`, misrepresenting a known
+  limitation as a regression). Revisit by adding a `USING`/`GIVING` code path to
+  `generateSort` that reads the USING file's records into the SD's in-memory
+  buffer (`buildSortFileRegistry`'s existing support) before sorting and writes
+  the sorted buffer straight to the GIVING file afterward, if a future pass has
+  time.
+
+- **`WRITE ... BEFORE ADVANCING` as the very LAST write to a file that also uses
+  ADVANCING elsewhere, round-6 finding 1's narrow edge** - the deferred-
+  terminator model (see finding 1's fix) leaves a file's last physical line
+  unterminated whenever the last WRITE used `AFTER ADVANCING` (or no ADVANCING
+  clause at all), which is why CLOSE unconditionally flushes one final newline
+  for any file in `ADVANCING_FILES`. A `BEFORE ADVANCING` write already
+  self-terminates its own line (confirmed empirically: its own newline/carriage-
+  return is emitted immediately after its own text, not deferred) - if such a
+  write happens to be the *last* WRITE before CLOSE, that unconditional final
+  newline is one blank line too many. Not independently verified against cobc
+  (t01, the only ADVANCING corpus program, uses `AFTER ADVANCING` exclusively)
+  and not promoted as its own corpus program. Revisit by tracking, per file,
+  whether the most recently generated WRITE for it was BEFORE- or
+  AFTER-positioned (a compile-time property, decidable per WRITE statement) and
+  only emitting CLOSE's unconditional flush when the *last* WRITE to that file
+  in program order was AFTER-positioned (or absent), if a future pass has time.

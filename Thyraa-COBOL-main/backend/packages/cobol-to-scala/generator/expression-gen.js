@@ -137,6 +137,39 @@ let SORT_FILE_REGISTRY = new Map();
 let RECORD_FILE_REGISTRY = new Map();
 /** FD file name (upper) -> its first 01 record's own name (raw COBOL text) - the mirror-image lookup for a plain READ with no INTO clause. */
 let FILE_RECORD_REGISTRY = new Map();
+/**
+ * FD file names (upper) that have at least one WRITE statement anywhere in
+ * the PROCEDURE DIVISION with an ADVANCING clause (round-6 finding 1) -
+ * compiler-verified against installed GnuCOBOL that a file's WRITE behavior
+ * switches *wholesale* to the carriage-control-style "deferred terminator"
+ * model (see generateWriteStatement's doc comment) the moment ANY WRITE for
+ * that file uses ADVANCING, even for a later plain WRITE to the same file
+ * with no ADVANCING clause of its own (which then contributes zero
+ * separator characters, not the ordinary one-newline-per-record behavior
+ * a file that never uses ADVANCING at all gets). A file NOT in this set
+ * keeps the exact byte-for-byte pre-round-6 `println` behavior - this is
+ * what guarantees zero regression across every existing corpus program
+ * (none of which use ADVANCING at all).
+ */
+let ADVANCING_FILES = new Set();
+/**
+ * FD file name (upper) -> its `FILE STATUS IS <field>` field's own camelCase
+ * flat-var name (round-6 finding 2/3's t04 companion gap: `SELECT ... FILE
+ * STATUS IS ws-status` was already parsed into
+ * `environmentDivision.fileControls[i].status`, but nothing in codegen ever
+ * read it - OPEN/READ/WRITE/CLOSE never assigned that field at all, so it
+ * silently kept whatever value WORKING-STORAGE gave it (typically spaces)
+ * forever. That is worse than a wrong comparison result: a bare `READ
+ * file-name` with no AT END clause at all (the overwhelmingly common
+ * FILE-STATUS-driven EOF idiom - see t04) has no other way to detect
+ * end-of-file, so the read loop simply never terminates - a silent, total
+ * hang, not just wrong output.) Absent (unset) for a file with no FILE
+ * STATUS clause - every read/write/open/close of such a file is completely
+ * unaffected (this is a pure addition, not a behavior change, for the
+ * overwhelming majority of existing corpus programs, none of which declare
+ * FILE STATUS).
+ */
+let FILE_STATUS_REGISTRY = new Map();
 /** "<name>::<immediate parent name>" (both upper) -> field info, for OF/IN qualified references */
 let QUALIFIED_REGISTRY = new Map();
 /** Level-88 condition name (upper) -> { info: <parent field's registry info>, values: [...] } */
@@ -185,6 +218,21 @@ export function setSortFileRegistry(registry) {
 export function setRecordFileRegistry(recordToFile, fileToRecord) {
   RECORD_FILE_REGISTRY = recordToFile instanceof Map ? recordToFile : new Map();
   FILE_RECORD_REGISTRY = fileToRecord instanceof Map ? fileToRecord : new Map();
+}
+
+/** See ADVANCING_FILES' doc comment above. */
+export function setAdvancingFiles(fileNames) {
+  ADVANCING_FILES = fileNames instanceof Set ? fileNames : new Set();
+}
+
+/** See FILE_STATUS_REGISTRY's doc comment above. */
+export function setFileStatusRegistry(registry) {
+  FILE_STATUS_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+/** The FILE STATUS flat-var camelCase name for `fileName` (upper-normalized internally), or null if that file declared no FILE STATUS clause. */
+function fileStatusVarFor(fileName) {
+  return FILE_STATUS_REGISTRY.get(String(fileName || '').toUpperCase()) || null;
 }
 
 /** The FD file name a WRITE/REWRITE of `recordName` actually belongs to - falls back to the record's own name when it isn't a registered FD record (defensive; every corpus program's record is registered). */
@@ -481,9 +529,9 @@ function convertIdentifier(cobolId) {
     return `${toCamelCase(cobolId.qualifier)}.${toCamelCase(cobolId.name || '')}`;
   }
 
-  // Handle Literal objects
+  // Handle Literal objects (round-6 finding 2/3: thread literalType through)
   if (cobolId.type === 'Literal') {
-    return convertLiteral(cobolId.value);
+    return convertLiteral(cobolId.value, cobolId.literalType);
   }
 
   // Fallback - try to extract name property
@@ -526,7 +574,10 @@ function safeNodeString(node) {
   if (typeof node !== 'object') return String(node);
 
   if (node.value !== undefined && typeof node.value !== 'object') {
-    return convertLiteral(node.value);
+    // round-6 finding 2/3: a Literal node reaching here still carries its
+    // own literalType - pass it through instead of re-guessing from text
+    // shape (a quoted digit-shaped string, e.g. "10", must stay a string).
+    return convertLiteral(node.value, node.type === 'Literal' ? node.literalType : undefined);
   }
 
   // Only `.type` counts as "this is a tagged AST construct" - NOT
@@ -549,13 +600,40 @@ function safeNodeString(node) {
 }
 
 /**
- * Convert a COBOL literal to Scala
+ * Convert a COBOL literal to Scala.
+ *
+ * `literalType` (round-6 finding 2/3), when supplied, is the authoritative
+ * source-shape tag the parser's `Literal` AST node already carries
+ * ('string'/'numeric'/'figurative' - see parser/ast.js) - a QUOTED string
+ * literal whose *text* happens to look like digits (e.g. `"10"`,
+ * `FILE STATUS IS "00"`, `INSPECT ... REPLACING CHARACTERS BY "0"`) must
+ * render as a Scala string literal (`"10"`), never as a bare numeric token
+ * (`10`), no matter what its characters look like - COBOL's own lexical
+ * quoting already disambiguates this at parse time, so codegen has no
+ * business re-guessing from the text shape once that information is
+ * available. Without this, a bare `10` compared against (or assigned into) a
+ * String-typed field is a hard Scala 3 compile error ("Values of types
+ * String and Int cannot be compared"), and a quoted digit-shaped literal fed
+ * to a String-typed runtime helper (e.g. `CobolInspect.replaceCharacters`)
+ * fails the same way.
+ *
+ * The bare shape-sniffing regex below is kept ONLY as a fallback for the
+ * handful of call sites that don't (or structurally can't) carry a
+ * `literalType` hint (e.g. a plain JS value with no originating AST node) -
+ * every call site that has one available now passes it; see the "audit"
+ * note on each convertLiteral(...) call site.
  */
-function convertLiteral(value) {
+function convertLiteral(value, literalType) {
   if (value === null || value === undefined) return 'null';
 
   if (typeof value === 'string') {
-    // Check if it's a numeric string
+    if (literalType === 'string') {
+      return `"${value.replace(/"/g, '\\"')}"`;
+    }
+    if (literalType === 'numeric') {
+      return value;
+    }
+    // No literalType hint available - fall back to the old text-shape guess.
     if (/^-?\d+(\.\d+)?$/.test(value)) {
       return value;
     }
@@ -601,6 +679,14 @@ function convertLiteral(value) {
 export function generateCobolFmtHelper() {
   return [
     'object CobolFmt:',
+    '  // WRITE ... AFTER/BEFORE ADVANCING n LINES (round-6 finding 1) - the',
+    '  // separator text emitted between one physical line and the next,',
+    '  // compiler-verified against installed GnuCOBOL: ADVANCING 0 LINES is a',
+    '  // bare carriage return (same-line overprint), ADVANCING n LINES (n>=1)',
+    '  // is exactly n newline characters (n-1 blank lines plus the ordinary',
+    '  // line break), never n-1.',
+    '  def advanceSep(n: Int): String = if n <= 0 then "\\r" else "\\n" * n',
+    '',
     '  def num(v: BigDecimal, intDigits: Int, decDigits: Int, signed: Boolean): String =',
     '    val neg = v.signum < 0',
     '    val absVal = v.abs',
@@ -884,7 +970,15 @@ export function generateCobolInspectHelper() {
 export function generateCobolUnstringHelper() {
   return [
     'object CobolUnstring:',
-    '  def unstring(source: String, startPos: Int, delims: Seq[(String, Boolean)], maxFields: Int): (Vector[String], Vector[String], Int) =',
+    '  // Fourth element (round-6 finding 6): true when the source held MORE',
+    '  // delimited fields than there were INTO targets to receive them (some',
+    '  // of the source was left unexamined because every receiver was already',
+    '  // full) - compiler-verified against installed GnuCOBOL (t12): exactly',
+    '  // "hit the maxFields cap while text after the last-consumed delimiter',
+    '  // still remains", not merely "maxFields fields were produced" (an exact',
+    '  // fit - the last field consuming the source right up to its end - is',
+    '  // NOT overflow).',
+    '  def unstring(source: String, startPos: Int, delims: Seq[(String, Boolean)], maxFields: Int): (Vector[String], Vector[String], Int, Boolean) =',
     '    var pos = math.max(0, math.min(startPos, source.length))',
     '    var fields = Vector.empty[String]',
     '    var matched = Vector.empty[String]',
@@ -912,7 +1006,8 @@ export function generateCobolUnstringHelper() {
     '            endPos += bestText.length',
     '        matched = matched :+ bestText',
     '        pos = endPos',
-    '    (fields, matched, pos)',
+    '    val overflow = fields.length == maxFields && pos < source.length',
+    '    (fields, matched, pos, overflow)',
   ].join('\n');
 }
 
@@ -1107,7 +1202,14 @@ export function convertArithmeticExpression(expr) {
       return convertIdentifier(expr.variable);
     }
     if (expr.value !== null && expr.value !== undefined) {
-      return convertLiteral(expr.value);
+      // An ArithmeticExpression's own `.value` (as opposed to `.left`/
+      // `.right` holding nested Literal nodes) is only ever populated by
+      // parsePrimary's NUMERIC_LITERAL branch (parser/procedure-parser.js) -
+      // a bare arithmetic-expression term never wraps a *string* literal
+      // this way (those come through as their own Literal node instead,
+      // handled by the `expr.type === 'Literal'` branch below) - so this is
+      // always numeric, explicitly (round-6 finding 2/3 audit).
+      return convertLiteral(expr.value, 'numeric');
     }
     return '0';
   }
@@ -1117,11 +1219,15 @@ export function convertArithmeticExpression(expr) {
   }
 
   if (expr.type === 'Literal') {
-    return convertLiteral(expr.value);
+    // round-6 finding 2/3: this is the call site that broke FILE STATUS
+    // string comparisons and CobolInspect literal arguments - a quoted
+    // digit-shaped string literal (e.g. "10", "0") must stay a Scala string,
+    // never fall through to convertLiteral's bare-shape numeric guess.
+    return convertLiteral(expr.value, expr.literalType);
   }
 
   if (expr.type === 'literal') {
-    return convertLiteral(expr.value);
+    return convertLiteral(expr.value, expr.literalType);
   }
 
   if (expr.type === 'identifier') {
@@ -1754,7 +1860,11 @@ function renderLiteralForTarget(lit, info) {
   if (info?.scalaType === 'Int') {
     return normalizeIntLiteralText(truncateNumericLiteralTextForMove(raw, info));
   }
-  return convertLiteral(raw);
+  // Reached only once the 'figurative' and 'string' branches above have
+  // already been excluded - lit.literalType is 'numeric' here (round-6
+  // finding 2/3 audit: pass it explicitly rather than relying on
+  // convertLiteral's text-shape fallback).
+  return convertLiteral(raw, 'numeric');
 }
 
 /**
@@ -2974,6 +3084,22 @@ function stringSourceSegmentExpr(source) {
  * of a mutable StringBuilder built from that width-normalized snapshot.
  * WITH POINTER's identifier is both read (starting position) and written
  * back (final position, one past the last character stored) when present.
+ *
+ * ON OVERFLOW / NOT ON OVERFLOW (round-6 findings 4/5) - compiler-verified
+ * against installed GnuCOBOL (t12): overflow is set the instant any source
+ * character can't be stored because the target ran out of room (`_ptr - 1 +
+ * _i` would land at or past the target's declared width) - characters that
+ * *do* fit are still stored (STRING never backs out a partial store), and
+ * everything past the point of overflow is simply dropped, never written.
+ * The per-character bounds check below is unconditional (finding 5 - it
+ * previously called `_sb.setCharAt` with no bounds check at all, a guaranteed
+ * `StringIndexOutOfBoundsException` the moment the combined source segments
+ * exceeded the target's width, with or without an ON OVERFLOW clause even
+ * being present); the ON OVERFLOW/NOT ON OVERFLOW branches (finding 4,
+ * previously parsed but silently dropped at codegen) are only emitted when
+ * the statement actually has one, so a STRING with neither clause generates
+ * the same shape as before (now overflow-safe) instead of an unused `_overflow`
+ * var and empty branches.
  */
 export function generateString(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -2982,16 +3108,21 @@ export function generateString(statement, indent = 0) {
   const width = targetInfo?.picLength || 0;
   const targetExpr = convertIdentifier(statement.into);
   const initialPtr = statement.pointer ? convertIdentifier(statement.pointer) : '1';
+  const hasOverflowClauses = (statement.onOverflow && statement.onOverflow.length > 0) ||
+    (statement.notOnOverflow && statement.notOnOverflow.length > 0);
 
   const lines = [`${indentStr}{`];
   lines.push(`${bi}val _base = (${targetExpr}).padTo(${width}, ' ').take(${width})`);
   lines.push(`${bi}val _sb = new StringBuilder(_base)`);
   lines.push(`${bi}var _ptr = ${initialPtr}`);
+  lines.push(`${bi}var _overflow = false`);
 
   (statement.sources || []).forEach((source, i) => {
     const segVar = `_seg${i}`;
     lines.push(`${bi}val ${segVar} = ${stringSourceSegmentExpr(source)}`);
-    lines.push(`${bi}for _i <- ${segVar}.indices do _sb.setCharAt(_ptr - 1 + _i, ${segVar}(_i))`);
+    lines.push(
+      `${bi}for _i <- ${segVar}.indices do { val _pos = _ptr - 1 + _i; if _pos >= 0 && _pos < ${width} then _sb.setCharAt(_pos, ${segVar}(_i)) else _overflow = true }`
+    );
     lines.push(`${bi}_ptr = _ptr + ${segVar}.length`);
   });
 
@@ -2999,6 +3130,24 @@ export function generateString(statement, indent = 0) {
   if (statement.pointer) {
     lines.push(`${bi}${renderAssignment(statement.pointer, '_ptr')}`);
   }
+
+  if (hasOverflowClauses) {
+    lines.push(`${bi}if _overflow then`);
+    const onOverflow = statement.onOverflow || [];
+    lines.push(
+      onOverflow.length > 0
+        ? onOverflow.map(s => generateExpression(s, indent + 2)).join('\n')
+        : `${bi}  ()`
+    );
+    lines.push(`${bi}else`);
+    const notOnOverflow = statement.notOnOverflow || [];
+    lines.push(
+      notOnOverflow.length > 0
+        ? notOnOverflow.map(s => generateExpression(s, indent + 2)).join('\n')
+        : `${bi}  ()`
+    );
+  }
+
   lines.push(`${indentStr}}`);
 
   return lines.join('\n');
@@ -3079,7 +3228,7 @@ export function generateUnstring(statement, indent = 0) {
 
   const lines = [`${indentStr}{`];
   lines.push(
-    `${bi}val (_parts, _delims, _newPtr) = CobolUnstring.unstring(${source}, (${initialPtr}) - 1, Seq(${delimsScala}), ${targets.length})`
+    `${bi}val (_parts, _delims, _newPtr, _overflow) = CobolUnstring.unstring(${source}, (${initialPtr}) - 1, Seq(${delimsScala}), ${targets.length})`
   );
 
   targets.forEach((t, index) => {
@@ -3109,6 +3258,31 @@ export function generateUnstring(statement, indent = 0) {
     // CobolUnstring.unstring returns a 0-based "next unconsumed character"
     // index; WITH POINTER's own field is COBOL's 1-based position.
     lines.push(`${bi}${renderAssignment(statement.pointer, '_newPtr + 1')}`);
+  }
+
+  // ON OVERFLOW / NOT ON OVERFLOW (round-6 finding 6) - the clauses are now
+  // parsed (parser/procedure-parser.js's parseUnstringStatement); `_overflow`
+  // (CobolUnstring.unstring's own 4th return value - see its doc comment) is
+  // set exactly when the source had more delimited fields than there were
+  // INTO targets to receive them. Only emitted when the statement actually
+  // has one of these clauses, mirroring generateString's identical pattern.
+  const hasOverflowClauses = (statement.onOverflow && statement.onOverflow.length > 0) ||
+    (statement.notOnOverflow && statement.notOnOverflow.length > 0);
+  if (hasOverflowClauses) {
+    lines.push(`${bi}if _overflow then`);
+    const onOverflow = statement.onOverflow || [];
+    lines.push(
+      onOverflow.length > 0
+        ? onOverflow.map(s => generateExpression(s, indent + 2)).join('\n')
+        : `${bi}  ()`
+    );
+    lines.push(`${bi}else`);
+    const notOnOverflow = statement.notOnOverflow || [];
+    lines.push(
+      notOnOverflow.length > 0
+        ? notOnOverflow.map(s => generateExpression(s, indent + 2)).join('\n')
+        : `${bi}  ()`
+    );
   }
 
   lines.push(`${indentStr}}`);
@@ -4241,6 +4415,16 @@ function generateReadStatement(statement, indent = 0) {
   // with its original trailing spaces (round-5 finding 1). A too-long line is
   // truncated the same way any other alphanumeric MOVE would be.
   const fittedExpr = width > 0 ? `CobolFmt.fitLeft(_record, ${width})` : '_record';
+  // round-6 finding 2/3 companion (t04): a registered FILE STATUS field must
+  // become "00" on a successful READ and "10" once the iterator is
+  // exhausted - including for a *bare* READ with no AT END clause at all
+  // (t04's own idiom, and the single most common real-world reason a
+  // program declares FILE STATUS to begin with: detecting EOF without an
+  // AT END clause). Absent (null) for a file with no FILE STATUS clause -
+  // every branch below degrades to the exact pre-round-6 generated code in
+  // that case, so this is a pure addition with zero effect on any program
+  // that doesn't declare FILE STATUS.
+  const statusVar = fileStatusVarFor(fileName);
 
   const lines = [];
 
@@ -4251,6 +4435,9 @@ function generateReadStatement(statement, indent = 0) {
     if (destCamel) {
       lines.push(`${indentStr}  ${destCamel} = ${fittedExpr}`);
     }
+    if (statusVar) {
+      lines.push(`${indentStr}  ${statusVar} = "00"`);
+    }
 
     if (statement.notAtEnd && Array.isArray(statement.notAtEnd)) {
       for (const stmt of statement.notAtEnd) {
@@ -4260,13 +4447,30 @@ function generateReadStatement(statement, indent = 0) {
 
     lines.push(`${indentStr}else`);
 
+    if (statusVar) {
+      lines.push(`${indentStr}  ${statusVar} = "10"`);
+    }
+
     if (statement.atEnd && Array.isArray(statement.atEnd)) {
       for (const stmt of statement.atEnd) {
         lines.push(generateExpression(stmt, indent + 1));
       }
-    } else {
+    } else if (!statusVar) {
       lines.push(`${indentStr}  () // AT END`);
     }
+  } else if (statusVar) {
+    // Bare READ, no AT END clause, but FILE STATUS IS declared: FILE STATUS
+    // is this program's ONLY way to detect end-of-file, so (unlike the
+    // no-FILE-STATUS branch below, which can get away with silently
+    // no-op-ing past EOF) this must branch on `.hasNext` explicitly.
+    lines.push(`${indentStr}if ${iteratorVar}.hasNext then`);
+    lines.push(`${indentStr}  val _record = ${iteratorVar}.next()`);
+    if (destCamel) {
+      lines.push(`${indentStr}  ${destCamel} = ${fittedExpr}`);
+    }
+    lines.push(`${indentStr}  ${statusVar} = "00"`);
+    lines.push(`${indentStr}else`);
+    lines.push(`${indentStr}  ${statusVar} = "10"`);
   } else {
     lines.push(`${indentStr}val _record = ${iteratorVar}.nextOption()`);
     if (destCamel) {
@@ -4314,16 +4518,94 @@ function recordContentExpr(recordName) {
  * record holding a 15-character value round-trips through cobc as a
  * 15-character physical line, not a space-padded 20-character one) - round-5
  * finding 1/s01.
+ *
+ * ADVANCING (round-6 finding 1) - `WRITE ... AFTER/BEFORE ADVANCING n LINES`/
+ * `PAGE` - is captured by the parser (`statement.advancing`) but was
+ * previously ignored here entirely; a correct-looking handler existed in
+ * file-io-gen.js's generateWrite, but that function is dead code (never
+ * called from the live dispatch - see generateExpression's 'WRITE' case,
+ * which always calls this function instead). Compiler-verified against
+ * installed GnuCOBOL (see tests/round6-fixes.test.js and t01's oracle
+ * output) that the real model is NOT "println with N-1 leading blank
+ * lines"; it's a deferred-terminator, carriage-control-style model:
+ *   - `AFTER ADVANCING n LINES` (n>=1): emit exactly n newline characters,
+ *     THEN the record text, with NO trailing terminator of its own - the
+ *     record's own line ending is whatever the *next* WRITE (or CLOSE, for
+ *     the last one) contributes as ITS leading separator.
+ *   - `... ADVANCING 0 LINES`: emit a single carriage return ("\r", same-line
+ *     overprint), then the text - not the same as "no separator at all".
+ *   - `... ADVANCING PAGE`: emits a form feed ("\f") then the text (not
+ *     independently verified against cobc - no corpus program exercises
+ *     PAGE - but consistent with the same deferred-separator model and
+ *     conventional carriage-control PAGE semantics).
+ *   - `BEFORE ADVANCING ...`: the record text is written first (with
+ *     whatever separator is already pending from an earlier statement),
+ *     and THIS statement's own separator is appended immediately
+ *     afterward, self-terminating (confirmed empirically: a BEFORE-ADVANCING
+ *     write's own newline appears right after its own text, not deferred to
+ *     the next statement).
+ *   - A WRITE with NO ADVANCING clause at all, to a file that has ADVANCING
+ *     used somewhere else, contributes a bare empty separator (confirmed
+ *     empirically - this is genuinely different from, and less than, the
+ *     ordinary one-newline-per-record behavior such a file would get if
+ *     ADVANCING were never used on it anywhere at all).
+ *
+ * Because mixing ADVANCING and non-ADVANCING writes to the *same* file
+ * changes the whole file's write model (see ADVANCING_FILES' doc comment),
+ * this only activates for a file that has at least one ADVANCING WRITE
+ * anywhere in the program (`ADVANCING_FILES`, built once by
+ * scala-generator.js's collectAdvancingFileNames()); every other file's
+ * WRITE is completely unaffected - the exact pre-round-6 `println` call -
+ * which is what keeps every one of the 93 pre-existing corpus programs
+ * (none of which use ADVANCING) byte-for-byte unchanged.
+ *
+ * The deferred model leaves the file's very last physical line
+ * unterminated whenever the last WRITE used AFTER-ADVANCING (or no
+ * ADVANCING clause at all) - CLOSE emits the final newline for such files
+ * (see file-io-gen.js's generateClose). A last WRITE using BEFORE-ADVANCING
+ * already self-terminates, so that combination (last write is
+ * BEFORE-ADVANCING) would get one extra trailing blank line from CLOSE's
+ * unconditional final newline - a known, narrow, unverified edge case no
+ * corpus program exercises (see tests/oracle/README.md's "Known gaps").
  */
 function generateWriteStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const recordName = statement.recordName || statement.record || 'record';
-  const { writerVar } = fileHandleVarNames(fileNameForRecord(recordName));
+  const fileName = fileNameForRecord(recordName);
+  const { writerVar } = fileHandleVarNames(fileName);
   const contentExpr = statement.from
     ? recordContentExpr(statement.from.name || statement.from)
     : recordContentExpr(recordName);
+  // round-6 finding 2/3 companion: this generator never models a WRITE
+  // failure path, so a registered FILE STATUS field always goes to "00"
+  // (successful write) here - see FILE_STATUS_REGISTRY's doc comment.
+  const statusVar = fileStatusVarFor(fileName);
+  const statusSuffix = statusVar ? ` ${statusVar} = "00"` : '';
 
-  return `${indentStr}${writerVar}.println((${contentExpr}).stripTrailing())`;
+  if (!ADVANCING_FILES.has(String(fileName || '').toUpperCase())) {
+    return statusVar
+      ? `${indentStr}{ ${writerVar}.println((${contentExpr}).stripTrailing());${statusSuffix} }`
+      : `${indentStr}${writerVar}.println((${contentExpr}).stripTrailing())`;
+  }
+
+  const textExpr = `(${contentExpr}).stripTrailing()`;
+  const adv = statement.advancing;
+  let sepExpr = '""';
+  let position = 'AFTER';
+  if (adv) {
+    position = adv.position === 'BEFORE' ? 'BEFORE' : 'AFTER';
+    if (adv.type === 'PAGE') {
+      sepExpr = '"\\f"';
+    } else {
+      const nExpr = convertArithmeticExpression(adv.value);
+      sepExpr = `CobolFmt.advanceSep((${nExpr}).toInt)`;
+    }
+  }
+
+  if (position === 'BEFORE') {
+    return `${indentStr}{ ${writerVar}.print(${textExpr}); ${writerVar}.print(${sepExpr});${statusSuffix} }`;
+  }
+  return `${indentStr}{ ${writerVar}.print(${sepExpr}); ${writerVar}.print(${textExpr});${statusSuffix} }`;
 }
 
 /**

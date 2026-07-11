@@ -1,18 +1,27 @@
 # Enterprise Readiness Gap Analysis
 
-**Date:** 2026-02-18
+**Date:** 2026-02-18 (original)
+**Updated 2026-07-11 (engine assessment only)**
 **Scope:** Full codebase analysis of the COBOL-to-Scala conversion platform
 **Assessment:** Current state vs. enterprise-grade production requirements
+
+> **Update banner (2026-07-11):** Between the original 2026-02-18 assessment and today, the **COBOL→Scala conversion engine** (`Thyraa-COBOL-main/backend/packages/cobol-to-scala/`) went through a 14-round autonomous adversarial-verification campaign: the oracle-verified program corpus grew from 48 to **209 programs**, **879/879 automated tests pass**, and **110 silent-divergence bugs** (wrong output, crashes, hangs) were found and fixed at root cause, each checked against a real GnuCOBOL (`cobc`) compiler oracle byte-for-byte. Section 11 (Conversion Engine Maturity) below has been rewritten to reflect this — it is now dramatically stronger than in February, though real open gaps remain (SQL/CICS wiring, reference modification, GO TO webs, OCCURS DEPENDING ON, and more).
+>
+> **This campaign was engine-only.** It did not touch authentication, CI/CD, containerization, observability, compliance, the frontend, or the API surface. **Every other section in this document (1–10, 12) is unchanged from February and remains accurate as of 2026-07-11** — those gaps are still open and are now the sole gating blockers to production readiness, since the conversion core is no longer the weakest link.
+>
+> For full detail on the campaign methodology and results, see `docs/ADVERSARIAL_ROUNDS_REPORT.md` (round-by-round narrative) and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (statement-level capability audit + roadmap). For the companion platform-gap scorecard, see `docs/ENTERPRISE_GAP_ANALYSIS.md`.
 
 ---
 
 ## Executive Summary
 
-The COBOL-to-Scala platform is a well-architected early-stage MVP with strong documentation and a clear vision. However, **significant gaps exist across 12 critical areas** before it can be considered enterprise-ready. The most urgent gaps are in **security, testing, observability, and deployment infrastructure**. Below is a prioritized breakdown.
+The COBOL-to-Scala platform is a well-architected early-stage MVP with strong documentation and a clear vision. As of the original analysis, **significant gaps existed across 12 critical areas** before it could be considered enterprise-ready. As of 2026-07-11, one of those 12 areas — conversion engine maturity (Section 11) — has been substantially closed by a 14-round adversarial-verification campaign (see banner above). **The other 11 areas are unchanged.** The most urgent remaining gaps are in **security, testing infrastructure (platform-side), CI/CD, observability, and deployment infrastructure**. Below is a prioritized breakdown.
 
 ---
 
 ## 1. SECURITY (Critical)
+
+*Still true as of 2026-07-11 — the engine hardening campaign made no security-relevant changes.*
 
 ### 1.1 No Authentication or Authorization
 - **Gap:** All API endpoints (`/api/analyze`, `/api/convert/*`) are completely open with zero authentication.
@@ -55,13 +64,16 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 
 ## 2. TESTING (Critical)
 
+> **Update (2026-07-11):** 2.1 below described the conversion engine's own test suite (`parser.test.js`) as of February and is now **stale for that one package** — see the correction note under 2.1. 2.2's broader claim about platform-level test coverage (API, controller, cache, queue, worker pool, batch processor, frontend) is **still accurate**: confirmed by search, there are zero test files outside `Thyraa-COBOL-main/backend/packages/cobol-to-scala/` anywhere in the repo as of 2026-07-11.
+
 ### 2.1 No Real Test Framework
-- **Gap:** Tests use manual `console.log` output with hardcoded "PASSED" strings (`parser.test.js`). No assertion library, no test runner framework (Jest, Vitest, Mocha).
+- **Gap (as of 2026-02-18):** Tests use manual `console.log` output with hardcoded "PASSED" strings (`parser.test.js`). No assertion library, no test runner framework (Jest, Vitest, Mocha).
 - **Impact:** Tests never actually fail — they always print "PASSED" regardless of output correctness.
-- **Enterprise Need:** Proper test framework with assertions, exit code-based pass/fail.
+- **Correction (2026-07-11):** This has been fixed **inside the conversion engine package only** (`packages/cobol-to-scala/`). The console.log("PASSED") pattern was replaced with Node's built-in `node:test` runner and real assertions; the suite has since grown to **879 assertion-based tests, 879 passing, 0 failing, 0 skipped** (`npm test` in that package), including parser unit tests, codec property/parity tests, generator tests, an oracle-comparison harness against real GnuCOBOL, and per-finding regression tests from the 14-round adversarial campaign (see Section 11 and `docs/ADVERSARIAL_ROUNDS_REPORT.md`). No other package or the frontend was touched — the fix is scoped entirely to the conversion engine.
+- **Enterprise Need (still open platform-wide):** Proper test framework with assertions and exit code-based pass/fail for the API/server layer and frontend, which still have no test files at all.
 
 ### 2.2 Minimal Test Coverage
-- **Gap:** Only 2 test files covering basic parser and generator smoke tests. Zero tests for:
+- **Gap — still true as of 2026-07-11:** The conversion engine's own coverage is no longer minimal (879 tests, 209 oracle-verified COBOL programs — see Section 11), but every other area listed below remains at zero:
   - API endpoints (integration tests)
   - Controller logic
   - Cache service
@@ -70,8 +82,8 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
   - Batch processor
   - Frontend components
   - Error handling paths
-  - Edge cases (empty input, malformed COBOL, huge files)
-- **Enterprise Need:** >80% code coverage target, unit + integration + E2E test suites.
+  - Edge cases (empty input, malformed COBOL, huge files) — partially addressed for the conversion engine only, via the adversarial-refutation corpus
+- **Enterprise Need:** >80% code coverage target, unit + integration + E2E test suites, extended to the API/server/frontend layers that still have none.
 
 ### 2.3 No Test Coverage Reporting
 - **Gap:** No coverage tool configured (Istanbul/c8/nyc).
@@ -82,12 +94,14 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 - **Enterprise Need:** Contract tests to prevent breaking API changes.
 
 ### 2.5 No Performance/Load Testing
-- **Gap:** No benchmarks, no load tests, no stress tests for the conversion engine.
+- **Gap — still true as of 2026-07-11:** No benchmarks, no load tests, no stress tests for the conversion engine or the API layer. The 14-round adversarial campaign (Section 11) verified **correctness** (byte-for-byte output equivalence against a real compiler oracle) exclusively — it produced no throughput/latency benchmarks, no capacity model, and no load testing of any kind.
 - **Enterprise Need:** Performance baselines, regression detection, capacity planning data.
 
 ---
 
 ## 3. CI/CD PIPELINE (Critical)
+
+*Still true as of 2026-07-11 — the adversarial campaign ran as a manual/local research effort (see `docs/ADVERSARIAL_ROUNDS_REPORT.md`), not through any CI pipeline; no pipeline was added.*
 
 ### 3.1 No CI/CD Configuration
 - **Gap:** No `.github/workflows/`, no GitHub Actions, no Jenkins, no GitLab CI — zero automation.
@@ -111,6 +125,8 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 ---
 
 ## 4. OBSERVABILITY & MONITORING (High)
+
+*Still true as of 2026-07-11 — no logging, metrics, tracing, or health-check changes were made.*
 
 ### 4.1 No Structured Logging
 - **Gap:** All logging is `console.log/error/warn` — unstructured, no log levels, no correlation IDs, no contextual metadata.
@@ -137,6 +153,8 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 
 ## 5. CONTAINERIZATION & DEPLOYMENT (High)
 
+*Still true as of 2026-07-11 — no Docker, orchestration, or deployment work was done.*
+
 ### 5.1 No Docker Support
 - **Gap:** No Dockerfile, no docker-compose.yml, no container configuration.
 - **Impact:** No reproducible builds, no isolated environments, manual dependency management.
@@ -158,6 +176,8 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 
 ## 6. DATA PERSISTENCE & STATE MANAGEMENT (High)
 
+*Still true as of 2026-07-11 — no database, backup, or retention-policy work was done.*
+
 ### 6.1 No Database
 - **Gap:** No persistent storage for conversion history, user sessions, audit trails, or job results. Everything is in-memory or Redis cache with TTL expiry.
 - **Impact:** Server restart loses all state. No historical data for auditing or analytics.
@@ -174,6 +194,8 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 ---
 
 ## 7. SCALABILITY & RELIABILITY (High)
+
+*Still true as of 2026-07-11 — the campaign hardened per-program conversion correctness, not the running service's scaling, failover, or backpressure behavior.*
 
 ### 7.1 Single-Instance Architecture
 - **Gap:** Application runs as a single Node.js process. No clustering, no horizontal scaling, no load balancing.
@@ -197,6 +219,8 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 
 ## 8. API DESIGN & DOCUMENTATION (Medium)
 
+*Still true as of 2026-07-11 — no API surface changes were made; the conversion engine's SQL generator remains unwired into the pipeline (Section 11), so the API's shape is unaffected either way.*
+
 ### 8.1 No OpenAPI/Swagger Specification
 - **Gap:** API is documented in markdown only. No machine-readable API spec.
 - **Enterprise Need:** OpenAPI 3.0 spec, Swagger UI, auto-generated client SDKs.
@@ -216,6 +240,8 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 ---
 
 ## 9. COMPLIANCE & GOVERNANCE (Medium)
+
+*Still true as of 2026-07-11 — no audit logging, data classification, or compliance-framework work was done. Note: correctness verification (Section 11) is not compliance evidence — it demonstrates output-fidelity for 209 test programs, not an auditable control framework.*
 
 ### 9.1 No Audit Logging
 - **Gap:** No record of who converted what, when, or the outcome. No access logs beyond what Express outputs.
@@ -237,6 +263,8 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 
 ## 10. FRONTEND ENTERPRISE GAPS (Medium)
 
+*Still true as of 2026-07-11 — the campaign made no frontend changes.*
+
 ### 10.1 No Frontend Testing
 - **Gap:** Zero React component tests, no E2E tests (Playwright/Cypress), no visual regression tests.
 - **Enterprise Need:** Component unit tests, integration tests, E2E test suite.
@@ -255,28 +283,50 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 
 ---
 
-## 11. CONVERSION ENGINE MATURITY (Medium)
+## 11. CONVERSION ENGINE MATURITY (Substantially Improved — Real Gaps Remain)
 
-### 11.1 Known Bugs (Documented)
-- Record length calculation shows 0 instead of computed values
-- Complex expressions render as `[object Object]`
-- Over-engineered data structures for simple fields
+> **Rewritten 2026-07-11.** This section described the conversion engine as of 2026-02-18, before a 14-round autonomous adversarial-verification campaign hardened it. The February assessment (thin coverage, several silent-correctness bugs, no validation framework) is now **stale** for this section specifically. Full detail: `docs/ADVERSARIAL_ROUNDS_REPORT.md` (campaign narrative) and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (statement-by-statement audit + `tests/oracle/README.md` finding tables). This section does **not** change the overall enterprise-readiness verdict — see the banner at the top of this document and Sections 1–10/12, which are unaffected.
 
-### 11.2 Limited COBOL Dialect Support
-- **Gap:** No explicit support for vendor-specific COBOL dialects (IBM Enterprise COBOL, Micro Focus, GnuCOBOL differences).
-- **Enterprise Need:** Dialect configuration, vendor-specific extensions, dialect detection.
+### 11.1 Known Bugs (Documented, 2026-02-18) — FIXED
+The three bugs originally logged here were root-caused and fixed as part of the campaign, not merely patched around:
+- "Record length calculation shows 0 instead of computed values" — was a field-name mismatch between parser (`item.pic`) and generator (`item.picture`); fixed via a shared `generator/layout.js` with byte counts hand-verified against real COBOL PIC/USAGE combinations (e.g. `S9(13)V99 COMP-3` → 8 bytes).
+- "Complex expressions render as `[object Object]`" — was expression/condition converters matching AST node-type names the parser never actually emitted; fixed so real AST shapes are handled, and any genuinely unhandled construct now emits a visible `??? /* TODO */` marker rather than a silent stringified object.
+- "Over-engineered data structures for simple fields" — addressed via the byte-accurate case-class generator (`generator/case-class-gen.js`) with real `parse`/`format` companions per field's actual USAGE/PIC.
 
-### 11.3 No Conversion Validation Framework
-- **Gap:** No automated verification that converted Scala code is semantically equivalent to original COBOL.
-- **Enterprise Need:** Dual-run validation, output comparison, property-based testing, formal verification considerations.
+These fixes are locked in by regression tests, not just narrative claims: 879/879 automated tests pass (`npm test` in `Thyraa-COBOL-main/backend/packages/cobol-to-scala/`), and 209 oracle-verified COBOL programs (up from 48 in February) produce byte-identical stdout to real GnuCOBOL (`cobc`).
 
-### 11.4 No Conversion Metrics/Reporting
-- **Gap:** No metrics on conversion success rate, common failure patterns, lines of code converted, complexity analysis.
-- **Enterprise Need:** Conversion analytics dashboard, success/failure tracking, quality scoring.
+### 11.2 Limited COBOL Dialect Support — STILL OPEN, clarified
+- **Gap — still true as of 2026-07-11:** No explicit support for vendor-specific COBOL dialects. The verification oracle used throughout the campaign is **GnuCOBOL**, not IBM Enterprise COBOL — a different, though closely compatible, dialect/implementation. Nothing in the campaign has been verified against IBM Enterprise COBOL or Micro Focus.
+- **Enterprise Need:** Dialect configuration, vendor-specific extensions, dialect detection, and — for enterprises running IBM z/OS COBOL — a real IBM Enterprise COBOL oracle to re-verify the corpus against, since GnuCOBOL compatibility does not guarantee IBM compatibility.
+
+### 11.3 No Conversion Validation Framework — LARGELY BUILT
+- **2026-02-18 gap:** No automated verification that converted Scala code is semantically equivalent to original COBOL.
+- **2026-07-11 status:** A real dual-run validation framework now exists and has been exercised at scale: for each of 209 corpus programs, `oracleCompare()` compiles and runs the program under real `cobc`, generates and compiles the corresponding Scala, and diffs stdout byte-for-byte — with 0 outstanding `t.todo()` entries. This was stress-tested by 14 rounds of adversarial refutation (programs deliberately written to break the generator): 110 real silent-divergence bugs were found and fixed this way across the campaign (trend per round: 11, 16, 15, 16, 6, 6, 8, 4, 6, 6, 3, 4, 5, 4 — plateaued at 3–5/round in rounds 11–14, short of the campaign's own 0–2 convergence bar). Hunting was paused at round 14 by owner decision (~22h into a 48h budget), not because the engine converged, so a round 15 should be expected to surface more real bugs.
+- **What this framework does *not* yet cover, honestly:** it validates the 209 specific corpus programs against GnuCOBOL, not "all COBOL" or IBM Enterprise COBOL (see 11.2); it does not include property-based or formal-verification techniques beyond the roundtrip byte-parity tests in `tests/roundtrip.test.js`; and it has no live dashboard (see 11.4).
+- **Enterprise Need (narrowed, not closed):** Extend the corpus with real-world-shaped programs beyond the current 209 (a full VSAM maintenance job, a multi-cursor DB2 batch program — see the campaign report's §7 resume plan), and add an IBM Enterprise COBOL oracle run for enterprises that require it.
+
+### 11.4 No Conversion Metrics/Reporting — STILL OPEN
+- **Gap — still true as of 2026-07-11:** There is no live conversion-analytics dashboard, no per-conversion success/failure tracking in the running product, and no complexity/quality scoring surfaced to end users. The campaign produced detailed *static* reports (`docs/ADVERSARIAL_ROUNDS_REPORT.md`, `tests/oracle/README.md` finding tables) documenting test/program counts and bug trends, but these are engineering artifacts checked into the repo, not a product feature.
+- **Enterprise Need:** Conversion analytics dashboard, success/failure tracking, quality scoring, surfaced through the actual product (not just docs).
+
+### 11.5 Remaining Open Engine Gaps (honest inventory, 2026-07-11)
+Even with the above improvements, the following are confirmed still open in the engine (see `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` Part 1.3 and `tests/oracle/README.md`'s Known Gaps for full detail):
+- **SQL generator not wired into the main pipeline** — `generator/sql-gen.js` produces compile-verified Doobie code standalone, but it is not yet spliced into `generator/scala-generator.js`'s own output path.
+- **CICS support is scaffolding only** — `generator/cics-gen.js` produces an honest service-skeleton (DTOs, repository traits, `???`-bodied stubs), not a behavioral translation.
+- **Reference modification** (COBOL's `field(start:length)` substring syntax) degrades to a visible `???` placeholder in generated code.
+- **REWRITE, DELETE, START** file-I/O statements remain unimplemented comment-only stubs (only LINE SEQUENTIAL OPEN/CLOSE/READ/WRITE are oracle-verified; INDEXED/RELATIVE organizations are not handled).
+- **`SORT ... USING/GIVING`** (the whole-file sort form without an input/output procedure) is a visible TODO marker; the procedure-based SORT/MERGE/RELEASE/RETURN form is built and oracle-verified.
+- **External/dynamic `CALL`** to a subprogram not defined in the same source file emits a visible TODO marker; same-file multi-`PROGRAM-ID` CALL interop is built and oracle-verified.
+- **OCCURS DEPENDING ON** tables are sized at a fixed maximum for `parse`/`format`, not the live counter field; every occurrence carries a `// TODO(ODO)` marker.
+- **General inter-paragraph GO TO webs** (outside a `PERFORM ... THRU` range) are unsupported by design — a genuinely hard problem across the whole COBOL-modernization industry, not unique to this engine.
+- **JCL → sbt/pipeline skeletons are not generated** — JCL structural parsing and dataset-lineage JSON exist, but no rendered flow diagrams or sbt scaffolding are produced from that lineage yet.
+- None of these are silent: the engine's cross-cutting rule is that every unhandled construct surfaces as a `??? /* TODO */` marker or an explicit comment, never silently-wrong output.
 
 ---
 
 ## 12. OPERATIONAL READINESS (Medium)
+
+*Still true as of 2026-07-11 — no runbooks, capacity planning, or backup/restore work was done. Note on 12.2: the campaign's 209-program corpus and 879 tests measure conversion **correctness**, not throughput or resource usage — they are not a substitute for the capacity benchmarks this section calls for.*
 
 ### 12.1 No Runbooks or Playbooks
 - **Gap:** No documented procedures for incident response, on-call, or common operational tasks.
@@ -294,11 +344,13 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 
 ## Priority Matrix
 
+> Updated 2026-07-11: rows are unchanged from February except "Real Test Framework & Coverage" (scoped down to the platform layer, since the engine's own test framework is fixed) and "Conversion Validation Framework" (marked done, moved out of the active blocker list — see Section 11.3). All other rows, including P0/P1 security and infrastructure items, are unchanged and remain the actual gating blockers.
+
 | Priority | Category | Effort | Business Impact |
 |----------|----------|--------|-----------------|
 | P0 - Blocker | Authentication & Authorization | High | Cannot deploy without access control |
 | P0 - Blocker | CI/CD Pipeline | Medium | Cannot maintain quality at scale |
-| P0 - Blocker | Real Test Framework & Coverage | Medium | Cannot verify correctness |
+| P0 - Blocker | Platform Test Framework & Coverage (API/controller/frontend — engine-side is done, see 2.1/11.1) | Medium | Cannot verify correctness outside the conversion engine |
 | P1 - Critical | Rate Limiting & Input Validation | Low | DoS prevention |
 | P1 - Critical | Structured Logging & Monitoring | Medium | Cannot debug production issues |
 | P1 - Critical | Docker Containerization | Medium | Cannot deploy reproducibly |
@@ -310,17 +362,19 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 | P3 - Medium | Audit Logging & Compliance | High | Regulatory requirements |
 | P3 - Medium | Frontend Testing | Medium | UI quality assurance |
 | P3 - Medium | Accessibility Compliance | Medium | Legal/regulatory requirement |
-| P3 - Medium | Conversion Validation Framework | High | Core product quality |
+| ~~P3 - Medium~~ **DONE (2026-07-11)** | ~~Conversion Validation Framework~~ — built and oracle-verified (209 programs, 879 tests); remaining work is extending corpus breadth and an IBM Enterprise COBOL oracle run, not building the framework itself | — | Core product quality — no longer the blocking risk it was in February |
 | P4 - Low | i18n Support | Medium | Global enterprise reach |
-| P4 - Low | Multi-dialect COBOL Support | High | Broader market coverage |
+| P4 - Low | Multi-dialect COBOL Support (IBM Enterprise COBOL/Micro Focus — GnuCOBOL-verified only, see 11.2) | High | Broader market coverage |
 
 ---
 
 ## Recommended Immediate Actions (Next 30 Days)
 
+> Updated 2026-07-11: item 3 is narrowed below — it is done for the conversion engine package but still open everywhere else. All other items are unchanged and still the recommended next actions.
+
 1. **Add authentication middleware** — JWT/OAuth 2.0 on all API routes
 2. **Set up CI/CD** — GitHub Actions with build, lint, test, security scan
-3. **Replace console.log tests** with Vitest/Jest + assertion-based test suite
+3. **Replace console.log tests with Vitest/Jest + assertion-based test suite** — done for `packages/cobol-to-scala/` (now `node:test`, 879 assertions, see Section 2.1/11.1); still needed for the API/controller layer and the frontend, which remain untested
 4. **Add `helmet.js`** and configure CORS whitelist
 5. **Add `express-rate-limit`** and request body size limits
 6. **Create Dockerfile** and `docker-compose.yml` for reproducible development
@@ -333,4 +387,6 @@ The COBOL-to-Scala platform is a well-architected early-stage MVP with strong do
 
 ## Conclusion
 
-The platform has a **solid architectural foundation** and **excellent documentation** that positions it well for enterprise evolution. The conversion engine core (lexer, parser, generator) demonstrates strong domain understanding. However, **the application is currently at prototype/demo maturity** and requires substantial investment across security, testing, observability, and infrastructure to meet enterprise production standards. The gaps identified are all addressable and common for early-stage products transitioning to enterprise readiness.
+**Original (2026-02-18):** The platform has a **solid architectural foundation** and **excellent documentation** that positions it well for enterprise evolution. The conversion engine core (lexer, parser, generator) demonstrates strong domain understanding. However, **the application is currently at prototype/demo maturity** and requires substantial investment across security, testing, observability, and infrastructure to meet enterprise production standards. The gaps identified are all addressable and common for early-stage products transitioning to enterprise readiness.
+
+**Updated (2026-07-11):** The conversion engine assessment above is no longer accurate on its own — a 14-round adversarial-verification campaign has moved the engine from "demonstrates strong domain understanding" to "209 COBOL programs oracle-verified byte-for-byte against a real compiler, 879/879 tests passing, 110 root-cause bugs fixed," with the remaining engine gaps now specific and enumerated (Section 11.5) rather than systemic. **This does not change the platform's overall enterprise-readiness verdict.** The campaign was scoped entirely to the conversion engine and touched no authentication, CI/CD, containerization, observability, compliance, database, or frontend concern — Sections 1–10 and 12 are unchanged and remain the actual gating blockers to production. In short: the product's technical core is now demonstrably more trustworthy, but the platform wrapped around it is still at the same prototype/demo maturity described in February. See `docs/ENTERPRISE_GAP_ANALYSIS.md` for the companion scorecard tracking the same platform gaps from a different angle, and `docs/ADVERSARIAL_ROUNDS_REPORT.md` / `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` for the full engine-hardening record.

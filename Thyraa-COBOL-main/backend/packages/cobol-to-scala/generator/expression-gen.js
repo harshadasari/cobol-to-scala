@@ -2296,6 +2296,82 @@ function generateGroupMove(sourceNameUpper, targetNameUpper, indent) {
 }
 
 /**
+ * round-9 finding 4: detect a *subscripted* reference to a whole GROUP that
+ * itself has an OCCURS clause - `WS-ROW(1)` where `05 WS-ROW OCCURS 3 TIMES`
+ * groups several children together (`10 WS-A`/`10 WS-B`) - as opposed to
+ * groupRefNameUpper's *bare* (no-subscript) group reference. A group with
+ * OCCURS has no flat var of its own at all (only its children do, each
+ * wrapped in its own Vector - see buildFieldRegistry's doc comment), so
+ * `WS-ROW(1)` is neither "the bare-group MOVE case" (groupRefNameUpper
+ * requires zero subscripts) nor an ordinary elementary reference
+ * (lookupFieldForRef finds nothing for a group name) - used by generateMove
+ * to recognize `MOVE WS-ROW(i) TO WS-ROW(j)` (whole-row copy/shift within a
+ * table of groups) and route it through generateSubscriptedGroupMove instead
+ * of falling through to the (wrong, non-compiling) elementary MOVE path.
+ */
+function subscriptedGroupRowRef(ref) {
+  if (!ref || typeof ref !== 'object') return null;
+  if (!Array.isArray(ref.subscripts) || ref.subscripts.length === 0) return null;
+  const nameUpper = String(ref.name || '').toUpperCase();
+  if (!isRegisteredGroupName(nameUpper)) return null;
+  return { groupKey: resolveGroupKey(nameUpper), subscripts: ref.subscripts };
+}
+
+/**
+ * round-9 finding 4 (continued): the actual per-child copy for a whole-row
+ * MOVE (`MOVE WS-ROW(i) TO WS-ROW(j)`, both references into the *same* table
+ * of groups) - reuses the row group's own GROUP_REGISTRY entry (the same
+ * metadata groupDisplayValueExpr/scatterGroupFromString already walk) so
+ * every child (including a nested group child, recursed into, and a FILLER
+ * child's own hidden flat var) gets copied from the source row index to the
+ * target row index: `<childCamel> = <childCamel>.updated(<targetIdx>,
+ * <childCamel>(<sourceIdx>))`. Each child is already a `Vector[...]` (one
+ * layer per OCCURS-bearing ancestor - here, the row's own OCCURS) regardless
+ * of the child's own further nesting, so a single `.updated` correctly
+ * copies an entire nested structure (further nested groups/OCCURS within the
+ * row) as one unit - only a child that has an *additional* OCCURS clause of
+ * its own (a table nested inside each row, a two-dimensional shape no corpus
+ * program - old or new - exercises) can't be represented this way, since its
+ * flat var would need a *second* Vector index dimension threaded through the
+ * whole recursion; that (narrow, unexercised) shape bails out to null so the
+ * caller can fall back to a visible marker rather than emit a wrong/
+ * non-compiling copy.
+ *
+ * Only a single subscript dimension on each side is supported (matches every
+ * corpus program's own shape, including w05's) - a multi-dimensional row
+ * reference bails out to null for the same reason.
+ */
+function subscriptedGroupMoveChildLines(groupKey, targetIdx, sourceIdx, indent) {
+  const indentStr = '  '.repeat(indent);
+  const children = GROUP_REGISTRY.get(groupKey);
+  if (!children || children.length === 0) return null;
+
+  const lines = [];
+  for (const c of children) {
+    if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) return null;
+    if (c.groupKey) {
+      const nested = subscriptedGroupMoveChildLines(c.groupKey, targetIdx, sourceIdx, indent);
+      if (nested == null) return null;
+      lines.push(...nested);
+      continue;
+    }
+    if (!c.camel) return null;
+    lines.push(`${indentStr}${c.camel} = ${c.camel}.updated(${targetIdx}, ${c.camel}(${sourceIdx}))`);
+  }
+  return lines;
+}
+
+function generateSubscriptedGroupMove(groupKey, targetSubscripts, sourceSubscripts, indent) {
+  if (!Array.isArray(targetSubscripts) || targetSubscripts.length !== 1 ||
+      !Array.isArray(sourceSubscripts) || sourceSubscripts.length !== 1) {
+    return null;
+  }
+  const targetIdx = subscriptIndexExpr(targetSubscripts[0]);
+  const sourceIdx = subscriptIndexExpr(sourceSubscripts[0]);
+  return subscriptedGroupMoveChildLines(groupKey, targetIdx, sourceIdx, indent);
+}
+
+/**
  * Generate MOVE statement
  */
 export function generateMove(statement, indent = 0) {
@@ -2312,6 +2388,28 @@ export function generateMove(statement, indent = 0) {
       lines.push(generateGroupMove(sourceGroupUpper, targetGroupUpper, indent));
       continue;
     }
+
+    // round-9 finding 4: MOVE of a subscripted whole-group table row (e.g.
+    // `MOVE WS-ROW(1) TO WS-ROW(3)`) - see subscriptedGroupRowRef's doc
+    // comment. Narrowed to the same table on both sides (the common
+    // shift/copy-a-row-within-one-table idiom, and w05's own shape); a
+    // cross-table row MOVE falls through to the pre-existing (elementary)
+    // path below, unchanged.
+    const sourceRow = subscriptedGroupRowRef(source);
+    const targetRow = subscriptedGroupRowRef(target);
+    if (sourceRow && targetRow && sourceRow.groupKey === targetRow.groupKey) {
+      const rowLines = generateSubscriptedGroupMove(sourceRow.groupKey, targetRow.subscripts, sourceRow.subscripts, indent);
+      if (rowLines != null) {
+        lines.push(rowLines.join('\n'));
+        continue;
+      }
+      lines.push(
+        `${indentStr}() // MOVE ${source.name}(...) TO ${target.name}(...): ??? TODO - whole-row MOVE with a ` +
+        'nested-OCCURS or multi-dimensional row child is not supported; row left unchanged'
+      );
+      continue;
+    }
+
     const info = lookupFieldForRef(target);
     const sourceExpr = renderMoveSource(source, info);
     lines.push(`${indentStr}${renderAssignment(target, sourceExpr)}`);
@@ -2754,13 +2852,31 @@ function relationalOperandExpr(node, otherDescriptor) {
  *     source rather than via a runtime helper.
  */
 function renderRelationalCondition(condition) {
-  const rawOp = condition.relationalOperator || '=';
+  return renderComparisonExpr(condition.subject, condition.object, condition.relationalOperator || '=');
+}
+
+/**
+ * Shared core of renderRelationalCondition, factored out so any other call
+ * site needing a COBOL-correct comparison between two arbitrary operand
+ * nodes (not just an actual parsed RelationalCondition) can reuse the exact
+ * same type-coercion/space-padding rules instead of emitting a bare `==`.
+ * round-9 finding 1: EVALUATE's VALUE-clause WHEN test
+ * (evaluateConditionExpr's default/'VALUE' case) previously called this
+ * padding logic nowhere at all - it rendered a bare
+ * `(subjectExpr) == (valueExpr)`, which is a hard Scala String `==` (exact
+ * length match required) whenever the subject and the WHEN value are
+ * differently-sized alphanumeric operands (e.g. `01 WS-LONG PIC X(6)` vs a
+ * 2-character WHEN literal/field) - COBOL space-pads the shorter operand
+ * first, exactly like an ordinary IF/relational comparison does (already
+ * fixed for that path by round-8 finding 3, immediately below).
+ */
+function renderComparisonExpr(subjectNode, objectNode, rawOp) {
   const op = rawOp === '<>' ? '!=' : (COMPARISON_OPERATORS[rawOp] || rawOp);
   const isEq = op === '==' || op === '!=';
   const cmp = (l, r) => (isEq ? `${l} ${op} ${r}` : `(${l}.compareTo(${r}) ${op} 0)`);
 
-  const subj = relationalOperandDescriptor(condition.subject);
-  const obj = relationalOperandDescriptor(condition.object);
+  const subj = relationalOperandDescriptor(subjectNode);
+  const obj = relationalOperandDescriptor(objectNode);
   // relationalOperandExpr (not a bare convertArithmeticExpression) so a
   // figurative-constant operand (HIGH-VALUES/LOW-VALUES/SPACES/...) renders
   // as its actual comparison text, sized against the *other* operand's own
@@ -2770,8 +2886,8 @@ function renderRelationalCondition(condition) {
   // just below); a figurative operand mismatched against a genuinely numeric
   // field (the branch further down) is a pre-existing, untested edge case
   // this fix does not additionally chase.
-  const leftExpr = relationalOperandExpr(condition.subject, obj);
-  const rightExpr = relationalOperandExpr(condition.object, subj);
+  const leftExpr = relationalOperandExpr(subjectNode, obj);
+  const rightExpr = relationalOperandExpr(objectNode, subj);
 
   if (subj.scalaClass === obj.scalaClass) {
     if (subj.scalaClass !== 'string') {
@@ -3150,6 +3266,16 @@ function evaluateConditionExpr(subject, cond) {
         if (l88 !== null) {
           return subject.type === 'FALSE' ? `!(${l88})` : l88;
         }
+      }
+      // round-9 finding 1: reuse the same operand-classification/space-
+      // padding rules an ordinary relational IF already gets (renderComparisonExpr,
+      // shared with renderRelationalCondition) instead of a bare `==` - a
+      // TRUE/FALSE pseudo-subject (handled above, and the only case with no
+      // real "subject node" to classify) is the one shape this can't cover,
+      // so it still falls back to evaluateSubjectExpr/convertArithmeticExpression
+      // directly.
+      if (subject && subject.type !== 'TRUE' && subject.type !== 'FALSE' && subject != null) {
+        return renderComparisonExpr(subject, cond.value, '=');
       }
       return `(${evaluateSubjectExpr(subject)}) == (${convertArithmeticExpression(cond.value)})`;
     }
@@ -3925,6 +4051,33 @@ function generateMultiply(statement, indent = 0) {
 }
 
 /**
+ * round-9 finding 6: the BigDecimal-valued *stored* quotient - i.e. the exact
+ * same ROUNDED-or-truncated-to-declared-digits value storeNumericByInfo would
+ * actually assign to the first GIVING target - without that function's
+ * further Int/Long/Float/Double/edited-string final coercion. DIVIDE ...
+ * GIVING q REMAINDER r's remainder is defined as `dividend - (q * divisor)`
+ * using q's own *stored* (picture-truncated) value, not the mathematically
+ * exact quotient - compiler-verified (tests/corpus/proc/w11-divide-remainder-scale.cbl:
+ * `7.5000 / 2.0000` stores an exact `3.7500` quotient into a PIC 9(4)V9(4)
+ * target - no truncation actually occurs here, since 4 decimal digits is
+ * enough room - so REMAINDER must be `7.5 - (3.75 * 2.0) = 0`, not
+ * BigDecimal's own `%` operator's answer of `1.5`, which effectively uses an
+ * *integer* quotient (floor(7.5/2.0) = 3) instead of COBOL's own
+ * decimal-digit-truncated one). Falls back to the exact (untruncated)
+ * quotient expression for a target this generator can't apply digit
+ * truncation to at all - unregistered, or COMP-1/COMP-2 (no PIC digit counts
+ * to truncate to) - matching storeNumericByInfo's own equivalent fallback.
+ */
+function storedQuotientBDExpr(givingTarget, resultBD, rounded) {
+  const info = lookupFieldForRef(givingTarget);
+  if (!info || info.scalaType === 'Float' || info.scalaType === 'Double') return resultBD;
+  const intDigits = info.integerDigits > 0 ? info.integerDigits : 18;
+  const decDigits = info.decimalDigits || 0;
+  const fn = rounded ? 'roundNumeric' : 'truncNumeric';
+  return `CobolFmt.${fn}(${resultBD}, ${intDigits}, ${decDigits})`;
+}
+
+/**
  * Generate DIVIDE statement. GIVING targets that call for BigDecimal
  * (decimal-place) division are coerced via toBigDecimalOperand (never a
  * naive `BigDecimal(<already-rendered-expression-text>)` wrap - see its doc
@@ -3967,7 +4120,13 @@ function generateDivide(statement, indent = 0) {
       finalExpr: storeNumericExpr(target, resultBD, `${dividend} / ${divisor}`, rounded),
     }));
     if (statement.remainder) {
-      const remainderBD = `(${dividendBD} % ${divisorBD})`;
+      // round-9 finding 6: REMAINDER = dividend - (stored quotient * divisor),
+      // using the FIRST GIVING target's own actually-stored (ROUNDED-or-
+      // truncated) quotient value - not BigDecimal's own `%` operator, which
+      // silently uses an integer-floor quotient instead of COBOL's
+      // decimal-digit-truncated one (see storedQuotientBDExpr's doc comment).
+      const storedQuotientBD = storedQuotientBDExpr(giving[0], resultBD, rounded);
+      const remainderBD = `(${dividendBD} - ((${storedQuotientBD}) * ${divisorBD}))`;
       entries.push({
         target: statement.remainder,
         resultBD: remainderBD,
@@ -4056,7 +4215,20 @@ export function groupDisplayValueExpr(groupKey) {
       parts.push(width > 0 ? `CobolFmt.fitLeft(${c.camel}, ${width})` : c.camel);
     } else {
       const asBD = info.scalaType === 'BigDecimal' ? c.camel : `BigDecimal(${c.camel})`;
-      parts.push(`CobolFmt.digitsOf(${asBD}, ${info.integerDigits}, ${info.decimalDigits})`);
+      const digitsText = `CobolFmt.digitsOf(${asBD}, ${info.integerDigits}, ${info.decimalDigits})`;
+      // round-9 finding 2: a signed numeric child (e.g. `PIC S9(5)V99 COMP-3`)
+      // loses its sign entirely if only digitsOf's own unsigned digit text is
+      // used - fine for an ordinary MOVE-numeric-to-alphanumeric (COBOL really
+      // does drop the sign there), but this same channel also carries a
+      // group's value across a CALL ... BY REFERENCE boundary
+      // (scatterGroupFromString is its exact inverse - see that function's
+      // updated numeric branch below), where the sign is real data that must
+      // round-trip, not a display-formatting choice. A one-character '+'/'-'
+      // sign marker is prepended for a signed child only (unsigned children -
+      // by far the common case - keep the exact prior text/width, so every
+      // other caller of this function, e.g. whole-group DISPLAY, s06, is
+      // unaffected).
+      parts.push(info.signed ? `((if ${asBD} < BigDecimal(0) then "-" else "+") + ${digitsText})` : digitsText);
     }
   }
   return parts.join(' + ');
@@ -4126,11 +4298,22 @@ export function scatterGroupFromString(groupKey, sourceExpr, indent) {
 
     const intDigits = info.integerDigits || 0;
     const decDigits = info.decimalDigits || 0;
-    const width = intDigits + decDigits;
-    const sliceExpr = `(${sourceExpr}).substring(${offset}, ${offset + width})`;
-    const bdExpr = decDigits > 0
+    const digitWidth = intDigits + decDigits;
+    // round-9 finding 2: the exact inverse of groupDisplayValueExpr's own
+    // updated numeric branch - a signed child's marshalled text carries one
+    // extra leading sign character ('+'/'-') before its unsigned digit text,
+    // which must be consumed here (and negate the parsed magnitude) or the
+    // sign is silently dropped and, worse, the leftover sign character would
+    // corrupt the digit-slice parsing itself.
+    const signWidth = info.signed ? 1 : 0;
+    const width = signWidth + digitWidth;
+    const sliceExpr = `(${sourceExpr}).substring(${offset + signWidth}, ${offset + width})`;
+    const bdMagExpr = decDigits > 0
       ? `BigDecimal((${sliceExpr}).take(${intDigits}) + "." + (${sliceExpr}).drop(${intDigits}))`
       : `BigDecimal(${sliceExpr})`;
+    const bdExpr = info.signed
+      ? `(if (${sourceExpr}).substring(${offset}, ${offset + 1}) == "-" then -(${bdMagExpr}) else (${bdMagExpr}))`
+      : bdMagExpr;
     const finalExpr = info.scalaType === 'BigDecimal' ? bdExpr
       : info.scalaType === 'Long' ? `${bdExpr}.toLong`
       : info.scalaType === 'Float' ? `${bdExpr}.toFloat`

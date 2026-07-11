@@ -176,25 +176,29 @@ through this data-driven suite.
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 118 corpus programs found
-(19 under `data/`, 99 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+**cobc oracle capture / expected-vs-oracle check** - 144 corpus programs found
+(19 under `data/`, 125 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
 excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
-precompiler, see `tests/sql.test.js` instead), all 118 compiled and ran cleanly under
-cobc (exit 0). 28 of the 118 (19 `data/` + 9 `proc/` baseline programs) already have a
-hand-written `.expected.txt` that matches the captured `.oracle.txt` exactly - 0
-mismatches. The 20 `r01`-`r14*`, 15 `n01`-`n16*`, 16 `q01`-`q12*`, 14
-`s01`-`s12*`, 11 `t01`-`t12*` (`t09` excluded), and 14 `u01`-`u13*` programs have no
-hand-written `.expected.txt` by design (they're verified directly against cobc via
-`oracleCompare()` below, not a separately hand-authored expectation) and show up
-here as a diagnostic-only capture ("no `<name>.expected.txt` alongside ... yet").
+precompiler, see `tests/sql.test.js` instead; two round-9 repros, `w09`/`w12`, are
+deliberately excluded entirely - see the round-9 table below - since cobc itself
+rejects them), all 144 compiled and ran cleanly under cobc (exit 0). 28 of the 144
+(19 `data/` + 9 `proc/` baseline programs) already have a hand-written `.expected.txt`
+that matches the captured `.oracle.txt` exactly - 0 mismatches. The 20 `r01`-`r14*`,
+15 `n01`-`n16*`, 16 `q01`-`q12*`, 14 `s01`-`s12*`, 11 `t01`-`t12*` (`t09` excluded),
+14 `u01`-`u13*`, 12 `v01`-`v12*`, and 12 `w01`-`w14*` (`w09`/`w12` excluded) programs
+have no hand-written `.expected.txt` by design (they're verified directly against
+cobc via `oracleCompare()` below, not a separately hand-authored expectation) and
+show up here as a diagnostic-only capture ("no `<name>.expected.txt` alongside ...
+yet").
 
 **Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
 end-to-end (0 todo).
 
-**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 99/99 programs match
-end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
-`q01`-`q12*`, all 14 `s01`-`s12*`, all 11 `t01`-`t12*` (`t09` excluded), and all 14
-`u01`-`u13*` adversarial-refutation programs below.
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 125/125 programs
+match end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
+`q01`-`q12*`, all 14 `s01`-`s12*`, all 11 `t01`-`t12*` (`t09` excluded), all 14
+`u01`-`u13*`, all 12 `v01`-`v12*`, and all 12 `w01`-`w14*` (`w09`/`w12` excluded)
+adversarial-refutation programs below.
 
 ### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
@@ -368,6 +372,62 @@ found and fixed - the "how to run" commands are the source of truth, this table 
 only a snapshot. See also `tests/round7-fixes.test.js` for focused,
 toolchain-independent unit tests of each fix above.
 
+### Round-8 adversarial-refutation findings (v01-v12) and their fixes
+
+A round-8 refuter found 4 more root-cause dishonest divergences, all in CALL
+BY REFERENCE marshalling of a GROUP item, `FUNCTION NUMVAL` under
+SPECIAL-NAMES' `DECIMAL-POINT IS COMMA`, unequal-width alphanumeric relational
+comparison, and group-level VALUE-clause inheritance. All 4 are now fixed;
+every promoted program hard-passes `oracleCompare()`.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | `CALL ... USING BY REFERENCE` of a GROUP item generated a reference to a nonexistent flat Scala var on both the caller and callee side (a group has no flat var of its own - only its children do) | New `groupDisplayValueExpr`/`scatterGroupFromString` (`generator/expression-gen.js`) marshal a group operand as its own concatenated raw-storage text across the CALL boundary in both directions (caller argument, callee `entry(...)` parameter and return value) | v02 |
+| 2 | `FUNCTION NUMVAL` under SPECIAL-NAMES' `DECIMAL-POINT IS COMMA` crashed - `CobolFmt.numval` had no `decimalComma` parameter at all (unlike its `num`/`edited` siblings, which already had one) | `CobolFmt.numval` gains a `decimalComma` parameter, threaded through the same way `num`/`edited` already are | v05, v05c |
+| 3 | An unequal-width alphanumeric relational comparison (`IF WS-SHORT = WS-LONG` with different declared PIC X widths) did a bare Scala `==`/`.compareTo` with no space-padding - COBOL always right-pads the shorter operand to the longer's declared width before comparing | `renderRelationalCondition`'s string-vs-string branch computes each operand's own compile-time-known width (`stringOperandWidth`) and splices literal space-padding onto the shorter side | v08 |
+| 4 | A group-level VALUE clause (`01 WS-REC VALUE "AB1234". 05 WS-CODE PIC X(2). 05 WS-NUM PIC 9(4).`) never propagated down to a VALUE-less child - every such child silently defaulted to zero/blank instead of its own positional slice of the ancestor's literal | New `ownValueStorageText`/`defaultElementaryValueWithInheritance` (`generator/scala-generator.js`) compute each VALUE-less descendant's own byte-offset slice of the nearest VALUE-bearing ancestor's storage text, recursively through nested groups | v10 |
+
+All 12 round-8 probes (`v01`-`v12`, including the `v05b`/`v05c` bisections)
+were promoted; 9 of the 12 already passed unmodified before this round's
+fixes (`v01` CALL-loop static semantics, `v03` BY CONTENT isolation, `v04`
+3-level nested CALL chains, `v06` INSPECT per-operand BEFORE/AFTER scoping,
+`v07` 3-deep `PERFORM VARYING ... AFTER`, `v09` `MOVE ALL` onto an OCCURS
+elementary, `v11` an intrinsic FUNCTION used directly as a condition, `v12`
+cross-CALL file I/O, and `v05b` decimal-comma with only an edited MOVE
+target) - these lock in existing behavior as regression guards, not new
+fixes. See `tests/round8-fixes.test.js` for focused, toolchain-independent
+unit tests of the 4 fixes above.
+
+### Round-9 adversarial-refutation findings (w01-w14) and their fixes
+
+A round-9 refuter found 6 more root-cause dishonest divergences. All 6 are
+now fixed; every promoted program hard-passes `oracleCompare()`.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | `EVALUATE <subject> WHEN <value>` (the VALUE-clause WHEN test, `evaluateConditionExpr`'s default case) rendered a bare `(subjectExpr) == (valueExpr)` with no space-padding - unlike an ordinary IF/relational comparison (round-8 finding 3), which already pads the shorter of two unequal-width alphanumeric operands | Round-8 finding 3's operand-classification/padding core was factored out of `renderRelationalCondition` into a shared `renderComparisonExpr(subjectNode, objectNode, rawOp)` (`generator/expression-gen.js`); `evaluateConditionExpr`'s VALUE case now calls it too (a TRUE/FALSE pseudo-subject, which has no real "subject node" to classify, still falls back to the old rendering - the only shape this doesn't cover) | w01 |
+| 2 | `CALL ... USING BY REFERENCE` of a GROUP with a *signed* COMP-3 (or other signed numeric) child silently dropped its sign crossing the CALL boundary - the round-8 finding-1 marshalling channel (`groupDisplayValueExpr`/`scatterGroupFromString`) reused `CobolFmt.digitsOf`'s own *unsigned* digit text (correct for an ordinary MOVE-numeric-to-alphanumeric, where COBOL really does drop the sign, but not for this internal round-trip channel, where the sign is real data) | A signed numeric child's marshalled text now carries a one-character `'+'`/`'-'` sign marker ahead of its unsigned digit text (`groupDisplayValueExpr`), and the scatter direction (`scatterGroupFromString`) consumes that marker and negates the parsed magnitude when it reads `'-'` - both updated symmetrically; an unsigned child is completely unaffected (same text/width as before) | w02 |
+| 3 | A group-level VALUE clause laid across a **non-DISPLAY** (COMP-3/BINARY) child sliced the child's byte span as if it held plain ASCII digit text (the DISPLAY-numeric assumption `defaultElementaryValueWithInheritance` otherwise makes) - compiler-verified against installed GnuCOBOL that cobc instead byte-reinterprets that same span as the child's own actual storage format (packed-decimal nibbles for COMP-3), producing a different, but fully deterministic, digit sequence (`VALUE "AB1234CD"` under a `PIC 9(4) COMP-3` child displays `1323`, not the naive `0123`) | New `nonDisplayInheritedNumericText` (`generator/scala-generator.js`) reuses the already-tested `codecs.js` `packedDecode`/`binaryDecode` (the same decoders this generator relies on for real COMP-3/BINARY file-record storage elsewhere) to reinterpret the inherited byte slice, then truncates to the child's own low-order declared digit count (packed-decimal's own leading-pad-nibble math guarantees the true digits are always the *last* N characters of the raw decoded digit string). **Route taken: matched cobc's actual byte-reinterpretation** (not the documented-TODO fallback) - it reproduced exactly, reusing existing tested codec functions, so no `???` marker was needed. COMP-3 is oracle-verified (w03); COMP/COMP-4/COMP-5/BINARY reuses the identical truncation principle for consistency but has no corpus program exercising a binary child under a group VALUE clause - flagged below under "Known gaps" | w03 |
+| 4 | `MOVE WS-ROW(1) TO WS-ROW(3)` (a whole-row MOVE of a *subscripted* GROUP-with-OCCURS reference) hit neither the bare-group MOVE path (`groupRefNameUpper` requires zero subscripts) nor the elementary-MOVE fallback (WS-ROW itself has no flat Scala var - only its children do) - a hard "Not found: wsRow" compile error | New `subscriptedGroupRowRef`/`generateSubscriptedGroupMove`/`subscriptedGroupMoveChildLines` (`generator/expression-gen.js`) detect a subscripted reference to the same registered OCCURS-group on both sides of a MOVE and compose each child's own `.updated(targetIdx, <child>(sourceIdx))` read/write, reusing `GROUP_REGISTRY` (recursing into a nested-group child); bails out to a visible `???` marker for a shape it can't represent this way (a nested-OCCURS-within-the-row child, or more than one subscript dimension) rather than emitting a wrong/non-compiling copy | w05 |
+| 5 | A **backward** `PERFORM x THRU y` range (`y` declared *before* `x` in program order, e.g. `PERFORM PARA-C THRU PARA-A` when PARA-A comes first) silently generated an empty no-op wrapper - the range-collection loop's own `if (u.name === toParagraph) break` fired on `toParagraph` before `fromParagraph` was ever reached at all, since for a backward range that happens first in program order | `generatePerformThruMethod` (`generator/method-gen.js`) now explicitly detects `endIndex < startIndex` (both paragraphs' positions in the whole-program unit list) and, compiler-verified against installed GnuCOBOL (w10), matches cobc's actual behavior: run the start paragraph (plus whatever naturally falls through after it, reusing the existing `renderNestedFallthroughDefs` machinery, now over every unit through the true end of the program rather than stopping at `toParagraph`), then terminate (`sys.exit(0)`) instead of ever returning to the PERFORM's own caller - matching cobc's own "falls off the end of the PROCEDURE DIVISION" (implicit STOP RUN) semantics. The general "falls through past the start paragraph" tail is not independently oracle-verified beyond w10 (whose start paragraph happens to be the program's own last unit) - see "Known gaps" | w10 |
+| 6 | `DIVIDE ... GIVING q REMAINDER r` computed `r` via BigDecimal's own `%` operator - which effectively uses an *integer*-floor quotient (`floor(7.5/2.0) = 3`, remainder `1.5`) instead of COBOL's own decimal-digit-truncated quotient (`3.75`, remainder `0`) - wrong whenever `q`'s own declared decimal digits are wide enough that no truncation actually occurs | New `storedQuotientBDExpr` (`generator/expression-gen.js`) computes the exact same ROUNDED-or-truncated-to-declared-digits BigDecimal value `q` is itself stored with (reusing `storeNumericByInfo`'s own formula, minus its final Int/Long/Float/Double/edited-string coercion); REMAINDER is now `dividend - (storedQuotient * divisor)`, using that value | w11 |
+
+All 12 valid round-9 probes (`w01`-`w08`, `w10`, `w11`, `w13`, `w14`) were
+promoted; the 6 survivors (`w04`, `w06`, `w07`, `w08`, `w13`, `w14`) already
+passed unmodified before this round's fixes (`w04` SET index arithmetic,
+`w06` INSPECT CONVERTING with overlapping FROM/TO alphabets, `w07` STRING
+with multiple different delimiters, `w08` MOVE into a JUSTIFIED RIGHT field
+with truncation, `w13` MULTIPLY/DIVIDE ROUNDED, `w14` exponentiation with a
+zero/negative exponent) - these lock in existing behavior as regression
+guards, not new fixes. `w09` (a 3-level REDEFINES chain) and `w12`
+(an 88-level condition name used directly as an `EVALUATE WHEN` operand
+under a non-TRUE/FALSE subject) are both rejected by cobc itself (compile
+errors, not runtime divergences) and were deliberately **not promoted** -
+same reasoning as every other cobc-rejected repro this refutation process
+has found: a program real COBOL itself refuses to compile is not a
+meaningful oracle comparison target. See `tests/round9-fixes.test.js` for
+focused, toolchain-independent unit tests of all 6 fixes above.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -503,3 +563,50 @@ toolchain-independent unit tests of each fix above.
   `linkedPrograms`/external-stub option (a caller-supplied Scala shim per
   external name) if a future pass needs to convert a program that genuinely
   calls out to a separately-compiled subprogram.
+
+- **Group-level VALUE slicing over a BINARY (COMP/COMP-4/COMP-5) child,
+  round-9 finding 3's narrower half** - `nonDisplayInheritedNumericText`
+  (`generator/scala-generator.js`) reuses `codecs.js`'s `binaryDecode` for a
+  BINARY child exactly the same way it reuses `packedDecode` for a COMP-3
+  child, and truncates the decoded two's-complement value to the child's own
+  low-order declared digit count for consistency with the COMP-3 case and
+  with this generator's usual high-order-truncation convention
+  (`CobolFmt.truncNumeric`) - but only the COMP-3 path is compiler-verified
+  (w03); no corpus program exercises a BINARY child inheriting a group VALUE
+  clause, so this half of the fix has not been checked against real cobc.
+  Revisit by adding a BINARY-specific probe once a use case surfaces.
+
+- **A subscripted whole-row MOVE (`MOVE WS-ROW(i) TO WS-ROW(j)`) across TWO
+  DIFFERENT tables, or with more than one subscript dimension, round-9
+  finding 4's narrower edge** - `subscriptedGroupRowRef`/
+  `generateSubscriptedGroupMove` (`generator/expression-gen.js`) only handle
+  the same table on both sides (`sourceRow.groupKey === targetRow.groupKey`)
+  with exactly one subscript per side (w05's own shape, and the common
+  shift/copy-a-row-within-one-table idiom) - a cross-table row MOVE, a
+  two-dimensional (OCCURS-within-OCCURS) row reference, or a row child that
+  itself has its own further OCCURS clause all fall back to a visible,
+  still-compiling `??? TODO` marker (the multi-table/multi-dimension cases
+  fall through to the pre-existing elementary-MOVE path instead, unchanged)
+  rather than emitting a wrong/non-compiling copy. Not exercised by any
+  corpus program. Revisit by threading a second Vector-index dimension
+  through `subscriptedGroupMoveChildLines`'s recursion, and by extending
+  `generateGroupMove`'s existing differing-layout (byte-level case-class
+  round-trip) strategy to a subscripted-row shape, if a future program needs
+  either.
+
+- **A backward `PERFORM x THRU y` range's post-start-paragraph fallthrough,
+  round-9 finding 5's narrower edge** - compiler-verified against installed
+  GnuCOBOL (w10) that cobc runs the start paragraph then behaves as if
+  execution fell off the true end of the PROCEDURE DIVISION, but w10's own
+  start paragraph (`PARA-C`) happens to already be the program's physically
+  last unit, so "run the start paragraph" and "run the start paragraph, then
+  keep cascading through every unit remaining in the program via ordinary
+  fall-through/GO TO, then terminate" are behaviorally identical in that one
+  verified case. `generatePerformThruMethod`'s fix implements the more
+  general form (reusing `renderNestedFallthroughDefs` over every unit from
+  the start paragraph through the true end of the program, then
+  `sys.exit(0)`), which is the principled reading of "falls off the end of
+  the PROCEDURE DIVISION" - but no corpus program independently confirms the
+  general "more units still run after the start paragraph" case against real
+  cobc. Revisit with a second backward-THRU probe (start paragraph NOT the
+  program's last unit) if a future pass has time.

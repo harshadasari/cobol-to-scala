@@ -598,13 +598,51 @@ export function generatePerformThruMethod(fromParagraph, toParagraph, units, amb
   const methodName = `${fromName}To${toPascalCase(toParagraph.replace(/^\d+[-_]?/, ''))}`;
   const nameFor = (u) => resolveParagraphMethodName(u.name, u.sectionName, ambiguousNames);
 
-  // Find all units in the range (inclusive), in program order.
-  let inRange = false;
-  const rangeUnits = [];
-  for (const u of units) {
-    if (u.name === fromParagraph) inRange = true;
-    if (inRange) rangeUnits.push(u);
-    if (u.name === toParagraph) break;
+  const startIndex = units.findIndex(u => u.name === fromParagraph);
+  const endIndex = units.findIndex(u => u.name === toParagraph);
+
+  // round-9 finding 5: a *backward* THRU range - `toParagraph` precedes
+  // `fromParagraph` in physical program order, e.g. `PERFORM PARA-C THRU
+  // PARA-A` when PARA-A is declared before PARA-C - is not "loop backward
+  // through the range". Compiler-verified against installed GnuCOBOL
+  // (tests/corpus/proc/w10-perform-thru-backward.cbl) that cobc runs *only*
+  // the start paragraph (PARA-C), then behaves exactly as if execution had
+  // fallen off the true physical end of the PROCEDURE DIVISION (an implicit
+  // STOP RUN) - it does NOT return control to whatever statement follows the
+  // PERFORM in its own caller (w10's own `DISPLAY "COUNT=" WS-COUNT` right
+  // after the PERFORM is never reached at all).
+  //
+  // This also happens to be the *only* way the ordinary forward-range
+  // collection loop below terminates correctly for this shape: `if (u.name
+  // === toParagraph) break` fires the moment the loop reaches toParagraph in
+  // program order - for a backward range that happens *before*
+  // fromParagraph is ever reached (`inRange` never becomes true) - which
+  // silently produced an empty rangeUnits list (a no-op `()` wrapper,
+  // executing nothing at all) before this fix.
+  //
+  // General form (not independently oracle-verified beyond w10, where the
+  // start paragraph happens to be the program's physically last unit):
+  // reuses renderNestedFallthroughDefs unchanged, over every unit from the
+  // start paragraph through the true end of the program (not stopping at
+  // toParagraph at all - toParagraph is behind, not ahead), so an ordinary
+  // GO TO/fallthrough within that tail still cascades exactly like a forward
+  // range's own tail does; a trailing `sys.exit(0)` after the initial call
+  // then models "falls off the end of the PROCEDURE DIVISION" - matching an
+  // implicit STOP RUN - so the wrapper never returns to its own caller.
+  const isBackward = startIndex !== -1 && endIndex !== -1 && endIndex < startIndex;
+
+  let rangeUnits;
+  if (isBackward) {
+    rangeUnits = units.slice(startIndex);
+  } else {
+    // Find all units in the range (inclusive), in program order.
+    let inRange = false;
+    rangeUnits = [];
+    for (const u of units) {
+      if (u.name === fromParagraph) inRange = true;
+      if (inRange) rangeUnits.push(u);
+      if (u.name === toParagraph) break;
+    }
   }
 
   if (rangeUnits.length === 0) {
@@ -615,6 +653,12 @@ export function generatePerformThruMethod(fromParagraph, toParagraph, units, amb
   const lines = [`${indentStr}def ${methodName}(): Unit =`];
   lines.push(...renderNestedFallthroughDefs(rangeUnits, defIndent, nameFor));
   lines.push(`${'  '.repeat(defIndent)}${nameFor(rangeUnits[0])}()`);
+  if (isBackward) {
+    lines.push(
+      `${'  '.repeat(defIndent)}sys.exit(0) // round-9 finding 5: backward PERFORM ... THRU falls off the ` +
+      'end of the PROCEDURE DIVISION rather than returning to its caller'
+    );
+  }
 
   return lines.join('\n');
 }

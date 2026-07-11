@@ -1,0 +1,16 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. W14.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-BASE    PIC 9(4)V99 VALUE 5.
+       01 WS-EXP0    PIC S9(2)   VALUE 0.
+       01 WS-EXPN    PIC S9(2)   VALUE -2.
+       01 WS-R0      PIC 9(4)V9999.
+       01 WS-RN      PIC 9(4)V9999.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           COMPUTE WS-R0 = WS-BASE ** WS-EXP0.
+           DISPLAY "POW-ZERO=" WS-R0.
+           COMPUTE WS-RN = WS-BASE ** WS-EXPN.
+           DISPLAY "POW-NEG=" WS-RN.
+           STOP RUN.

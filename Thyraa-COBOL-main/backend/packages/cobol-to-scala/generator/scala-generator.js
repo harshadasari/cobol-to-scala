@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 import { toPascalCase, toCamelCase, generateCaseClass, collectAmbiguousGroupClassNames } from './case-class-gen.js';
 import { getPicPattern, scalaBaseType, occursCount, hasOccurs, itemByteLength } from './layout.js';
+import { packedDecode, binaryDecode } from './codecs.js';
 import { generateAllEnums, groupLevel88sByParent } from './enum-gen.js';
 import {
   generateExpression,
@@ -675,6 +676,72 @@ function ownValueStorageText(item, width) {
  *     walk(), which only computes a non-null inheritedSlice for a
  *     VALUE-less, non-OCCURS item).
  */
+/**
+ * round-9 finding 3: cobc's actual byte-reinterpretation for a non-DISPLAY
+ * (COMP-3/BINARY) numeric child inheriting its initial value from an
+ * enclosing group's own VALUE clause. The DISPLAY-numeric assumption
+ * defaultElementaryValueWithInheritance otherwise makes (this item's byte
+ * span holds its own ASCII digit characters) is wrong for a packed-decimal
+ * or binary child - cobc lays the VALUE literal's raw text down across the
+ * group's storage exactly like it does for a DISPLAY child (no special-
+ * casing at VALUE-initialization time; the compiler doesn't know or care
+ * what a byte span "means" for some child at that offset), and that span is
+ * then read back through whatever the child's own USAGE clause says its
+ * storage format actually is - packed-decimal nibbles for COMP-3, two's-
+ * complement for COMP/COMP-4/COMP-5/BINARY - producing whatever
+ * (deterministic, if odd-looking) digits that decoding yields.
+ * Compiler-verified for COMP-3 against installed GnuCOBOL - see
+ * tests/corpus/proc/w03-group-value-comp3-slice.cbl: `VALUE "AB1234CD"`
+ * laid under `05 WS-AMT PIC 9(4) COMP-3` reinterprets raw bytes 0x31 0x32
+ * 0x33 as packed decimal and displays "1323", not the naive "0123" a plain-
+ * digit-text assumption produces.
+ *
+ * Reuses the already-tested codecs.js packedDecode/binaryDecode (the exact
+ * same decoders this generator relies on for real COMP-3/BINARY file-record
+ * storage elsewhere - case-class-gen.js) instead of re-deriving the nibble/
+ * byte-order rules from scratch. Neither decoder knows this item's own
+ * declared digit count - packedDecode returns every digit nibble present in
+ * the slice (including a packed-decimal leading pad nibble for an even digit
+ * count), binaryDecode returns the full two's-complement magnitude for the
+ * slice's whole byte width - so the result is always truncated to this
+ * item's own low-order `digits` decimal digits afterward (packedByteLength's
+ * own pad-nibble math guarantees the true digits are always exactly the
+ * *last* `digits` characters of packedDecode's raw digit string), matching
+ * the same high-order-digit truncation convention used everywhere else in
+ * this generator (CobolFmt.truncNumeric).
+ *
+ * Only COMP-3 is oracle-verified (w03); COMP/COMP-4/COMP-5/BINARY reuses the
+ * identical truncation principle for consistency but has no corpus program
+ * exercising a binary child under a group VALUE clause to verify against -
+ * flagged here and in tests/oracle/README.md as the narrower, unverified
+ * half of this fix.
+ *
+ * Returns null (caller falls back to defaultElementaryValue's ordinary zero
+ * default) when the slice can't be decoded at all - e.g. a COMP-3 slice
+ * containing a genuinely invalid (>9) digit nibble, which packedDecode
+ * itself rejects - rather than letting a RangeError escape and abort the
+ * whole conversion over one VALUE-inheriting child's unlucky byte content.
+ */
+function nonDisplayInheritedNumericText(inheritedSlice, digits, usage) {
+  const bytes = Uint8Array.from(inheritedSlice, ch => ch.charCodeAt(0) & 0xff);
+  const isPacked = usage === 'COMP-3' || usage === 'COMPUTATIONAL-3' || usage === 'PACKED-DECIMAL';
+  try {
+    let unscaled;
+    if (isPacked) {
+      ({ unscaled } = packedDecode(bytes));
+    } else {
+      const endianness = usage === 'COMP-5' || usage === 'COMPUTATIONAL-5' ? 'LITTLE' : 'BIG';
+      unscaled = binaryDecode(bytes, { endianness });
+    }
+    const negative = unscaled < 0n;
+    const magnitudeStr = (negative ? -unscaled : unscaled).toString();
+    const truncated = magnitudeStr.length > digits ? magnitudeStr.slice(-digits) : magnitudeStr.padStart(digits, '0');
+    return (negative ? '-' : '') + truncated;
+  } catch {
+    return null;
+  }
+}
+
 function defaultElementaryValueWithInheritance(item, scalaType, inheritedSlice) {
   if (item.value || inheritedSlice == null) return defaultElementaryValue(item, scalaType);
 
@@ -682,11 +749,29 @@ function defaultElementaryValueWithInheritance(item, scalaType, inheritedSlice) 
     return defaultElementaryValue({ ...item, value: { type: 'string', value: inheritedSlice } }, scalaType);
   }
 
-  if (!/^\d+$/.test(inheritedSlice)) return defaultElementaryValue(item, scalaType);
-
   const pic = item.pic && typeof item.pic === 'object' ? item.pic : null;
   const intDigits = pic?.integerDigits ?? inheritedSlice.length;
   const decDigits = pic?.decimalDigits || 0;
+
+  const usage = (item.usage || 'DISPLAY').toUpperCase();
+  const isNonDisplay = usage === 'COMP-3' || usage === 'COMPUTATIONAL-3' || usage === 'PACKED-DECIMAL' ||
+    usage === 'COMP' || usage === 'COMP-4' || usage === 'COMP-5' || usage === 'BINARY' ||
+    usage === 'COMPUTATIONAL' || usage === 'COMPUTATIONAL-4' || usage === 'COMPUTATIONAL-5';
+
+  if (isNonDisplay) {
+    const digits = intDigits + decDigits;
+    const digitsText = digits > 0 ? nonDisplayInheritedNumericText(inheritedSlice, digits, usage) : null;
+    if (digitsText == null) return defaultElementaryValue(item, scalaType);
+    const neg = digitsText.startsWith('-');
+    const unsignedDigits = neg ? digitsText.slice(1) : digitsText;
+    const numericText = decDigits > 0
+      ? `${neg ? '-' : ''}${unsignedDigits.slice(0, intDigits)}.${unsignedDigits.slice(intDigits)}`
+      : digitsText;
+    return defaultElementaryValue({ ...item, value: { type: 'numeric', value: numericText } }, scalaType);
+  }
+
+  if (!/^\d+$/.test(inheritedSlice)) return defaultElementaryValue(item, scalaType);
+
   const numericText = decDigits > 0
     ? `${inheritedSlice.slice(0, intDigits)}.${inheritedSlice.slice(intDigits)}`
     : inheritedSlice;

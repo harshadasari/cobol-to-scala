@@ -109,7 +109,17 @@ function summarizeMismatch(result) {
 // depends on these results, same pattern as any other data-driven suite). ---
 const cobcAvailable = await checkCobcAvailable();
 const scalaCliAvailable = await checkScalaCliAvailable();
-const allCblFiles = (await walkCblFiles(CORPUS_ROOT)).sort();
+// tests/corpus/sql/ programs contain EXEC SQL ... END-EXEC blocks, which
+// plain GnuCOBOL cannot compile (they require a database precompiler such as
+// ocesql/DB2's coprocessor, neither of which is part of this repo's oracle
+// toolchain) - cobc rejects them with "'EXEC' is not defined". They are
+// exercised by tests/sql.test.js (parse -> Doobie generation -> scala-cli
+// compile against real doobie-core) instead of by the cobc oracle, so they
+// are excluded from the cobc capture sweep here rather than allowed to fail
+// it. Every other corpus subdirectory remains cobc-oracled as before.
+const allCblFiles = (await walkCblFiles(CORPUS_ROOT))
+  .sort()
+  .filter((f) => path.relative(CORPUS_ROOT, f).split(path.sep)[0] !== 'sql');
 const dataCblFiles = allCblFiles.filter(
   (f) => path.relative(CORPUS_ROOT, f).split(path.sep)[0] === 'data'
 );

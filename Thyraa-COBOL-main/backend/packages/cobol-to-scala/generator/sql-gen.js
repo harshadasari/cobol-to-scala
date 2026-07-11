@@ -422,6 +422,21 @@ function wrapBlock(ctx, innerLines) {
 // WHENEVER-driven post-statement SQLCODE checks
 // ============================================================================
 
+/**
+ * Backtick-quoted zero-arg call to the (not-yet-wired) paragraph method a
+ * WHENEVER ... GOTO target names. Always backticked rather than emitted as a
+ * bare identifier: COBOL paragraph names routinely start with a digit (this
+ * repo's own convention includes e.g. `9999-NOT-FOUND`, per
+ * `tests/corpus/README.md`), which `toCamelCase` happily turns into a
+ * digit-leading string (`9999NotFound`) that would be an invalid bare Scala
+ * identifier - backticks make any COBOL-derived name a valid call
+ * regardless of the (unknown, owned-by-another-generator) paragraph->method
+ * naming convention actually used once this is wired in.
+ */
+function scalaMethodCall(cobolLabel) {
+  return `\`${scalaVarName(cobolLabel)}\`()`;
+}
+
 function appendNotFoundCheck(ctx) {
   if (!ctx.declaredVars.has('__SQLCODE__')) return [];
   const h = ctx.wheneverHandlers.NOT_FOUND;
@@ -429,7 +444,7 @@ function appendNotFoundCheck(ctx) {
   if (h.action === 'STOP') {
     return [`${I(ctx)}if sqlCode == 100 then throw new java.sql.SQLException("SQLCODE=100 (NOT FOUND)")`];
   }
-  return [`${I(ctx)}if sqlCode == 100 then return ${scalaVarName(h.target)}() // WHENEVER NOT FOUND GOTO ${h.target}`];
+  return [`${I(ctx)}if sqlCode == 100 then return ${scalaMethodCall(h.target)} // WHENEVER NOT FOUND GOTO ${h.target}`];
 }
 
 function appendSqlErrorCheck(ctx) {
@@ -439,7 +454,7 @@ function appendSqlErrorCheck(ctx) {
   if (h.action === 'STOP') {
     return [`${I(ctx)}if sqlCode < 0 then throw new java.sql.SQLException(s"SQLCODE=$sqlCode: $\{SqlRuntime.describe(sqlCode)}")`];
   }
-  return [`${I(ctx)}if sqlCode < 0 then return ${scalaVarName(h.target)}() // WHENEVER SQLERROR GOTO ${h.target}`];
+  return [`${I(ctx)}if sqlCode < 0 then return ${scalaMethodCall(h.target)} // WHENEVER SQLERROR GOTO ${h.target}`];
 }
 
 // ============================================================================
@@ -714,9 +729,32 @@ export function generateSqlProgram(parsedProgram, options = {}) {
   };
 }
 
+/**
+ * Legacy-compatible single-statement entry point.
+ *
+ * `generator/scala-generator.js` still has `import { generateSql, ... } from
+ * './sql-gen.js'` at its top (currently an unused import - grepping that
+ * file finds no call site) left over from this module's earlier stub. That
+ * file is owned by other in-flight work and out of bounds for this task, so
+ * this name has to keep existing as a named export or that file's ESM
+ * import would fail to resolve at load time and break the whole suite.
+ * Rather than leave a dead placeholder, this delegates to the new
+ * `generateStatement` dispatcher - so *if* something wires it up later, it
+ * does something real. Note the shape it expects changed: the old stub took
+ * an ad-hoc `{ type, sql, cursor, into }` object; this expects the enriched
+ * `analyzeSqlStatement`/`parseAllSqlStatements` shape (`kind`/
+ * `hostVariables`/...).
+ */
+export function generateSql(statement, indent = 0) {
+  if (!statement) return '';
+  const ctx = createContext([statement], { indent });
+  return generateStatement(statement, ctx).join('\n');
+}
+
 export default {
   generateSqlProgram,
   generateStatement,
+  generateSql,
   resolveHostVarType,
   heuristicTypeFromName,
   buildIndicatorMap,

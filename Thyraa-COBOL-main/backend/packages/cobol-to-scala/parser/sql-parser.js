@@ -487,6 +487,298 @@ export function parseSqlText(sqlText) {
   });
 }
 
+// ============================================================================
+// Phase 3: enriched SQL statement model for typed Doobie generation
+//
+// The functions above (`parseSqlBlock`/`parseAllSqlBlocks`/`parseSqlText`)
+// are untouched and keep returning `SqlStatement` AST nodes exactly as
+// before - `parser/index.js` still calls them and nothing about their shape
+// changed. Everything below is additive: `analyzeSqlStatement` normalizes a
+// raw `EXEC SQL ... END-EXEC` body (the same `rawSql` string the functions
+// above already compute) into the richer, generator-friendly shape
+// `generator/sql-gen.js` consumes:
+//
+//   {
+//     kind: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE' | 'DECLARE_CURSOR' |
+//           'OPEN' | 'FETCH' | 'CLOSE' | 'INCLUDE' | 'WHENEVER' | 'COMMIT' |
+//           'ROLLBACK' | <other SQL verb, passed through uppercased>,
+//     sql: string | null,                 // null for statements with no
+//                                          // standalone query text (OPEN,
+//                                          // FETCH, CLOSE, COMMIT, ROLLBACK,
+//                                          // INCLUDE, WHENEVER)
+//     hostVariables: [{ name, role: 'input' | 'output' | 'indicator',
+//                        indicatorFor? }],
+//     cursorName?: string,
+//     includeTarget?: string,             // EXEC SQL INCLUDE member-name
+//     whenever?: { condition: 'NOT_FOUND' | 'SQLERROR' | 'SQLWARNING',
+//                  action: 'CONTINUE' | 'STOP' | 'GOTO', target?: string },
+//     tables: string[],
+//     raw: string,                        // the untouched EXEC SQL body
+//   }
+//
+// `parseAllSqlStatements(tokens)` walks a whole token stream the same way
+// `parseAllSqlBlocks` does and returns an array of these enriched objects in
+// source order - this is what `generator/sql-gen.js`'s `generateSqlProgram`
+// consumes by default.
+// ============================================================================
+
+const KIND_NORMALIZATION = {
+  OPEN_CURSOR: 'OPEN',
+  CLOSE_CURSOR: 'CLOSE',
+};
+
+/**
+ * Normalize `determineSqlType`'s output to the enum this module's enriched
+ * API uses (only OPEN_CURSOR/CLOSE_CURSOR are renamed; every other kind,
+ * including ones not in the "core" list like CALL/SET/PREPARE/UNKNOWN, is
+ * passed through uppercased rather than silently dropped).
+ */
+function normalizeKind(rawKind) {
+  return KIND_NORMALIZATION[rawKind] || rawKind;
+}
+
+/**
+ * Locate the INTO host-variable list for SELECT/FETCH statements.
+ * Returns `{ text, start, end }` where `[start, end)` spans from the `INTO`
+ * keyword itself through just before a following `FROM` (SELECT) or through
+ * end-of-string (FETCH, which has no trailing FROM) - `start`/`end` let a
+ * caller excise the whole clause (see `stripIntoClause`) or classify a host
+ * variable match's position as inside/outside the INTO list (see
+ * `scanHostVariables`). Returns null for every other statement kind,
+ * including INSERT - deliberately, since INSERT's own "INTO table-name"
+ * clause has nothing to do with host variables and must never be scanned
+ * for them (this replaces the old FROM-before-INTO heuristic in
+ * `extractIntoClause`, which was a fragile proxy for the same distinction).
+ */
+export function extractIntoSection(sqlText, kind) {
+  if (kind !== 'SELECT' && kind !== 'FETCH') return null;
+  const intoMatch = /\bINTO\b/i.exec(sqlText);
+  if (!intoMatch) return null;
+
+  const start = intoMatch.index;
+  const afterIntoIdx = start + intoMatch[0].length;
+  const rest = sqlText.slice(afterIntoIdx);
+  const fromMatch = /\bFROM\b/i.exec(rest);
+  const end = fromMatch ? afterIntoIdx + fromMatch.index : sqlText.length;
+
+  return { text: sqlText.slice(afterIntoIdx, end), start, end };
+}
+
+/**
+ * Remove a SELECT/FETCH's INTO clause from its SQL text (Doobie queries have
+ * no INTO - the host variables it names become the typed row Doobie decodes
+ * into). No-op (returns the text unchanged, whitespace-normalized) when the
+ * statement kind has no INTO section.
+ */
+export function stripIntoClause(sqlText, kind) {
+  const section = extractIntoSection(sqlText, kind);
+  const stripped = section ? sqlText.slice(0, section.start) + sqlText.slice(section.end) : sqlText;
+  return stripped.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Scan `:host-var` occurrences (including `:host-var:indicator-var` pairs -
+ * DB2 host-variable/indicator-variable syntax) and classify each into the
+ * enriched `{ name, role, indicatorFor? }` shape.
+ *
+ * A host variable positioned inside the statement's INTO section (per
+ * `extractIntoSection`) is `role: 'output'`; everything else (WHERE, SET,
+ * VALUES, ...) is `role: 'input'`. An indicator variable is always
+ * `role: 'indicator'` regardless of its paired variable's role, carrying
+ * `indicatorFor` (the paired variable's name) so a generator can look up
+ * "does this variable have a nullability indicator?" without a second pass.
+ *
+ * Deduplicates by (name, role) so a variable reused twice in one statement
+ * (e.g. `WHERE A = :x OR B = :x`) is reported once - a generator building a
+ * typed tuple/parameter list wants one declaration per variable, not one per
+ * mention.
+ */
+export function scanHostVariables(sqlText, kind) {
+  const intoSection = extractIntoSection(sqlText, kind);
+  const HOST_VAR_PAIR_RE = /:([A-Za-z][A-Za-z0-9_-]*)(\s*:([A-Za-z][A-Za-z0-9_-]*))?/g;
+
+  const results = [];
+  const seenKeys = new Set();
+  let match;
+
+  while ((match = HOST_VAR_PAIR_RE.exec(sqlText)) !== null) {
+    const name = match[1];
+    const indicatorName = match[3] || null;
+
+    const inInto = !!intoSection && match.index >= intoSection.start && match.index < intoSection.end;
+    const primaryRole = inInto ? 'output' : 'input';
+    const primaryKey = `${name.toUpperCase()}:${primaryRole}`;
+    if (!seenKeys.has(primaryKey)) {
+      seenKeys.add(primaryKey);
+      results.push({ name, role: primaryRole });
+    }
+
+    if (indicatorName) {
+      const indicatorKey = `${indicatorName.toUpperCase()}:indicator`;
+      if (!seenKeys.has(indicatorKey)) {
+        seenKeys.add(indicatorKey);
+        results.push({ name: indicatorName, role: 'indicator', indicatorFor: name });
+      }
+    }
+  }
+
+  return results;
+}
+
+/**
+ * `EXEC SQL INCLUDE member-name END-EXEC` - ties to a copybook/DCLGEN member
+ * (see `parser/dclgen-parser.js`) that supplies the host-variable structure.
+ */
+function extractIncludeTarget(sqlText) {
+  const m = sqlText.match(/INCLUDE\s+([A-Za-z0-9_$#@-]+)/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * `DECLARE cursor-name CURSOR ... FOR SELECT ...` - the part after `FOR` is
+ * the actual query Doobie needs; the cursor-name/CURSOR prefix is metadata
+ * already captured separately as `cursorName`.
+ */
+function extractCursorSelect(sqlText) {
+  const m = sqlText.match(/CURSOR\s+FOR\s+([\s\S]+)$/i);
+  return m ? m[1].trim() : sqlText;
+}
+
+/**
+ * `WHENEVER (NOT FOUND | SQLERROR | SQLWARNING) (CONTINUE | GO TO label | STOP)`
+ * Returns null if the clause doesn't match this (fairly rigid) grammar -
+ * callers should treat that as "WHENEVER seen but not understood" rather
+ * than silently assuming CONTINUE.
+ */
+function parseWhenever(sqlText) {
+  const m = sqlText.match(/WHENEVER\s+(NOT\s+FOUND|SQLERROR|SQLWARNING)\s+(CONTINUE|GO\s*TO\s+([A-Za-z0-9-]+)|STOP)/i);
+  if (!m) return null;
+
+  const conditionRaw = m[1].toUpperCase().replace(/\s+/g, ' ');
+  const condition = conditionRaw === 'NOT FOUND' ? 'NOT_FOUND' : conditionRaw;
+
+  const actionRaw = m[2].toUpperCase();
+  if (/^CONTINUE/.test(actionRaw)) return { condition, action: 'CONTINUE' };
+  if (/^STOP/.test(actionRaw)) return { condition, action: 'STOP' };
+  return { condition, action: 'GOTO', target: m[3] };
+}
+
+/**
+ * Analyze one already-extracted `EXEC SQL ... END-EXEC` body (the `rawSql`
+ * string `parseSqlBlock`'s token walk already builds) into the enriched
+ * shape documented above. Pure function of the raw SQL text - does not
+ * require tokens, so it is equally usable from a hand-written SQL string in
+ * a unit test or from `parseAllSqlStatements`'s token walk below.
+ */
+export function analyzeSqlStatement(rawSql) {
+  const sql = (rawSql || '').trim();
+  const kind = normalizeKind(determineSqlType(sql));
+  const cursorName = extractCursorName(sql);
+  const hostVariables = scanHostVariables(sql, kind);
+  const tables = extractTableNames(sql);
+
+  const result = { kind, hostVariables, tables, raw: sql };
+
+  if (cursorName) result.cursorName = cursorName;
+
+  if (kind === 'INCLUDE') {
+    result.includeTarget = extractIncludeTarget(sql);
+    result.sql = null;
+  } else if (kind === 'WHENEVER') {
+    const whenever = parseWhenever(sql);
+    if (whenever) result.whenever = whenever;
+    result.sql = null;
+  } else if (kind === 'DECLARE_CURSOR') {
+    result.sql = extractCursorSelect(sql);
+  } else if (kind === 'OPEN' || kind === 'CLOSE' || kind === 'FETCH' ||
+             kind === 'COMMIT' || kind === 'ROLLBACK') {
+    result.sql = null;
+  } else {
+    result.sql = sql;
+  }
+
+  return result;
+}
+
+/**
+ * Parse one `EXEC SQL ... END-EXEC` block from `startPosition` into the
+ * enriched shape (mirrors `parseSqlBlock`'s token-collecting walk, kept
+ * separate so that function's legacy `SqlStatement` output is untouched).
+ */
+export function parseSqlStatementBlock(tokens, startPosition = 0) {
+  const ctx = new ParserContext(tokens);
+  ctx.position = startPosition;
+
+  while (!ctx.isAtEnd()) {
+    if (ctx.checkValue('EXEC')) {
+      const next = ctx.peek(1);
+      if (next && next.value?.toUpperCase() === 'SQL') {
+        ctx.advance(); // EXEC
+        ctx.advance(); // SQL
+        break;
+      }
+    }
+    ctx.advance();
+  }
+
+  if (ctx.isAtEnd()) return null;
+
+  let rawSql = '';
+  while (!ctx.isAtEnd()) {
+    const current = ctx.current();
+
+    if (current.type === TokenType.END_EXEC || current.value?.toUpperCase() === 'END-EXEC') {
+      ctx.advance();
+      break;
+    }
+
+    if (current.type === TokenType.STRING_LITERAL) {
+      rawSql += `'${current.value}'`;
+    } else if (current.type === TokenType.OP_COLON) {
+      rawSql += ':';
+    } else {
+      rawSql += current.value + ' ';
+    }
+
+    ctx.advance();
+  }
+
+  return {
+    statement: analyzeSqlStatement(rawSql.trim()),
+    endPosition: ctx.position,
+  };
+}
+
+/**
+ * Find and analyze every `EXEC SQL ... END-EXEC` block in a token stream,
+ * in source order. This is the primary feed for
+ * `generator/sql-gen.js`'s `generateSqlProgram`.
+ */
+export function parseAllSqlStatements(tokens) {
+  const statements = [];
+  let position = 0;
+
+  while (position < tokens.length) {
+    const token = tokens[position];
+
+    if (token.value?.toUpperCase() === 'EXEC') {
+      const nextToken = tokens[position + 1];
+      if (nextToken?.value?.toUpperCase() === 'SQL') {
+        const result = parseSqlStatementBlock(tokens, position);
+        if (result) {
+          statements.push(result.statement);
+          position = result.endPosition;
+          continue;
+        }
+      }
+    }
+
+    position++;
+  }
+
+  return statements;
+}
+
 /**
  * CICS Command Types
  */
@@ -608,4 +900,11 @@ export default {
   determineSqlType,
   CicsCommands,
   SqlTypes,
+  // Phase 3: enriched statement model
+  analyzeSqlStatement,
+  parseSqlStatementBlock,
+  parseAllSqlStatements,
+  extractIntoSection,
+  stripIntoClause,
+  scanHostVariables,
 };

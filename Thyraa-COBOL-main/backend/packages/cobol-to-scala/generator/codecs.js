@@ -8,9 +8,17 @@
  *
  * Covers:
  *   - Packed decimal (COMP-3 / PACKED-DECIMAL): two digits per byte, sign nibble last.
- *   - Binary (COMP / COMP-4 / COMP-5 / BINARY): big-endian two's complement.
+ *   - Binary (COMP / COMP-4 / COMP-5 / BINARY): two's complement. Byte ORDER
+ *     is big-endian for COMP/COMP-4/BINARY but little-endian (host-native)
+ *     for COMP-5 - compiler-verified against real GnuCOBOL, see
+ *     tests/oracle/codec-refutation.md - so binaryEncode/binaryDecode take
+ *     an explicit `{ endianness: 'BIG'|'LITTLE' }` option (default 'BIG').
  *   - Zoned decimal (DISPLAY numeric): one digit per byte, with sign overpunch
- *     (embedded in the zone of a digit) or SIGN separate character.
+ *     (embedded in the zone of a digit) or SIGN separate character. The
+ *     non-separate sign scheme differs by codePage: 'EBCDIC' uses letter
+ *     substitution, 'ASCII' swaps the sign digit's zone nibble (0x3x
+ *     positive / 0x7x negative) - these are genuinely different byte
+ *     schemes, not the same table viewed through two charsets.
  *   - EBCDIC code page 037 <-> Unicode, full 256-code-point translation.
  *
  * All numeric encode/decode functions operate on BigInt so that 18-digit COBOL
@@ -23,9 +31,23 @@
 
 function toBigInt(value) {
   if (typeof value === 'bigint') return value;
-  if (typeof value === 'number' && Number.isInteger(value)) return BigInt(value);
+  if (typeof value === 'number' && Number.isInteger(value)) {
+    // A non-safe-integer Number has already lost precision by the time it
+    // reaches this function (e.g. 999999999999999999 as a literal silently
+    // rounds to 1000000000000000000 before toBigInt ever sees it) - there is
+    // no way to recover the true value here, so refuse instead of silently
+    // encoding the wrong number. Caller must pass a BigInt or a string.
+    if (!Number.isSafeInteger(value)) {
+      throw new RangeError(
+        `toBigInt: ${value} exceeds Number.MAX_SAFE_INTEGER precision; pass a BigInt or string instead`
+      );
+    }
+    return BigInt(value);
+  }
   if (typeof value === 'string' && value.trim() !== '') return BigInt(value);
-  throw new TypeError(`expected a BigInt (or integer number/string), got ${typeof value}: ${value}`);
+  // All validation failures in this module use RangeError uniformly (mirrors
+  // Scala's IllegalArgumentException) so callers can catch one error type.
+  throw new RangeError(`expected a BigInt (or integer number/string), got ${typeof value}: ${value}`);
 }
 
 function assertDigits(digits) {
@@ -115,19 +137,27 @@ export function packedDecode(bytes, options = {}) {
     return { unscaled: 0n, scale, signed: true, negative: false };
   }
 
-  let digitStr = '';
+  // Collect digit nibbles as numbers (0-15), not characters: a naive
+  // String(nibble) + /^[0-9]+$/ check is dead code here, because
+  // String(10..15) yields "10".."15" - two ASCII digit characters that still
+  // pass a digit-character regex even though the nibble itself (0xA-0xF) is
+  // not a valid packed-decimal digit. Each nibble must be range-checked
+  // directly as a number instead.
+  const digitNibbles = [];
   for (let i = 0; i < bytes.length - 1; i++) {
     const b = bytes[i] & 0xff;
-    digitStr += String((b >> 4) & 0x0f);
-    digitStr += String(b & 0x0f);
+    digitNibbles.push((b >> 4) & 0x0f, b & 0x0f);
   }
   const last = bytes[bytes.length - 1] & 0xff;
-  digitStr += String((last >> 4) & 0x0f);
+  digitNibbles.push((last >> 4) & 0x0f);
   const signNibble = last & 0x0f;
 
-  if (!/^[0-9]+$/.test(digitStr)) {
-    throw new RangeError(`packedDecode: non-digit nibble encountered in ${digitStr}`);
+  for (const nibble of digitNibbles) {
+    if (nibble > 9) {
+      throw new RangeError(`packedDecode: non-digit nibble 0x${nibble.toString(16)} encountered in digit position`);
+    }
   }
+  const digitStr = digitNibbles.join('');
 
   // C/E/A/F are treated as positive-or-unsigned; D/B are negative. C, D and F
   // are the only nibbles our own encoder emits; A/B/E are accepted on decode
@@ -143,8 +173,19 @@ export function packedDecode(bytes, options = {}) {
 // ============================================================================
 // Binary (COMP / COMP-4 / COMP-5 / BINARY)
 //
-// Big-endian two's complement. Byte width is chosen by total digit count:
-// 1-4 digits -> 2 bytes, 5-9 digits -> 4 bytes, 10-18 digits -> 8 bytes.
+// Two's complement. Byte width is chosen by total digit count: 1-4 digits ->
+// 2 bytes, 5-9 digits -> 4 bytes, 10-18 digits -> 8 bytes.
+//
+// Byte ORDER depends on which USAGE this is, confirmed against real GnuCOBOL
+// (see tests/oracle/codec-refutation.md):
+//   - COMP / COMP-4 / BINARY -> big-endian (the `binary-byteorder: big-endian`
+//     dialect default), i.e. `endianness: 'BIG'` (the default here too).
+//   - COMP-5 -> host-native byte order, which is little-endian on the x86_64
+//     GnuCOBOL build this was verified against (`-fbinary-byteorder=native`
+//     is COMP-5's defining behavior, independent of the dialect config), i.e.
+//     `endianness: 'LITTLE'`.
+// Callers (generator/case-class-gen.js) must pass 'LITTLE' only for COMP-5
+// fields; every other binary USAGE stays 'BIG'.
 // ============================================================================
 
 /**
@@ -157,17 +198,27 @@ export function binaryByteLength(digits) {
   return 8; // <= 18, enforced by assertDigits
 }
 
+function checkEndianness(endianness, fnName) {
+  if (endianness !== 'BIG' && endianness !== 'LITTLE') {
+    throw new RangeError(`${fnName}: invalid endianness '${endianness}', expected 'BIG' or 'LITTLE'`);
+  }
+}
+
 /**
- * Encode a signed BigInt as big-endian two's complement bytes.
+ * Encode a signed BigInt as two's complement bytes.
  *
  * @param {bigint} value
- * @param {number} byteLength - 2, 4 or 8 (or any positive width)
+ * @param {number} byteLength - 1-8 (2, 4 and 8 are the COBOL-meaningful widths)
+ * @param {{endianness?: 'BIG'|'LITTLE'}} [options] - 'BIG' (default) for
+ *   COMP/COMP-4/BINARY, 'LITTLE' for COMP-5 (host-native on x86_64).
  * @returns {Uint8Array}
  */
-export function binaryEncode(value, byteLength) {
+export function binaryEncode(value, byteLength, options = {}) {
+  const { endianness = 'BIG' } = options;
+  checkEndianness(endianness, 'binaryEncode');
   const v = toBigInt(value);
-  if (!Number.isInteger(byteLength) || byteLength < 1) {
-    throw new RangeError(`binaryEncode: invalid byteLength ${byteLength}`);
+  if (!Number.isInteger(byteLength) || byteLength < 1 || byteLength > 8) {
+    throw new RangeError(`binaryEncode: invalid byteLength ${byteLength} (must be an integer 1-8)`);
   }
   const bits = BigInt(byteLength) * 8n;
   const max = (1n << (bits - 1n)) - 1n;
@@ -183,21 +234,32 @@ export function binaryEncode(value, byteLength) {
     bytes[i] = Number(rest & 0xffn);
     rest >>= 8n;
   }
+  if (endianness === 'LITTLE') bytes.reverse();
   return bytes;
 }
 
 /**
- * Decode big-endian two's complement bytes to a signed BigInt.
- * @param {Uint8Array|Buffer|number[]} bytes
+ * Decode two's complement bytes to a signed BigInt.
+ * @param {Uint8Array|Buffer|number[]} bytes - 0-8 bytes (anything wider than
+ *   8 bytes has no COBOL binary-field meaning and is rejected rather than
+ *   silently producing a wide/garbage value).
+ * @param {{endianness?: 'BIG'|'LITTLE'}} [options]
  * @returns {bigint}
  */
-export function binaryDecode(bytes) {
+export function binaryDecode(bytes, options = {}) {
+  const { endianness = 'BIG' } = options;
+  checkEndianness(endianness, 'binaryDecode');
   const byteLength = bytes.length;
+  if (byteLength > 8) {
+    throw new RangeError(`binaryDecode: buffer too long (${byteLength} bytes), max is 8 (COBOL COMP/COMP-5 width)`);
+  }
   if (byteLength === 0) return 0n;
+
+  const ordered = endianness === 'LITTLE' ? Array.from(bytes).reverse() : bytes;
 
   let value = 0n;
   for (let i = 0; i < byteLength; i++) {
-    value = (value << 8n) | BigInt(bytes[i] & 0xff);
+    value = (value << 8n) | BigInt(ordered[i] & 0xff);
   }
   const bits = BigInt(byteLength) * 8n;
   const signBit = 1n << (bits - 1n);
@@ -216,14 +278,24 @@ export function binaryDecode(bytes) {
 // the sign onto the leading or trailing digit's zone; SIGN ... SEPARATE
 // fields add one extra byte holding a literal '+'/'-' character instead.
 //
-// The overpunch table below is expressed as characters (not raw EBCDIC
-// nibbles) because the same table is used verbatim for both EBCDIC (via the
-// cp037 table further down) and ASCII-native zoned decimal representations:
-//   positive digit 0-9 -> { A B C D E F G H I
-//   negative digit 0-9 -> } J K L M N O P Q R
-// (This is exactly why, under cp037, byte 0xC0 renders as '{': the digit
-// zone for positive numbers is 0xC0-0xC9, and 0xC1-0xC9 already coincide
-// with 'A'-'I' in EBCDIC; cp037 byte 0xC0 itself decodes to '{'.)
+// The sign-overpunch SCHEME differs by codePage - these are NOT the same
+// bytes reinterpreted through a different charset, they are two genuinely
+// different conventions (compiler-verified against real GnuCOBOL, see
+// tests/oracle/codec-refutation.md, "Post-fix verification" section):
+//
+//   'EBCDIC' -> letter-substitution overpunch. The sign digit is replaced by
+//   a letter, expressed here as characters and pushed through the cp037
+//   table below: positive digit 0-9 -> { A B C D E F G H I, negative digit
+//   0-9 -> } J K L M N O P Q R. (This is exactly why cp037 byte 0xC0 is '{':
+//   the positive digit zone is 0xC0-0xC9 and 0xC1-0xC9 already coincide with
+//   'A'-'I' in EBCDIC.)
+//
+//   'ASCII' -> zone-nibble swap, no letters at all. The sign digit's byte is
+//   a PLAIN ASCII digit for positive (0x30 + d, unchanged) and has its zone
+//   nibble swapped from 0x3 to 0x7 for negative (0x70 + d). E.g. digit 5
+//   negative -> 0x75. (An earlier version of this module reused the EBCDIC
+//   letter table for 'ASCII' too - refuted by cobc: every nonzero signed
+//   digit came out wrong.)
 // ============================================================================
 
 const POSITIVE_OVERPUNCH = ['{', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
@@ -240,6 +312,20 @@ function overpunchDecode(ch) {
   if (negIdx >= 0) return { digit: negIdx, negative: true };
   if (ch >= '0' && ch <= '9') return { digit: ch.charCodeAt(0) - 48, negative: false };
   throw new RangeError(`zonedDecode: '${ch}' is not a valid sign-overpunch or digit character`);
+}
+
+/** ASCII-native zoned sign encode: positive digit d -> 0x30+d, negative -> 0x70+d. */
+function asciiSignByte(digit, negative) {
+  return (negative ? 0x70 : 0x30) + digit;
+}
+
+/** ASCII-native zoned sign decode, inverse of asciiSignByte; throws on any other byte. */
+function asciiSignDigit(byte) {
+  if (byte >= 0x30 && byte <= 0x39) return { digit: byte - 0x30, negative: false };
+  if (byte >= 0x70 && byte <= 0x79) return { digit: byte - 0x70, negative: true };
+  throw new RangeError(
+    `zonedDecode: byte 0x${byte.toString(16).padStart(2, '0')} is not a valid ASCII zoned sign digit`
+  );
 }
 
 /**
@@ -274,19 +360,21 @@ export function zonedEncode(unscaled, digits, options = {}) {
   const digitChars = digitStr.padStart(digits, '0').split('');
 
   const separate = signed && signSeparate;
-  let chars;
   if (separate) {
     const signChar = negative ? '-' : '+';
-    chars = signLeading ? [signChar, ...digitChars] : [...digitChars, signChar];
-  } else if (signed) {
-    const idx = signLeading ? 0 : digitChars.length - 1;
-    digitChars[idx] = overpunchChar(Number(digitChars[idx]), negative);
-    chars = digitChars;
-  } else {
-    chars = digitChars;
+    const chars = signLeading ? [signChar, ...digitChars] : [...digitChars, signChar];
+    return charsToBytes(chars, codePage);
   }
 
-  return charsToBytes(chars, codePage);
+  // Non-separate: every digit is a plain digit byte except the sign-bearing
+  // position, which is overwritten below with the codePage-specific scheme.
+  const bytes = charsToBytes(digitChars, codePage);
+  if (signed) {
+    const idx = signLeading ? 0 : digitChars.length - 1;
+    const digit = Number(digitChars[idx]);
+    bytes[idx] = codePage === 'ASCII' ? asciiSignByte(digit, negative) : charToEbcdicByte(overpunchChar(digit, negative));
+  }
+  return bytes;
 }
 
 /**
@@ -310,8 +398,17 @@ export function zonedDecode(bytes, options = {}) {
     codePage = 'EBCDIC',
   } = options;
 
-  const chars = bytesToChars(bytes, codePage);
   const separate = signed && signSeparate;
+  const bufLen = bytes ? bytes.length : 0;
+  const minLength = separate ? 2 : 1;
+  if (bufLen < minLength) {
+    throw new RangeError(
+      `zonedDecode: buffer too short (${bufLen} byte${bufLen === 1 ? '' : 's'}), need at least ${minLength} ` +
+        `byte${minLength === 1 ? '' : 's'}${separate ? ' (digit(s) + sign byte)' : ' (digit)'}`
+    );
+  }
+
+  const chars = bytesToChars(bytes, codePage);
 
   let negative = false;
   let digitChars;
@@ -326,9 +423,15 @@ export function zonedDecode(bytes, options = {}) {
   } else if (signed) {
     digitChars = chars.slice();
     const idx = signLeading ? 0 : digitChars.length - 1;
-    const decoded = overpunchDecode(digitChars[idx]);
-    digitChars[idx] = String(decoded.digit);
-    negative = decoded.negative;
+    if (codePage === 'ASCII') {
+      const decoded = asciiSignDigit(bytes[idx] & 0xff);
+      digitChars[idx] = String(decoded.digit);
+      negative = decoded.negative;
+    } else {
+      const decoded = overpunchDecode(digitChars[idx]);
+      digitChars[idx] = String(decoded.digit);
+      negative = decoded.negative;
+    }
   } else {
     digitChars = chars.slice();
   }

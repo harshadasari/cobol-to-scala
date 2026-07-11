@@ -10,10 +10,19 @@ package com.thyraa.cobol.runtime
  * Covers:
  *   - Packed decimal (COMP-3 / PACKED-DECIMAL): two digits per byte, sign
  *     nibble last (0xC positive, 0xD negative, 0xF unsigned).
- *   - Binary (COMP / COMP-4 / COMP-5 / BINARY): big-endian two's complement,
- *     2/4/8 bytes chosen by digit count (1-4/5-9/10-18).
+ *   - Binary (COMP / COMP-4 / COMP-5 / BINARY): two's complement, 2/4/8 bytes
+ *     chosen by digit count (1-4/5-9/10-18). Byte ORDER is big-endian for
+ *     COMP/COMP-4/BINARY but little-endian (host-native) for COMP-5 -
+ *     compiler-verified against real GnuCOBOL, see
+ *     tests/oracle/codec-refutation.md - so binaryEncode/binaryDecode take an
+ *     explicit `endianness: "BIG"|"LITTLE"` parameter (default "BIG").
  *   - Zoned decimal (DISPLAY numeric) with sign overpunch (embedded in the
- *     zone of the leading or trailing digit) or SIGN ... SEPARATE.
+ *     zone of the leading or trailing digit) or SIGN ... SEPARATE. The
+ *     non-SEPARATE sign scheme itself differs by `codePage`: "EBCDIC" uses
+ *     letter substitution (compiler-verified for the *scheme*, see the
+ *     refutation doc), "ASCII" swaps the sign digit's zone nibble
+ *     (0x3x positive / 0x7x negative) - also compiler-verified, and NOT the
+ *     same table reused across a charset translation.
  *   - EBCDIC code page 037 <-> Unicode, full 256-code-point translation.
  *
  * Where the JS reference represents a decimal as a (BigInt unscaled, scale)
@@ -89,28 +98,58 @@ object CobolCodecs:
   def packedDecode(bytes: Array[Byte], scale: Int = 0): BigDecimal =
     if bytes.isEmpty then BigDecimal(0).setScale(scale)
     else
-      val sb = new StringBuilder
+      // Collect digit nibbles as Ints (0-15), not characters appended to a
+      // String: a naive "digitStr matches all digit characters" check is
+      // dead code here, because e.g. nibble 10 stringifies to "10" - two
+      // ASCII digit characters that still look like digits even though the
+      // nibble itself (0xA-0xF) is not a valid packed-decimal digit. Each
+      // nibble must be range-checked directly as a number instead.
+      val totalDigitNibbles = 2 * (bytes.length - 1) + 1
+      val digitNibbles = new Array[Int](totalDigitNibbles)
+      var idx = 0
       var i = 0
       while i < bytes.length - 1 do
         val b = bytes(i) & 0xff
-        sb.append((b >> 4) & 0x0f)
-        sb.append(b & 0x0f)
+        digitNibbles(idx) = (b >> 4) & 0x0f
+        idx += 1
+        digitNibbles(idx) = b & 0x0f
+        idx += 1
         i += 1
       end while
       val last = bytes(bytes.length - 1) & 0xff
-      sb.append((last >> 4) & 0x0f)
+      digitNibbles(idx) = (last >> 4) & 0x0f
       val signNibble = last & 0x0f
+
+      for nibble <- digitNibbles do
+        if nibble > 9 then
+          throw new IllegalArgumentException(
+            f"packedDecode: non-digit nibble 0x$nibble%x encountered in digit position"
+          )
 
       // C/E/A/F are treated as positive-or-unsigned; D/B are negative. C, D
       // and F are the only nibbles our own encoder emits; A/B/E are accepted
       // here for tolerance of packed decimal produced by other mainframe software.
       val negative = signNibble == 0xd || signNibble == 0xb
-      val magnitude = BigInt(sb.toString)
+      val magnitude = BigInt(digitNibbles.mkString)
       val unscaled = if negative then -magnitude else magnitude
       BigDecimal(unscaled, scale)
 
   // ==========================================================================
   // Binary (COMP / COMP-4 / COMP-5 / BINARY)
+  //
+  // Byte width is chosen by total digit count: 1-4 digits -> 2 bytes, 5-9
+  // digits -> 4 bytes, 10-18 digits -> 8 bytes.
+  //
+  // Byte ORDER depends on which USAGE this is, confirmed against real
+  // GnuCOBOL (see tests/oracle/codec-refutation.md):
+  //   - COMP / COMP-4 / BINARY -> big-endian (the `binary-byteorder:
+  //     big-endian` dialect default), i.e. endianness = "BIG" (the default).
+  //   - COMP-5 -> host-native byte order, little-endian on the x86_64
+  //     GnuCOBOL build this was verified against (`-fbinary-byteorder=native`
+  //     is COMP-5's defining behavior, independent of the dialect config),
+  //     i.e. endianness = "LITTLE".
+  // Callers (generator/case-class-gen.js) must pass "LITTLE" only for COMP-5
+  // fields; every other binary USAGE stays "BIG".
   // ==========================================================================
 
   /** Byte width for a binary (COMP) field with the given total digit count. */
@@ -120,11 +159,20 @@ object CobolCodecs:
     else if digits <= 9 then 4
     else 8
 
+  private def requireEndianness(endianness: String, fnName: String): Unit =
+    require(
+      endianness == "BIG" || endianness == "LITTLE",
+      s"$fnName: invalid endianness '$endianness', expected 'BIG' or 'LITTLE'"
+    )
+
   /**
-   * Encode a signed Long as big-endian two's complement bytes.
+   * Encode a signed Long as two's complement bytes.
    * @param byteLength 1-8 (2, 4 and 8 are the COBOL-meaningful widths)
+   * @param endianness "BIG" (default) for COMP/COMP-4/BINARY, "LITTLE" for
+   *                   COMP-5 (host-native on x86_64).
    */
-  def binaryEncode(value: Long, byteLength: Int): Array[Byte] =
+  def binaryEncode(value: Long, byteLength: Int, endianness: String = "BIG"): Array[Byte] =
+    requireEndianness(endianness, "binaryEncode")
     require(byteLength >= 1 && byteLength <= 8, s"binaryEncode: byteLength must be 1-8, got $byteLength")
     if byteLength < 8 then
       // Only check range when byteLength < 8: at 8 bytes every Long value is
@@ -145,17 +193,25 @@ object CobolCodecs:
       v = v >> 8
       i -= 1
     end while
-    bytes
+    if endianness == "LITTLE" then bytes.reverse else bytes
 
-  /** Decode big-endian two's complement bytes (up to 8) to a signed Long. */
-  def binaryDecode(bytes: Array[Byte]): Long =
+  /**
+   * Decode two's complement bytes to a signed Long.
+   * @param bytes 0-8 bytes; anything wider has no COBOL binary-field meaning
+   *              and is rejected rather than silently overflowing into a
+   *              garbage Long value.
+   */
+  def binaryDecode(bytes: Array[Byte], endianness: String = "BIG"): Long =
+    requireEndianness(endianness, "binaryDecode")
     val byteLength = bytes.length
+    require(byteLength <= 8, s"binaryDecode: buffer too long ($byteLength bytes), max is 8 (COBOL COMP/COMP-5 width)")
     if byteLength == 0 then 0L
     else
+      val ordered = if endianness == "LITTLE" then bytes.reverse else bytes
       var result = 0L
       var i = 0
       while i < byteLength do
-        result = (result << 8) | (bytes(i) & 0xff).toLong
+        result = (result << 8) | (ordered(i) & 0xff).toLong
         i += 1
       end while
       if byteLength < 8 then
@@ -174,12 +230,23 @@ object CobolCodecs:
   // trailing digit's zone; SIGN ... SEPARATE fields add one extra byte
   // holding a literal '+'/'-' character instead.
   //
-  // The overpunch table is expressed as characters (not raw EBCDIC nibbles)
-  // because the same table is used for both EBCDIC (via the cp037 table
-  // below) and ASCII-native zoned decimal: positive digit 0-9 -> { A-I,
-  // negative digit 0-9 -> } J-R. (This is exactly why cp037 byte 0xC0 is
-  // '{': the positive digit zone is 0xC0-0xC9 and 0xC1-0xC9 already coincide
-  // with 'A'-'I' in EBCDIC.)
+  // The sign-overpunch SCHEME differs by codePage - these are NOT the same
+  // bytes reinterpreted through a different charset, they are two genuinely
+  // different conventions (compiler-verified against real GnuCOBOL, see
+  // tests/oracle/codec-refutation.md, "Post-fix verification" section):
+  //
+  //   "EBCDIC" -> letter-substitution overpunch, expressed here as characters
+  //   pushed through the cp037 table below: positive digit 0-9 -> { A-I,
+  //   negative digit 0-9 -> } J-R. (This is exactly why cp037 byte 0xC0 is
+  //   '{': the positive digit zone is 0xC0-0xC9 and 0xC1-0xC9 already
+  //   coincide with 'A'-'I' in EBCDIC.)
+  //
+  //   "ASCII" -> zone-nibble swap, no letters at all. The sign digit's byte
+  //   is a PLAIN ASCII digit for positive (0x30 + d, unchanged) and has its
+  //   zone nibble swapped from 0x3 to 0x7 for negative (0x70 + d), e.g.
+  //   digit 5 negative -> 0x75. (An earlier version of this file reused the
+  //   EBCDIC letter table for "ASCII" too - refuted by cobc: every nonzero
+  //   signed digit came out wrong.)
   // ==========================================================================
 
   private val PositiveOverpunch: Array[Char] = Array('{', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I')
@@ -197,6 +264,19 @@ object CobolCodecs:
       if negIdx >= 0 then (negIdx, true)
       else if ch >= '0' && ch <= '9' then (ch - '0', false)
       else throw new IllegalArgumentException(s"zonedDecode: '$ch' is not a valid sign-overpunch or digit character")
+
+  /** ASCII-native zoned sign encode: positive digit d -> 0x30+d, negative -> 0x70+d. */
+  private def asciiSignByte(digit: Int, negative: Boolean): Byte =
+    ((if negative then 0x70 else 0x30) + digit).toByte
+
+  /** ASCII-native zoned sign decode, inverse of asciiSignByte; throws on any other byte. */
+  private def asciiSignDigit(byte: Int): (Int, Boolean) =
+    if byte >= 0x30 && byte <= 0x39 then (byte - 0x30, false)
+    else if byte >= 0x70 && byte <= 0x79 then (byte - 0x70, true)
+    else
+      throw new IllegalArgumentException(
+        f"zonedDecode: byte 0x$byte%02x is not a valid ASCII zoned sign digit"
+      )
 
   /**
    * Encode a BigDecimal as zoned-decimal (DISPLAY numeric) bytes.
@@ -227,17 +307,21 @@ object CobolCodecs:
     val digitChars = (("0" * (digits - digitStr.length)) + digitStr).toCharArray
 
     val separate = signed && signSeparate
-    val chars: Array[Char] =
-      if separate then
-        val signChar = if negative then '-' else '+'
-        if signLeading then signChar +: digitChars else digitChars :+ signChar
-      else if signed then
+    if separate then
+      val signChar = if negative then '-' else '+'
+      val chars = if signLeading then signChar +: digitChars else digitChars :+ signChar
+      charsToBytes(chars, codePage)
+    else
+      // Every digit is a plain digit byte except the sign-bearing position,
+      // which is overwritten below with the codePage-specific scheme.
+      val bytes = charsToBytes(digitChars, codePage)
+      if signed then
         val idx = if signLeading then 0 else digitChars.length - 1
-        digitChars(idx) = overpunchChar(digitChars(idx) - '0', negative)
-        digitChars
-      else digitChars
-
-    charsToBytes(chars, codePage)
+        val digit = digitChars(idx) - '0'
+        bytes(idx) =
+          if codePage == "ASCII" then asciiSignByte(digit, negative)
+          else charToEbcdicByte(overpunchChar(digit, negative))
+      bytes
 
   /**
    * Decode zoned-decimal (DISPLAY numeric) bytes to a BigDecimal at the
@@ -251,8 +335,15 @@ object CobolCodecs:
     signSeparate: Boolean = false,
     codePage: String = "EBCDIC"
   ): BigDecimal =
-    val chars = bytesToChars(bytes, codePage)
     val separate = signed && signSeparate
+    val minLength = if separate then 2 else 1
+    if bytes.length < minLength then
+      throw new IllegalArgumentException(
+        s"zonedDecode: buffer too short (${bytes.length} bytes), need at least $minLength" +
+          (if separate then " (digit(s) + sign byte)" else " (digit)")
+      )
+
+    val chars = bytesToChars(bytes, codePage)
 
     val (negative, digitChars): (Boolean, Array[Char]) =
       if separate then
@@ -260,10 +351,15 @@ object CobolCodecs:
         else (chars.last == '-', chars.init)
       else if signed then
         val idx = if signLeading then 0 else chars.length - 1
-        val (digit, neg) = overpunchDecode(chars(idx))
         val copy = chars.clone()
-        copy(idx) = ('0' + digit).toChar
-        (neg, copy)
+        if codePage == "ASCII" then
+          val (digit, neg) = asciiSignDigit(bytes(idx) & 0xff)
+          copy(idx) = ('0' + digit).toChar
+          (neg, copy)
+        else
+          val (digit, neg) = overpunchDecode(chars(idx))
+          copy(idx) = ('0' + digit).toChar
+          (neg, copy)
       else (false, chars)
 
     val digitStr = new String(digitChars)

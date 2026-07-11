@@ -118,6 +118,30 @@ test('packed decimal: unsigned sign nibble (0xF) decodes as signed=false', () =>
   assert.equal(decoded.signed, false);
 });
 
+test('packed decimal: decode rejects a non-BCD nibble in a digit position (dead-code regression)', () => {
+  // String(10..15) stringifies to "10".."15" - two ASCII digit characters
+  // that used to slip past a naive /^[0-9]+$/ check on the joined digit
+  // string, even though the nibble itself (0xA-0xF) is not a valid
+  // packed-decimal digit. Each nibble must be range-checked as a number.
+  assert.throws(() => packedDecode(Uint8Array.from([0xa0, 0x1c])), RangeError); // leading nibble 0xA
+  assert.throws(() => packedDecode(Uint8Array.from([0xf5, 0x0c])), RangeError); // leading nibble 0xF
+  assert.throws(() => packedDecode(Uint8Array.from([0xe1, 0x2c])), RangeError); // leading nibble 0xE
+});
+
+test('unsafe (non-safe-integer) Number inputs are rejected in favor of BigInt/string', () => {
+  // Number.MAX_SAFE_INTEGER + 1 has already lost precision as a JS Number by
+  // the time it reaches the codec - there is no way to recover the intended
+  // value, so it must be refused rather than silently encoding the wrong
+  // (rounded) number.
+  assert.throws(() => packedEncode(Number.MAX_SAFE_INTEGER + 1, 18), RangeError);
+  assert.throws(() => binaryEncode(2 ** 60, 8), RangeError);
+  // Passing the same magnitude as a BigInt or a string is fine.
+  assert.doesNotThrow(() => packedEncode(BigInt(Number.MAX_SAFE_INTEGER) + 1n, 18));
+  assert.doesNotThrow(() => packedEncode(String(Number.MAX_SAFE_INTEGER) + '1', 18));
+  // An ordinary safe integer Number still works exactly as before.
+  assert.equal(hex(packedEncode(123, 3)), '123c');
+});
+
 // ============================================================================
 // Binary (COMP / COMP-4 / BINARY)
 // ============================================================================
@@ -193,6 +217,71 @@ test('binary: round trip across all digit-count byte widths', () => {
   }
 });
 
+// ----------------------------------------------------------------------------
+// COMP-5 (host-native little-endian on x86_64) - see
+// tests/oracle/codec-refutation.md section 3. Plain COMP/COMP-4/BINARY stay
+// big-endian (the 'BIG' default) - only COMP-5 fields pass endianness: 'LITTLE'.
+// ----------------------------------------------------------------------------
+
+test("binary: COMP-5 KNOWN VALUES from cobc (codec-refutation.md section 3, rows 25-28)", () => {
+  // int16 max/min, little-endian.
+  assert.equal(hex(binaryEncode(32767n, 2, { endianness: 'LITTLE' })), 'ff7f');
+  assert.equal(hex(binaryEncode(-32768n, 2, { endianness: 'LITTLE' })), '0080');
+  // int32 max/min, little-endian.
+  assert.equal(hex(binaryEncode(2147483647n, 4, { endianness: 'LITTLE' })), 'ffffff7f');
+  assert.equal(hex(binaryEncode(-2147483648n, 4, { endianness: 'LITTLE' })), '00000080');
+
+  // Decode is the exact inverse of the cobc-produced bytes.
+  assert.equal(binaryDecode(Uint8Array.from([0xff, 0x7f]), { endianness: 'LITTLE' }), 32767n);
+  assert.equal(binaryDecode(Uint8Array.from([0x00, 0x80]), { endianness: 'LITTLE' }), -32768n);
+  assert.equal(binaryDecode(Uint8Array.from([0xff, 0xff, 0xff, 0x7f]), { endianness: 'LITTLE' }), 2147483647n);
+  assert.equal(binaryDecode(Uint8Array.from([0x00, 0x00, 0x00, 0x80]), { endianness: 'LITTLE' }), -2147483648n);
+});
+
+test('binary: default (and plain COMP/COMP-4/BINARY) endianness is still big-endian, unaffected by the COMP-5 fix', () => {
+  assert.equal(hex(binaryEncode(32767n, 2)), '7fff'); // no options => 'BIG'
+  assert.equal(hex(binaryEncode(32767n, 2, { endianness: 'BIG' })), '7fff');
+  // The same bytes decode to a different (and, pre-fix, silently wrong)
+  // value depending on endianness - this is the "concrete blast radius"
+  // documented in codec-refutation.md section 3.
+  assert.equal(binaryDecode(Uint8Array.from([0xff, 0x7f])), -129n); // big-endian (default)
+  assert.equal(binaryDecode(Uint8Array.from([0xff, 0x7f]), { endianness: 'LITTLE' }), 32767n);
+});
+
+test('binary: COMP-5 round trip at every boundary width, little-endian', () => {
+  const cases = [
+    { byteLength: 2, max: 32767n, min: -32768n },
+    { byteLength: 4, max: 2147483647n, min: -2147483648n },
+    { byteLength: 8, max: 9223372036854775807n, min: -9223372036854775808n },
+  ];
+  const opts = { endianness: 'LITTLE' };
+  for (const { byteLength, max, min } of cases) {
+    assert.equal(binaryDecode(binaryEncode(max, byteLength, opts), opts), max, `max at ${byteLength} bytes`);
+    assert.equal(binaryDecode(binaryEncode(min, byteLength, opts), opts), min, `min at ${byteLength} bytes`);
+    assert.equal(binaryDecode(binaryEncode(0n, byteLength, opts), opts), 0n, `zero at ${byteLength} bytes`);
+  }
+});
+
+test('binary: invalid endianness option is rejected on both encode and decode', () => {
+  assert.throws(() => binaryEncode(1n, 2, { endianness: 'MIDDLE' }), RangeError);
+  assert.throws(() => binaryDecode(Uint8Array.from([1, 2]), { endianness: 'MIDDLE' }), RangeError);
+});
+
+test('binary: encode rejects byteLength outside 1-8', () => {
+  assert.throws(() => binaryEncode(1n, 0), RangeError);
+  assert.throws(() => binaryEncode(1n, 9), RangeError);
+});
+
+test('binary: decode rejects buffers wider than 8 bytes instead of silently overflowing', () => {
+  // Pre-fix, an oversized buffer would compute a wide two's-complement value
+  // in JS (BigInt has no width limit) that the Scala Long counterpart cannot
+  // represent - the two implementations would silently diverge. Both must
+  // now reject anything over 8 bytes instead.
+  const nineBytes = new Uint8Array(9).fill(0xff);
+  assert.throws(() => binaryDecode(nineBytes), RangeError);
+  assert.throws(() => binaryDecode(nineBytes, { endianness: 'LITTLE' }), RangeError);
+});
+
 // ============================================================================
 // Zoned Decimal (DISPLAY numeric) with sign overpunch
 // ============================================================================
@@ -245,14 +334,55 @@ test('zoned decimal: SIGN LEADING SEPARATE adds a literal +/- byte before the di
   assert.equal(hex(negative), '60f1f2f3');
 });
 
-test('zoned decimal: ASCII code page uses the overpunch characters directly as bytes', () => {
-  // +5 -> overpunch char 'E' (0x45 in ASCII, no cp037 translation).
+test('zoned decimal: ASCII code page uses the zone-nibble-swap sign scheme, NOT the EBCDIC letter table', () => {
+  // CORRECTED per tests/oracle/codec-refutation.md section 6 (compiler-verified
+  // against real GnuCOBOL, cobc 4.0-early-dev.0, native ASCII charset): the
+  // previous expectation here ('45'/'E' for +5, 'N' for -5) reused the EBCDIC
+  // overpunch letter table for the ASCII code page, which cobc's actual
+  // native-ASCII sign convention does NOT do. The real scheme only swaps the
+  // sign digit's zone nibble: positive digit d -> 0x30+d (a plain, unchanged
+  // ASCII digit), negative digit d -> 0x70+d.
+  // +5 -> 0x35 (plain ASCII digit '5', unchanged from an unsigned encoding).
   const positive = zonedEncode(5n, 1, { codePage: 'ASCII' });
-  assert.equal(hex(positive), '45');
-  assert.equal(String.fromCharCode(positive[0]), 'E');
-  // -5 -> overpunch char 'N'.
+  assert.equal(hex(positive), '35');
+  // -5 -> 0x75 (zone nibble swapped from 0x3 to 0x7; cobc-verified).
   const negative = zonedEncode(-5n, 1, { codePage: 'ASCII' });
-  assert.equal(String.fromCharCode(negative[0]), 'N');
+  assert.equal(hex(negative), '75');
+});
+
+test('zoned decimal: ASCII KNOWN VALUES from cobc (tests/oracle/codec-refutation.md section 6, rows 31-38)', () => {
+  const cases = [
+    { digit: 0, negative: false, byte: 0x30 }, // cobc row 31 ('+0' and '-0' both collapse to 0x30)
+    { digit: 1, negative: false, byte: 0x31 }, // row 33
+    { digit: 1, negative: true, byte: 0x71 }, // row 34
+    { digit: 5, negative: false, byte: 0x35 }, // row 35
+    { digit: 5, negative: true, byte: 0x75 }, // row 36
+    { digit: 9, negative: false, byte: 0x39 }, // row 37
+    { digit: 9, negative: true, byte: 0x79 }, // row 38
+  ];
+  for (const { digit, negative, byte } of cases) {
+    const value = negative ? -BigInt(digit) : BigInt(digit);
+    const encoded = zonedEncode(value, 1, { codePage: 'ASCII' });
+    assert.equal(hex(encoded), byte.toString(16).padStart(2, '0'), `encode digit=${digit} negative=${negative}`);
+    const decoded = zonedDecode(encoded, { codePage: 'ASCII' });
+    assert.equal(decoded.unscaled, negative && digit !== 0 ? -BigInt(digit) : BigInt(digit), `decode digit=${digit}`);
+  }
+});
+
+test('zoned decimal: ASCII multi-digit -123 flips only the sign digit\'s zone (cobc rows 40/41)', () => {
+  // SIGN TRAILING (default): only the last digit's zone flips, 0x33 -> 0x73;
+  // non-sign digits '1' '2' stay plain 0x31 0x32.
+  const trailing = zonedEncode(-123n, 3, { codePage: 'ASCII' });
+  assert.equal(hex(trailing), '313273');
+  // SIGN LEADING: only the first digit's zone flips, 0x31 -> 0x71.
+  const leading = zonedEncode(-123n, 3, { codePage: 'ASCII', signLeading: true });
+  assert.equal(hex(leading), '713233');
+});
+
+test('zoned decimal: ASCII sign byte outside 0x3x/0x7x digit range is rejected on decode', () => {
+  // 0x41 ('A') is a valid EBCDIC-scheme overpunch letter but not a valid
+  // ASCII zone-nibble-swap sign byte - must not be silently misread.
+  assert.throws(() => zonedDecode(Uint8Array.from([0x41]), { codePage: 'ASCII' }), RangeError);
 });
 
 test('zoned decimal: round trip across sign placement x separate x code page x zero/negative', () => {
@@ -304,6 +434,19 @@ test('zoned decimal: unsigned field rejects negative values', () => {
 test('zoned decimal: invalid overpunch character is rejected on decode', () => {
   // 0xFF is not a valid digit zone or overpunch byte in the trailing position.
   assert.throws(() => zonedDecode(Uint8Array.from([0xf1, 0xff])), RangeError);
+});
+
+test('zoned decimal: decode rejects an empty buffer instead of silently returning 0', () => {
+  assert.throws(() => zonedDecode(Uint8Array.from([])), RangeError);
+  assert.throws(() => zonedDecode(Uint8Array.from([]), { signed: false }), RangeError);
+});
+
+test('zoned decimal: decode rejects a too-short SIGN SEPARATE buffer (needs digit(s) + sign byte)', () => {
+  // Pre-fix, an empty (or digit-only, missing sign byte) buffer under
+  // signSeparate:true silently decoded to unscaled=0n instead of raising an
+  // error - there is no way to tell "no data" from "a genuine zero" that way.
+  assert.throws(() => zonedDecode(Uint8Array.from([]), { signSeparate: true }), RangeError);
+  assert.throws(() => zonedDecode(Uint8Array.from([0x31]), { signSeparate: true }), RangeError);
 });
 
 // ============================================================================
@@ -416,4 +559,40 @@ test('cp037: table is a bijection (256 distinct Unicode code points, safe to inv
 
 test('cp037: unmapped Unicode code point throws on encode', () => {
   assert.throws(() => charToEbcdicByte('€'), RangeError); // Euro sign has no cp037 mapping
+});
+
+// ============================================================================
+// Cross-cutting: exception-type consistency
+//
+// Every validation failure in this module must throw RangeError (mirroring
+// Scala's IllegalArgumentException) so callers can catch a single error
+// type, rather than some paths throwing RangeError and others TypeError/
+// falling through to an unrelated built-in exception (e.g. an unguarded
+// ArrayIndexOutOfBoundsException-equivalent on the Scala side).
+// ============================================================================
+
+test('all validation failures across every codec throw RangeError uniformly', () => {
+  const hostileCalls = [
+    () => packedByteLength(0),
+    () => packedEncode(-1n, 3, { signed: false }),
+    () => packedEncode(12345n, 3),
+    () => packedEncode(Number.MAX_SAFE_INTEGER + 1, 18),
+    () => packedDecode(Uint8Array.from([0xa0, 0x1c])),
+    () => binaryByteLength(0),
+    () => binaryEncode(1n, 0),
+    () => binaryEncode(1n, 9),
+    () => binaryEncode(32768n, 2),
+    () => binaryEncode(1n, 2, { endianness: 'MIDDLE' }),
+    () => binaryDecode(new Uint8Array(9)),
+    () => binaryDecode(Uint8Array.from([1, 2]), { endianness: 'MIDDLE' }),
+    () => zonedEncode(-1n, 3, { signed: false }),
+    () => zonedEncode(12345n, 3),
+    () => zonedDecode(Uint8Array.from([])),
+    () => zonedDecode(Uint8Array.from([0x41]), { codePage: 'ASCII' }),
+    () => zonedDecode(Uint8Array.from([0xf1, 0xff])),
+    () => charToEbcdicByte('€'),
+  ];
+  for (const call of hostileCalls) {
+    assert.throws(call, RangeError, `expected RangeError from ${call}`);
+  }
 });

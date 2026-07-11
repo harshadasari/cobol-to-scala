@@ -1,0 +1,8 @@
+{
+  "datasets": {
+    "PROD.LOADLIB": { "writtenBy": [], "readBy": ["STEP010", "STEP020"] },
+    "PROD.CUSTOMER.MASTER": { "writtenBy": [], "readBy": ["STEP010"] },
+    "&&WORK": { "writtenBy": ["STEP010"], "readBy": ["STEP020"] },
+    "PROD.CUSTOMER.STAGED": { "writtenBy": ["STEP020"], "readBy": ["STEP030"] }
+  }
+}

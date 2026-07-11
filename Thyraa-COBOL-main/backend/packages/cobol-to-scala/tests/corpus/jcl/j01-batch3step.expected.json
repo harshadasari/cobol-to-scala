@@ -1,0 +1,158 @@
+{
+  "job": {
+    "name": "BATCH01",
+    "accounting": "ACCT123,DEPT5",
+    "programmer": "J DOE",
+    "class": "A",
+    "msgclass": "X",
+    "msglevel": "(1,1)",
+    "params": {},
+    "dds": []
+  },
+  "steps": [
+    {
+      "name": "STEP010",
+      "program": "EXTRACT",
+      "proc": null,
+      "parm": null,
+      "cond": null,
+      "overrides": {},
+      "dds": [
+        {
+          "ddname": "STEPLIB",
+          "dsn": "PROD.LOADLIB",
+          "disp": { "status": "SHR", "normal": "KEEP", "abnormal": "KEEP", "defaulted": ["normal", "abnormal"] },
+          "sysout": null,
+          "dummy": false,
+          "star": false,
+          "temp": false,
+          "referback": null,
+          "inlineData": null,
+          "params": {}
+        },
+        {
+          "ddname": "INFILE",
+          "dsn": "PROD.CUSTOMER.MASTER",
+          "disp": { "status": "SHR", "normal": "KEEP", "abnormal": "KEEP", "defaulted": ["normal", "abnormal"] },
+          "sysout": null,
+          "dummy": false,
+          "star": false,
+          "temp": false,
+          "referback": null,
+          "inlineData": null,
+          "params": {}
+        },
+        {
+          "ddname": "WORKOUT",
+          "dsn": "&&WORK",
+          "disp": { "status": "NEW", "normal": "PASS", "abnormal": "PASS", "defaulted": ["abnormal"] },
+          "sysout": null,
+          "dummy": false,
+          "star": false,
+          "temp": true,
+          "referback": null,
+          "inlineData": null,
+          "params": { "UNIT": "SYSDA", "SPACE": "(TRK,(5,5))" }
+        }
+      ]
+    },
+    {
+      "name": "STEP020",
+      "program": "TRANSFRM",
+      "proc": null,
+      "parm": null,
+      "cond": null,
+      "overrides": {},
+      "dds": [
+        {
+          "ddname": "STEPLIB",
+          "dsn": "PROD.LOADLIB",
+          "disp": { "status": "SHR", "normal": "KEEP", "abnormal": "KEEP", "defaulted": ["normal", "abnormal"] },
+          "sysout": null,
+          "dummy": false,
+          "star": false,
+          "temp": false,
+          "referback": null,
+          "inlineData": null,
+          "params": {}
+        },
+        {
+          "ddname": "WORKIN",
+          "dsn": "&&WORK",
+          "disp": { "status": "OLD", "normal": "DELETE", "abnormal": "DELETE", "defaulted": ["abnormal"] },
+          "sysout": null,
+          "dummy": false,
+          "star": false,
+          "temp": true,
+          "referback": null,
+          "inlineData": null,
+          "params": {}
+        },
+        {
+          "ddname": "OUTFILE",
+          "dsn": "PROD.CUSTOMER.STAGED",
+          "disp": { "status": "NEW", "normal": "CATLG", "abnormal": "DELETE", "defaulted": [] },
+          "sysout": null,
+          "dummy": false,
+          "star": false,
+          "temp": false,
+          "referback": null,
+          "inlineData": null,
+          "params": { "UNIT": "SYSDA", "SPACE": "(CYL,(10,5))" }
+        }
+      ]
+    },
+    {
+      "name": "STEP030",
+      "program": "REPORT",
+      "proc": null,
+      "parm": null,
+      "cond": { "code": "4", "operator": "LT" },
+      "overrides": {},
+      "dds": [
+        {
+          "ddname": "REPTIN",
+          "dsn": null,
+          "disp": { "status": "OLD", "normal": "KEEP", "abnormal": "KEEP", "defaulted": ["abnormal"] },
+          "sysout": null,
+          "dummy": false,
+          "star": false,
+          "temp": false,
+          "referback": { "step": "STEP020", "ddname": "OUTFILE" },
+          "inlineData": null,
+          "params": {}
+        },
+        {
+          "ddname": "REPTOUT",
+          "dsn": null,
+          "disp": null,
+          "sysout": "*",
+          "dummy": false,
+          "star": false,
+          "temp": false,
+          "referback": null,
+          "inlineData": null,
+          "params": {}
+        },
+        {
+          "ddname": "SYSPRINT",
+          "dsn": null,
+          "disp": null,
+          "sysout": "*",
+          "dummy": false,
+          "star": false,
+          "temp": false,
+          "referback": null,
+          "inlineData": null,
+          "params": {}
+        }
+      ]
+    }
+  ],
+  "procs": {},
+  "comments": [
+    "SAMPLE 3-STEP BATCH JOB WITH TEMP DATASET PASSING AND REFERBACK",
+    "STEP 1: EXTRACT CUSTOMER MASTER INTO A TEMP WORK FILE"
+  ],
+  "unrecognized": []
+}

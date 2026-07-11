@@ -1,0 +1,29 @@
+      ******************************************************************
+      *  DCLGEN TABLE(HRSCHEMA.EMPLOYEE)                              *
+      *  LIBRARY(HR.DCLGEN.COPYLIB(EMPLOYEE))                         *
+      *  QUOTE                                                         *
+      ******************************************************************
+    EXEC SQL DECLARE EMPLOYEE TABLE
+    ( EMP_ID                        INTEGER NOT NULL,
+      EMP_NAME                      VARCHAR(30) NOT NULL,
+      SALARY                        DECIMAL(9,2),
+      HIRE_DATE                     DATE,
+      DEPT_CODE                     CHAR(4) NOT NULL
+    ) END-EXEC.
+      ******************************************************************
+      *  COBOL DECLARATION FOR TABLE HRSCHEMA.EMPLOYEE                 *
+      ******************************************************************
+       01  DCLEMPLOYEE.
+      *    EMP_ID
+           10 EMP-ID                 PIC S9(9) USAGE COMP.
+      *    EMP_NAME
+           10 EMP-NAME.
+              49 EMP-NAME-LEN        PIC S9(4) USAGE COMP.
+              49 EMP-NAME-TEXT       PIC X(30).
+      *    SALARY
+           10 SALARY                 PIC S9(7)V99 USAGE COMP-3.
+      *    HIRE_DATE
+           10 HIRE-DATE              PIC X(10).
+      *    DEPT_CODE
+           10 DEPT-CODE              PIC X(4).
+      ****END OF DECLARATION*****

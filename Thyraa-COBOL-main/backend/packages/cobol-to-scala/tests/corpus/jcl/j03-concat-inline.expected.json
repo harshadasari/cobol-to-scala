@@ -1,0 +1,107 @@
+{
+  "job": {
+    "name": "BATCH03",
+    "accounting": null,
+    "programmer": null,
+    "class": "A",
+    "msgclass": "X",
+    "msglevel": null,
+    "params": {},
+    "dds": []
+  },
+  "steps": [
+    {
+      "name": "STEP01",
+      "program": "MYPROG",
+      "proc": null,
+      "parm": null,
+      "cond": null,
+      "overrides": {},
+      "dds": [
+        {
+          "ddname": "STEPLIB",
+          "dsn": "PROD.LOADLIB",
+          "disp": { "status": "SHR", "normal": "KEEP", "abnormal": "KEEP", "defaulted": ["normal", "abnormal"] },
+          "sysout": null,
+          "dummy": false,
+          "star": false,
+          "temp": false,
+          "referback": null,
+          "inlineData": null,
+          "params": {},
+          "concatenation": [
+            {
+              "ddname": null,
+              "dsn": "PROD.VENDOR.LOADLIB",
+              "disp": { "status": "SHR", "normal": "KEEP", "abnormal": "KEEP", "defaulted": ["normal", "abnormal"] },
+              "sysout": null,
+              "dummy": false,
+              "star": false,
+              "temp": false,
+              "referback": null,
+              "inlineData": null,
+              "params": {}
+            },
+            {
+              "ddname": null,
+              "dsn": "SYS1.LINKLIB",
+              "disp": { "status": "SHR", "normal": "KEEP", "abnormal": "KEEP", "defaulted": ["normal", "abnormal"] },
+              "sysout": null,
+              "dummy": false,
+              "star": false,
+              "temp": false,
+              "referback": null,
+              "inlineData": null,
+              "params": {}
+            }
+          ]
+        },
+        {
+          "ddname": "SYSIN",
+          "dsn": null,
+          "disp": null,
+          "sysout": null,
+          "dummy": false,
+          "star": true,
+          "temp": false,
+          "referback": null,
+          "inlineData": ["CARD ONE OF INPUT", "CARD TWO OF INPUT"],
+          "params": {}
+        },
+        {
+          "ddname": "SYSPRINT",
+          "dsn": null,
+          "disp": null,
+          "sysout": "*",
+          "dummy": false,
+          "star": false,
+          "temp": false,
+          "referback": null,
+          "inlineData": null,
+          "params": {}
+        },
+        {
+          "ddname": "DUMMYDD",
+          "dsn": null,
+          "disp": null,
+          "sysout": null,
+          "dummy": true,
+          "star": false,
+          "temp": false,
+          "referback": null,
+          "inlineData": null,
+          "params": {}
+        }
+      ]
+    }
+  ],
+  "procs": {},
+  "comments": [
+    "JOB WITH CONCATENATED STEPLIB, INLINE SYSIN, DUMMY DD, AND AN",
+    "UNSUPPORTED CONDITIONAL-JCL CONSTRUCT (MUST SURFACE, NOT BE DROPPED)"
+  ],
+  "unrecognized": [
+    { "name": "", "operation": "IF", "operands": "(STEP01.RC EQ 0)", "comment": "THEN" },
+    { "name": "", "operation": "ENDIF", "operands": "", "comment": "" }
+  ]
+}

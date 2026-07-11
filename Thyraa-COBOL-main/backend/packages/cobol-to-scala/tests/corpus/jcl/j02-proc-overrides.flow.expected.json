@@ -1,0 +1,6 @@
+{
+  "datasets": {
+    "PROD.INPUT.FILE": { "writtenBy": [], "readBy": ["RUN01.PSTEP1"] },
+    "PROD.OUTPUT.FILE": { "writtenBy": ["RUN01.PSTEP1"], "readBy": ["RUN01.PSTEP2"] }
+  }
+}

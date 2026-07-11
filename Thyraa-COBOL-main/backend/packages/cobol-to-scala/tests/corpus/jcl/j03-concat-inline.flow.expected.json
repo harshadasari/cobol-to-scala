@@ -1,0 +1,7 @@
+{
+  "datasets": {
+    "PROD.LOADLIB": { "writtenBy": [], "readBy": ["STEP01"] },
+    "PROD.VENDOR.LOADLIB": { "writtenBy": [], "readBy": ["STEP01"] },
+    "SYS1.LINKLIB": { "writtenBy": [], "readBy": ["STEP01"] }
+  }
+}

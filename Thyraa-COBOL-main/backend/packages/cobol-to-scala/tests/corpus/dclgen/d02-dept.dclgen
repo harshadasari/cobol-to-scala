@@ -1,0 +1,21 @@
+      ******************************************************************
+      *  DCLGEN TABLE(HRSCHEMA.DEPT)                                  *
+      *  LIBRARY(HR.DCLGEN.COPYLIB(DEPT))                             *
+      *  QUOTE                                                         *
+      ******************************************************************
+    EXEC SQL DECLARE DEPT TABLE
+    ( DEPT_CODE                     CHAR(4) NOT NULL,
+      DEPT_NAME                     CHAR(20) NOT NULL,
+      MGR_ID                        INTEGER
+    ) END-EXEC.
+      ******************************************************************
+      *  COBOL DECLARATION FOR TABLE HRSCHEMA.DEPT                     *
+      ******************************************************************
+       01  DCLDEPT.
+      *    DEPT_CODE
+           10 DEPT-CODE              PIC X(4).
+      *    DEPT_NAME
+           10 DEPT-NAME              PIC X(20).
+      *    MGR_ID
+           10 MGR-ID                 PIC S9(9) USAGE COMP.
+      ****END OF DECLARATION*****

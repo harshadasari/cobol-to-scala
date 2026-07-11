@@ -1,0 +1,169 @@
+{
+  "job": {
+    "name": "BATCH02",
+    "accounting": null,
+    "programmer": null,
+    "class": "B",
+    "msgclass": "X",
+    "msglevel": null,
+    "params": {},
+    "dds": []
+  },
+  "steps": [
+    {
+      "name": "RUN01",
+      "program": null,
+      "proc": "MYPROC",
+      "parm": null,
+      "cond": null,
+      "overrides": { "OUTCLS": "Z" },
+      "dds": [],
+      "expandedSteps": [
+        {
+          "name": "RUN01.PSTEP1",
+          "program": "SORTPGM",
+          "parm": null,
+          "cond": null,
+          "dds": [
+            {
+              "ddname": "SORTIN",
+              "dsn": "PROD.INPUT.FILE",
+              "disp": { "status": "SHR", "normal": "KEEP", "abnormal": "KEEP", "defaulted": ["normal", "abnormal"] },
+              "sysout": null,
+              "dummy": false,
+              "star": false,
+              "temp": false,
+              "referback": null,
+              "inlineData": null,
+              "params": {}
+            },
+            {
+              "ddname": "SORTOUT",
+              "dsn": "PROD.OUTPUT.FILE",
+              "disp": { "status": "NEW", "normal": "CATLG", "abnormal": "DELETE", "defaulted": [] },
+              "sysout": null,
+              "dummy": false,
+              "star": false,
+              "temp": false,
+              "referback": null,
+              "inlineData": null,
+              "params": {}
+            },
+            {
+              "ddname": "SYSOUT",
+              "dsn": null,
+              "disp": null,
+              "sysout": "Z",
+              "dummy": false,
+              "star": false,
+              "temp": false,
+              "referback": null,
+              "inlineData": null,
+              "params": {}
+            }
+          ]
+        },
+        {
+          "name": "RUN01.PSTEP2",
+          "program": "PURGE",
+          "parm": "7",
+          "cond": null,
+          "dds": [
+            {
+              "ddname": "PURGEIN",
+              "dsn": "PROD.OUTPUT.FILE",
+              "disp": { "status": "SHR", "normal": "KEEP", "abnormal": "KEEP", "defaulted": ["normal", "abnormal"] },
+              "sysout": null,
+              "dummy": false,
+              "star": false,
+              "temp": false,
+              "referback": null,
+              "inlineData": null,
+              "params": {}
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "procs": {
+    "MYPROC": {
+      "name": "MYPROC",
+      "symbolics": { "OUTCLS": "A", "RETAIN": "7" },
+      "steps": [
+        {
+          "name": "PSTEP1",
+          "program": "SORTPGM",
+          "proc": null,
+          "parm": null,
+          "cond": null,
+          "overrides": {},
+          "dds": [
+            {
+              "ddname": "SORTIN",
+              "dsn": "PROD.INPUT.FILE",
+              "disp": { "status": "SHR", "normal": "KEEP", "abnormal": "KEEP", "defaulted": ["normal", "abnormal"] },
+              "sysout": null,
+              "dummy": false,
+              "star": false,
+              "temp": false,
+              "referback": null,
+              "inlineData": null,
+              "params": {}
+            },
+            {
+              "ddname": "SORTOUT",
+              "dsn": "PROD.OUTPUT.FILE",
+              "disp": { "status": "NEW", "normal": "CATLG", "abnormal": "DELETE", "defaulted": [] },
+              "sysout": null,
+              "dummy": false,
+              "star": false,
+              "temp": false,
+              "referback": null,
+              "inlineData": null,
+              "params": {}
+            },
+            {
+              "ddname": "SYSOUT",
+              "dsn": null,
+              "disp": null,
+              "sysout": "&OUTCLS",
+              "dummy": false,
+              "star": false,
+              "temp": false,
+              "referback": null,
+              "inlineData": null,
+              "params": {}
+            }
+          ]
+        },
+        {
+          "name": "PSTEP2",
+          "program": "PURGE",
+          "proc": null,
+          "parm": "&RETAIN",
+          "cond": null,
+          "overrides": {},
+          "dds": [
+            {
+              "ddname": "PURGEIN",
+              "dsn": "PROD.OUTPUT.FILE",
+              "disp": { "status": "SHR", "normal": "KEEP", "abnormal": "KEEP", "defaulted": ["normal", "abnormal"] },
+              "sysout": null,
+              "dummy": false,
+              "star": false,
+              "temp": false,
+              "referback": null,
+              "inlineData": null,
+              "params": {}
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "comments": [
+    "IN-STREAM PROC WITH SYMBOLIC DEFAULTS, INVOKED WITH AN OVERRIDE"
+  ],
+  "unrecognized": []
+}

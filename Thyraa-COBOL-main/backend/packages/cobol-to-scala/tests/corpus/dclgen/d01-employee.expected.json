@@ -1,0 +1,28 @@
+{
+  "tableName": "EMPLOYEE",
+  "recordName": "DCLEMPLOYEE",
+  "columns": [
+    { "name": "EMP_ID", "sqlType": "INTEGER", "precision": null, "scale": null, "nullable": false },
+    { "name": "EMP_NAME", "sqlType": "VARCHAR", "precision": 30, "scale": null, "nullable": false },
+    { "name": "SALARY", "sqlType": "DECIMAL", "precision": 9, "scale": 2, "nullable": true },
+    { "name": "HIRE_DATE", "sqlType": "DATE", "precision": null, "scale": null, "nullable": true },
+    { "name": "DEPT_CODE", "sqlType": "CHAR", "precision": 4, "scale": null, "nullable": false }
+  ],
+  "hostVariables": [
+    { "cobolName": "EMP-ID", "level": 10, "picture": "S9(9)", "usage": "COMP" },
+    { "cobolName": "EMP-NAME", "level": 10, "picture": null, "usage": null },
+    { "cobolName": "EMP-NAME-LEN", "level": 49, "picture": "S9(4)", "usage": "COMP" },
+    { "cobolName": "EMP-NAME-TEXT", "level": 49, "picture": "X(30)", "usage": "DISPLAY" },
+    { "cobolName": "SALARY", "level": 10, "picture": "S9(7)V99", "usage": "COMP-3" },
+    { "cobolName": "HIRE-DATE", "level": 10, "picture": "X(10)", "usage": "DISPLAY" },
+    { "cobolName": "DEPT-CODE", "level": 10, "picture": "X(4)", "usage": "DISPLAY" }
+  ],
+  "columnToHost": [
+    { "column": "EMP_ID", "hostVar": "EMP-ID" },
+    { "column": "EMP_NAME", "hostVar": "EMP-NAME" },
+    { "column": "SALARY", "hostVar": "SALARY" },
+    { "column": "HIRE_DATE", "hostVar": "HIRE-DATE" },
+    { "column": "DEPT_CODE", "hostVar": "DEPT-CODE" }
+  ],
+  "unrecognized": []
+}

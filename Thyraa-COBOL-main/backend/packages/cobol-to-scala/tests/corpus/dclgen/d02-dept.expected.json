@@ -1,0 +1,20 @@
+{
+  "tableName": "DEPT",
+  "recordName": "DCLDEPT",
+  "columns": [
+    { "name": "DEPT_CODE", "sqlType": "CHAR", "precision": 4, "scale": null, "nullable": false },
+    { "name": "DEPT_NAME", "sqlType": "CHAR", "precision": 20, "scale": null, "nullable": false },
+    { "name": "MGR_ID", "sqlType": "INTEGER", "precision": null, "scale": null, "nullable": true }
+  ],
+  "hostVariables": [
+    { "cobolName": "DEPT-CODE", "level": 10, "picture": "X(4)", "usage": "DISPLAY" },
+    { "cobolName": "DEPT-NAME", "level": 10, "picture": "X(20)", "usage": "DISPLAY" },
+    { "cobolName": "MGR-ID", "level": 10, "picture": "S9(9)", "usage": "COMP" }
+  ],
+  "columnToHost": [
+    { "column": "DEPT_CODE", "hostVar": "DEPT-CODE" },
+    { "column": "DEPT_NAME", "hostVar": "DEPT-NAME" },
+    { "column": "MGR_ID", "hostVar": "MGR-ID" }
+  ],
+  "unrecognized": []
+}

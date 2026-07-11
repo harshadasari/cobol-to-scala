@@ -12,6 +12,12 @@ _(none currently open - all prior pins resolved; see cycle entries. Tracked-OPEN
 
 ## Activity
 
+### 2026-07-11 16:10 — Cycles 25-27: rounds 8-9 committed; round-10 verdict + fix in flight
+- Round-8 fixes committed (8c570c4, 633/0/0, 132 programs): group BY REFERENCE marshalling, NUMVAL comma mode, comparison padding, group VALUE slicing + 9 survivor promotions (nested CALL chains, cross-CALL file I/O).
+- Round-9 fixes committed (3b254c8, 667/0/0, 144 programs): EVALUATE padding site, sign-preserving group marshalling, packed-aware VALUE slicing, subscripted-row MOVE, backward THRU fall-through, REMAINDER via stored quotient.
+- Round-10 refutation: NOT CONVERGED at 6, but ALL 6 attacks on round-9 fixes survived (fixes generalize). New territory findings: DECLARATIVES entirely unparsed (handlers run unconditionally), OPEN failure crashes instead of FILE STATUS 35, LINE SEQUENTIAL WRITE renders display text while READ decodes packed bytes (model mismatch - corruption for COMP-3 in files), WRITE of ODO records (compile error), ADD CORRESPONDING ROUNDED ignored + token leak, multi-target COMPUTE (inverted parser break - never worked).
+- Round-10 fix agent in flight. Trend: 11,16,15,16,6,6,8,4,6,6. Wall ~17h/48h; wrap-up planned by ~40h regardless of convergence.
+
 ### 2026-07-11 14:20 — Cycles 22-24: round-7 committed (23e74e2, verified 590/0/0); critic ALL-CLEAR; round-8 in fix
 - Round-7 fixes committed after orchestrator-run verification (590/0/0; one stale unit assertion reconciled against the a06 oracle before commit). 118 corpus programs.
 - Periodic completeness critic (independent, ran everything itself): NO BLOCKING findings. All 5 load-bearing claims reproduced exactly - incl. full re-capture of all 118 .oracle.txt from live cobc leaving the git tree byte-identical (fixture integrity proven). Advisories fixed in this entry: stale pinned blockers cleared, status snapshot updated, closing verification entry for 23e74e2 recorded (this entry), roadmap CALL/refmod gap placement to be folded into the final docs pass.

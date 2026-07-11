@@ -1,0 +1,25 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. THRUBWD3.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-COUNT  PIC 9(3) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-SECTION SECTION.
+       MAIN-PARA.
+           PERFORM PARA-C THRU PARA-A.
+           DISPLAY "BACK IN MAIN COUNT=" WS-COUNT.
+           STOP RUN.
+       WORK-SECTION SECTION.
+       PARA-A.
+           ADD 1 TO WS-COUNT.
+           DISPLAY "IN-PARA-A".
+       PARA-B.
+           ADD 10 TO WS-COUNT.
+           DISPLAY "IN-PARA-B".
+       PARA-C.
+           ADD 100 TO WS-COUNT.
+           DISPLAY "IN-PARA-C".
+       TAIL-SECTION SECTION.
+       PARA-D.
+           ADD 1000 TO WS-COUNT.
+           DISPLAY "IN-PARA-D".

@@ -25,6 +25,7 @@ import {
   setRecordFileRegistry,
   setAdvancingFiles as setAdvancingFilesExpr,
   setFileStatusRegistry as setFileStatusRegistryExpr,
+  setDeclarativeHandlers as setDeclarativeHandlersExpr,
   setCallProgramRegistry,
   generateCobolFmtHelper,
   generateCobolInspectHelper,
@@ -38,6 +39,7 @@ import {
 import {
   generateMethod,
   generateAllMethods,
+  generateSectionMethod,
   toMethodName,
   flattenProcedureUnits,
   collectAmbiguousParagraphNames,
@@ -49,6 +51,7 @@ import {
   generateFileHandleDeclarations,
   setAdvancingFiles as setAdvancingFilesFileIO,
   setFileStatusRegistry as setFileStatusRegistryFileIO,
+  setDeclarativeHandlers as setDeclarativeHandlersFileIO,
 } from './file-io-gen.js';
 import { generateSql, generateDoobieImports, generateTransactorSetup } from './sql-gen.js';
 
@@ -1279,6 +1282,13 @@ function buildFieldRegistry(ast) {
           // camelCases when it needs an actual Scala identifier.
           ascending: (occ.ascending || []).map(n => String(n).toUpperCase()),
           descending: (occ.descending || []).map(n => String(n).toUpperCase()),
+          // OCCURS ... DEPENDING ON (round-10 finding 4): the live counter
+          // field's own camelCase flat-var name (or null for a fixed-size
+          // OCCURS table) - lets a WRITE of the enclosing record build a
+          // variable-length concatenation driven by the counter's *current*
+          // runtime value instead of always writing the fixed max count
+          // (see expression-gen.js's odoDisplayValueExpr).
+          dependingOn: occ.dependingOn ? toCamelCase(occ.dependingOn) : null,
         });
 
         (occ.indexedBy || []).forEach((idxName, i) => {
@@ -1462,6 +1472,7 @@ function buildFieldRegistry(ast) {
           decimalDigits: fillerPic?.decimalDigits || 0,
           signed: !!(fillerPic && fillerPic.signed),
           editPattern: null,
+          usage: (item.usage || 'DISPLAY').toUpperCase(),
           occursDepth: fullChain.length,
           picLength: fillerPic?.length || 0,
           justified: false,
@@ -1516,6 +1527,14 @@ function buildFieldRegistry(ast) {
         decimalDigits: pic?.decimalDigits || 0,
         signed: !!(pic && pic.signed),
         editPattern: pic?.editPattern || null,
+        // round-10 finding 3: this item's own USAGE clause (upper, defaults
+        // to 'DISPLAY') - lets expression-gen.js's WRITE codegen tell a
+        // packed/binary (non-DISPLAY) group child apart from a plain
+        // zoned-DISPLAY one, which is what decides whether a WRITE of the
+        // whole group must go through the record's byte-level format()
+        // instead of the plain display-text concatenation path (see
+        // groupContainsNonDisplay/writeContentAndMode).
+        usage: (item.usage || 'DISPLAY').toUpperCase(),
         occursDepth: fullChain.length,
         // Same per-level occurs counts, outer dimension first, used to build
         // `defaultExpr`'s own nested Vector.fill above - kept on the info
@@ -1841,18 +1860,23 @@ function generateEnums(ast, indent = 0) {
 function splitProcedureDivision(ast) {
   // Format 1: ast.procedure.paragraphs (nested format) - no sections in this shape.
   if (ast.procedure?.paragraphs && Array.isArray(ast.procedure.paragraphs)) {
-    return { topLevelParagraphs: ast.procedure.paragraphs, sections: [] };
+    return { topLevelParagraphs: ast.procedure.paragraphs, sections: [], declaratives: [] };
   }
   // Format 2: ast.procedures is a ProcedureDivision object with paragraphs + sections.
   if (ast.procedures?.paragraphs && Array.isArray(ast.procedures.paragraphs)) {
     const sections = Array.isArray(ast.procedures.sections) ? ast.procedures.sections : [];
-    return { topLevelParagraphs: ast.procedures.paragraphs, sections };
+    // round-10 finding 1: DECLARATIVES ... END DECLARATIVES SECTIONs (see
+    // parser/procedure-parser.js's parseDeclaratives) - deliberately kept
+    // separate from `sections` above (never flattened into the normal
+    // fall-through flow generateProgramFlowLines/generateAllMethods build).
+    const declaratives = Array.isArray(ast.procedures.declaratives) ? ast.procedures.declaratives : [];
+    return { topLevelParagraphs: ast.procedures.paragraphs, sections, declaratives };
   }
   // Format 3: ast.procedures is an array directly.
   if (Array.isArray(ast.procedures)) {
-    return { topLevelParagraphs: ast.procedures, sections: [] };
+    return { topLevelParagraphs: ast.procedures, sections: [], declaratives: [] };
   }
-  return { topLevelParagraphs: [], sections: [] };
+  return { topLevelParagraphs: [], sections: [], declaratives: [] };
 }
 
 /**
@@ -1862,6 +1886,79 @@ function splitProcedureDivision(ast) {
 function generateMethods(ast, indent = 1) {
   const { topLevelParagraphs, sections } = splitProcedureDivision(ast);
   return generateAllMethods(topLevelParagraphs, sections, indent);
+}
+
+/**
+ * round-10 finding 1: generate one Scala method per DECLARATIVES SECTION
+ * (reusing generateSectionMethod exactly as an ordinary section would use
+ * it - a DECLARATIVES section is structurally identical, just excluded from
+ * `sections`/the normal fall-through chain, see splitProcedureDivision), plus
+ * the two lookup registries (fileName -> method name, mode -> method name)
+ * file-io-gen.js's generateOpen and expression-gen.js's generateReadStatement
+ * consult to invoke the right one on a file-operation failure - see those
+ * modules' own setDeclarativeHandlers/declarativeHandlerFor.
+ *
+ * Only a `USE AFTER [STANDARD] ERROR PROCEDURE ON ...` clause (useClause.kind
+ * === 'ERROR') is wired into either registry; any other USE form
+ * (useClause.kind === 'UNSUPPORTED', e.g. USE FOR DEBUGGING) still gets its
+ * body compiled into a real (if arguably unreachable) method - an honest,
+ * visible TODO comment marks it as never invoked, rather than silently
+ * dropping the section or guessing at a wiring this generator doesn't
+ * understand.
+ *
+ * Returns `{ methods: '', fileHandlers: new Map(), modeHandlers: new Map() }`
+ * for the overwhelmingly common case (no DECLARATIVES at all) - a pure
+ * no-op, so every one of the 144 pre-existing corpus programs (none of which
+ * use DECLARATIVES) is completely unaffected.
+ */
+function generateDeclarativeSupport(ast, indent = 1) {
+  const { declaratives } = splitProcedureDivision(ast);
+  const fileHandlers = new Map();
+  const modeHandlers = new Map();
+  if (!declaratives || declaratives.length === 0) {
+    return { methods: '', fileHandlers, modeHandlers };
+  }
+
+  const methodTexts = [];
+  for (const decl of declaratives) {
+    const methodName = toMethodName(decl.name);
+    const useClause = decl.useClause;
+
+    if (!useClause || useClause.kind !== 'ERROR') {
+      methodTexts.push(
+        `${'  '.repeat(indent)}// DECLARATIVES SECTION "${decl.name}": unsupported USE form - ` +
+        'compiled below but never invoked from any file-operation failure path'
+      );
+    }
+
+    methodTexts.push(generateSectionMethod(decl, indent, new Set()));
+    // generateSectionMethod's own nested fall-through steps call each
+    // paragraph's *flat top-level method* by name (exactly like
+    // generateAllMethods' ordinary-section handling does) - that flat
+    // method has to actually exist somewhere, which generateSectionMethod
+    // itself does not generate (mirrors generateAllMethods, which always
+    // emits both: one flat method per paragraph, plus the section wrapper).
+    // A paragraphless section (direct statements under the SECTION header)
+    // needs no separate paragraph methods - generateSectionMethod's own
+    // returned method already IS the flat method in that case.
+    if (decl.paragraphs && decl.paragraphs.length > 0) {
+      for (const para of decl.paragraphs) {
+        methodTexts.push(generateMethod(para, indent));
+      }
+    }
+
+    if (useClause && useClause.kind === 'ERROR') {
+      for (const target of useClause.targets || []) {
+        if (target.kind === 'FILE' && target.name) {
+          fileHandlers.set(String(target.name).toUpperCase(), methodName);
+        } else if (target.kind) {
+          modeHandlers.set(String(target.kind).toUpperCase(), methodName);
+        }
+      }
+    }
+  }
+
+  return { methods: methodTexts.join('\n\n'), fileHandlers, modeHandlers };
 }
 
 /**
@@ -1994,6 +2091,15 @@ export function generateScala(ast, options = {}) {
   setFileStatusRegistryExpr(fileStatusRegistry);
   setFileStatusRegistryFileIO(fileStatusRegistry);
 
+  // DECLARATIVES `USE AFTER STANDARD ERROR PROCEDURE` handler methods +
+  // registries (round-10 finding 1) - built before generateMethods/
+  // generateMainMethod below (which generate the OPEN/READ statements that
+  // consult these registries) and before file-io-gen.js's generateOpen is
+  // ever invoked for this program.
+  const declarativeSupport = generateDeclarativeSupport(ast, 1);
+  setDeclarativeHandlersExpr(declarativeSupport.fileHandlers, declarativeSupport.modeHandlers);
+  setDeclarativeHandlersFileIO(declarativeSupport.fileHandlers, declarativeSupport.modeHandlers);
+
   // Package declaration, imports, and the embedded runtime helper objects
   // (CobolCodecs/CobolFmt/CobolInspect/CobolUnstring) - skipped when
   // `opts.skipPreamble` is set (round-7 finding 1: generateMultiProgramScala
@@ -2117,6 +2223,18 @@ export function generateScala(ast, options = {}) {
     sections.push('');
     sections.push('  // Database connection');
     sections.push(generateTransactorSetup(opts.dbConfig || {}, 1));
+  }
+
+  // DECLARATIVES error-handler methods (round-10 finding 1) - generated
+  // ahead of the ordinary PROCEDURE DIVISION methods below, but excluded
+  // from `sections`/normal PERFORM/fall-through resolution entirely (see
+  // splitProcedureDivision) - only reachable via the file-I/O failure paths
+  // wired up in file-io-gen.js's generateOpen/expression-gen.js's
+  // generateReadStatement.
+  if (declarativeSupport.methods) {
+    sections.push('');
+    sections.push('  // DECLARATIVES (USE AFTER ERROR PROCEDURE handlers)');
+    sections.push(declarativeSupport.methods);
   }
 
   // Methods from procedures

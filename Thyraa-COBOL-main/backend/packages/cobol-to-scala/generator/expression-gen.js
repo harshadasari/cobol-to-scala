@@ -249,6 +249,28 @@ function fileStatusVarFor(fileName) {
   return FILE_STATUS_REGISTRY.get(String(fileName || '').toUpperCase()) || null;
 }
 
+/**
+ * round-10 finding 1: DECLARATIVES handler registries, mirroring
+ * file-io-gen.js's own identical copy (see that module's doc comment for the
+ * full rationale) - this module needs its own copy because READ (below) is
+ * generated here, independently of file-io-gen.js's OPEN/CLOSE.
+ */
+let DECL_FILE_HANDLERS = new Map();
+let DECL_MODE_HANDLERS = new Map();
+
+export function setDeclarativeHandlers(fileHandlers, modeHandlers) {
+  DECL_FILE_HANDLERS = fileHandlers instanceof Map ? fileHandlers : new Map();
+  DECL_MODE_HANDLERS = modeHandlers instanceof Map ? modeHandlers : new Map();
+}
+
+function declarativeHandlerFor(fileName, mode) {
+  return (
+    DECL_FILE_HANDLERS.get(String(fileName || '').toUpperCase()) ||
+    DECL_MODE_HANDLERS.get(String(mode || '').toUpperCase()) ||
+    null
+  );
+}
+
 /** The FD file name a WRITE/REWRITE of `recordName` actually belongs to - falls back to the record's own name when it isn't a registered FD record (defensive; every corpus program's record is registered). */
 function fileNameForRecord(recordName) {
   return RECORD_FILE_REGISTRY.get(String(recordName || '').toUpperCase()) || recordName;
@@ -1767,14 +1789,20 @@ export function generateCompute(statement, indent = 0) {
   // storeNumericExpr. The exact (unrounded, untruncated) BigDecimal result
   // (resultBD) is reused both for that per-target coercion and for the ON
   // SIZE ERROR digit-capacity test below.
+  //
+  // round-10 finding 6: `COMPUTE A B ROUNDED C = expr` applies ROUNDED to
+  // only the target(s) it immediately follows - each target's OWN
+  // `.rounded` flag (set by parseComputeStatement) is authoritative; a
+  // target with no ROUNDED of its own truncates, even though
+  // `statement.rounded` (true if ANY target in the statement had ROUNDED)
+  // is also true in that case.
   const resultBD = toBigDecimalOperand(statement.expression);
   const rawExpr = convertArithmeticExpression(statement.expression);
-  const rounded = !!statement.rounded;
   const keyword = statement.isNew ? 'val ' : '';
   const entries = targets.map(target => ({
     target,
     resultBD,
-    finalExpr: storeNumericExpr(target, resultBD, rawExpr, rounded),
+    finalExpr: storeNumericExpr(target, resultBD, rawExpr, target?.rounded === true),
   }));
 
   if (!hasSizeErrorClause(statement)) {
@@ -2617,15 +2645,16 @@ function generateAddCorresponding(statement, indent = 0) {
 
   // Each matched pair is stored through the same ROUNDED-or-truncated
   // store-time coercion every other arithmetic statement now uses (round-3
-  // findings 8/13) - ADD CORRESPONDING has no ROUNDED clause support in this
-  // parser (see parseAddStatement's CORRESPONDING branch), so this always
-  // truncates rather than rounds, same as any other unrounded arithmetic
-  // target.
+  // findings 8/13). round-10 finding 5: `ADD CORRESPONDING ... ROUNDED` is
+  // now parsed (parseAddStatement's CORRESPONDING branch) into
+  // `statement.rounded` - CORRESPONDING has exactly one implicit target
+  // group, so a single statement-level flag applies to every matched pair.
+  const rounded = !!statement.rounded;
   return pairs
     .map(pair => {
       const sumBD = `(${fieldRefToBigDecimalExpr(pair.targetCamel, pair.targetInfo)} + ${fieldRefToBigDecimalExpr(pair.sourceCamel, pair.sourceInfo)})`;
       const rawExpr = `${pair.targetCamel} + (${coerceCorrespondingValue(pair)})`;
-      return `${indentStr}${pair.targetCamel} = ${storeNumericByInfo(pair.targetInfo, sumBD, rawExpr, false)}`;
+      return `${indentStr}${pair.targetCamel} = ${storeNumericByInfo(pair.targetInfo, sumBD, rawExpr, rounded)}`;
     })
     .join('\n');
 }
@@ -2654,11 +2683,13 @@ function generateSubtractCorresponding(statement, indent = 0) {
     return `${indentStr}() // SUBTRACT CORRESPONDING ${sourceUpper} FROM ${targetUpper}: no matching child field names found in the group registry`;
   }
 
+  // round-10 finding 5 (same audit applied to SUBTRACT CORRESPONDING).
+  const rounded = !!statement.rounded;
   return pairs
     .map(pair => {
       const diffBD = `(${fieldRefToBigDecimalExpr(pair.targetCamel, pair.targetInfo)} - ${fieldRefToBigDecimalExpr(pair.sourceCamel, pair.sourceInfo)})`;
       const rawExpr = `${pair.targetCamel} - (${coerceCorrespondingValue(pair)})`;
-      return `${indentStr}${pair.targetCamel} = ${storeNumericByInfo(pair.targetInfo, diffBD, rawExpr, false)}`;
+      return `${indentStr}${pair.targetCamel} = ${storeNumericByInfo(pair.targetInfo, diffBD, rawExpr, rounded)}`;
     })
     .join('\n');
 }
@@ -4235,6 +4266,150 @@ export function groupDisplayValueExpr(groupKey) {
 }
 
 /**
+ * round-10 finding 3/4: USAGE clauses whose on-disk storage is NOT plain
+ * zoned-DISPLAY digit/character bytes - packed decimal, binary, and the two
+ * floating-point USAGEs. A WRITE of a record containing any of these must
+ * round-trip the record's own true byte-level encoding (CobolCodecs, via the
+ * record's generated case-class format()) rather than groupDisplayValueExpr's
+ * display-text convention, which silently produced bytes a real cobc READ of
+ * the same record could never have written in the first place (x03: a
+ * COMP-3 field's *unsigned digit text* was written, then the very next READ
+ * tried to packedDecode those ASCII digit bytes as if they were packed
+ * decimal - a guaranteed crash/corruption, never a plausible cobc byte
+ * layout at all).
+ */
+const NON_DISPLAY_USAGES = new Set([
+  'COMP-3', 'COMPUTATIONAL-3', 'PACKED-DECIMAL',
+  'COMP', 'COMP-4', 'COMP-5', 'BINARY', 'COMPUTATIONAL', 'COMPUTATIONAL-4', 'COMPUTATIONAL-5',
+  'COMP-1', 'COMPUTATIONAL-1', 'COMP-2', 'COMPUTATIONAL-2',
+]);
+
+function isNonDisplayUsage(usage) {
+  return NON_DISPLAY_USAGES.has(String(usage || '').toUpperCase());
+}
+
+/**
+ * True when `groupKey`'s own children (recursing into nested groups; an
+ * OCCURS table's own elementary USAGE counts too) include at least one
+ * non-DISPLAY field anywhere - see isNonDisplayUsage. Drives
+ * writeRecordPlan's mode selection: true routes a WRITE of this record
+ * through the byte-level case-class format() path (writeByteConstructorExpr)
+ * instead of the plain display-text concatenation
+ * (writeGroupDisplayValueExpr) - see that function's own doc comment for why
+ * the two paths are genuinely incompatible, not just cosmetically different.
+ */
+function groupContainsNonDisplay(groupKey) {
+  const children = GROUP_REGISTRY.get(groupKey);
+  if (!children || children.length === 0) return false;
+  for (const c of children) {
+    if (c.groupKey && groupContainsNonDisplay(c.groupKey)) return true;
+    if (!c.groupKey && c.info && isNonDisplayUsage(c.info.usage)) return true;
+  }
+  return false;
+}
+
+/**
+ * Builds the `<Child1>, <Child2>, ...` constructor-argument list needed to
+ * instantiate this group's own generated case class from its CURRENT flat-var
+ * values (`<ClassName>(<args>)`), for writeByteLevelLines's `.format(...)`
+ * call. Each plain elementary child contributes its own flat-var camel
+ * identifier directly (case-class-gen.js gives every real child its own
+ * same-named, same-order constructor parameter - see generateCaseClass);
+ * a nested group child recurses into its own constructor call
+ * (`<NestedClassName>(<nested-args>)`).
+ *
+ * Returns `null` (not a guessed/wrong constructor call) for any shape this
+ * can't safely build - a FILLER child (no established flat-var <-> case-class
+ * constructor-slot correspondence, same restriction generateGroupMove's own
+ * differing-layout path already documents), an OCCURS table child (fixed or
+ * ODO - a case class's own `format()` always writes the table at its FIXED
+ * max width, which is exactly wrong for an ODO table's variable-length WRITE;
+ * combining COMP-3/binary fields with an OCCURS table in the same record is
+ * consequently left as an honest, visible TODO rather than a silently wrong
+ * byte layout - see writeRecordPlan), a nested group whose case-class name is
+ * ambiguous across two different records, or a child with no registry info
+ * at all.
+ */
+function groupChildConstructorExpr(groupKey) {
+  const children = GROUP_REGISTRY.get(groupKey);
+  if (!children || children.length === 0) return null;
+
+  const parts = [];
+  for (const c of children) {
+    if (c.isFiller) return null;
+    if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) return null;
+    if (c.groupKey) {
+      const nestedClassName = toPascalCase(c.nameUpper);
+      if (AMBIGUOUS_GROUP_CLASS_NAMES.has(nestedClassName)) return null;
+      const nestedArgs = groupChildConstructorExpr(c.groupKey);
+      if (nestedArgs == null) return null;
+      parts.push(`${nestedClassName}(${nestedArgs})`);
+      continue;
+    }
+    if (!c.info || !c.camel) return null;
+    parts.push(c.camel);
+  }
+  return parts.join(', ');
+}
+
+/**
+ * round-10 finding 4: the DISPLAY-only-ODO variant of groupDisplayValueExpr -
+ * identical for every plain child, but a TABLE_REGISTRY child with a live
+ * OCCURS ... DEPENDING ON counter (`tableInfo.dependingOn`, see
+ * scala-generator.js's tableRegistry construction) contributes exactly
+ * `dependingOn`-many elements' worth of digit text (the table's *current*
+ * runtime length), not the fixed max occurrence count
+ * groupDisplayValueExpr's own unconditional bail-out on any OCCURS child
+ * refuses to guess at. A fixed-size (no DEPENDING ON) OCCURS child, or one
+ * whose own USAGE is non-DISPLAY (packed+ODO - see writeRecordPlan, an
+ * honest TODO instead), still bails out to `null` exactly like
+ * groupDisplayValueExpr always has - only the ODO+DISPLAY combination is new
+ * here. A separate function (not folded into groupDisplayValueExpr itself)
+ * specifically so this new ODO-aware behavior is scoped to the WRITE path
+ * (writeRecordPlan) alone - every other groupDisplayValueExpr caller (bare
+ * whole-group DISPLAY, READ's group-mode fallback text) is completely
+ * unaffected, since cobc's own DISPLAY-of-an-ODO-group behavior has not been
+ * independently oracle-verified the way the WRITE case has (x04).
+ */
+function odoDisplayValueExpr(groupKey) {
+  const children = GROUP_REGISTRY.get(groupKey);
+  if (!children || children.length === 0) return null;
+
+  const parts = [];
+  for (const c of children) {
+    if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) {
+      const tableInfo = TABLE_REGISTRY.get(c.nameUpper);
+      if (!tableInfo || !tableInfo.dependingOn || !c.info || isNonDisplayUsage(c.info.usage)) return null;
+      const info = c.info;
+      const asBDExpr = info.scalaType === 'BigDecimal' ? `${c.camel}(i)` : `BigDecimal(${c.camel}(i))`;
+      const digitsText = `CobolFmt.digitsOf(${asBDExpr}, ${info.integerDigits || 0}, ${info.decimalDigits || 0})`;
+      const elemExpr = info.signed
+        ? `((if ${asBDExpr} < BigDecimal(0) then "-" else "+") + ${digitsText})`
+        : digitsText;
+      parts.push(`(0 until (${tableInfo.dependingOn}).toInt).map(i => ${elemExpr}).mkString`);
+      continue;
+    }
+    if (c.groupKey) {
+      const nested = odoDisplayValueExpr(c.groupKey);
+      if (nested == null) return null;
+      parts.push(nested);
+      continue;
+    }
+    const info = c.info;
+    if (!info) return null;
+    if (info.scalaType === 'String') {
+      const width = info.picLength || 0;
+      parts.push(width > 0 ? `CobolFmt.fitLeft(${c.camel}, ${width})` : c.camel);
+    } else {
+      const asBD = info.scalaType === 'BigDecimal' ? c.camel : `BigDecimal(${c.camel})`;
+      const digitsText = `CobolFmt.digitsOf(${asBD}, ${info.integerDigits}, ${info.decimalDigits})`;
+      parts.push(info.signed ? `((if ${asBD} < BigDecimal(0) then "-" else "+") + ${digitsText})` : digitsText);
+    }
+  }
+  return parts.join(' + ');
+}
+
+/**
  * round-8 finding 1: the inverse of groupDisplayValueExpr - scatters a
  * previously-concatenated whole-group string (produced by
  * groupDisplayValueExpr for this *same* group, byte-for-byte - see the
@@ -4930,7 +5105,15 @@ function readAssignLines(dest, lineExpr, indentStr) {
   }
   if (dest.mode === 'group') {
     const fitted = dest.width > 0 ? `CobolFmt.fitLeft(${lineExpr}, ${dest.width})` : lineExpr;
-    const lines = [`${indentStr}val _parsed = ${dest.className}.parse((${fitted}).getBytes)`];
+    // round-10 finding 3 companion: explicit ISO-8859-1 (not the platform
+    // default charset) so this matches the identity byte<->char mapping the
+    // file's own reader now uses (generateOpen's INPUT case) - required for
+    // a non-DISPLAY (COMP-3/binary) child's raw bytes to decode correctly;
+    // a no-op for a plain-ASCII (DISPLAY-only) group, which is what every
+    // existing corpus program exercising this path (e.g. u12) already is.
+    const lines = [
+      `${indentStr}val _parsed = ${dest.className}.parse((${fitted}).getBytes(java.nio.charset.StandardCharsets.ISO_8859_1))`,
+    ];
     for (const c of dest.children) {
       lines.push(`${indentStr}${c.camel} = _parsed.${c.ccField}`);
     }
@@ -5024,6 +5207,14 @@ function generateReadStatement(statement, indent = 0) {
     lines.push(`${indentStr}  ${statusVar} = "00"`);
     lines.push(`${indentStr}else`);
     lines.push(`${indentStr}  ${statusVar} = "10"`);
+    // round-10 finding 1: no AT END clause on this READ means nothing else
+    // handles the end-of-file condition - a registered DECLARATIVES
+    // handler for this file (or its INPUT mode generically) fires here,
+    // exactly like an OPEN failure does (file-io-gen.js's generateOpen).
+    const readHandler = declarativeHandlerFor(fileName, 'INPUT');
+    if (readHandler) {
+      lines.push(`${indentStr}  ${readHandler}()`);
+    }
   } else {
     lines.push(`${indentStr}val _record = ${iteratorVar}.nextOption()`);
     if (dest.mode !== 'none') {
@@ -5047,27 +5238,59 @@ function generateReadStatement(statement, indent = 0) {
 }
 
 /**
- * Scala expression for the current display-text content of `recordName` - a
- * flat elementary var if it's registered as one, or (a group FD record, e.g.
- * a record containing FILLER between named fields, s06/finding 3's own FD
- * shape) the same raw-storage concatenation groupDisplayValueExpr builds for
- * DISPLAY of a whole group. `record` (not `record.stripTrailing()` etc.) is
- * still the field's own fully space-padded storage - trimming to match
- * cobc's LINE SEQUENTIAL WRITE behavior happens once, at the call site
- * (generateWriteStatement), not here.
+ * round-10 finding 3/4: decide (and build) how a WRITE of `recordName`
+ * should render its record content:
+ *   - `{ mode: 'elementary', expr }` - `recordName` is itself a plain
+ *     elementary flat var (unchanged pre-round-10 behavior).
+ *   - `{ mode: 'bytes', className, ctorArgs }` - a group containing at least
+ *     one non-DISPLAY (packed/binary/float) child (groupContainsNonDisplay):
+ *     the record's own on-disk bytes are the ONLY correct representation
+ *     (x03) - generateWriteStatement routes this through the case class's
+ *     own `.format(...)`, written as raw (ISO-8859-1-identity-mapped) bytes,
+ *     never through display-text concatenation.
+ *   - `{ mode: 'bytes-unsupported' }` - needed byte-level (non-DISPLAY child
+ *     present) but groupChildConstructorExpr couldn't safely build the
+ *     constructor call (a FILLER, an OCCURS table, or an ambiguous nested
+ *     group name got in the way) - generateWriteStatement emits a visible,
+ *     compiling TODO marker instead of a wrong/guessed byte layout.
+ *   - `{ mode: 'text', expr }` - pure-DISPLAY group (including one with a
+ *     DISPLAY-only OCCURS ... DEPENDING ON child, x04 - odoDisplayValueExpr)
+ *     or a group groupDisplayValueExpr can otherwise render - the existing,
+ *     unchanged display-text concatenation path (trailing-space stripping
+ *     at the WRITE call site is what every existing DISPLAY-only file-I/O
+ *     corpus program, e.g. s01/t01-t06/u12, already depends on).
+ *   - `{ mode: 'text', expr: <bare camelCase fallback> }` - nothing else
+ *     resolved (matches the old, pre-round-10 fallback exactly).
  */
-function recordContentExpr(recordName) {
+function writeRecordPlan(recordName) {
   const info = lookupField(recordName);
   if (info) {
     const camel = info.camel;
     if (info.dataType === 'numeric') {
       const asBigDecimal = info.scalaType === 'BigDecimal' ? camel : `BigDecimal(${camel})`;
-      return `CobolFmt.num(${asBigDecimal}, ${info.integerDigits}, ${info.decimalDigits}, ${info.signed}, ${DECIMAL_POINT_IS_COMMA})`;
+      return { mode: 'elementary', expr: `CobolFmt.num(${asBigDecimal}, ${info.integerDigits}, ${info.decimalDigits}, ${info.signed}, ${DECIMAL_POINT_IS_COMMA})` };
     }
-    return camel;
+    return { mode: 'elementary', expr: camel };
   }
-  const groupExpr = groupDisplayValueExpr(resolveGroupKey(String(recordName || '').toUpperCase()));
-  return groupExpr ? `(${groupExpr})` : toCamelCase(recordName);
+
+  const nameUpper = String(recordName || '').toUpperCase();
+  const groupKey = resolveGroupKey(nameUpper);
+  const isGroup = GROUP_REGISTRY.has(groupKey) && !AMBIGUOUS_GROUP_CLASS_NAMES.has(toPascalCase(nameUpper));
+
+  if (isGroup && groupContainsNonDisplay(groupKey)) {
+    const ctorArgs = groupChildConstructorExpr(groupKey);
+    if (ctorArgs == null) return { mode: 'bytes-unsupported' };
+    return { mode: 'bytes', className: toPascalCase(nameUpper), ctorArgs };
+  }
+
+  if (isGroup) {
+    const odoExpr = odoDisplayValueExpr(groupKey);
+    if (odoExpr) return { mode: 'text', expr: `(${odoExpr})` };
+    const groupExpr = groupDisplayValueExpr(groupKey);
+    if (groupExpr) return { mode: 'text', expr: `(${groupExpr})` };
+  }
+
+  return { mode: 'text', expr: toCamelCase(recordName) };
 }
 
 /**
@@ -5138,14 +5361,36 @@ function generateWriteStatement(statement, indent = 0) {
   const recordName = statement.recordName || statement.record || 'record';
   const fileName = fileNameForRecord(recordName);
   const { writerVar } = fileHandleVarNames(fileName);
-  const contentExpr = statement.from
-    ? recordContentExpr(statement.from.name || statement.from)
-    : recordContentExpr(recordName);
+  const sourceName = statement.from ? (statement.from.name || statement.from) : recordName;
+  const plan = writeRecordPlan(sourceName);
   // round-6 finding 2/3 companion: this generator never models a WRITE
   // failure path, so a registered FILE STATUS field always goes to "00"
   // (successful write) here - see FILE_STATUS_REGISTRY's doc comment.
   const statusVar = fileStatusVarFor(fileName);
   const statusSuffix = statusVar ? ` ${statusVar} = "00"` : '';
+
+  // round-10 finding 3: a record containing a non-DISPLAY (packed/binary/
+  // float) child must be written through its own byte-level format(), not
+  // the display-text concatenation path below - see writeRecordPlan's doc
+  // comment. Not modeled against the ADVANCING carriage-control model at all
+  // (no corpus program combines the two - packed/binary FD records with
+  // ADVANCING WRITE - so this always uses the plain "bytes + one newline"
+  // shape cobc itself produces for LINE SEQUENTIAL, x03).
+  if (plan.mode === 'bytes') {
+    const bytesExpr = `${plan.className}.format(${plan.className}(${plan.ctorArgs}))`;
+    const textExpr = `new String(${bytesExpr}, java.nio.charset.StandardCharsets.ISO_8859_1)`;
+    return statusVar
+      ? `${indentStr}{ ${writerVar}.print(${textExpr}); ${writerVar}.print("\\n");${statusSuffix} }`
+      : `${indentStr}{ ${writerVar}.print(${textExpr}); ${writerVar}.print("\\n") }`;
+  }
+  if (plan.mode === 'bytes-unsupported') {
+    return (
+      `${indentStr}() // TODO: WRITE ${sourceName}: a byte-level (non-DISPLAY-child) record with a FILLER/OCCURS ` +
+      'child is not supported (see tests/oracle/README.md known gaps); record not written'
+    );
+  }
+
+  const contentExpr = plan.expr;
 
   if (!ADVANCING_FILES.has(String(fileName || '').toUpperCase())) {
     return statusVar

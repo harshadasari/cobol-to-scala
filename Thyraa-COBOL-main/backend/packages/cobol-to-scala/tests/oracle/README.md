@@ -176,29 +176,29 @@ through this data-driven suite.
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 144 corpus programs found
-(19 under `data/`, 125 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+**cobc oracle capture / expected-vs-oracle check** - 156 corpus programs found
+(19 under `data/`, 137 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
 excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
 precompiler, see `tests/sql.test.js` instead; two round-9 repros, `w09`/`w12`, are
 deliberately excluded entirely - see the round-9 table below - since cobc itself
-rejects them), all 144 compiled and ran cleanly under cobc (exit 0). 28 of the 144
+rejects them), all 156 compiled and ran cleanly under cobc (exit 0). 28 of the 156
 (19 `data/` + 9 `proc/` baseline programs) already have a hand-written `.expected.txt`
 that matches the captured `.oracle.txt` exactly - 0 mismatches. The 20 `r01`-`r14*`,
 15 `n01`-`n16*`, 16 `q01`-`q12*`, 14 `s01`-`s12*`, 11 `t01`-`t12*` (`t09` excluded),
-14 `u01`-`u13*`, 12 `v01`-`v12*`, and 12 `w01`-`w14*` (`w09`/`w12` excluded) programs
-have no hand-written `.expected.txt` by design (they're verified directly against
-cobc via `oracleCompare()` below, not a separately hand-authored expectation) and
-show up here as a diagnostic-only capture ("no `<name>.expected.txt` alongside ...
-yet").
+14 `u01`-`u13*`, 12 `v01`-`v12*`, 12 `w01`-`w14*` (`w09`/`w12` excluded), and 12
+`x01`-`x12` programs have no hand-written `.expected.txt` by design (they're
+verified directly against cobc via `oracleCompare()` below, not a separately
+hand-authored expectation) and show up here as a diagnostic-only capture ("no
+`<name>.expected.txt` alongside ... yet").
 
 **Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
 end-to-end (0 todo).
 
-**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 125/125 programs
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 137/137 programs
 match end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
 `q01`-`q12*`, all 14 `s01`-`s12*`, all 11 `t01`-`t12*` (`t09` excluded), all 14
-`u01`-`u13*`, all 12 `v01`-`v12*`, and all 12 `w01`-`w14*` (`w09`/`w12` excluded)
-adversarial-refutation programs below.
+`u01`-`u13*`, all 12 `v01`-`v12*`, all 12 `w01`-`w14*` (`w09`/`w12` excluded), and
+all 12 `x01`-`x12` adversarial-refutation programs below.
 
 ### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
@@ -428,6 +428,46 @@ has found: a program real COBOL itself refuses to compile is not a
 meaningful oracle comparison target. See `tests/round9-fixes.test.js` for
 focused, toolchain-independent unit tests of all 6 fixes above.
 
+### Round-10 adversarial-refutation findings (x01-x12) and their fixes
+
+A round-10 refuter found 6 more root-cause dishonest divergences: DECLARATIVES/
+`USE AFTER STANDARD ERROR PROCEDURE` had ZERO parser handling at all (the
+whole block silently ran unconditionally at program start), an OPEN failure
+crashed with a raw Java exception instead of setting FILE STATUS, WRITE and
+READ used two flatly incompatible byte models for the same non-DISPLAY
+(COMP-3/binary) record shape, WRITE of an `OCCURS ... DEPENDING ON` record
+referenced a nonexistent bare variable, ADD/SUBTRACT CORRESPONDING never
+consumed their own trailing ROUNDED clause, and multi-target COMPUTE's own
+target-collection loop had an inverted `break` that silently discarded every
+target after the first. All 6 are now fixed; every promoted program
+hard-passes `oracleCompare()`.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | `DECLARATIVES ... END DECLARATIVES` (a `USE AFTER [STANDARD] ERROR PROCEDURE ON <file-name\|INPUT\|OUTPUT\|I-O\|EXTEND>` handler section) had no parser support whatsoever - the whole block, including its own mandatory `USE` statement, was absorbed by the ordinary section/paragraph loop, so its body ran unconditionally at program start (before the program's real first paragraph), not only on a file-operation failure | New `parseDeclaratives`/`parseUseStatement` (`parser/procedure-parser.js`) run as a dedicated pre-pass immediately after `PROCEDURE DIVISION`'s own USING/RETURNING clause (exactly where the grammar requires DECLARATIVES to appear), collecting every DECLARATIVES SECTION into a new `division.declaratives` array - deliberately kept OUT of `division.sections`/`division.paragraphs`, so `method-gen.js`'s fall-through flattening never sees them at all. `scala-generator.js`'s new `generateDeclarativeSupport` compiles each one into an ordinary (but never-unconditionally-called) method plus two lookup registries (file name -> handler, mode -> handler) that `file-io-gen.js`'s `generateOpen` and `expression-gen.js`'s `generateReadStatement` consult (see finding 2) to invoke the right handler on a real file-operation failure, then fall through to the statement after the failing one - exactly cobc's own observed behavior (x01: the handler's own DISPLAY fires with the freshly-set FILE STATUS, then the program continues normally). Scope is deliberately pragmatic: only `ON <file-name>` and `ON INPUT/OUTPUT/I-O/EXTEND` targets are wired to anything; any other `USE` form (`USE FOR DEBUGGING`, ...) still parses and compiles (an honest `// unsupported USE form` comment marks it) but is never invoked - see "Known gaps" | x01 |
+| 2 | An OPEN failure (missing file, bad path, ...) surfaced as a raw, uncaught `java.io.FileNotFoundException`/`IOException` - a hard runtime crash, with no FILE STATUS mapping at all, compiler-verified wrong against installed GnuCOBOL (cobc itself just sets FILE STATUS and keeps running) | `generateOpen` (`generator/file-io-gen.js`) now wraps every java.io-touching OPEN mode (INPUT/OUTPUT/I-O/EXTEND; the unrecognized-mode fallback never touches java.io, so it's untouched) in `try`/`catch`: `FileNotFoundException` -> FILE STATUS `"35"`, any other `IOException` -> `"30"` - matching cobc's own observed default (x02: `OPEN INPUT` of a nonexistent file -> `"35"`, program continues). A registered DECLARATIVES handler (finding 1) for this file/mode fires right after the status is set; with neither a FILE STATUS field nor a handler registered, the catch body is a harmless `()` (matches cobc's default of silently continuing past a failed OPEN with no other visible effect). The bare-READ-at-EOF path (the FILE-STATUS-driven READ branch) got the same handler-invocation hook | x01, x02 |
+| 3 | WRITE and READ of the SAME non-DISPLAY (COMP-3/binary) record used two flatly incompatible byte models: WRITE rendered the field's *display-text* unsigned digit representation (`groupDisplayValueExpr`), but READ decoded the physical bytes as real packed-decimal/binary via the record's own generated case-class `parse()` - a WRITE-then-READ round trip was guaranteed to crash (`packedDecode: non-digit nibble ... encountered`) or silently corrupt data, never actually reproducing cobc's own on-disk format | **Write-path model decision: the record's on-disk bytes (CobolCodecs encoding, via the record's own generated case-class `format()`) are the single true byte-level format** - new `writeRecordPlan`/`groupContainsNonDisplay`/`groupChildConstructorExpr` (`generator/expression-gen.js`) route a WRITE of any record containing at least one non-DISPLAY child through `format()`, written as raw bytes (an ISO-8859-1 identity-mapped string, never display text) - the exact same bytes READ's `parse()` already (correctly) decodes, and byte-for-byte what cobc itself writes (x03 verified: cobc's `23 45 67 8c 41 41 41 41` for `+23456.78 "AAAA"` reproduced exactly). A pure-DISPLAY record is completely unaffected - still the original `println(...).stripTrailing()` text path, which is what s01/t01-t06/u12 and every other existing file-I/O corpus program depends on (all re-verified green). Companion fix: the file reader (`Source.fromFile`) and writer (`PrintWriter`) now use an explicit ISO-8859-1 (Latin-1) charset - a lossless 1:1 byte<->char identity mapping - instead of the JVM's platform default (UTF-8), which silently mangles any byte >= 0x80 that a packed/binary field routinely produces; a pure no-op for every existing plain-ASCII record | x03 |
+| 4 | WRITE of a record containing an `OCCURS ... DEPENDING ON` (ODO) child fell straight through `groupDisplayValueExpr`'s unconditional OCCURS-child bail-out (`return null`) to a nonexistent bare variable reference - a hard compile error | New `odoDisplayValueExpr` (`generator/expression-gen.js`) - used only by the WRITE path (`writeRecordPlan`), so DISPLAY-of-a-group behavior is untouched - contributes exactly `<counter>`-many elements' worth of digit text for a DISPLAY-only ODO child, where `<counter>` is the table's LIVE runtime value (not the fixed max occurrence count `case-class-gen.js`'s own `parse()`/`format()` are pinned to); `scala-generator.js`'s `tableRegistry` now also records the ODO counter field's own camelCase name (`dependingOn`) for this lookup. Verified byte-exact against cobc (x04: `MOVE 2 TO OUT-COUNT` -> both sides write the identical 9-byte file `02111222\n`, not the fixed-max-5-element record). A non-DISPLAY (packed/binary) ODO child would combine with finding 3's byte-level path, which conservatively bails to a visible `() // TODO` marker instead of guessing at a wrong layout - see "Known gaps" | x04 |
+| 5 | `ADD/SUBTRACT CORRESPONDING group-1 TO/FROM group-2 ROUNDED` never consumed its own trailing `ROUNDED` at all - the parser returned immediately after building the statement, leaving the unconsumed `ROUNDED` token to leak out as a bogus separate `UnknownStatement`, and `generateAddCorresponding`/`generateSubtractCorresponding` always hardcoded `false` for the rounded flag regardless | `parseAddStatement`/`parseSubtractStatement`'s CORRESPONDING branches (`parser/procedure-parser.js`) now check for a trailing `ROUNDED` before returning, setting `statement.rounded`; `generateAddCorresponding`/`generateSubtractCorresponding` (`generator/expression-gen.js`) pass `!!statement.rounded` into the same `storeNumericByInfo` ROUNDED-or-truncated store-time path every other arithmetic statement already uses (x05 verified: `0.06` into a `V9` target rounds to `000.1`, not truncates to `000.0`) | x05 |
+| 6 | `COMPUTE A B C = expr` (multiple targets) silently collapsed to just the FIRST target - `parseComputeStatement`'s target-collection loop had a stray inverted `if (!ctx.check(OP_EQUAL)) break;` that fired the instant it saw the SECOND target's own name (itself an IDENTIFIER, not `=`), immediately aborting the loop | Removed the inverted break entirely (the loop's own `while (ctx.check(IDENTIFIER))` condition alone already stops correctly at `=`) - `parser/procedure-parser.js`. Each target's own optional trailing `ROUNDED` is now stashed directly on that target's own `VariableReference` node (`target.rounded`), so `COMPUTE A B ROUNDED C = expr` rounds only B; `generateCompute` (`generator/expression-gen.js`) stores each target through `storeNumericExpr` using ITS OWN per-target flag, not a shared statement-level one (x06 verified: `A=022.05 B=022 C=022.1` - A truncated, C rounded, matching cobc exactly) | x06 |
+
+All 12 round-10 probes (`x01`-`x12`) were promoted; the 6 survivors
+(`x07`-`x12`) already passed unmodified before this round's fixes - `x07`
+SIGN IS LEADING SEPARATE marshalling across a CALL BY REFERENCE boundary,
+`x08` a backward `PERFORM ... THRU` range whose start paragraph is NOT the
+program's last unit (the probe that resolves round-9 finding 5's own noted
+uncertainty - see "Known gaps" below), `x09` DIVIDE ... GIVING REMAINDER
+with negative and mixed-sign, differently-scaled operands, `x10` EVALUATE
+against figurative SPACES on both the subject and the WHEN side, `x11`
+OCCURS ... DEPENDING ON driven at the PROCEDURE DIVISION level (a live,
+mid-loop-mutated counter growing the loop bound, plus a shrink-then-read-
+beyond-the-new-count probe), and `x12` a triple-nested inline `PERFORM
+VARYING` where only the innermost loop's own `EXIT PERFORM` unwinds, plus
+`CONTINUE` as the sole statement of both an IF's THEN and ELSE branches -
+these lock in existing behavior as regression guards, not new fixes. See
+`tests/round10-fixes.test.js` for focused, toolchain-independent unit tests
+of all 6 fixes above.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -594,19 +634,82 @@ focused, toolchain-independent unit tests of all 6 fixes above.
   round-trip) strategy to a subscripted-row shape, if a future program needs
   either.
 
-- **A backward `PERFORM x THRU y` range's post-start-paragraph fallthrough,
-  round-9 finding 5's narrower edge** - compiler-verified against installed
-  GnuCOBOL (w10) that cobc runs the start paragraph then behaves as if
-  execution fell off the true end of the PROCEDURE DIVISION, but w10's own
-  start paragraph (`PARA-C`) happens to already be the program's physically
-  last unit, so "run the start paragraph" and "run the start paragraph, then
-  keep cascading through every unit remaining in the program via ordinary
-  fall-through/GO TO, then terminate" are behaviorally identical in that one
-  verified case. `generatePerformThruMethod`'s fix implements the more
-  general form (reusing `renderNestedFallthroughDefs` over every unit from
-  the start paragraph through the true end of the program, then
-  `sys.exit(0)`), which is the principled reading of "falls off the end of
-  the PROCEDURE DIVISION" - but no corpus program independently confirms the
-  general "more units still run after the start paragraph" case against real
-  cobc. Revisit with a second backward-THRU probe (start paragraph NOT the
-  program's last unit) if a future pass has time.
+- ~~A backward `PERFORM x THRU y` range's post-start-paragraph fallthrough,
+  round-9 finding 5's narrower edge~~ **RESOLVED by round-10's `x08`.**
+  Round-9's `w10` only confirmed cobc's "run the start paragraph, then behave
+  as if execution fell off the end of the PROCEDURE DIVISION" model for a
+  start paragraph that already happened to be the program's own last unit -
+  round-10's `x08` (`PERFORM PARA-C THRU PARA-A` inside a SECTION, with a
+  SEPARATE `TAIL-SECTION`/`PARA-D` still physically following it in program
+  order) is the general case: cobc's own oracle output shows `PARA-D` DOES
+  still run (`IN-PARA-C` then `IN-PARA-D`, cascading past the THRU range's own
+  start paragraph through the rest of the program before terminating), and
+  the generated Scala matches byte-for-byte via `oracleCompare()` - confirming
+  `generatePerformThruMethod`'s existing general-case implementation
+  (`renderNestedFallthroughDefs` over every unit from the start paragraph
+  through the true end of the program, then `sys.exit(0)`) was already
+  correct, not just "correct in the one case tested so far."
+
+- **A record combining a non-DISPLAY (COMP-3/binary) child WITH an OCCURS
+  table (fixed-size or `... DEPENDING ON`) in the same record, round-10
+  finding 3/4's own explicitly-acknowledged intersection** - `writeRecordPlan`
+  routes such a record to the byte-level `format()` path (finding 3, since it
+  has a non-DISPLAY child), but `groupChildConstructorExpr` unconditionally
+  bails out (`return null`) the moment it sees ANY OCCURS-table child (a
+  case class's own `.format()` always writes a table at its fixed max width,
+  which would be wrong for an ODO table's variable-length WRITE, and this
+  generator has no established way to build a `Vector[...]`-shaped
+  constructor argument from the flat per-element vars for a *fixed*-size
+  table either) - `generateWriteStatement` emits a visible, still-compiling
+  `() // TODO: ... a byte-level (non-DISPLAY-child) record with a
+  FILLER/OCCURS child is not supported` marker instead of a wrong/guessed
+  byte layout. Same bail-out (same TODO marker) for a FILLER child in a
+  non-DISPLAY record, for the same reason `generateGroupMove`'s own
+  differing-layout path already documents (no established flat-var <->
+  case-class-constructor-slot correspondence for a FILLER). Not exercised by
+  any corpus program (x03 and x04 each exercise ONE of these two
+  ingredients, deliberately, never combined). Revisit by teaching
+  `groupChildConstructorExpr` to build a `Vector.tabulate(...)`/live-count-
+  sliced constructor argument for a table child if a future program needs
+  this combination.
+
+- **A bare elementary (non-group, no children at all) FD record declared
+  directly as a non-DISPLAY USAGE (e.g. a 01-level `PIC S9(5)V99 COMP-3` FD
+  record with no subordinate 05-level items)** - `generateCaseClass`
+  (`generator/case-class-gen.js`) only ever generates a case class (and thus
+  a `.format()`/`.parse()`) for an item with at least one real child;
+  `writeRecordPlan`'s byte-level branch is therefore reachable only through
+  the GROUP path, so a childless non-DISPLAY elementary record still falls
+  through to the pre-round-10 `CobolFmt.num(...)`-based text rendering,
+  unaffected by this round's fix either way. Not exercised by any corpus
+  program (every FD record in the corpus that has a non-DISPLAY USAGE is a
+  child of a group, per ordinary COBOL style). Revisit only if a future
+  program needs a childless non-DISPLAY 01-level FD record specifically.
+
+- **DECLARATIVES `USE` forms other than `[AFTER] [STANDARD] ERROR PROCEDURE
+  ON ...`, round-10 finding 1's deliberately narrow scope** - `USE FOR
+  DEBUGGING ON ...`, `USE BEFORE REPORTING ...`, and any other `USE` clause
+  this parser doesn't specifically recognize are still parsed (tagged `{
+  kind: 'UNSUPPORTED' }` by `parseUseStatement`, so they never corrupt the
+  token stream) and their section body still compiles to a real, callable
+  Scala method - but `generateDeclarativeSupport` never registers it in
+  either handler registry, so it is never actually invoked from anywhere (an
+  honest `// unsupported USE form` comment marks the generated method as
+  such). Not exercised by any corpus program. Revisit by adding dedicated
+  wiring for whichever additional `USE` form a future program needs.
+
+- **DECLARATIVES handler invocation is wired only from OPEN's failure path
+  and a bare (no AT END clause) READ's end-of-file path, round-10 finding
+  1/2's own pragmatic scope** - a READ that DOES have an AT END clause never
+  invokes a registered handler even on end-of-file (matches real COBOL: the
+  AT END phrase is the statement's own explicit handling, which takes
+  precedence over the implicit DECLARATIVES procedure), and WRITE/CLOSE have
+  no modeled failure path AT ALL in this generator to hook a handler into (a
+  WRITE always "succeeds" here - there is no simulated disk-full/permission
+  error to react to) - so a DECLARATIVES handler registered `ON` a file's
+  OUTPUT/EXTEND mode, or `ON` a file only ever WRITE-failure-triggered in
+  real COBOL, is parsed and compiled but has no invocation site that could
+  ever reach it. Only the OPEN-failure (x01/x02) and bare-READ-EOF paths are
+  oracle-verified. Revisit by modeling an actual WRITE/CLOSE failure
+  scenario (and wiring its own handler invocation) if a future program needs
+  it.

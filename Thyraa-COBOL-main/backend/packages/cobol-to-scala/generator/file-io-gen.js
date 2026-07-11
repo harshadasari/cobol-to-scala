@@ -109,7 +109,59 @@ function fileStatusVarFor(fileName) {
 }
 
 /**
- * Generate OPEN statement
+ * round-10 finding 1: DECLARATIVES `USE AFTER STANDARD ERROR PROCEDURE ON
+ * <file-name|INPUT|OUTPUT|I-O|EXTEND>` handler methods, keyed two ways -
+ * `DECL_FILE_HANDLERS` (file name, upper -> method name) for an `ON
+ * <file-name>` target, `DECL_MODE_HANDLERS` (mode, upper -> method name) for
+ * an `ON INPUT`/`ON OUTPUT`/`ON I-O`/`ON EXTEND` target (applies to every
+ * file opened in that mode with no more specific per-file handler
+ * registered). Built once per conversion by scala-generator.js alongside
+ * every other registry (see setDeclarativeHandlers) - empty for every
+ * program with no DECLARATIVES at all (every one of the 144 pre-existing
+ * corpus programs), so this is a pure addition with zero effect on them.
+ */
+let DECL_FILE_HANDLERS = new Map();
+let DECL_MODE_HANDLERS = new Map();
+
+export function setDeclarativeHandlers(fileHandlers, modeHandlers) {
+  DECL_FILE_HANDLERS = fileHandlers instanceof Map ? fileHandlers : new Map();
+  DECL_MODE_HANDLERS = modeHandlers instanceof Map ? modeHandlers : new Map();
+}
+
+/** A file-specific handler always wins over a mode-generic one (matches how a more specific USE target reads in real COBOL). */
+function declarativeHandlerFor(fileName, mode) {
+  return (
+    DECL_FILE_HANDLERS.get(String(fileName || '').toUpperCase()) ||
+    DECL_MODE_HANDLERS.get(String(mode || '').toUpperCase()) ||
+    null
+  );
+}
+
+/**
+ * Generate OPEN statement.
+ *
+ * round-10 finding 2: an OPEN failure (missing file for INPUT/I-O/EXTEND,
+ * an unwritable path for OUTPUT/EXTEND, ...) used to surface as a raw,
+ * uncaught Java exception (FileNotFoundException/IOException) - a hard
+ * runtime crash with no FILE STATUS mapping at all, compiler-verified wrong
+ * against installed GnuCOBOL (x02: cobc itself just sets FILE STATUS to
+ * "35" and continues running the rest of the program). Every mode that
+ * actually touches java.io (all but the `default`/unrecognized-mode
+ * fallback, which never opens anything) is now wrapped in try/catch:
+ *   - `java.io.FileNotFoundException` (by far the most common case - the
+ *     file/path doesn't exist) -> FILE STATUS "35".
+ *   - any other `java.io.IOException` -> FILE STATUS "30" (cobc's generic
+ *     "permanent error" code).
+ * A registered DECLARATIVES `USE AFTER STANDARD ERROR PROCEDURE ON
+ * <this-file>/<this-mode>` handler (round-10 finding 1, see
+ * setDeclarativeHandlers/declarativeHandlerFor) is invoked right after the
+ * status is set, exactly mirroring cobc's own "run the declarative, then
+ * fall through to the statement after OPEN" behavior (x01). With NEITHER a
+ * registered FILE STATUS field NOR a matching handler, the catch block is a
+ * bare `()` - matching cobc's own default behavior of silently continuing
+ * past a failed OPEN with no other visible effect (x02, when FILE STATUS is
+ * absent - not exercised by any corpus program, since x02 always declares
+ * one, but this keeps the fallback honest either way).
  */
 export function generateOpen(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -121,42 +173,87 @@ export function generateOpen(statement, indent = 0) {
     const fileName = extractFileName(file);
     const { fileVar, readerVar, writerVar, iteratorVar, randomVar } = fileHandleVarNames(fileName);
     const mode = (statement.mode || file?.mode || 'INPUT').toUpperCase();
+    const statusVar = fileStatusVarFor(fileName);
+    const handlerMethod = declarativeHandlerFor(fileName, mode);
+
+    const bi = `${indentStr}  `;
+    const openLines = [];
+    let canFail = true;
 
     switch (mode) {
       case 'INPUT':
-        lines.push(`${indentStr}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
-        lines.push(`${indentStr}${readerVar} = scala.io.Source.fromFile(${fileVar})`);
-        lines.push(`${indentStr}${iteratorVar} = ${readerVar}.getLines()`);
+        openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
+        // round-10 finding 3 companion: ISO-8859-1 is a lossless 1:1
+        // byte<->char identity mapping (unlike the JVM's UTF-8-by-default
+        // charset, which rejects/mangles arbitrary non-ASCII byte values) -
+        // required so a record containing packed/binary bytes round-trips
+        // through this text-line reader exactly, and a no-op for every
+        // plain-ASCII (DISPLAY-only) record already in the corpus.
+        openLines.push(`${bi}${readerVar} = scala.io.Source.fromFile(${fileVar})(scala.io.Codec.ISO8859)`);
+        openLines.push(`${bi}${iteratorVar} = ${readerVar}.getLines()`);
         break;
 
       case 'OUTPUT':
-        lines.push(`${indentStr}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
-        lines.push(`${indentStr}${writerVar} = new java.io.PrintWriter(${fileVar})`);
+        openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
+        openLines.push(
+          `${bi}${writerVar} = new java.io.PrintWriter(new java.io.OutputStreamWriter(` +
+          `new java.io.FileOutputStream(${fileVar}), java.nio.charset.StandardCharsets.ISO_8859_1))`
+        );
         break;
 
       case 'I-O':
       case 'IO':
-        lines.push(`${indentStr}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
-        lines.push(`${indentStr}${randomVar} = new java.io.RandomAccessFile(${fileVar}, "rw")`);
+        openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
+        openLines.push(`${bi}${randomVar} = new java.io.RandomAccessFile(${fileVar}, "rw")`);
         break;
 
       case 'EXTEND':
-        lines.push(`${indentStr}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
-        lines.push(`${indentStr}${writerVar} = new java.io.PrintWriter(new java.io.FileWriter(${fileVar}, true))`);
+        openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
+        openLines.push(
+          `${bi}${writerVar} = new java.io.PrintWriter(new java.io.OutputStreamWriter(` +
+          `new java.io.FileOutputStream(${fileVar}, true), java.nio.charset.StandardCharsets.ISO_8859_1))`
+        );
         break;
 
       default:
-        lines.push(`${indentStr}// OPEN ${mode} ${fileName}`);
+        canFail = false;
+        break;
     }
 
-    // round-6 finding 2/3 companion: this generator never models an OPEN
-    // failure (missing file, permission error, etc. all surface as a raw
-    // Java exception, not a FILE STATUS code) - a registered FILE STATUS
-    // field always goes to "00" (successful open) here.
-    const statusVar = fileStatusVarFor(fileName);
-    if (statusVar) {
-      lines.push(`${indentStr}${statusVar} = "00"`);
+    if (!canFail) {
+      // Unrecognized mode: never touches java.io at all, so nothing can
+      // throw - no try/catch needed, just the plain comment (and, as
+      // before, a "00" FILE STATUS if one happens to be registered).
+      lines.push(`${indentStr}// OPEN ${mode} ${fileName}`);
+      if (statusVar) {
+        lines.push(`${indentStr}${statusVar} = "00"`);
+      }
+      continue;
     }
+
+    // round-6 finding 2/3 companion: a registered FILE STATUS field goes to
+    // "00" on a successful open.
+    if (statusVar) {
+      openLines.push(`${bi}${statusVar} = "00"`);
+    }
+
+    lines.push(`${indentStr}try`);
+    lines.push(...openLines);
+    lines.push(`${indentStr}catch`);
+
+    const bi2 = `${bi}  `;
+    function catchBody(code) {
+      const body = [];
+      if (statusVar) body.push(`${bi2}${statusVar} = "${code}"`);
+      if (handlerMethod) body.push(`${bi2}${handlerMethod}()`);
+      if (body.length === 0) body.push(`${bi2}()`);
+      return body;
+    }
+
+    lines.push(`${bi}case _: java.io.FileNotFoundException =>`);
+    lines.push(...catchBody('35'));
+    lines.push(`${bi}case _: java.io.IOException =>`);
+    lines.push(...catchBody('30'));
   }
 
   return lines.join('\n');
@@ -491,4 +588,5 @@ export default {
   generateFileStatusCheck,
   generateFileHandleDeclarations,
   fileHandleVarNames,
+  setDeclarativeHandlers,
 };

@@ -202,6 +202,16 @@ export class Procedure extends ASTNode {
     this.procedureType = options.procedureType || 'paragraph'; // paragraph or section
     this.statements = options.statements || [];
     this.paragraphs = options.paragraphs || [];     // For sections containing paragraphs
+    // round-10 finding 1: only ever set on a DECLARATIVES SECTION (see
+    // ProcedureDivision.declaratives below) - the section's own mandatory
+    // USE statement, e.g. `{ kind: 'ERROR', after: true, targets: [{ kind:
+    // 'FILE', name: 'IN-FILE' }] }` for `USE AFTER STANDARD ERROR PROCEDURE
+    // ON IN-FILE` - or `{ kind: 'UNSUPPORTED' }` for any other USE form
+    // (USE FOR DEBUGGING, USE BEFORE REPORTING, ...), which this generator
+    // parses (so it doesn't corrupt the token stream) but never wires into
+    // any invocation path. `null` for every ordinary (non-declarative)
+    // section/paragraph - unaffected by this addition.
+    this.useClause = options.useClause || null;
   }
 }
 
@@ -941,6 +951,15 @@ export class ProcedureDivision extends ASTNode {
     this.returning = options.returning || null;
     this.sections = options.sections || [];
     this.paragraphs = options.paragraphs || [];
+    // round-10 finding 1: DECLARATIVES ... END DECLARATIVES SECTIONs, kept
+    // entirely separate from `sections`/`paragraphs` above (and so excluded
+    // from ordinary top-to-bottom program flow - see
+    // scala-generator.js/method-gen.js, which only ever flatten `sections`/
+    // `paragraphs` into the main fall-through chain). Each entry is a
+    // `Procedure` (procedureType: 'section') with its own `useClause` and
+    // nested `paragraphs`, exactly like an ordinary section - see
+    // parser/procedure-parser.js's parseDeclaratives.
+    this.declaratives = options.declaratives || [];
   }
 }
 

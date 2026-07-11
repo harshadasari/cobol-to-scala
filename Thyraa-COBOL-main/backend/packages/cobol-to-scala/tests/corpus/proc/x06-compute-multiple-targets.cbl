@@ -1,0 +1,14 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. COMPMULTI.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-A PIC 9(3)V99.
+       01 WS-B PIC 9(3).
+       01 WS-C PIC 9(3)V9.
+       01 WS-X PIC 9(2) VALUE 7.
+       01 WS-Y PIC 9(2) VALUE 3.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           COMPUTE WS-A WS-B WS-C ROUNDED = WS-X * WS-Y + 1.055.
+           DISPLAY "A=" WS-A " B=" WS-B " C=" WS-C.
+           STOP RUN.

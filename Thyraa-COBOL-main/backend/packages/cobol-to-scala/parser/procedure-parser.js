@@ -1201,18 +1201,26 @@ function parseComputeStatement(ctx) {
 
   const stmt = new ComputeStatement();
 
-  // Parse targets
+  // Parse targets: `COMPUTE A B ROUNDED C = expr` supports multiple targets,
+  // each with its OWN optional trailing ROUNDED (round-10 finding 6) - the
+  // `while (ctx.check(TokenType.IDENTIFIER))` condition alone already stops
+  // correctly the moment the next token is `=` (not an IDENTIFIER), so
+  // nothing else is needed to keep collecting every target ahead of it; a
+  // stray `if (!ctx.check(TokenType.OP_EQUAL)) break;` here used to abort the
+  // loop after the very FIRST target (since the second target's own name is
+  // itself an IDENTIFIER, not `=`), silently discarding every target after
+  // the first - see this function's own AST-level fix: ROUNDED is stashed on
+  // the individual target's own VariableReference node (`target.rounded`),
+  // not just a single statement-wide flag, so `COMPUTE A B ROUNDED C = ...`
+  // rounds only B, truncating A and C, exactly like real COBOL.
   while (ctx.check(TokenType.IDENTIFIER)) {
     const target = parseVariableReference(ctx);
-    if (target) {
-      stmt.targets.push(target);
-      if (ctx.matchValue('ROUNDED')) {
-        stmt.rounded = true;
-      }
+    if (!target) break;
+    if (ctx.matchValue('ROUNDED')) {
+      target.rounded = true;
+      stmt.rounded = true; // true when ANY target was ROUNDED (back-compat)
     }
-    if (!ctx.check(TokenType.OP_EQUAL)) {
-      break;
-    }
+    stmt.targets.push(target);
   }
 
   // Skip equals
@@ -1256,6 +1264,16 @@ function parseAddStatement(ctx) {
     ctx.matchValue('TO');
     const target = parseVariableReference(ctx);
     stmt.to.push(target);
+    // round-10 finding 5: `ADD CORRESPONDING a TO b ROUNDED` never consumed
+    // its own trailing ROUNDED at all - the unconsumed token then leaked out
+    // as a bogus standalone UnknownStatement, and generateAddCorresponding
+    // always truncated (never rounded) regardless. ROUNDED has no per-target
+    // form here (CORRESPONDING has exactly one implicit target group), so a
+    // single statement-level flag is enough - see generateAddCorresponding's
+    // now-honored storeNumericByInfo call.
+    if (ctx.matchValue('ROUNDED')) {
+      stmt.rounded = true;
+    }
     return stmt;
   }
 
@@ -1330,6 +1348,10 @@ function parseSubtractStatement(ctx) {
     ctx.matchValue('FROM');
     const target = parseVariableReference(ctx);
     stmt.from.push(target);
+    // round-10 finding 5 (same audit applied to SUBTRACT CORRESPONDING).
+    if (ctx.matchValue('ROUNDED')) {
+      stmt.rounded = true;
+    }
     return stmt;
   }
 
@@ -2732,6 +2754,147 @@ function parseExecStatement(ctx) {
 }
 
 /**
+ * Parse a DECLARATIVES SECTION's mandatory USE statement (round-10 finding
+ * 1). Scope is deliberately pragmatic - only the `USE [AFTER] [STANDARD]
+ * ERROR PROCEDURE ON <target-list>` form (the overwhelmingly common one,
+ * covering file-status-driven error handling) is fully understood; every
+ * other USE form (`USE FOR DEBUGGING ON ...`, `USE BEFORE REPORTING ...`,
+ * `USE GLOBAL ...`) is still consumed token-by-token up to the terminating
+ * period (so it can never corrupt the rest of the parse) but tagged `{ kind:
+ * 'UNSUPPORTED' }` - the section's own body still parses and generates as an
+ * ordinary (if unreachable) method, an honest TODO rather than a silent
+ * wrong wiring.
+ *
+ * `ON <target-list>` accepts any mix of one or more file-names and/or the
+ * INPUT/OUTPUT/I-O/EXTEND keywords (optionally comma-separated) - e.g. `ON
+ * IN-FILE, OUT-FILE` or `ON INPUT OUTPUT`.
+ */
+function parseUseStatement(ctx) {
+  if (!ctx.matchValue('USE')) return null;
+
+  const isAfter = ctx.matchValue('AFTER');
+  ctx.matchValue('STANDARD');
+  const isErrorForm = ctx.matchValue('ERROR') || ctx.matchValue('EXCEPTION');
+
+  if (isErrorForm) {
+    ctx.matchValue('PROCEDURE');
+    ctx.matchValue('ON');
+
+    const targets = [];
+    while (!ctx.isAtEnd() && !ctx.check(TokenType.PERIOD)) {
+      if (ctx.check(TokenType.COMMA)) {
+        ctx.advance();
+        continue;
+      }
+      if (ctx.matchValue('INPUT')) {
+        targets.push({ kind: 'INPUT' });
+        continue;
+      }
+      if (ctx.matchValue('OUTPUT')) {
+        targets.push({ kind: 'OUTPUT' });
+        continue;
+      }
+      if (ctx.matchValue('I-O')) {
+        targets.push({ kind: 'I-O' });
+        continue;
+      }
+      if (ctx.matchValue('EXTEND')) {
+        targets.push({ kind: 'EXTEND' });
+        continue;
+      }
+      if (ctx.check(TokenType.IDENTIFIER)) {
+        targets.push({ kind: 'FILE', name: ctx.advance().value });
+        continue;
+      }
+      // Tolerate anything unexpected (defensive - keeps forward progress).
+      ctx.advance();
+    }
+
+    return { kind: 'ERROR', after: isAfter, targets };
+  }
+
+  // Unsupported USE form: skip to the period without interpreting it.
+  while (!ctx.isAtEnd() && !ctx.check(TokenType.PERIOD)) {
+    ctx.advance();
+  }
+  return { kind: 'UNSUPPORTED' };
+}
+
+/**
+ * Parse the `DECLARATIVES. ... END DECLARATIVES.` prologue (round-10 finding
+ * 1) - zero or more SECTIONs, each starting with a mandatory USE statement
+ * (parseUseStatement) immediately after its own `<name> SECTION.` header,
+ * followed by zero or more ordinary named paragraphs. Structurally identical
+ * to how parseProcedureDivision's own main loop builds an ordinary section
+ * (Procedure objects, procedureType 'section', nested paragraphs) - the only
+ * difference is the extra mandatory USE clause per section, and the fact
+ * that the caller stores these on `division.declaratives` instead of
+ * `division.sections`, which is what actually keeps them out of normal
+ * top-to-bottom program flow (see method-gen.js's flattenProcedureUnits -
+ * it only ever walks `sections`/`paragraphs`).
+ */
+function parseDeclaratives(ctx) {
+  ctx.advance(); // DECLARATIVES
+  ctx.skipPeriod();
+
+  const declaratives = [];
+  let currentSection = null;
+  let currentParagraph = null;
+
+  while (!ctx.isAtEnd() && !(ctx.checkValue('END') && ctx.peek(1)?.value?.toUpperCase() === 'DECLARATIVES')) {
+    if (ctx.check(TokenType.PERIOD)) {
+      ctx.advance();
+      continue;
+    }
+
+    if (isParagraphName(ctx)) {
+      const name = ctx.advance().value;
+
+      if (ctx.checkValue('SECTION')) {
+        ctx.advance();
+        ctx.skipPeriod();
+
+        currentSection = new Procedure({ name, procedureType: 'section' });
+        currentSection.useClause = parseUseStatement(ctx);
+        ctx.skipPeriod();
+        declaratives.push(currentSection);
+        currentParagraph = null;
+        continue;
+      }
+
+      ctx.skipPeriod();
+      currentParagraph = new Procedure({ name, procedureType: 'paragraph' });
+      if (currentSection) {
+        currentSection.paragraphs.push(currentParagraph);
+      }
+      continue;
+    }
+
+    const stmt = parseStatement(ctx);
+    if (stmt) {
+      if (currentParagraph) {
+        currentParagraph.statements.push(stmt);
+      } else if (currentSection) {
+        currentSection.statements.push(stmt);
+      }
+    } else if (!ctx.isAtEnd()) {
+      const unknown = parseUnknownStatement(ctx, []);
+      if (currentParagraph) {
+        currentParagraph.statements.push(unknown);
+      } else if (currentSection) {
+        currentSection.statements.push(unknown);
+      }
+    }
+  }
+
+  ctx.matchValue('END');
+  ctx.matchValue('DECLARATIVES');
+  ctx.skipPeriod();
+
+  return declaratives;
+}
+
+/**
  * Parse PROCEDURE DIVISION
  */
 export function parseProcedureDivision(tokens) {
@@ -2786,6 +2949,13 @@ export function parseProcedureDivision(tokens) {
 
   // Skip period
   ctx.skipPeriod();
+
+  // round-10 finding 1: DECLARATIVES ... END DECLARATIVES, if present, is
+  // syntactically required to come immediately here (before any ordinary
+  // section/paragraph) - see parseDeclaratives.
+  if (ctx.checkValue('DECLARATIVES')) {
+    division.declaratives = parseDeclaratives(ctx);
+  }
 
   // Parse sections and paragraphs
   let currentSection = null;

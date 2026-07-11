@@ -116,21 +116,53 @@ function lookupFieldForRef(ref) {
 
 /** name (upper) -> { times, indexed: [camel...], ascending: [camel...], descending: [camel...] } */
 let TABLE_REGISTRY = new Map();
-/** group-item name (upper) -> [{ nameUpper, camel }, ...] immediate real children */
+/** group-item full ancestor-path key -> [{ nameUpper, camel, info, groupKey }, ...] immediate real children */
 let GROUP_REGISTRY = new Map();
+/** group-item bare uppercased COBOL name -> its full ancestor-path key in GROUP_REGISTRY */
+let GROUP_KEY_REGISTRY = new Map();
+/** group-item name (upper) -> total byte length of one occurrence (FUNCTION LENGTH support) */
+let GROUP_BYTE_LENGTH_REGISTRY = new Map();
 /** SD file name AND its 01 record name (both upper) -> sort-buffer support info */
 let SORT_FILE_REGISTRY = new Map();
 /** "<name>::<immediate parent name>" (both upper) -> field info, for OF/IN qualified references */
 let QUALIFIED_REGISTRY = new Map();
 /** Level-88 condition name (upper) -> { info: <parent field's registry info>, values: [...] } */
 let CONDITION_REGISTRY = new Map();
+/**
+ * PascalCase case-class names (see case-class-gen.js's
+ * collectAmbiguousGroupClassNames) that collide across two different
+ * top-level records' nested groups in this program - consulted only by
+ * generateGroupMove's differing-layout byte-level round trip below, which
+ * has no parent-path context of its own to disambiguate an ambiguous name
+ * the way generateAllCaseClasses/generateCaseClass can.
+ */
+let AMBIGUOUS_GROUP_CLASS_NAMES = new Set();
 
 export function setTableRegistry(registry) {
   TABLE_REGISTRY = registry instanceof Map ? registry : new Map();
 }
 
-export function setGroupRegistry(registry) {
+export function setGroupRegistry(registry, keyRegistry) {
   GROUP_REGISTRY = registry instanceof Map ? registry : new Map();
+  GROUP_KEY_REGISTRY = keyRegistry instanceof Map ? keyRegistry : new Map();
+}
+
+/**
+ * Resolve a bare (unqualified) uppercased group name - as read directly off
+ * a MOVE/ADD CORRESPONDING source/target or a RELEASE/RETURN FROM/INTO
+ * reference, none of which carry OF/IN qualification in the Phase 2 corpus -
+ * to its full ancestor-path key in GROUP_REGISTRY (see
+ * scala-generator.js's buildFieldRegistry). Falls back to the bare name
+ * itself when it isn't in GROUP_KEY_REGISTRY at all (a top-level record's
+ * own key always equals its bare name, so this is a no-op for the
+ * overwhelmingly common case).
+ */
+function resolveGroupKey(bareNameUpper) {
+  return GROUP_KEY_REGISTRY.get(bareNameUpper) || bareNameUpper;
+}
+
+export function setGroupByteLengthRegistry(registry) {
+  GROUP_BYTE_LENGTH_REGISTRY = registry instanceof Map ? registry : new Map();
 }
 
 export function setSortFileRegistry(registry) {
@@ -143,6 +175,10 @@ export function setQualifiedRegistry(registry) {
 
 export function setConditionRegistry(registry) {
   CONDITION_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+export function setAmbiguousGroupClassNames(names) {
+  AMBIGUOUS_GROUP_CLASS_NAMES = names instanceof Set ? names : new Set();
 }
 
 function lookupTable(name) {
@@ -182,30 +218,57 @@ function level88ConditionExpr(nameUpper) {
   const fieldExpr = info.camel;
   const isString = info.scalaType === 'String';
 
-  function literalFor(v) {
-    if (!v || v.type === 'figurative') {
-      const fig = String(v?.value || '').toUpperCase();
-      if (fig === 'SPACE') return isString ? '" "' : '0';
-      return isString ? '""' : '0';
-    }
-    if (isString) return `"${escapeScalaStringLiteral(String(v.value))}"`;
-    if (info.scalaType === 'BigDecimal') return `BigDecimal("${v.value}")`;
-    if (info.scalaType === 'Long') return `${normalizeIntLiteralText(v.value)}L`;
-    return normalizeIntLiteralText(v.value);
-  }
-
   const parts = (values || []).map(v => {
     if (v.through !== undefined && v.through !== null) {
-      const lo = literalFor(v);
-      const hi = literalFor({ ...v, value: v.through });
+      const lo = level88ValueLiteral(v, info);
+      const hi = level88ValueLiteral({ ...v, value: v.through }, info);
       return isString
         ? `(${fieldExpr}.compareTo(${lo}) >= 0 && ${fieldExpr}.compareTo(${hi}) <= 0)`
         : `(${fieldExpr} >= ${lo} && ${fieldExpr} <= ${hi})`;
     }
-    return `(${fieldExpr} == ${literalFor(v)})`;
+    return `(${fieldExpr} == ${level88ValueLiteral(v, info)})`;
   });
 
   return parts.length > 0 ? `(${parts.join(' || ')})` : 'false';
+}
+
+/**
+ * Scala literal for one level-88 VALUE entry, coerced to its parent field's
+ * (`info`) declared Scala type. Shared by level88ConditionExpr (IF/EVALUATE
+ * condition-name tests) and level88FirstValueAssignment (SET
+ * condition-name-1 TO TRUE) - both need the exact same VALUE-literal
+ * rendering, just used differently (a comparison vs. an assignment source).
+ */
+function level88ValueLiteral(v, info) {
+  const isString = info.scalaType === 'String';
+  if (!v || v.type === 'figurative') {
+    const fig = String(v?.value || '').toUpperCase();
+    if (fig === 'SPACE') return isString ? '" "' : '0';
+    return isString ? '""' : '0';
+  }
+  if (isString) return `"${escapeScalaStringLiteral(String(v.value))}"`;
+  if (info.scalaType === 'BigDecimal') return `BigDecimal("${v.value}")`;
+  if (info.scalaType === 'Long') return `${normalizeIntLiteralText(v.value)}L`;
+  return normalizeIntLiteralText(v.value);
+}
+
+/**
+ * The parent field's camelCase identifier and the Scala literal for the
+ * FIRST VALUE (or the low end of the first VALUE ... THRU ... range) a
+ * level-88 condition name declares - exactly what `SET condition-name-1 TO
+ * TRUE` must assign to the parent field. A condition-name is not itself an
+ * addressable data item (see level88ConditionExpr's doc comment) - it is
+ * sugar for one or more VALUEs of its parent elementary item - so "set the
+ * condition to true" means "move the first declared VALUE into the parent
+ * field" (IBM/GnuCOBOL rule for SET ... TO TRUE on a condition-name).
+ * Returns null when nameUpper isn't a registered condition name, or declares
+ * no VALUEs at all (shouldn't happen for valid COBOL).
+ */
+function level88FirstValueAssignment(nameUpper) {
+  const entry = nameUpper ? CONDITION_REGISTRY.get(nameUpper) : null;
+  if (!entry || !Array.isArray(entry.values) || entry.values.length === 0) return null;
+  const { info, values } = entry;
+  return { camel: info.camel, literal: level88ValueLiteral(values[0], info) };
 }
 
 /**
@@ -257,6 +320,30 @@ function subscriptIndexExpr(sub) {
 }
 
 /**
+ * The camelCase flat-var identifier for an assignment TARGET reference,
+ * honoring OF/IN qualification (`MOVE x TO QTY OF WS-B`) the same way
+ * convertIdentifier already does for a *read* reference - a qualified
+ * reference disambiguates *which* same-named field is meant (see
+ * buildFieldRegistry's ambiguous-name handling), so resolving it through the
+ * qualified registry - rather than always taking the bare
+ * `toCamelCase(targetRef.name)` an assignment target had used previously -
+ * is required whenever the bare name is ambiguous (a bare `toCamelCase` of
+ * an ambiguous name isn't even a declared identifier at all - see
+ * buildFieldRegistry's "only an unambiguous name gets a bare-name registry
+ * entry" comment).
+ */
+function targetCamelFor(targetRef) {
+  const name = targetRef.name || '';
+  if (Array.isArray(targetRef.qualifiers) && targetRef.qualifiers.length > 0) {
+    const info = lookupQualified(name.toUpperCase(), String(targetRef.qualifiers[0]).toUpperCase());
+    if (info) return info.camel;
+    const bare = lookupField(name);
+    if (bare) return bare.camel;
+  }
+  return toCamelCase(name);
+}
+
+/**
  * Render an assignment to a (possibly subscripted) target as a Scala
  * statement. WORKING-STORAGE OCCURS tables are represented as flat
  * `var name: Vector[...]` fields (one Vector layer per occurs-bearing
@@ -271,7 +358,7 @@ function renderAssignment(targetRef, valueExpr) {
     return `${toCamelCase(targetRef)} = ${valueExpr}`;
   }
 
-  const camel = toCamelCase(targetRef.name || '');
+  const camel = targetCamelFor(targetRef);
   const subscripts = Array.isArray(targetRef.subscripts) ? targetRef.subscripts : [];
   if (subscripts.length === 0) {
     return `${camel} = ${valueExpr}`;
@@ -480,6 +567,24 @@ export function generateCobolFmtHelper() {
     '    val totalDigits = intDigits + decDigits',
     '    val unscaled = (absVal * BigDecimal(10).pow(decDigits)).setScale(0, BigDecimal.RoundingMode.HALF_UP).toBigInt.toString',
     '    if unscaled.length < totalDigits then ("0" * (totalDigits - unscaled.length)) + unscaled else unscaled.takeRight(math.max(totalDigits, unscaled.length))',
+    '',
+    '  // FUNCTION NUMVAL argument parsing: COBOL allows spaces anywhere around',
+    '  // the (optional, leading or trailing) sign - not just at the very start/',
+    '  // end of the string - e.g. \'+  12.5\' and \'12.5-\' are both COBOL-legal.',
+    '  // BigDecimal\'s own parser only tolerates leading/trailing whitespace, so',
+    '  // every space is stripped first (spaces are never significant inside a',
+    '  // NUMVAL argument - they only ever separate a sign from its digits), the',
+    '  // sign (wherever it ended up) is normalized to the front, and what',
+    '  // remains is parsed as a plain signed decimal.',
+    '  def numval(s: String): BigDecimal =',
+    '    val compact = s.filterNot(_.isWhitespace)',
+    '    val hasLeadingSign = compact.nonEmpty && (compact.head == \'+\' || compact.head == \'-\')',
+    '    val hasTrailingSign = compact.nonEmpty && (compact.last == \'+\' || compact.last == \'-\')',
+    '    val negative = (hasLeadingSign && compact.head == \'-\') || (hasTrailingSign && compact.last == \'-\')',
+    '    var digits = compact',
+    '    if hasLeadingSign then digits = digits.drop(1)',
+    '    if hasTrailingSign then digits = digits.dropRight(1)',
+    '    if digits.isEmpty then BigDecimal(0) else BigDecimal((if negative then "-" else "") + digits)',
     '',
     '  // Numeric MOVE truncation to a target\'s declared digit widths: extra',
     '  // low-order decimal digits are dropped (never rounded - MOVE truncates,',
@@ -948,6 +1053,17 @@ function functionLength(arg) {
   if (arg && arg.type === 'VariableReference') {
     const info = lookupFieldForRef(arg);
     if (info && info.picLength) return String(info.picLength);
+    // Not an elementary item in the field registry - check whether it's a
+    // GROUP item instead (FUNCTION LENGTH of a group is always the sum of
+    // its elementary children's storage bytes, a compile-time constant - see
+    // GROUP_BYTE_LENGTH_REGISTRY/scala-generator.js's buildFieldRegistry -
+    // never a nonexistent flat-var reference or a runtime `.length` call,
+    // which would be this generator's own unpadded internal string length,
+    // not COBOL's storage length).
+    const nameUpper = String(arg.name || '').toUpperCase();
+    if (GROUP_BYTE_LENGTH_REGISTRY.has(nameUpper)) {
+      return String(GROUP_BYTE_LENGTH_REGISTRY.get(nameUpper));
+    }
   }
   return `${convertArithmeticExpression(arg)}.length`;
 }
@@ -977,9 +1093,13 @@ function generateFunctionCall(fc) {
     case 'NUMVAL':
     case 'NUMVAL-C':
       // NUMVAL's argument is always an alphanumeric field/literal that may
-      // carry leading/trailing spaces from fixed-width storage; .trim keeps
-      // BigDecimal's parser happy without altering the numeric text itself.
-      return `BigDecimal((${convertArithmeticExpression(args[0])}).trim)`;
+      // carry not just leading/trailing spaces from fixed-width storage but
+      // COBOL-legal *internal* spaces between an explicit sign and its
+      // digits (e.g. '+  12.5') - a plain .trim only strips the outer edges,
+      // so BigDecimal's own parser (which rejects internal whitespace
+      // outright) still crashes on those. CobolFmt.numval strips every space
+      // and normalizes the sign first - see its doc comment.
+      return `CobolFmt.numval(${convertArithmeticExpression(args[0])})`;
     case 'MOD': {
       // COBOL FUNCTION MOD is floored-division modulo (result takes the
       // divisor's sign), not Scala/Java's truncating `%` (which takes the
@@ -991,9 +1111,19 @@ function generateFunctionCall(fc) {
       return `(((${a}) % (${b}) + (${b})) % (${b}))`;
     }
     case 'MAX':
-      return args.map(convertArithmeticExpression).reduce((a, b) => `Math.max(${a}, ${b})`);
+      // Math.max has no BigDecimal overload (FUNCTION MAX's operands are
+      // frequently BigDecimal-typed COBOL numerics) - List(...).max works for
+      // any Scala numeric type via its built-in Ordering (Int/Long/
+      // BigDecimal all have one). Operands render via convertArithmeticExpression
+      // (their natural Scala type, same as every other arithmetic use of
+      // these fields elsewhere) rather than being forced to BigDecimal -
+      // COMPUTE/MOVE assign the result directly with no further coercion, so
+      // forcing BigDecimal here would break an Int-typed COMPUTE target when
+      // the operands are themselves plain Int fields (see
+      // tests/corpus/proc/r11-intrinsics-composition.cbl's WS-MAX-RESULT).
+      return `List(${args.map(convertArithmeticExpression).join(', ')}).max`;
     case 'MIN':
-      return args.map(convertArithmeticExpression).reduce((a, b) => `Math.min(${a}, ${b})`);
+      return `List(${args.map(convertArithmeticExpression).join(', ')}).min`;
     default:
       return `??? /* TODO: unsupported FUNCTION ${fc?.name || name} */`;
   }
@@ -1237,8 +1367,40 @@ function renderMoveSource(source, info) {
     return renderVariableMoveSource(source, info);
   }
 
+  // MOVE FUNCTION MAX(...)/MIN(...)/NUMVAL(...) TO <numeric-edited field>:
+  // these intrinsics are generated as guaranteed-BigDecimal Scala expressions
+  // (see generateFunctionCall's MAX/MIN/NUMVAL cases) - route through
+  // CobolFmt.edited (the runtime numeric-edit formatter) the same way a
+  // VariableReference source into an edited target already does
+  // (renderVariableMoveSource), instead of falling through to
+  // convertArithmeticExpression's raw (unformatted, and String-vs-BigDecimal
+  // type-mismatched) rendering.
+  if (source && source.type === 'FunctionCall' && info?.dataType === 'edited' && info.editPattern &&
+      BIGDECIMAL_RESULT_FUNCTIONS.has(String(source.name || '').toUpperCase())) {
+    const rawExpr = generateFunctionCall(source);
+    const rawValueExpr = numericRawValueExpr(rawExpr, { scalaType: 'BigDecimal' });
+    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawValueExpr}, ${info.blankWhenZero ? 'true' : 'false'})`;
+  }
+
   return convertArithmeticExpression(source);
 }
+
+/**
+ * FUNCTION names whose generated Scala expression is BigDecimal-typed when
+ * MOVEd into a numeric-edited field - used by renderMoveSource above to
+ * decide when `MOVE FUNCTION xxx(...) TO <numeric-edited field>` can safely
+ * be routed through CobolFmt.edited's BigDecimal formatting path. NUMVAL/
+ * NUMVAL-C are unconditionally BigDecimal (CobolFmt.numval's return type).
+ * MAX/MIN follow their *operands'* natural Scala type (see
+ * generateFunctionCall - not forced to BigDecimal, so an Int-typed COMPUTE/
+ * MOVE target isn't broken by an unwanted coercion), so this is only exact
+ * when the MAX/MIN operands are themselves BigDecimal-typed fields - true
+ * for every corpus program that MOVEs a MAX/MIN result into an edited field
+ * (they're always decimal-valued PICTUREs, e.g. PIC S9(5)V99, in practice -
+ * an edited-numeric receiver only makes semantic sense for a decimal-ish
+ * source to begin with).
+ */
+const BIGDECIMAL_RESULT_FUNCTIONS = new Set(['MAX', 'MIN', 'NUMVAL', 'NUMVAL-C']);
 
 function renderLiteralForTarget(lit, info) {
   if (lit.literalType === 'figurative') {
@@ -1520,6 +1682,20 @@ function generateGroupMove(sourceNameUpper, targetNameUpper, indent) {
     );
   }
 
+  // A bare COBOL group name with no parent-path context can't be resolved to
+  // the right one of two colliding (parent-qualified) case-class names - see
+  // AMBIGUOUS_GROUP_CLASS_NAMES/case-class-gen.js's resolveClassName - so
+  // fall back to the same kind of visible, still-compiling marker as the
+  // FILLER/REDEFINES case above rather than risk referencing the wrong
+  // (or a nonexistent) class.
+  if (AMBIGUOUS_GROUP_CLASS_NAMES.has(toPascalCase(sourceNameUpper)) || AMBIGUOUS_GROUP_CLASS_NAMES.has(toPascalCase(targetNameUpper))) {
+    return (
+      `${indentStr}() // MOVE ${sourceNameUpper} TO ${targetNameUpper}: ??? TODO - differing-layout group MOVE ` +
+      'involving an ambiguous nested group name (declared identically under two different records) is not ' +
+      'supported; group left unchanged'
+    );
+  }
+
   const bi = '  '.repeat(indent + 1);
   const srcClass = toPascalCase(sourceNameUpper);
   const tgtClass = toPascalCase(targetNameUpper);
@@ -1561,35 +1737,123 @@ export function generateMove(statement, indent = 0) {
 
 /**
  * Match immediate child field names between two group items (looked up in
- * GROUP_REGISTRY by uppercased COBOL name), recursing into any child pair
- * that is itself a group on both sides. This is MOVE CORRESPONDING's actual
- * rule (COBOL-85 13.16.20.3): move every elementary item in the receiving
- * group whose name matches (ignoring level number/qualification) an
- * elementary item in the sending group; unmatched fields on either side are
- * left untouched.
+ * GROUP_REGISTRY by its full ancestor-path key - see scala-generator.js's
+ * buildFieldRegistry), recursing into any child pair that is itself a group
+ * on both sides. This is MOVE CORRESPONDING's actual rule (COBOL-85
+ * 13.16.20.3): move every elementary item in the receiving group whose name
+ * matches (ignoring level number/qualification) an elementary item in the
+ * sending group; unmatched fields on either side are left untouched.
+ *
+ * The recursive step uses each child's own `groupKey` (not its bare
+ * `nameUpper`) to look up its own children - required whenever two different
+ * top-level records each declare their own same-named nested group (e.g.
+ * both with `05 DTL-GROUP`): GROUP_REGISTRY has a *separate* entry per
+ * distinct group occurrence (keyed by full ancestor path), so recursing by
+ * bare name alone would resolve to whichever same-named group happened to be
+ * registered - not necessarily the correct one for *this* source/target pair
+ * - see tests/corpus/proc/r13-addcorresponding-nested.cbl.
  */
-function correspondingPairs(sourceNameUpper, targetNameUpper) {
-  const srcChildren = GROUP_REGISTRY.get(sourceNameUpper) || [];
-  const tgtChildren = GROUP_REGISTRY.get(targetNameUpper) || [];
+function correspondingPairs(sourceKey, targetKey) {
+  const srcChildren = GROUP_REGISTRY.get(sourceKey) || [];
+  const tgtChildren = GROUP_REGISTRY.get(targetKey) || [];
   const pairs = [];
 
   for (const tgt of tgtChildren) {
     const src = srcChildren.find(s => s.nameUpper === tgt.nameUpper);
     if (!src) continue;
 
-    if (GROUP_REGISTRY.has(src.nameUpper) && GROUP_REGISTRY.has(tgt.nameUpper)) {
-      pairs.push(...correspondingPairs(src.nameUpper, tgt.nameUpper));
+    if (src.groupKey && tgt.groupKey) {
+      pairs.push(...correspondingPairs(src.groupKey, tgt.groupKey));
     } else {
       pairs.push({
         sourceCamel: src.camel,
         targetCamel: tgt.camel,
-        sourceInfo: lookupField(src.nameUpper),
-        targetInfo: lookupField(tgt.nameUpper),
+        sourceInfo: src.info || lookupField(src.nameUpper),
+        targetInfo: tgt.info || lookupField(tgt.nameUpper),
       });
     }
   }
 
   return pairs;
+}
+
+/**
+ * Pair up two groups' immediate children BY POSITION (declared order), not
+ * by matching field names the way correspondingPairs (MOVE CORRESPONDING)
+ * does. This is the actual semantics of RELEASE record FROM identifier and
+ * RETURN file INTO identifier: both are COBOL's implicit *structural* MOVE
+ * of the whole record (a positional, name-independent copy - like any other
+ * COBOL group MOVE) - RELEASE/RETURN have no CORRESPONDING keyword and never
+ * matched by name in real COBOL, regardless of whether the FROM/INTO group's
+ * field names happen to coincide with the SD record's own (a source group
+ * legitimately declaring differently-named fields, as in
+ * tests/corpus/proc/r06-sort-mkcomp3.cbl's WS-SRC-DEPT vs SORT-DEPT, is the
+ * whole point of RELEASE/RETURN's FROM/INTO existing at all - reusing
+ * correspondingPairs here silently produced zero pairs, hence zero copying).
+ * Recurses into a nested-group pair at the same position on both sides,
+ * mirroring correspondingPairs' own recursion. The shorter side's length
+ * determines the pair count (COBOL only requires the FROM/INTO side not
+ * exceed the SD record's declared size).
+ */
+function positionalPairs(sourceKey, targetKey) {
+  const srcChildren = GROUP_REGISTRY.get(sourceKey) || [];
+  const tgtChildren = GROUP_REGISTRY.get(targetKey) || [];
+  const pairs = [];
+  const n = Math.min(srcChildren.length, tgtChildren.length);
+
+  for (let i = 0; i < n; i++) {
+    const src = srcChildren[i];
+    const tgt = tgtChildren[i];
+
+    if (src.groupKey && tgt.groupKey) {
+      pairs.push(...positionalPairs(src.groupKey, tgt.groupKey));
+    } else {
+      pairs.push({
+        sourceCamel: src.camel,
+        targetCamel: tgt.camel,
+        sourceInfo: src.info || lookupField(src.nameUpper),
+        targetInfo: tgt.info || lookupField(tgt.nameUpper),
+      });
+    }
+  }
+
+  return pairs;
+}
+
+/**
+ * Scala subscript suffix for a (possibly multi-dimensional) subscript list,
+ * e.g. `(wsI - 1)` - the same rendering convertIdentifier uses for a
+ * subscripted VariableReference, factored out so it can be applied to a
+ * *different* identifier than the one the AST subscript node came from (see
+ * generateRelease/generateReturn: the FROM/INTO reference's own subscript
+ * applies uniformly to every one of the SD record's sibling flat-var
+ * fields, not just one).
+ */
+function subscriptSuffixExpr(subscripts) {
+  if (!Array.isArray(subscripts) || subscripts.length === 0) return '';
+  return subscripts.map(s => `(${subscriptIndexExpr(s)})`).join('');
+}
+
+/**
+ * Assignment to `camel` (a flat-var identifier string, not an AST node),
+ * honoring an optional subscript list the same way renderAssignment does for
+ * an ordinary VariableReference target - a subscripted table field is a
+ * `Vector[...]`, which has no index *setter*, so it must be rebuilt with
+ * `.updated(idx, value)` rather than `camel(idx) = value`. Used by
+ * generateReturn's INTO target, which (unlike renderAssignment's normal
+ * callers) computes the target field's own flat-var name via
+ * positionalPairs rather than starting from a VariableReference AST node.
+ */
+function renderCamelAssignment(camel, subscripts, valueExpr) {
+  if (!Array.isArray(subscripts) || subscripts.length === 0) {
+    return `${camel} = ${valueExpr}`;
+  }
+  const idxs = subscripts.map(subscriptIndexExpr);
+  function rec(depth, baseExpr) {
+    if (depth === idxs.length - 1) return `${baseExpr}.updated(${idxs[depth]}, ${valueExpr})`;
+    return `${baseExpr}.updated(${idxs[depth]}, ${rec(depth + 1, `${baseExpr}(${idxs[depth]})`)})`;
+  }
+  return `${camel} = ${rec(0, camel)}`;
 }
 
 /** Coerce a matched CORRESPONDING source value to the target field's Scala type. */
@@ -1617,7 +1881,7 @@ export function generateMoveCorresponding(statement, indent = 0) {
   const lines = [];
   for (const targetRef of targets) {
     const targetUpper = String(targetRef?.name || targetRef || '').toUpperCase();
-    const pairs = correspondingPairs(sourceUpper, targetUpper);
+    const pairs = correspondingPairs(resolveGroupKey(sourceUpper), resolveGroupKey(targetUpper));
     if (pairs.length === 0) {
       lines.push(
         `${indentStr}// MOVE CORRESPONDING ${sourceUpper} TO ${targetUpper}: no matching child field names found in the group registry`
@@ -1630,6 +1894,33 @@ export function generateMoveCorresponding(statement, indent = 0) {
   }
 
   return lines.length > 0 ? lines.join('\n') : `${indentStr}()`;
+}
+
+/**
+ * Generate ADD CORRESPONDING statement: `ADD CORRESPONDING group-1 TO
+ * group-2` adds every matching (by name, recursing into a nested same-named
+ * group on both sides - see correspondingPairs) elementary child of group-1
+ * into group-2's own value (`group-2.field = group-2.field + group-1.field`);
+ * group-1 itself is left unchanged (this is an ADD, not a MOVE) and any
+ * field on either side without a same-named counterpart is left untouched -
+ * same matching rule as MOVE CORRESPONDING (generateMoveCorresponding
+ * above), just accumulating instead of overwriting.
+ */
+function generateAddCorresponding(statement, indent = 0) {
+  const indentStr = '  '.repeat(indent);
+  const sourceRef = (Array.isArray(statement.addends) && statement.addends[0]) || statement.source;
+  const targetRef = (Array.isArray(statement.to) && statement.to[0]) || statement.target;
+  const sourceUpper = String(sourceRef?.name || sourceRef || '').toUpperCase();
+  const targetUpper = String(targetRef?.name || targetRef || '').toUpperCase();
+  const pairs = correspondingPairs(resolveGroupKey(sourceUpper), resolveGroupKey(targetUpper));
+
+  if (pairs.length === 0) {
+    return `${indentStr}() // ADD CORRESPONDING ${sourceUpper} TO ${targetUpper}: no matching child field names found in the group registry`;
+  }
+
+  return pairs
+    .map(pair => `${indentStr}${pair.targetCamel} = ${pair.targetCamel} + (${coerceCorrespondingValue(pair)})`)
+    .join('\n');
 }
 
 /**
@@ -1843,6 +2134,66 @@ function evaluateConditionExpr(subject, cond) {
       const to = convertArithmeticExpression(cond.to);
       return `((${s}) >= (${from}) && (${s}) <= (${to}))`;
     }
+    case 'NOT-RANGE': {
+      const s = evaluateSubjectExpr(subject);
+      const from = convertArithmeticExpression(cond.from);
+      const to = convertArithmeticExpression(cond.to);
+      return `!((${s}) >= (${from}) && (${s}) <= (${to}))`;
+    }
+    // RELATION/CLASS/SIGN are a full standalone "condition-1" WHEN object
+    // (parser/procedure-parser.js's parseEvaluateObject) - COBOL's
+    // `EVALUATE TRUE WHEN WS-A > WS-B` / `WHEN WS-X IS NUMERIC` idiom for an
+    // IF/ELSE-IF chain. The condition's own truth value *is* the match test,
+    // independent of whatever the paired subject's own value would otherwise
+    // compare against - only a FALSE pseudo-subject inverts it (mirrors the
+    // TRUE/FALSE handling every other case here already does).
+    case 'RELATION': {
+      const rawOp = cond.operator || '=';
+      const op = rawOp === '<>' ? '!=' : (COMPARISON_OPERATORS[rawOp] || rawOp);
+      const rel = `(${convertArithmeticExpression(cond.left)}) ${op} (${convertArithmeticExpression(cond.right)})`;
+      const result = cond.negated ? `!(${rel})` : rel;
+      return subject && subject.type === 'FALSE' ? `!(${result})` : result;
+    }
+    case 'CLASS': {
+      const field = convertArithmeticExpression(cond.subject);
+      let expr;
+      switch (cond.classType?.toUpperCase()) {
+        case 'NUMERIC':
+          expr = `${field}.forall(_.isDigit)`;
+          break;
+        case 'ALPHABETIC':
+          expr = `${field}.forall(_.isLetter)`;
+          break;
+        case 'ALPHABETIC-LOWER':
+          expr = `${field}.forall(c => c.isLetter && c.isLower)`;
+          break;
+        case 'ALPHABETIC-UPPER':
+          expr = `${field}.forall(c => c.isLetter && c.isUpper)`;
+          break;
+        default:
+          expr = `true /* ${cond.classType} class test */`;
+          break;
+      }
+      const result = cond.negated ? `!(${expr})` : expr;
+      return subject && subject.type === 'FALSE' ? `!(${result})` : result;
+    }
+    case 'SIGN': {
+      const field = convertArithmeticExpression(cond.subject);
+      let expr;
+      switch (cond.signType?.toUpperCase()) {
+        case 'POSITIVE':
+          expr = `${field} > 0`;
+          break;
+        case 'NEGATIVE':
+          expr = `${field} < 0`;
+          break;
+        default:
+          expr = `${field} == 0`;
+          break;
+      }
+      const result = cond.negated ? `!(${expr})` : expr;
+      return subject && subject.type === 'FALSE' ? `!(${result})` : result;
+    }
     case 'VALUE':
     default: {
       // `EVALUATE TRUE WHEN <88-name>` (or `WHEN FALSE`'s pseudo-subject) is
@@ -2028,6 +2379,15 @@ export function generateUnstring(statement, indent = 0) {
 
   targets.forEach((t, index) => {
     lines.push(`${indentStr}${renderAssignment(t.target, `_parts.lift(${index}).getOrElse("")`)}`);
+    if (t.count) {
+      // COUNT IN identifier: the number of characters actually delimited
+      // into the corresponding target from the (full fixed-width, already
+      // space-padded - see defaultElementaryValue/renderVariableMoveSource)
+      // source field - i.e. the matched substring's own length, not the
+      // receiving field's declared width (which the previous code silently
+      // left unpopulated, at its default-initialized 0).
+      lines.push(`${indentStr}${renderAssignment(t.count, `_parts.lift(${index}).map(_.length).getOrElse(0)`)}`);
+    }
   });
 
   if (statement.tallying) {
@@ -2214,6 +2574,10 @@ export function generateExpression(statement, indent = 0) {
  */
 function generateAdd(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
+
+  if (statement.corresponding) {
+    return generateAddCorresponding(statement, indent);
+  }
 
   // Get addends (values being added)
   const addendNodes = statement.addends || statement.operands || [];
@@ -2608,7 +2972,22 @@ function generateSearch(statement, indent = 0) {
     return generateSearchAll(statement, indent, tinfo);
   }
 
-  const idxVar = tinfo.indexed[0];
+  // SEARCH ... VARYING identifier-2 (IBM/GnuCOBOL '85 rules, verified against
+  // installed GnuCOBOL - see tests/corpus/proc/r01-search-midtable-varying.cbl):
+  // identifier-2 - NOT the table's own default (leftmost-declared) index -
+  // becomes the SOLE loop-control variable for this SEARCH. It is not
+  // resynced to the default index's (or anything else's) value at all - it
+  // keeps whatever value it already had going in - and it alone is bounds-
+  // checked/incremented on every iteration; the table's default index is left
+  // completely untouched by the SEARCH machinery itself (only a WHEN/AT END
+  // clause that happens to reference it directly would see its old, unmoved
+  // value). Confirmed empirically: `SEARCH tbl VARYING idx2` with a WHEN
+  // clause testing the *default* index never advances that index at all, and
+  // starting idx2 out of bounds (as if never SET) fires AT END immediately
+  // without ever evaluating a WHEN.
+  const idxVar = statement.varying
+    ? toCamelCase(statement.varying.name || statement.varying)
+    : tinfo.indexed[0];
   const times = tinfo.times;
   const bi = '  '.repeat(indent + 1);
   const wi = '  '.repeat(indent + 2);
@@ -2815,14 +3194,25 @@ function generateSort(statement, indent = 0) {
   if (flat.length === 0) {
     lines.push(`${indentStr}() // SORT ${statement.fileName}: no ASCENDING/DESCENDING KEY found - buffer left in RELEASE order`);
   } else {
-    const mixed = flat.some(k => k.order !== flat[0].order);
-    const tupleExpr = flat.length === 1 ? `r.${flat[0].camel}` : `(${flat.map(k => `r.${k.camel}`).join(', ')})`;
-    lines.push(`${indentStr}${info.bufferVar}.sortInPlaceBy(r => ${tupleExpr})`);
-    if (mixed) {
-      lines.push(`${indentStr}() // NOTE: mixed ASCENDING/DESCENDING multi-key SORT approximated by primary-key order only - no corpus target exercises this shape`);
-    } else if (flat[0].order === 'DESCENDING') {
-      lines.push(`${indentStr}${info.bufferVar}.reverseInPlace()`);
-    }
+    // True multi-key ordering with per-key ASCENDING/DESCENDING, evaluated
+    // as a tie-breaking cascade (first key decides unless equal, then the
+    // next key, ...) via sortInPlaceWith rather than sortInPlaceBy building
+    // one shared tuple Ordering - a single shared Ordering can't flip
+    // direction per-component for a mixed ASCENDING/DESCENDING key list (the
+    // previous approximation only ever reversed the *whole* comparison,
+    // which is only correct when every key shares the same direction).
+    // ArrayBuffer's sort is stable either way (verified), so ties still
+    // preserve RELEASE order exactly like the single-ascending-key case did.
+    const bi = `${indentStr}  `;
+    const cmpLines = [`${indentStr}${info.bufferVar}.sortInPlaceWith { (a, b) =>`];
+    flat.forEach((k, i) => {
+      const op = k.order === 'DESCENDING' ? '>' : '<';
+      const kw = i === 0 ? 'if' : 'else if';
+      cmpLines.push(`${bi}${kw} a.${k.camel} != b.${k.camel} then a.${k.camel} ${op} b.${k.camel}`);
+    });
+    cmpLines.push(`${bi}else false`);
+    cmpLines.push(`${indentStr}}`);
+    lines.push(cmpLines.join('\n'));
   }
 
   lines.push(`${indentStr}${info.idxVar} = 0`);
@@ -2839,13 +3229,16 @@ function generateSort(statement, indent = 0) {
 /**
  * Generate RELEASE statement: snapshot the SD record's current field values
  * (whatever was last MOVEd into them) as a new row appended to the sort
- * buffer. RELEASE ... FROM first moves the given source's matching fields
- * into the SD record fields (by name, the same as MOVE CORRESPONDING;
- * COBOL's RELEASE ... FROM is actually an unqualified structural MOVE, but
- * name-matching is the closest equivalent available without true
- * byte-layout aliasing, and coincides with a structural MOVE whenever the
- * source shares the record's field names in the same order, the overwhelmingly
- * common case).
+ * buffer. RELEASE ... FROM first performs the implicit structural MOVE of
+ * the given source's fields into the SD record's fields, matched BY
+ * POSITION (declared order) - see positionalPairs's doc comment for why
+ * this is not name-matched like MOVE CORRESPONDING. The FROM source is
+ * often itself a subscripted table element (`RELEASE rec FROM
+ * tbl-entry(idx)`, the common "release one row of a WORKING-STORAGE table
+ * into the sort file" idiom) - its subscript, if any, applies uniformly to
+ * every sibling field (Vector.apply reads are valid directly, unlike a
+ * subscripted *write* - see renderCamelAssignment - so no special handling
+ * is needed on this read side beyond appending the same suffix to each).
  */
 function generateRelease(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -2858,9 +3251,11 @@ function generateRelease(statement, indent = 0) {
   if (statement.from) {
     const fromUpper = String(statement.from.name || statement.from || '').toUpperCase();
     const recordUpper = String(statement.recordName || '').toUpperCase();
-    const pairs = correspondingPairs(fromUpper, recordUpper);
+    const fromSuffix = subscriptSuffixExpr(statement.from.subscripts);
+    const pairs = positionalPairs(resolveGroupKey(fromUpper), resolveGroupKey(recordUpper));
     for (const pair of pairs) {
-      lines.push(`${indentStr}${pair.targetCamel} = ${coerceCorrespondingValue(pair)}`);
+      const sourceExpr = coerceCorrespondingValue({ ...pair, sourceCamel: `${pair.sourceCamel}${fromSuffix}` });
+      lines.push(`${indentStr}${pair.targetCamel} = ${sourceExpr}`);
     }
   }
 
@@ -2891,11 +3286,19 @@ function generateReturn(statement, indent = 0) {
   }
 
   if (statement.into) {
+    // RETURN ... INTO's implicit structural MOVE - the mirror image of
+    // RELEASE ... FROM above (position-matched, not name-matched; see
+    // positionalPairs). The INTO target is often itself a subscripted table
+    // element (`RETURN sortfile INTO tbl-entry(idx)`) - unlike RELEASE's
+    // subscripted *read* side, a subscripted *write* needs
+    // renderCamelAssignment's `.updated(...)` rebuild (a Vector has no index
+    // setter).
     const intoUpper = String(statement.into.name || statement.into || '').toUpperCase();
-    const recordUpper = Array.from(SORT_FILE_REGISTRY.entries()).find(([, v]) => v === info)?.[0] || '';
-    const pairs = correspondingPairs(recordUpper, intoUpper);
+    const recordUpper = info.recordNameUpper || '';
+    const intoSubscripts = statement.into.subscripts;
+    const pairs = positionalPairs(resolveGroupKey(recordUpper), resolveGroupKey(intoUpper));
     for (const pair of pairs) {
-      lines.push(`${bi}${pair.targetCamel} = ${coerceCorrespondingValue(pair)}`);
+      lines.push(`${bi}${renderCamelAssignment(pair.targetCamel, intoSubscripts, coerceCorrespondingValue(pair))}`);
     }
   }
 
@@ -2994,70 +3397,117 @@ function generateStartStatement(statement, indent = 0) {
 }
 
 /**
- * Generate PERFORM statement
+ * Generate PERFORM statement nested inside another statement (an IF/
+ * EVALUATE/SEARCH branch body, etc. - a *top-level* paragraph's own PERFORM
+ * statements go through method-gen.js's generatePerformFromAST instead, via
+ * generateMethodBody's own PERFORM case). Target-paragraph references use
+ * paragraphMethodName (not toCamelCase) for the exact same reason
+ * method-gen.js's toMethodName does: a paragraph name with a leading numeric
+ * prefix (e.g. "1000-RECURSE") must have that prefix stripped before
+ * camelCasing, or `toCamelCase` alone leaves the leading digits in place
+ * (`1000Recurse`), which both isn't a legal Scala method-call target and
+ * doesn't match the actual generated method name (`recurse`) - see
+ * tests/corpus/proc/r09-perf-nested.cbl (a paragraph that PERFORMs itself
+ * from inside a nested IF).
  */
 function generatePerform(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const lines = [];
+  const testBefore = statement.testBefore !== false;
+
+  function body(bodyIndent) {
+    const bodyLines = [];
+    if (statement.targetParagraph) {
+      bodyLines.push(`${'  '.repeat(bodyIndent)}${paragraphMethodName(statement.targetParagraph)}()`);
+    }
+    if (statement.statements) {
+      for (const stmt of statement.statements) {
+        bodyLines.push(generateExpression(stmt, bodyIndent));
+      }
+    }
+    if (bodyLines.length === 0) bodyLines.push(`${'  '.repeat(bodyIndent)}()`);
+    return bodyLines.join('\n');
+  }
 
   if (statement.performType === 'simple') {
-    const target = toCamelCase(statement.targetParagraph || 'procedure');
-    lines.push(`${indentStr}${target}()`);
+    lines.push(`${indentStr}${paragraphMethodName(statement.targetParagraph || 'procedure')}()`);
   } else if (statement.performType === 'times') {
     const times = statement.times?.value || statement.times || '1';
     lines.push(`${indentStr}(1 to ${times}).foreach { _ =>`);
-    if (statement.targetParagraph) {
-      lines.push(`${indentStr}  ${toCamelCase(statement.targetParagraph)}()`);
-    }
-    if (statement.statements) {
-      for (const stmt of statement.statements) {
-        lines.push(generateExpression(stmt, indent + 1));
-      }
-    }
+    lines.push(body(indent + 1));
     lines.push(`${indentStr}}`);
   } else if (statement.performType === 'until') {
     const condition = convertCondition(statement.until);
-    lines.push(`${indentStr}while !(${condition}) do`);
-    if (statement.targetParagraph) {
-      lines.push(`${indentStr}  ${toCamelCase(statement.targetParagraph)}()`);
-    }
-    if (statement.statements) {
-      for (const stmt of statement.statements) {
-        lines.push(generateExpression(stmt, indent + 1));
-      }
+    if (testBefore) {
+      lines.push(`${indentStr}while !(${condition}) do`);
+      lines.push(body(indent + 1));
+    } else {
+      // WITH TEST AFTER: Scala 3 has no do-while postfix loop syntax at all
+      // (removed, not just restyled) - see method-gen.js's generatePerformFromAST
+      // for the identical rewrite this mirrors: fold the body into the
+      // while-condition block itself (so it always runs at least once before
+      // the first test) and leave the loop's own `do` body empty.
+      lines.push(`${indentStr}while`);
+      lines.push(body(indent + 1));
+      lines.push(`${'  '.repeat(indent + 1)}!(${condition})`);
+      lines.push(`${indentStr}do ()`);
     }
   } else if (statement.performType === 'varying') {
     const varying = statement.varying;
     const varName = toCamelCase(varying?.variable || 'i');
-    const from = varying?.from?.value || varying?.from || '1';
-    const by = varying?.by?.value || varying?.by || '1';
+    const from = varyingOperandExprLocal(varying?.from, 1);
+    const by = varyingOperandExprLocal(varying?.by, 1);
     const until = convertCondition(varying?.until);
+    const bi = '  '.repeat(indent + 1);
 
     // The loop-control variable is a WORKING-STORAGE item (declared once as
     // a flat var elsewhere) - assign it here rather than redeclaring with
     // `var`, so repeated PERFORM VARYING over the same variable in one
     // method body doesn't produce a duplicate-declaration compile error.
     lines.push(`${indentStr}${varName} = ${from}`);
-    lines.push(`${indentStr}while !(${until}) do`);
-    if (statement.targetParagraph) {
-      lines.push(`${indentStr}  ${toCamelCase(statement.targetParagraph)}()`);
+    if (testBefore) {
+      lines.push(`${indentStr}while !(${until}) do`);
+      lines.push(body(indent + 1));
+      lines.push(`${bi}${varName} = ${varName} + ${by}`);
+    } else {
+      // WITH TEST AFTER VARYING: the UNTIL test happens *before* the
+      // increment, against the still-current value - the increment only
+      // happens if the loop continues (verified against installed GnuCOBOL -
+      // see method-gen.js's generateVaryingNest, which this mirrors, for the
+      // full trace). Body+test fold into the while-condition block; the
+      // increment moves into the `do` body so it's skipped after the final,
+      // test-failing round.
+      lines.push(`${indentStr}while`);
+      lines.push(body(indent + 1));
+      lines.push(`${bi}!(${until})`);
+      lines.push(`${indentStr}do`);
+      lines.push(`${bi}${varName} = ${varName} + ${by}`);
     }
-    if (statement.statements) {
-      for (const stmt of statement.statements) {
-        lines.push(generateExpression(stmt, indent + 1));
-      }
-    }
-    lines.push(`${indentStr}  ${varName} = ${varName} + ${by}`);
   } else if (statement.statements) {
     // Inline PERFORM
     for (const stmt of statement.statements) {
       lines.push(generateExpression(stmt, indent));
     }
   } else if (statement.targetParagraph) {
-    lines.push(`${indentStr}${toCamelCase(statement.targetParagraph)}()`);
+    lines.push(`${indentStr}${paragraphMethodName(statement.targetParagraph)}()`);
   }
 
   return lines.join('\n');
+}
+
+/**
+ * Scala expression for a PERFORM VARYING FROM/BY operand, mirroring
+ * method-gen.js's varyingOperandExpr (duplicated locally for the same reason
+ * paragraphMethodName is - see that function's doc comment - method-gen.js
+ * imports from this module, so the reverse import would cycle).
+ */
+function varyingOperandExprLocal(operand, fallback) {
+  if (operand == null) return String(fallback);
+  if (typeof operand === 'object') {
+    if (operand.type === 'Literal') return String(operand.value);
+    if (operand.name) return toCamelCase(operand.name);
+  }
+  return String(operand);
 }
 
 /**
@@ -3180,7 +3630,18 @@ function generateSet(statement, indent = 0) {
   const targets = statement.targets || [statement.target];
 
   for (const target of targets) {
-    if (statement.value?.type === 'TRUE') {
+    const targetNameUpper = bareVariableNameUpper(target) || String(target?.name || target || '').toUpperCase();
+    const l88 = statement.value?.type === 'TRUE' ? level88FirstValueAssignment(targetNameUpper) : null;
+
+    if (l88) {
+      // SET condition-name-1 TO TRUE: the condition name itself has no
+      // Scala var (see level88FirstValueAssignment's doc comment) - assign
+      // its parent field the condition's first declared VALUE instead of
+      // emitting `<condition-name camelCase> = true`, which referenced a
+      // nonexistent identifier (e.g. `wsStatusActive = true` when only
+      // `wsStatus` - the *parent* PIC X(1) field - actually exists).
+      lines.push(`${indentStr}${l88.camel} = ${l88.literal}`);
+    } else if (statement.value?.type === 'TRUE') {
       lines.push(`${indentStr}${renderAssignment(target, 'true')}`);
     } else if (statement.value?.type === 'FALSE') {
       lines.push(`${indentStr}${renderAssignment(target, 'false')}`);

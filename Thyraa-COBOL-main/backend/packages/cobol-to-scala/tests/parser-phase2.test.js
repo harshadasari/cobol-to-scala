@@ -437,3 +437,82 @@ test('an unrecognized verb does not get swallowed as a bogus DISPLAY operand', (
   assert.deepEqual(typesOf(main.statements), ['DisplayStatement', 'UnknownStatement', 'StopStatement']);
   assert.equal(main.statements[0].values.length, 2);
 });
+
+// ---------------------------------------------------------------------------
+// Phase 2 adversarial-refutation finding 3: EVALUATE with an
+// arithmetic-expression subject, and a full relational/class/sign condition
+// (not just an 88-name) as a WHEN object under EVALUATE TRUE - see
+// parseEvaluateValue/parseEvaluateObject in procedure-parser.js and
+// tests/corpus/proc/r10-eval-nested.cbl.
+// ---------------------------------------------------------------------------
+
+test('EVALUATE <arithmetic-expression>: the subject keeps the whole expression, not just its first operand', () => {
+  const division = parseSnippet(`           EVALUATE WS-A + WS-B
+               WHEN 0 THRU 5
+                   MOVE 'LOW' TO WS-R
+               WHEN OTHER
+                   MOVE 'HI' TO WS-R
+           END-EVALUATE
+           STOP RUN.`);
+  const main = division.paragraphs[0];
+  assert.deepEqual(typesOf(main.statements), ['EvaluateStatement', 'StopStatement']);
+
+  const evaluate = main.statements[0];
+  assert.equal(evaluate.subjects.length, 1);
+  const subject = evaluate.subjects[0];
+  assert.equal(subject.type, 'ArithmeticExpression');
+  assert.equal(subject.operator, '+');
+  // parseEvaluateValue's left/right are the raw parseOperand() results
+  // (VariableReference nodes), not further wrapped.
+  assert.equal(subject.left.name, 'WS-A');
+  assert.equal(subject.right.name, 'WS-B');
+
+  // Exactly one WHEN clause (the THRU-range) plus WHEN OTHER - before the
+  // fix, the dropped `+ WS-B` left the cursor mid-expression and every token
+  // from there on (including every WHEN keyword) was swallowed as
+  // unrecognized fragments instead of ever becoming part of this
+  // EvaluateStatement.
+  assert.equal(evaluate.whenClauses.length, 1);
+  assert.deepEqual(evaluate.whenClauses[0].conditions, [
+    { type: 'RANGE', from: evaluate.whenClauses[0].conditions[0].from, to: evaluate.whenClauses[0].conditions[0].to },
+  ]);
+  assert.ok(evaluate.whenOther, 'WHEN OTHER statements should be captured');
+});
+
+test('EVALUATE TRUE WHEN <relational-condition> parses a RELATION object, not a truncated VALUE', () => {
+  const division = parseSnippet(`           EVALUATE TRUE
+               WHEN WS-A > WS-B
+                   MOVE 'GT' TO WS-R
+               WHEN WS-A = WS-B
+                   MOVE 'EQ' TO WS-R
+           END-EVALUATE
+           STOP RUN.`);
+  const main = division.paragraphs[0];
+  assert.deepEqual(typesOf(main.statements), ['EvaluateStatement', 'StopStatement']);
+
+  const evaluate = main.statements[0];
+  assert.deepEqual(evaluate.subjects, [{ type: 'TRUE' }]);
+  assert.equal(evaluate.whenClauses.length, 2);
+
+  const [gt, eq] = evaluate.whenClauses.map((w) => w.conditions[0]);
+  assert.equal(gt.type, 'RELATION');
+  assert.equal(gt.operator, '>');
+  assert.equal(gt.left.name, 'WS-A');
+  assert.equal(gt.right.name, 'WS-B');
+
+  assert.equal(eq.type, 'RELATION');
+  assert.equal(eq.operator, '=');
+});
+
+test('EVALUATE TRUE WHEN <identifier> IS NUMERIC parses a CLASS object', () => {
+  const division = parseSnippet(`           EVALUATE TRUE
+               WHEN WS-X IS NUMERIC
+                   MOVE 'N' TO WS-R
+           END-EVALUATE
+           STOP RUN.`);
+  const evaluate = division.paragraphs[0].statements[0];
+  const cond = evaluate.whenClauses[0].conditions[0];
+  assert.equal(cond.type, 'CLASS');
+  assert.equal(cond.classType, 'NUMERIC');
+  assert.equal(cond.subject.name, 'WS-X');
+});

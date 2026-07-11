@@ -201,11 +201,23 @@ ${indentStr}}`;
     if (testBefore) {
       return `${indentStr}while !(${condition}) do
 ${body}`;
-    } else {
-      return `${indentStr}do
-${body}
-${indentStr}while !(${condition})`;
     }
+
+    // WITH TEST AFTER (post-condition loop - body must run at least once
+    // even when the UNTIL condition is already true before the first
+    // iteration): Scala 3 removed the do-while postfix loop construct
+    // entirely (not merely restyled it) - `do <block> while <cond>` is a
+    // syntax error ("end of toplevel definition expected but 'do' found"),
+    // there is no direct replacement statement. The standard Scala 3
+    // rewrite folds the loop body into the `while`'s own condition block
+    // (whose *last* expression is the boolean test) and leaves the `do`
+    // body empty - the condition block runs unconditionally every time
+    // (including the first, before any test), which is exactly do-while
+    // semantics: body, then test, repeat while true.
+    return `${indentStr}while
+${body}
+${'  '.repeat(indent + 1)}!(${condition})
+${indentStr}do ()`;
   }
 
   // PERFORM VARYING [AFTER ...]
@@ -254,10 +266,34 @@ function generateVaryingNest(levels, i, stmt, indent) {
   // than redeclaring with `var`, so a second PERFORM VARYING over the same
   // variable in the same method body doesn't fail to compile with "... is
   // already defined as variable ...".
-  return `${indentStr}${varName} = ${from}
+  const testBefore = stmt.testBefore !== false;
+  const bodyIndentStr = '  '.repeat(indent + 1);
+
+  if (testBefore) {
+    return `${indentStr}${varName} = ${from}
 ${indentStr}while !(${until}) do
 ${body}
-${'  '.repeat(indent + 1)}${varName} = ${varName} + ${by}`;
+${bodyIndentStr}${varName} = ${varName} + ${by}`;
+  }
+
+  // WITH TEST AFTER VARYING: the TEST phrase applies uniformly to every
+  // nested VARYING/AFTER level in the same PERFORM statement (not just the
+  // outermost one) - each level's body must run at least once before its own
+  // UNTIL is first tested, and (verified against installed GnuCOBOL - see
+  // tests/corpus/proc/r07-perf-negafter.cbl's WITH TEST AFTER VARYING case)
+  // the UNTIL test itself happens *before* the increment, against the
+  // still-current (not yet incremented) value - the increment only happens
+  // if the loop is going to continue. So body+test are folded into the
+  // while-condition block (same do-while-elimination rewrite as every other
+  // WITH TEST AFTER form here - Scala 3 has no do-while postfix loop at all)
+  // and the increment moves into the `do` body, which only runs between
+  // iterations, never after the final (test-failing) one.
+  return `${indentStr}${varName} = ${from}
+${indentStr}while
+${body}
+${bodyIndentStr}!(${until})
+${indentStr}do
+${bodyIndentStr}${varName} = ${varName} + ${by}`;
 }
 
 /**

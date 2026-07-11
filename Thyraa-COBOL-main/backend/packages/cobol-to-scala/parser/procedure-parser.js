@@ -545,6 +545,57 @@ function makeCondition(options) {
   return cond;
 }
 
+/**
+ * Match a relational operator token (symbolic: =, >, <, >=, <=, <>; or word
+ * form: EQUAL [TO], GREATER [THAN [OR EQUAL [TO]]], LESS [THAN [OR EQUAL
+ * [TO]]]), returning the operator text to use (already flipped if `notMod` -
+ * an already-consumed leading "IS NOT" - applies), or null if the current
+ * token isn't a relational operator at all (cursor left untouched). Shared by
+ * parsePrimaryCondition (IF/PERFORM UNTIL/WHILE conditions) and
+ * parseEvaluateObject (EVALUATE TRUE/FALSE WHEN <condition> - see its doc
+ * comment) so both recognize the exact same operator grammar.
+ */
+function matchRelationalOperator(ctx, notMod) {
+  if (ctx.check(TokenType.OP_EQUAL) || ctx.matchValue('EQUAL', 'EQUALS')) {
+    ctx.match(TokenType.OP_EQUAL);
+    ctx.matchValue('TO');
+    return notMod ? '<>' : '=';
+  }
+  if (ctx.check(TokenType.OP_GREATER) || ctx.matchValue('GREATER')) {
+    ctx.match(TokenType.OP_GREATER);
+    ctx.matchValue('THAN');
+    if (ctx.matchValue('OR')) {
+      ctx.matchValue('EQUAL');
+      ctx.matchValue('TO');
+      return notMod ? '<' : '>=';
+    }
+    return notMod ? '<=' : '>';
+  }
+  if (ctx.check(TokenType.OP_LESS) || ctx.matchValue('LESS')) {
+    ctx.match(TokenType.OP_LESS);
+    ctx.matchValue('THAN');
+    if (ctx.matchValue('OR')) {
+      ctx.matchValue('EQUAL');
+      ctx.matchValue('TO');
+      return notMod ? '>' : '<=';
+    }
+    return notMod ? '>=' : '<';
+  }
+  if (ctx.check(TokenType.OP_GREATER_EQUAL)) {
+    ctx.advance();
+    return notMod ? '<' : '>=';
+  }
+  if (ctx.check(TokenType.OP_LESS_EQUAL)) {
+    ctx.advance();
+    return notMod ? '>' : '<=';
+  }
+  if (ctx.check(TokenType.OP_NOT_EQUAL)) {
+    ctx.advance();
+    return notMod ? '=' : '<>';
+  }
+  return null;
+}
+
 function parsePrimaryCondition(ctx) {
   // Parenthesized condition
   if (ctx.check(TokenType.OP_LPAREN)) {
@@ -623,41 +674,7 @@ function parsePrimaryCondition(ctx) {
     }
 
     // Relational condition
-    let operator = null;
-    if (ctx.check(TokenType.OP_EQUAL) || ctx.matchValue('EQUAL', 'EQUALS')) {
-      ctx.match(TokenType.OP_EQUAL);
-      ctx.matchValue('TO');
-      operator = notMod ? '<>' : '=';
-    } else if (ctx.check(TokenType.OP_GREATER) || ctx.matchValue('GREATER')) {
-      ctx.match(TokenType.OP_GREATER);
-      ctx.matchValue('THAN');
-      if (ctx.matchValue('OR')) {
-        ctx.matchValue('EQUAL');
-        ctx.matchValue('TO');
-        operator = notMod ? '<' : '>=';
-      } else {
-        operator = notMod ? '<=' : '>';
-      }
-    } else if (ctx.check(TokenType.OP_LESS) || ctx.matchValue('LESS')) {
-      ctx.match(TokenType.OP_LESS);
-      ctx.matchValue('THAN');
-      if (ctx.matchValue('OR')) {
-        ctx.matchValue('EQUAL');
-        ctx.matchValue('TO');
-        operator = notMod ? '>' : '<=';
-      } else {
-        operator = notMod ? '>=' : '<';
-      }
-    } else if (ctx.check(TokenType.OP_GREATER_EQUAL)) {
-      ctx.advance();
-      operator = notMod ? '<' : '>=';
-    } else if (ctx.check(TokenType.OP_LESS_EQUAL)) {
-      ctx.advance();
-      operator = notMod ? '>' : '<=';
-    } else if (ctx.check(TokenType.OP_NOT_EQUAL)) {
-      ctx.advance();
-      operator = notMod ? '=' : '<>';
-    }
+    const operator = matchRelationalOperator(ctx, notMod);
 
     if (operator) {
       const object = parseOperand(ctx);
@@ -826,6 +843,97 @@ function parseIfStatement(ctx) {
 }
 
 /**
+ * Parse an EVALUATE subject or WHEN-object's leading value: like parseOperand
+ * (preserving its string/figurative-constant/FUNCTION/ALL support), but also
+ * consumes a following arithmetic continuation (`WS-A + WS-B`, `WS-TOTAL -
+ * 1`, ...) so a full arithmetic-expression subject/object isn't silently
+ * truncated to just its first operand - see parseEvaluateStatement's doc
+ * comment.
+ */
+function parseEvaluateValue(ctx) {
+  let left = parseOperand(ctx);
+  while (
+    ctx.check(TokenType.OP_PLUS) || ctx.check(TokenType.OP_MINUS) ||
+    ctx.check(TokenType.OP_MULTIPLY) || ctx.check(TokenType.OP_DIVIDE) ||
+    ctx.check(TokenType.OP_POWER)
+  ) {
+    const operator = ctx.advance().value;
+    const right = parseOperand(ctx);
+    left = new ArithmeticExpression({ operator, left, right });
+  }
+  return left;
+}
+
+/**
+ * Parse one EVALUATE WHEN-clause object (COBOL's "evaluate-object"):
+ *   ANY | TRUE | FALSE
+ *   | [NOT] condition-1                      (relational/class/sign/88-name)
+ *   | [NOT] value [THRU value]
+ *
+ * The COBOL general format only allows a bare condition-1 (as opposed to a
+ * plain value/range) when the *paired* evaluate-subject is TRUE or FALSE -
+ * `EVALUATE TRUE WHEN WS-A > WS-B` / `WHEN WS-X IS NUMERIC` is the idiomatic
+ * replacement for an IF/ELSE-IF chain - but this parser doesn't thread the
+ * paired subject's shape down into here (and permissively recognizes the
+ * condition-1 grammar regardless); evaluateConditionExpr (expression-gen.js)
+ * is what actually applies TRUE/FALSE-subject semantics to whichever shape
+ * comes back. Returns one of the `whenClause.conditions[]` shapes
+ * expression-gen.js's evaluateConditionExpr switches on: `{type: 'ANY'|
+ * 'TRUE'|'FALSE'}`, `{type: 'RELATION', operator, left, right}`,
+ * `{type: 'CLASS'|'SIGN', ..., subject, negated}`, `{type: 'RANGE'|
+ * 'NOT-RANGE', from, to}`, or `{type: 'VALUE'|'NOT', value}`.
+ */
+function parseEvaluateObject(ctx) {
+  if (ctx.matchValue('ANY')) return { type: 'ANY' };
+  if (ctx.matchValue('TRUE')) return { type: 'TRUE' };
+  if (ctx.matchValue('FALSE')) return { type: 'FALSE' };
+
+  const negated = ctx.matchValue('NOT');
+  const value = parseEvaluateValue(ctx);
+
+  if (ctx.matchValue('IS')) {
+    const classNot = ctx.matchValue('NOT') || negated;
+    if (ctx.matchValue('NUMERIC')) {
+      return { type: 'CLASS', classType: 'NUMERIC', subject: value, negated: classNot };
+    }
+    if (ctx.matchValue('ALPHABETIC-LOWER')) {
+      return { type: 'CLASS', classType: 'ALPHABETIC-LOWER', subject: value, negated: classNot };
+    }
+    if (ctx.matchValue('ALPHABETIC-UPPER')) {
+      return { type: 'CLASS', classType: 'ALPHABETIC-UPPER', subject: value, negated: classNot };
+    }
+    if (ctx.matchValue('ALPHABETIC')) {
+      return { type: 'CLASS', classType: 'ALPHABETIC', subject: value, negated: classNot };
+    }
+    if (ctx.matchValue('POSITIVE')) {
+      return { type: 'SIGN', signType: 'POSITIVE', subject: value, negated: classNot };
+    }
+    if (ctx.matchValue('NEGATIVE')) {
+      return { type: 'SIGN', signType: 'NEGATIVE', subject: value, negated: classNot };
+    }
+    if (ctx.matchValue('ZERO', 'ZEROS', 'ZEROES')) {
+      return { type: 'SIGN', signType: 'ZERO', subject: value, negated: classNot };
+    }
+    // Not actually a recognized IS-clause (shouldn't happen with valid
+    // COBOL) - fall through and treat what was parsed as a plain value.
+    return negated ? { type: 'NOT', value } : { type: 'VALUE', value };
+  }
+
+  const operator = matchRelationalOperator(ctx, false);
+  if (operator) {
+    const object = parseEvaluateValue(ctx);
+    return { type: 'RELATION', operator, left: value, right: object, negated };
+  }
+
+  if (ctx.matchValue('THRU', 'THROUGH')) {
+    const endValue = parseEvaluateValue(ctx);
+    return negated ? { type: 'NOT-RANGE', from: value, to: endValue } : { type: 'RANGE', from: value, to: endValue };
+  }
+
+  return negated ? { type: 'NOT', value } : { type: 'VALUE', value };
+}
+
+/**
  * Parse EVALUATE statement
  */
 function parseEvaluateStatement(ctx) {
@@ -833,14 +941,22 @@ function parseEvaluateStatement(ctx) {
 
   const stmt = new EvaluateStatement();
 
-  // Parse subjects (what we're evaluating)
+  // Parse subjects (what we're evaluating). COBOL's general format allows
+  // any arithmetic-expression here, not just a bare identifier/literal (e.g.
+  // `EVALUATE WS-A + WS-B`) - parseEvaluateValue (below) parses a leading
+  // operand and folds in any following arithmetic operator/operand pairs, so
+  // the `+ WS-B` part isn't silently dropped (which previously left the
+  // parser cursor sitting mid-expression, and everything from there through
+  // the rest of the EVALUATE - every WHEN clause's own keywords included -
+  // got swallowed as unrecognized statement fragments instead of ever
+  // becoming part of this EvaluateStatement at all).
   do {
     if (ctx.matchValue('TRUE')) {
       stmt.subjects.push({ type: 'TRUE' });
     } else if (ctx.matchValue('FALSE')) {
       stmt.subjects.push({ type: 'FALSE' });
     } else {
-      const subject = parseOperand(ctx);
+      const subject = parseEvaluateValue(ctx);
       if (subject) {
         stmt.subjects.push(subject);
       }
@@ -861,25 +977,7 @@ function parseEvaluateStatement(ctx) {
 
     // Parse conditions for this WHEN
     do {
-      if (ctx.matchValue('ANY')) {
-        whenClause.conditions.push({ type: 'ANY' });
-      } else if (ctx.matchValue('TRUE')) {
-        whenClause.conditions.push({ type: 'TRUE' });
-      } else if (ctx.matchValue('FALSE')) {
-        whenClause.conditions.push({ type: 'FALSE' });
-      } else if (ctx.matchValue('NOT')) {
-        // NOT value or NOT range
-        const value = parseOperand(ctx);
-        whenClause.conditions.push({ type: 'NOT', value });
-      } else {
-        const value = parseOperand(ctx);
-        if (ctx.matchValue('THRU', 'THROUGH')) {
-          const endValue = parseOperand(ctx);
-          whenClause.conditions.push({ type: 'RANGE', from: value, to: endValue });
-        } else {
-          whenClause.conditions.push({ type: 'VALUE', value });
-        }
-      }
+      whenClause.conditions.push(parseEvaluateObject(ctx));
     } while (ctx.matchValue('ALSO'));
 
     // Parse statements for this WHEN

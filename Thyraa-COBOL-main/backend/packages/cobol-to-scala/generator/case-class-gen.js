@@ -119,6 +119,65 @@ export function calculateFieldLength(dataItem) {
   return itemByteLength(dataItem);
 }
 
+/**
+ * Find every uppercased PascalCase name that would be used as a case-class
+ * name more than once across the given top-level item lists (WORKING-STORAGE
+ * 01s, FILE SECTION records, ...) - counting BOTH top-level records and every
+ * nested group/REDEFINES-group reachable from them (generateCaseClass gives
+ * every one of those its own `case class`/`object`). COBOL's flat data-name
+ * namespace allows two *different* 01-records to each declare a same-named
+ * nested group (disambiguated in real COBOL only via OF/IN qualification -
+ * e.g. two records each with their own `05 DTL-GROUP`), which otherwise
+ * collides as `case class DtlGroup` defined twice in the same generated file
+ * ("DtlGroup is already defined as class DtlGroup"). Names appearing exactly
+ * once keep their plain PascalCase(name) (matching every previously-generated
+ * program byte-for-byte); only genuinely colliding names get a parent-path-
+ * qualified name (see resolveClassName) - so this only changes output for the
+ * specific programs that actually have the collision.
+ */
+export function collectAmbiguousGroupClassNames(itemLists) {
+  const counts = new Map();
+
+  function walk(list) {
+    for (const item of list || []) {
+      if (!item || !item.name) continue;
+      const realChildren = (item.children || []).filter(c => c.level !== 88);
+      if (realChildren.length === 0) continue;
+      const simple = toPascalCase(item.name);
+      counts.set(simple, (counts.get(simple) || 0) + 1);
+      walk(realChildren);
+    }
+  }
+
+  for (const list of itemLists) walk(list);
+
+  const ambiguous = new Set();
+  for (const [name, count] of counts) {
+    if (count > 1) ambiguous.add(name);
+  }
+  return ambiguous;
+}
+
+/**
+ * Resolve the actual case-class name to use for `name`, given the shared
+ * ambiguity set (collectAmbiguousGroupClassNames) and this item's immediate
+ * parent's OWN already-resolved class name. Unique names are untouched;
+ * colliding ones are qualified by their parent's class name (e.g. `DtlGroup`
+ * nested under both `WsA` and `WsB` becomes `WsADtlGroup`/`WsBDtlGroup`) -
+ * this is exactly the "disambiguate nested class names by parent path" fix.
+ * Falls back to the plain name if there's no parent (top-level records are
+ * never ambiguous with each other - COBOL 01-level names in the same section
+ * must already be unique) or no ambiguity set was supplied.
+ */
+export function resolveClassName(name, context = {}) {
+  const simple = toPascalCase(name);
+  const ambiguousNames = context.ambiguousNames;
+  if (ambiguousNames && ambiguousNames.has(simple) && context.parentClassName) {
+    return `${context.parentClassName}${simple}`;
+  }
+  return simple;
+}
+
 const BINARY_USAGES = new Set([
   'COMP', 'COMP-4', 'COMP-5', 'COMPUTATIONAL', 'COMPUTATIONAL-4', 'COMPUTATIONAL-5', 'BINARY',
 ]);
@@ -207,15 +266,21 @@ function classifyCodec(item, options = {}) {
  * @param {object} [options]
  * @param {'ascii'|'ebcdic'} [options.charset='ascii'] - charset used to decode/encode
  *   PIC X/A string fields and the codePage passed to zoned-decimal codecs.
+ * @param {object} [context] - `{ ambiguousNames: Set<string>, parentClassName: string|null }`,
+ *   see resolveClassName/collectAmbiguousGroupClassNames - only needed when
+ *   this program's data division has two different records sharing a
+ *   same-named nested group; omit for the (overwhelmingly common) unique case.
  */
-export function generateCaseClass(dataItem, indent = 0, options = {}) {
+export function generateCaseClass(dataItem, indent = 0, options = {}, context = {}) {
   const { name, children } = dataItem;
 
   if (!name || !children || children.length === 0) {
     return '';
   }
 
-  const className = toPascalCase(name);
+  const ctx = { ambiguousNames: context.ambiguousNames || new Set(), parentClassName: context.parentClassName || null };
+  const className = resolveClassName(name, ctx);
+  const childContext = { ambiguousNames: ctx.ambiguousNames, parentClassName: className };
   const indentStr = '  '.repeat(indent);
   const lines = [];
 
@@ -224,7 +289,7 @@ export function generateCaseClass(dataItem, indent = 0, options = {}) {
   const nestedClasses = [];
   for (const child of children) {
     if (child.children && child.children.length > 0 && !child.children.every(c => c.level === 88)) {
-      nestedClasses.push(generateCaseClass(child, indent, options));
+      nestedClasses.push(generateCaseClass(child, indent, options, childContext));
     }
   }
 
@@ -272,7 +337,7 @@ export function generateCaseClass(dataItem, indent = 0, options = {}) {
 
       let fieldType;
       if (hasRealChildren) {
-        fieldType = toPascalCase(child.name);
+        fieldType = resolveClassName(child.name, childContext);
         if (isTable) fieldType = `Vector[${fieldType}]`;
       } else {
         fieldType = mapCobolTypeToScala(child);
@@ -321,7 +386,7 @@ export function generateCaseClass(dataItem, indent = 0, options = {}) {
 
     let fieldType;
     if (hasRealChildren) {
-      fieldType = toPascalCase(child.name);
+      fieldType = resolveClassName(child.name, childContext);
       if (isTable) {
         fieldType = `Vector[${fieldType}]`;
       }
@@ -628,5 +693,7 @@ export default {
   toCamelCase,
   mapCobolTypeToScala,
   calculateFieldLength,
+  collectAmbiguousGroupClassNames,
+  resolveClassName,
   generateCaseClass
 };

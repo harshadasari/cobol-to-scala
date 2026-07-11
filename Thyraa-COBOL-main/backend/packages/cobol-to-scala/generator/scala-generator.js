@@ -7,17 +7,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { toPascalCase, toCamelCase, generateCaseClass } from './case-class-gen.js';
-import { getPicPattern, scalaBaseType, occursCount, hasOccurs } from './layout.js';
+import { toPascalCase, toCamelCase, generateCaseClass, collectAmbiguousGroupClassNames } from './case-class-gen.js';
+import { getPicPattern, scalaBaseType, occursCount, hasOccurs, itemByteLength } from './layout.js';
 import { generateAllEnums, groupLevel88sByParent } from './enum-gen.js';
 import {
   generateExpression,
   setFieldRegistry,
   setTableRegistry,
   setGroupRegistry,
+  setGroupByteLengthRegistry,
   setSortFileRegistry,
   setQualifiedRegistry,
   setConditionRegistry,
+  setAmbiguousGroupClassNames,
   generateCobolFmtHelper,
   generateCobolInspectHelper,
 } from './expression-gen.js';
@@ -747,6 +749,24 @@ function buildFieldRegistry(ast) {
   const registry = new Map();
   const tableRegistry = new Map();
   const groupRegistry = new Map();
+  // A group's own bare uppercased COBOL name -> its full ancestor-path key in
+  // groupRegistry (see the groupKey computation below) - lets a caller that
+  // only has a bare group name in hand (a MOVE/ADD CORRESPONDING source/
+  // target, or a RELEASE/RETURN FROM/INTO reference - none of which carry
+  // OF/IN qualification in the Phase 2 corpus) still resolve to the right
+  // groupRegistry entry, without needing to know the item's full ancestor
+  // chain itself. Last write wins for a bare name declared more than once
+  // (only possible for a *nested* group, e.g. two different records each
+  // declaring their own same-named nested group) - entry-point callers only
+  // ever reference either a top-level record (always unique) or a
+  // WORKING-STORAGE table-of-groups name (also unique in every corpus
+  // program), so this ambiguity never actually arises at an entry point;
+  // groupRegistry's own full-path keys (not this map) are what correctly
+  // disambiguate the *recursive* case.
+  const groupKeyRegistry = new Map();
+  // group-item name (upper) -> total byte length of one occurrence (see
+  // FUNCTION LENGTH(group-item) support in expression-gen.js's functionLength).
+  const groupByteLengthRegistry = new Map();
   // "<name>::<immediate parent name>" (both upper) -> field info, for OF/IN
   // qualified references (e.g. `NAME OF WS-TARGET-GROUP`) - populated for
   // every leaf regardless of whether its bare name is globally ambiguous, so
@@ -761,7 +781,19 @@ function buildFieldRegistry(ast) {
   const lines = [];
   const declaredIndexNames = new Set();
 
-  function walk(list, occursChain, parentNameUpper) {
+  // `ancestorNames` is the full chain of uppercased ancestor group names from
+  // the top-level 01 item down to (but not including) the current item -
+  // needed (not just the immediate parent) for two things: disambiguating a
+  // leaf name that collides *even after* immediate-parent qualification (two
+  // different top-level records each declaring their own same-named nested
+  // group containing a same-named child, e.g. both with `05 DTL-GROUP. 10
+  // QTY ...` - immediate-parent qualification alone produces the identical
+  // `dtlGroupQty` identifier for both, a duplicate-var compile error - see
+  // tests/corpus/proc/r13b-dupgroupname-iso.cbl), and resolving an OF/IN
+  // qualifier that names an ancestor *above* the immediate parent (`QTY OF
+  // WS-B`, skipping the intermediate DTL-GROUP level entirely - equally
+  // valid, common COBOL).
+  function walk(list, occursChain, ancestorNames) {
     for (const item of list) {
       if (isLevel(item, 88)) continue;
 
@@ -795,9 +827,16 @@ function buildFieldRegistry(ast) {
             camel: idxCamels[i],
             scalaType: 'Int',
             dataType: 'numeric',
-            integerDigits: String(occursCount(item)).length,
+            // GnuCOBOL's runtime DISPLAY format for an index-name is always
+            // signed, 9-digit zero-padded (e.g. `+000000004`) regardless of
+            // the table's declared OCCURS size - index-names are internally
+            // a fixed binary width, not sized by the table they index -
+            // verified against installed GnuCOBOL (see
+            // tests/corpus/proc/r01-search-midtable-varying.cbl /
+            // r02-search-noatend.cbl's DISPLAY of an index-name).
+            integerDigits: 9,
             decimalDigits: 0,
-            signed: false,
+            signed: true,
             editPattern: null,
             occursDepth: 0,
             picLength: 0,
@@ -814,26 +853,60 @@ function buildFieldRegistry(ast) {
       const realChildren = (item.children || []).filter(c => !isLevel(c, 88));
       if (realChildren.length > 0) {
         const parentUpper = (item.name || '').toUpperCase();
+        // Full ancestor-path key for THIS group, not just its bare name -
+        // two different top-level records can each declare their own
+        // same-named nested group (e.g. both with `05 DTL-GROUP`), which
+        // would otherwise collide on a single shared `groupRegistry` entry
+        // keyed just "DTL-GROUP" (whichever one is processed last would
+        // silently overwrite the other, corrupting MOVE/ADD CORRESPONDING's
+        // recursion into it for *both* records - see
+        // tests/corpus/proc/r13-addcorresponding-nested.cbl). Identical to a
+        // top-level item's own bare name when ancestorNames is empty, so
+        // every existing (non-nested-collision) lookup by bare name is
+        // unaffected.
+        const groupKey = [...ancestorNames, parentUpper].join('/');
         const ownCount = hasOccurs(item) && occursCount(item) > 1 ? occursCount(item) : null;
-        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain, parentUpper);
+        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain, [...ancestorNames, parentUpper]);
 
         // Group registry: immediate child names (COBOL name + camel), used
-        // by MOVE CORRESPONDING to match children between two group items by
-        // name at generation time. Built *after* recursing so each child's
-        // camel can be read back from qualifiedRegistry (keyed by this
-        // group's own name as parent) - the one identifier that's always
-        // correct for that child regardless of whether its bare name
+        // by MOVE/ADD CORRESPONDING to match children between two group
+        // items by name at generation time. Built *after* recursing so each
+        // child's camel can be read back from qualifiedRegistry (keyed by
+        // this group's own name as parent) - the one identifier that's
+        // always correct for that child regardless of whether its bare name
         // happens to collide with a same-named child under some other group.
+        // A child that is itself a group carries its own `groupKey` too, so
+        // CORRESPONDING's recursion (correspondingPairs/positionalPairs in
+        // expression-gen.js) can look up *that specific* nested group's
+        // children instead of an ambiguous bare name.
+        groupKeyRegistry.set(parentUpper, groupKey);
         groupRegistry.set(
-          parentUpper,
+          groupKey,
           realChildren
             .filter(c => !c.isFiller && c.name)
             .map(c => {
               const nameUpper = (c.name || '').toUpperCase();
               const info = qualifiedRegistry.get(`${nameUpper}::${parentUpper}`);
-              return { nameUpper, camel: info ? info.camel : toCamelCase(c.name) };
+              const childHasRealChildren = (c.children || []).some(cc => cc.level !== 88);
+              return {
+                nameUpper,
+                camel: info ? info.camel : toCamelCase(c.name),
+                info: info || null,
+                groupKey: childHasRealChildren ? `${groupKey}/${nameUpper}` : null,
+              };
             })
         );
+
+        // FUNCTION LENGTH(group-item): a compile-time constant (the sum of
+        // the group's elementary children's byte lengths, exactly what
+        // layout.js's itemByteLength already computes for record/case-class
+        // sizing) - not a runtime var, since there is no single flat Scala
+        // identifier holding a group's "value" the way there is for an
+        // elementary item. Recorded once per group name here (regardless of
+        // OCCURS - a bare, unsubscripted `FUNCTION LENGTH(tbl-group)` refers
+        // to one occurrence's width) so expression-gen.js's functionLength
+        // can look it up by name alone.
+        groupByteLengthRegistry.set(parentUpper, itemByteLength({ ...item, occurs: null }));
         continue;
       }
 
@@ -846,12 +919,18 @@ function buildFieldRegistry(ast) {
       const ambiguous = (leafNameCounts.get(nameUpper) || 0) > 1;
       // Names that collide across sibling/cousin groups (only possible via
       // OF/IN qualification in real COBOL - see countLeafNameOccurrences)
-      // get a parent-qualified identifier instead of the bare camelCase
-      // name every *unique* name still uses - preserves the existing,
-      // already-tested identifier scheme for the overwhelmingly common
-      // (unique-name) case.
+      // get a full-ancestor-path-qualified identifier instead of the bare
+      // camelCase name every *unique* name still uses - preserves the
+      // existing, already-tested identifier scheme for the overwhelmingly
+      // common (unique-name) case. The *full* chain (not just the immediate
+      // parent) is required: two different top-level records can each
+      // declare their own same-named nested group with a same-named child
+      // (both immediate parents are spelled identically too), which
+      // immediate-parent-only qualification cannot tell apart - the full
+      // path always can, since sibling names must differ and top-level
+      // record names must be unique in valid COBOL.
       const camel = ambiguous
-        ? `${toCamelCase(parentNameUpper || '')}${toPascalCase(item.name)}`
+        ? toCamelCase([...ancestorNames, item.name].join('-'))
         : toCamelCase(item.name);
       const baseType = scalaBaseType(item);
       let scalaType = baseType;
@@ -889,7 +968,15 @@ function buildFieldRegistry(ast) {
       // valid COBOL anyway - it always requires OF/IN - so nothing legit
       // depends on a bare-key entry existing here).
       if (!ambiguous) registry.set(nameUpper, info);
-      qualifiedRegistry.set(`${nameUpper}::${(parentNameUpper || '').toUpperCase()}`, info);
+      // Register a qualified-lookup entry for *every* ancestor level, not
+      // just the immediate parent - `QTY OF WS-B` (qualifying by a
+      // grandparent, skipping the intermediate DTL-GROUP level entirely) is
+      // equally valid, common COBOL, and convertIdentifier's OF/IN handling
+      // (see lookupQualified) needs an entry under whichever ancestor name
+      // the source actually used.
+      for (const ancestor of ancestorNames) {
+        qualifiedRegistry.set(`${nameUpper}::${ancestor}`, info);
+      }
 
       // Level-88 condition-name registry: every VALUE/VALUES (incl. THRU
       // ranges) declared under this elementary item, keyed by the 88-level's
@@ -906,10 +993,10 @@ function buildFieldRegistry(ast) {
     }
   }
 
-  walk(wsItems, [], null);
-  walk(fileItems, [], null);
+  walk(wsItems, [], []);
+  walk(fileItems, [], []);
 
-  return { lines: lines.join('\n'), registry, tableRegistry, groupRegistry, qualifiedRegistry, conditionRegistry };
+  return { lines: lines.join('\n'), registry, tableRegistry, groupRegistry, groupKeyRegistry, groupByteLengthRegistry, qualifiedRegistry, conditionRegistry };
 }
 
 /**
@@ -941,6 +1028,15 @@ function buildSortFileRegistry(ast) {
       bufferVar: `${toCamelCase(f.name)}Buffer`,
       idxVar: `${toCamelCase(f.name)}Idx`,
       fields,
+      // The 01 record's own uppercased COBOL name - this is the key
+      // GROUP_REGISTRY (buildFieldRegistry) uses for this record's field
+      // list, which generateReturn's RETURN ... INTO handling (in
+      // expression-gen.js) needs to look up positionalPairs(recordNameUpper,
+      // intoUpper). Recorded directly rather than reverse-searched out of
+      // this Map by identity (this map is keyed by *both* the SD's own name
+      // and the record's name pointing at the same `info` - reverse-search
+      // isn't guaranteed to land on the record's name specifically).
+      recordNameUpper: record.name ? record.name.toUpperCase() : '',
     };
 
     registry.set((f.name || '').toUpperCase(), info);
@@ -980,14 +1076,22 @@ function generateSortFileSupport(sortFileRegistry) {
  * Handles multiple parser output formats
  */
 function generateAllCaseClasses(ast, indent = 0, options = {}) {
-  const classes = [];
+  // Every top-level (01-level) record that will get its own case class is
+  // collected *before* any generation happens, so the ambiguous-nested-group-
+  // name set (see case-class-gen.js's collectAmbiguousGroupClassNames/
+  // resolveClassName) can be computed once across the *whole* program - two
+  // different top-level records each containing a same-named nested group
+  // (e.g. both declaring their own `05 DTL-GROUP`) would otherwise emit two
+  // colliding `case class DtlGroup`/`object DtlGroup` definitions in the same
+  // generated file.
+  const topLevelItems = [];
 
   function processItems(items) {
     if (!items) return;
     for (const item of items) {
       if ((item.level === 1 || item.level === '01' || item.level === 1) &&
           item.children && item.children.length > 0) {
-        classes.push(generateCaseClass(item, indent, options));
+        topLevelItems.push(item);
       }
     }
   }
@@ -999,11 +1103,11 @@ function generateAllCaseClasses(ast, indent = 0, options = {}) {
 
     for (const fd of files) {
       if (fd.record) {
-        classes.push(generateCaseClass(fd.record, indent, options));
+        topLevelItems.push(fd.record);
       }
       if (fd.records) {
         for (const record of fd.records) {
-          classes.push(generateCaseClass(record, indent, options));
+          topLevelItems.push(record);
         }
       }
     }
@@ -1050,6 +1154,11 @@ function generateAllCaseClasses(ast, indent = 0, options = {}) {
   if (ast.linkageSection && Array.isArray(ast.linkageSection)) {
     processItems(ast.linkageSection);
   }
+
+  const ambiguousNames = collectAmbiguousGroupClassNames(topLevelItems.map(item => [item]));
+  const classes = topLevelItems.map(item =>
+    generateCaseClass(item, indent, options, { ambiguousNames, parentClassName: null })
+  );
 
   return classes.filter(c => c).join('\n\n');
 }
@@ -1165,14 +1274,28 @@ export function generateScala(ast, options = {}) {
     registry: fieldRegistry,
     tableRegistry,
     groupRegistry,
+    groupKeyRegistry,
+    groupByteLengthRegistry,
     qualifiedRegistry,
     conditionRegistry,
   } = buildFieldRegistry(ast);
   setFieldRegistry(fieldRegistry);
   setTableRegistry(tableRegistry);
-  setGroupRegistry(groupRegistry);
+  setGroupRegistry(groupRegistry, groupKeyRegistry);
+  setGroupByteLengthRegistry(groupByteLengthRegistry);
   setQualifiedRegistry(qualifiedRegistry);
   setConditionRegistry(conditionRegistry);
+
+  // Case-class names that collide across two different top-level records
+  // (see case-class-gen.js's collectAmbiguousGroupClassNames/resolveClassName
+  // and generateAllCaseClasses below) - handed to expression-gen.js purely as
+  // a defensive guard for generateGroupMove's differing-layout byte-level
+  // round trip, which references a group's case-class name directly by its
+  // bare COBOL name and has no parent-path context to disambiguate an
+  // ambiguous one with (unlike generateAllCaseClasses, which does).
+  setAmbiguousGroupClassNames(
+    collectAmbiguousGroupClassNames([getWorkingStorageItems(ast), getFileSectionRecordItems(ast)])
+  );
 
   // SD ("sort") work-file support: a dedicated row case class + in-memory
   // buffer/cursor vars per SD, so SORT/RELEASE/RETURN can be generated as

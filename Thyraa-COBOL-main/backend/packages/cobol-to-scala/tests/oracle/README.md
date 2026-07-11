@@ -107,67 +107,73 @@ For programs under `tests/corpus/data/` specifically, the suite also runs
 
 ## Phase 2 scope: `tests/corpus/proc/`
 
-`tests/corpus/proc/` programs (SEARCH/SEARCH ALL, table/file SORT, MOVE
+`tests/corpus/proc/` programs (SEARCH/SEARCH ALL, table/file SORT, MOVE/ADD
 CORRESPONDING, GO TO ... DEPENDING ON, intrinsic FUNCTIONs, PERFORM forms,
-EVALUATE, STRING/UNSTRING/INSPECT) go through the exact same `oracleCompare()`
-data-driven pattern as Phase 1, in a separate "Phase 2 oracle compare" suite:
-match -> hard `assert.ok`, mismatch -> `t.todo('Phase 2 work queue - ...')`.
-As of this writing every `tests/corpus/proc/*.cbl` program matches end-to-end
-(0 todo); a todo only reappears here if a new proc/ program is added ahead of
-the generator support it needs.
+EVALUATE, STRING/UNSTRING/INSPECT, RELEASE/RETURN) go through the exact same
+`oracleCompare()` data-driven pattern as Phase 1, in a separate "Phase 2
+oracle compare" suite: match -> hard `assert.ok`, mismatch ->
+`t.todo('Phase 2 work queue - ...')`. As of this writing every
+`tests/corpus/proc/*.cbl` program matches end-to-end (0 todo); a todo only
+reappears here if a new proc/ program is added ahead of the generator support
+it needs.
+
+The `p10`-`p18` programs are the original Phase 2 baseline corpus. The
+`r01`-`r14` programs (including `*b`/`*c` isolation/bisection follow-ups) were
+added by a Phase 2 adversarial refuter that found 14 root-cause silent-
+divergence gaps against installed GnuCOBOL - see "Current inventory" below
+for the finding -> program -> fix mapping. They were promoted into this
+directory (not kept as a separate corpus) specifically so this same
+data-driven suite picks them up automatically: no test-registration code
+changes were needed to add them, only the generator/parser fixes each one's
+mismatch pointed at.
 
 ## Current inventory (last recorded run: 2026-07-11)
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 16 corpus programs found (7 under
-`data/`, 9 under `proc/`), all 16 compiled and ran cleanly under cobc (exit 0), and all
-16 already have a `.expected.txt` that matches the captured `.oracle.txt` exactly - 0
-mismatches. (If you add a corpus program without a `.expected.txt` yet, it will show up
-as a diagnostic-only pass here until one is added.)
+**cobc oracle capture / expected-vs-oracle check** - 48 corpus programs found (19
+under `data/`, 29 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
+precompiler, see `tests/sql.test.js` instead), all 48 compiled and ran cleanly under
+cobc (exit 0). 28 of the 48 (19 `data/` + 9 `proc/` baseline programs) already have a
+hand-written `.expected.txt` that matches the captured `.oracle.txt` exactly - 0
+mismatches. The 20 `r01`-`r14*` programs have no hand-written `.expected.txt` by
+design (they're verified directly against cobc via `oracleCompare()` below, not a
+separately hand-authored expectation) and show up here as a diagnostic-only capture
+("no `<name>.expected.txt` alongside ... yet").
 
-**Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 7/7 programs currently
-land in the `t.todo(...)` work queue; 0 currently match end-to-end. This is expected at
-this stage of the generator (Phase 1 corpus is deliberately adversarial about data
-layout) and is not something this harness fixes - it's owned by whoever works the
-generator next. Exact mismatch per program:
+**Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
+end-to-end (0 todo).
 
-| Program | Mismatch |
-|---|---|
-| `p01-comp3.cbl` | Scala compile error: `Not found: wsPosSmall` (and same for every other field) |
-| `p02-binary.cbl` | Scala compile error: `Not found: wsBin2Pos` (ditto, every field) |
-| `p03-zoned.cbl` | Scala compile error: `Not found: wsSmall` (ditto) |
-| `p04-occurs.cbl` | Scala compile error: `wsI is already defined as variable wsI` (plus, separately, undeclared group-item fields and dropped-subscript / dropped-loop-body issues - see below) |
-| `p05-odo.cbl` | Scala compile error: `Not found: wsCount` (ditto pattern) |
-| `p06-redefines.cbl` | Scala compile error: `Not found: wsDateNumeric` (ditto pattern) |
-| `p07-editing.cbl` | Scala compile error: `Not found: wsZsVal` (ditto pattern) |
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 29/29 programs match
+end-to-end (0 todo), including all 20 `r01`-`r14*` adversarial-refutation programs
+below.
 
-### Top 5 categories behind these failures (generator gaps, not harness bugs)
+### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
-1. **Undeclared top-level elementary `01`-level WORKING-STORAGE items.** `01` items
-   with no children are meant to become case classes; items with no children fall
-   through both `generateAllCaseClasses` (which requires `children.length > 0`) and
-   `generateWorkingStorageFields` (which only handles level-`77` items) in
-   `generator/scala-generator.js`. The generated method body then assigns/reads a Scala
-   identifier (e.g. `wsPosSmall`) that was never declared anywhere -
-   `Not found: <name>`. This alone accounts for all of p01, p02, p03, p05, p06, p07 and
-   part of p04.
-2. **Subscripted table-element references collapse to the bare group field name,
-   silently losing the index.** In p04, `WS-QTY(1)`, `WS-QTY(2)`, ... all generate as
-   the same bare `wsQty` reference/assignment - the subscript is dropped rather than
-   indexing into the `Vector` the case class holds.
-3. **`PERFORM VARYING` loop bodies are dropped.** In p04/p05 the generated `while`
-   loop correctly increments the loop variable and tests the exit condition, but the
-   statement(s) inside the loop (e.g. `ADD WS-QTY(WS-I) TO WS-QTY-TOTAL`) are rendered
-   as an empty `()` - the loop runs to completion and does nothing.
-4. **Repeated `PERFORM VARYING` with the same loop variable re-declares it.** Each
-   `PERFORM VARYING WS-I ...` in the same paragraph/procedure emits its own
-   `var wsI = 1`, so a second loop over `WS-I` in the same method fails to compile
-   with `wsI is already defined as variable wsI` (p04).
-5. **Multi-dimensional `OCCURS` subscripts aren't translated.** `WS-COL(WS-I, WS-J)`
-   (a 2-D table access in p04) collapses to the bare `wsCol` name instead of two levels
-   of `Vector` indexing.
+The refuter found 14 root-cause gaps, all silent (no TODO markers, no crash at
+generation time - each one produced plausible-looking but wrong, or non-compiling,
+Scala). All 14 are now fixed; every program hard-passes `oracleCompare()`. Only 4
+programs (`r03`, `r04`, `r05`, `r08`) already passed before this round of fixes.
 
-Re-run `npm test` after generator changes; the numbers/table above will drift as gaps
-close; the "how to run" commands are the source of truth, this table is only a
-snapshot.
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | `FUNCTION NUMVAL` crashed on COBOL-legal internal whitespace between the sign and digits (e.g. `'+  12.5'`) - a plain `.trim` only strips the outer edges, and `BigDecimal`'s parser rejects the remaining internal space outright | Added a `CobolFmt.numval` runtime helper that strips *every* space and normalizes the sign before parsing (`generator/expression-gen.js`) | r11, r11b, r11c |
+| 2 | `SET condition-name TO TRUE` emitted `<conditionNameCamel> = true` - the condition name has no Scala var of its own (IF/EVALUATE TRUE WHEN condition-name were already fixed in commit `5a9605e`; this was the one remaining broken form) | Assign the condition's *parent* field the first declared VALUE instead (`level88FirstValueAssignment` in `generator/expression-gen.js`) | r14, r14b |
+| 3 | `EVALUATE <arithmetic-expression>` silently dropped everything after the first operand (`WS-A + WS-B` -> just `WS-A`), and a full relational/class/sign condition as a WHEN object under `EVALUATE TRUE` collapsed to `(true) == (subject)` | Parser: `parseEvaluateValue`/`parseEvaluateObject` (`parser/procedure-parser.js`) parse a full arithmetic-expression subject and a full condition-1 WHEN object; codegen: `RELATION`/`CLASS`/`SIGN`/`NOT-RANGE` cases in `evaluateConditionExpr` (`generator/expression-gen.js`) | r10 |
+| 4 | Recursive/nested `PERFORM` of the same paragraph (from inside an IF/EVALUATE/etc.) mangled a digit-leading paragraph name (`1000-RECURSE` -> `1000Recurse()`) inconsistently with the actual generated method name (`recurse()`) | `expression-gen.js`'s `generatePerform` (used for a PERFORM nested inside another statement) now uses the same `paragraphMethodName` numeric-prefix-stripping logic method-gen.js's `toMethodName` uses for top-level PERFORMs | r09 |
+| 5 | `PERFORM WITH TEST AFTER` emitted a postfix `do <block> while <cond>` - Scala 3 removed do-while entirely, not just restyled it | Fold body(+increment)+test into the `while`-condition block, leave the loop's own `do` empty (or, for `VARYING`, move only the increment into `do` - the test uses the still-current value, verified against installed GnuCOBOL) - `method-gen.js` and `expression-gen.js` | r07 |
+| 6 | Two different top-level records each declaring a same-named nested group (`05 DTL-GROUP`) collided: duplicate `case class`/`object` definitions, duplicate flat `var` declarations, and CORRESPONDING matching recursed into the wrong occurrence's children | `case-class-gen.js`'s `collectAmbiguousGroupClassNames`/`resolveClassName` qualify only genuinely-colliding names by parent path; `scala-generator.js`'s flat-var registry qualifies by full ancestor path; `GROUP_REGISTRY` is now keyed by full ancestor path (not bare name) with a `groupKeyRegistry` for bare-name entry-point lookups | r13, r13b |
+| 7 | `FUNCTION LENGTH` of a GROUP item had no registry entry, falling back to a runtime `.length` call on a nonexistent flat var | New `groupByteLengthRegistry` (built from `layout.js`'s `itemByteLength`) gives `functionLength` a compile-time-constant answer for group arguments | r11 |
+| 8 | `FUNCTION MAX`/`MIN` used `Math.max`/`Math.min`, which have no `BigDecimal` overload | `List(...).max`/`.min` (works for any Scala numeric type via its own `Ordering`); a MOVE of the result into a numeric-edited field routes through `CobolFmt.edited` | r11, r14, r14c |
+| 9 | `SEARCH ... VARYING other-index` was completely ignored - the table's default index always drove the loop | The named `VARYING` identifier - not the table's default index - is now the sole loop-control variable, matching GnuCOBOL's actual (empirically verified) behavior: it is not resynced to anything and the default index is left untouched | r01 |
+| 10 | `DISPLAY` of an index-name used the table's own OCCURS size for width/sign, not GnuCOBOL's actual runtime format | Index-name registry entries now always use `integerDigits: 9, signed: true` (GnuCOBOL's fixed internal index-name format) | r01, r02 |
+| 11 | Multi-key `SORT` with mixed ASCENDING/DESCENDING keys was approximated by primary-key order only | `sortInPlaceWith` with a real per-key tie-breaking cascade honoring each key's own direction (stable, verified) | r06 |
+| 12 | `RELEASE ... FROM identifier` matched fields *by name* (like MOVE CORRESPONDING) - silently copied nothing when the FROM source's field names legitimately differed from the SD record's own | New `positionalPairs` (position-matched, not name-matched - RELEASE has no CORRESPONDING keyword) | r06, r06b |
+| 13 | `RETURN ... INTO identifier` had the same name-matching bug as RELEASE | Same `positionalPairs` fix, applied to the mirror-image direction | r06, r06b |
+| 14 | `UNSTRING ... COUNT IN` never populated the per-field count receiver (always left at its default 0) | Assign each COUNT IN target the matched substring's actual length | r12 |
+
+Re-run `npm test` after generator changes; the table above will drift as new gaps are
+found and fixed - the "how to run" commands are the source of truth, this table is
+only a snapshot. See also `tests/phase2-refutation-fixes.test.js` for focused,
+toolchain-independent unit tests of each fix above.

@@ -113,6 +113,9 @@ const allCblFiles = (await walkCblFiles(CORPUS_ROOT)).sort();
 const dataCblFiles = allCblFiles.filter(
   (f) => path.relative(CORPUS_ROOT, f).split(path.sep)[0] === 'data'
 );
+const procCblFiles = allCblFiles.filter(
+  (f) => path.relative(CORPUS_ROOT, f).split(path.sep)[0] === 'proc'
+);
 
 describe('toolchain availability', () => {
   test('cobc (GnuCOBOL) is on PATH and responds to --version', (t) => {
@@ -228,6 +231,40 @@ describe('Phase 1 oracle compare: cobc vs generated Scala (tests/corpus/data onl
         // marked todo (visible, non-failing) with the exact mismatch reason
         // rather than having their assertion removed or weakened.
         t.todo(`Phase 1 work queue - ${rel}: ${summarizeMismatch(result)}`);
+        return;
+      }
+
+      assert.ok(result.match, `COBOL and generated Scala output should match for ${rel}`);
+    });
+  }
+});
+
+describe('Phase 2 oracle compare: cobc vs generated Scala (tests/corpus/proc)', () => {
+  before(async () => {
+    if (cobcAvailable && scalaCliAvailable && procCblFiles.length > 0) {
+      await warmupScala();
+    }
+  });
+
+  for (const cblPath of procCblFiles) {
+    const rel = path.relative(CORPUS_ROOT, cblPath);
+
+    test(`oracle compare: ${rel}`, { timeout: ORACLE_COMPARE_TEST_TIMEOUT_MS }, async (t) => {
+      if (!cobcAvailable || !scalaCliAvailable) {
+        t.skip('cobc and/or scala-cli unavailable; skipping COBOL-vs-Scala comparison');
+        return;
+      }
+
+      const result = await oracleCompare(cblPath, { scalaOpts: { timeout: 120_000 } });
+
+      if (!result.match) {
+        // Same data-driven pattern as the Phase 1 (data/) suite above: a
+        // currently-failing proc/ program is a visible (non-failing) todo
+        // with the exact mismatch reason, never a silently weakened/removed
+        // assertion. As of this writing every tests/corpus/proc/*.cbl
+        // program matches, so this only fires for a *new* proc/ program
+        // added ahead of the generator work needed to support it.
+        t.todo(`Phase 2 work queue - ${rel}: ${summarizeMismatch(result)}`);
         return;
       }
 

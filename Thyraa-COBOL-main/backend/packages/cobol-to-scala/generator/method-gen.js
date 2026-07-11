@@ -71,73 +71,6 @@ function analyzeReturnType(procedure) {
 }
 
 /**
- * Generate a PERFORM statement
- */
-function generatePerform(statement, indent = 0) {
-  const indentStr = '  '.repeat(indent);
-  const target = toMethodName(statement.target);
-
-  // Simple PERFORM
-  if (!statement.times && !statement.until && !statement.varying) {
-    if (statement.thru) {
-      // PERFORM THRU - call all paragraphs in range
-      const thruTarget = toMethodName(statement.thru);
-      return `${indentStr}${target}To${toPascalCase(statement.thru)}()`;
-    }
-    return `${indentStr}${target}()`;
-  }
-
-  // PERFORM TIMES
-  if (statement.times) {
-    const times = typeof statement.times === 'number'
-      ? statement.times
-      : toCamelCase(statement.times);
-
-    return `${indentStr}(1 to ${times}).foreach { _ =>
-${indentStr}  ${target}()
-${indentStr}}`;
-  }
-
-  // PERFORM UNTIL
-  if (statement.until) {
-    const condition = convertCondition(statement.until);
-    const testBefore = statement.testBefore !== false;
-
-    if (testBefore) {
-      return `${indentStr}while !${condition.startsWith('(') ? condition : `(${condition})`} do
-${indentStr}  ${target}()`;
-    } else {
-      // Test after (DO WHILE equivalent)
-      return `${indentStr}do
-${indentStr}  ${target}()
-${indentStr}while !${condition.startsWith('(') ? condition : `(${condition})`}`;
-    }
-  }
-
-  // PERFORM VARYING
-  if (statement.varying) {
-    const varName = toCamelCase(statement.varying.variable);
-    const from = statement.varying.from || 1;
-    const by = statement.varying.by || 1;
-    const until = convertCondition(statement.varying.until);
-
-    if (by === 1) {
-      return `${indentStr}var ${varName} = ${from}
-${indentStr}while !${until.startsWith('(') ? until : `(${until})`} do
-${indentStr}  ${target}()
-${indentStr}  ${varName} += 1`;
-    } else {
-      return `${indentStr}var ${varName} = ${from}
-${indentStr}while !${until.startsWith('(') ? until : `(${until})`} do
-${indentStr}  ${target}()
-${indentStr}  ${varName} += ${by}`;
-    }
-  }
-
-  return `${indentStr}${target}()`;
-}
-
-/**
  * Normalize statement type from AST class names to simple keywords
  * e.g., "PerformStatement" -> "PERFORM", "IfStatement" -> "IF"
  */
@@ -182,24 +115,15 @@ function generateMethodBody(statements, indent = 1) {
         if (stmt.exitType === 'PROGRAM') {
           lines.push('  '.repeat(indent) + 'return');
         } else {
-          lines.push('  '.repeat(indent) + '// EXIT');
+          // `()` (not just a comment) so this compiles even when EXIT is the
+          // only statement in its paragraph - a common THRU-range-endpoint
+          // idiom (e.g. "1900-EXIT-PARA. EXIT.").
+          lines.push('  '.repeat(indent) + '() // EXIT');
         }
         break;
 
       case 'CONTINUE':
-        lines.push('  '.repeat(indent) + '// continue');
-        break;
-
-      case 'INITIALIZE':
-        lines.push(generateInitialize(stmt, indent));
-        break;
-
-      case 'SET':
-        lines.push(generateSet(stmt, indent));
-        break;
-
-      case 'CALL':
-        lines.push(generateCall(stmt, indent));
+        lines.push('  '.repeat(indent) + '() // CONTINUE');
         break;
 
       default:
@@ -284,23 +208,17 @@ ${indentStr}while !(${condition})`;
     }
   }
 
-  // PERFORM VARYING
+  // PERFORM VARYING [AFTER ...]
   if (stmt.performType === 'varying' && stmt.varying) {
-    const varName = toCamelCase(stmt.varying.variable || 'i');
-    const from = varyingOperandExpr(stmt.varying.from, 1);
-    const by = varyingOperandExpr(stmt.varying.by, 1);
-    const until = convertConditionToScala(stmt.varying.until);
-    const body = performBodyLines(stmt, indent + 1);
-
-    // The loop-control variable is a WORKING-STORAGE item (declared once as
-    // a flat var by scala-generator.js's buildFieldRegistry) - assign it
-    // rather than redeclaring with `var`, so a second PERFORM VARYING over
-    // the same variable in the same method body doesn't fail to compile
-    // with "... is already defined as variable ...".
-    return `${indentStr}${varName} = ${from}
-${indentStr}while !(${until}) do
-${body}
-${indentStr}  ${varName} = ${varName} + ${by}`;
+    // `varying` is the outermost loop; each `varying.after` entry (parser
+    // populates VaryingClause.after - see parser/procedure-parser.js's
+    // parseVaryingClause) is one more level nested *inside* it, in the order
+    // written - PERFORM VARYING a ... AFTER b ... AFTER c loops `a` in the
+    // outermost position and `c` innermost, matching COBOL's left-to-right
+    // AFTER nesting (the innermost variable completes its whole UNTIL range
+    // before the next-outer one advances).
+    const levels = [stmt.varying, ...(stmt.varying.after || [])];
+    return generateVaryingNest(levels, 0, stmt, indent);
   }
 
   // Inline PERFORM with statements (no VARYING/UNTIL/TIMES clause)
@@ -309,6 +227,37 @@ ${indentStr}  ${varName} = ${varName} + ${by}`;
   }
 
   return `${indentStr}${target}()`;
+}
+
+/**
+ * Render one level of a PERFORM VARYING ... AFTER ... nest (recursively -
+ * the innermost level's "body" is the PERFORM's own statements/target
+ * paragraph; every other level's "body" is the *next* level's whole
+ * while-loop). Resetting the inner variable to its FROM value happens
+ * naturally here: it's the first line of the block that becomes the outer
+ * loop's body, so it re-runs on every outer iteration, exactly like COBOL
+ * re-initializing each AFTER variable at the start of each enclosing
+ * iteration.
+ */
+function generateVaryingNest(levels, i, stmt, indent) {
+  const indentStr = '  '.repeat(indent);
+  const level = levels[i];
+  const varName = toCamelCase(level.variable || 'i');
+  const from = varyingOperandExpr(level.from, 1);
+  const by = varyingOperandExpr(level.by, 1);
+  const until = convertConditionToScala(level.until);
+  const isInnermost = i === levels.length - 1;
+  const body = isInnermost ? performBodyLines(stmt, indent + 1) : generateVaryingNest(levels, i + 1, stmt, indent + 1);
+
+  // The loop-control variable is a WORKING-STORAGE item (declared once as a
+  // flat var by scala-generator.js's buildFieldRegistry) - assign it rather
+  // than redeclaring with `var`, so a second PERFORM VARYING over the same
+  // variable in the same method body doesn't fail to compile with "... is
+  // already defined as variable ...".
+  return `${indentStr}${varName} = ${from}
+${indentStr}while !(${until}) do
+${body}
+${'  '.repeat(indent + 1)}${varName} = ${varName} + ${by}`;
 }
 
 /**
@@ -339,101 +288,17 @@ function convertConditionToScala(condition) {
 }
 
 /**
- * Generate INITIALIZE statement
- */
-function generateInitialize(statement, indent = 0) {
-  const indentStr = '  '.repeat(indent);
-  const targets = Array.isArray(statement.targets) ? statement.targets : [statement.target];
-
-  const lines = targets.map(target => {
-    const name = toCamelCase(target);
-    return `${indentStr}${name} = ${name}.getClass.getDeclaredConstructor().newInstance()`;
-  });
-
-  return lines.join('\n');
-}
-
-/**
- * Generate SET statement
- */
-function generateSet(statement, indent = 0) {
-  const indentStr = '  '.repeat(indent);
-  const target = toCamelCase(statement.target);
-
-  if (statement.toTrue) {
-    // SET condition TO TRUE
-    return `${indentStr}${target} = true`;
-  }
-
-  if (statement.toFalse) {
-    // SET condition TO FALSE
-    return `${indentStr}${target} = false`;
-  }
-
-  if (statement.upBy) {
-    // SET index UP BY
-    return `${indentStr}${target} += ${statement.upBy}`;
-  }
-
-  if (statement.downBy) {
-    // SET index DOWN BY
-    return `${indentStr}${target} -= ${statement.downBy}`;
-  }
-
-  const value = statement.value ? toCamelCase(statement.value) : '0';
-  return `${indentStr}${target} = ${value}`;
-}
-
-/**
- * Generate CALL statement
- */
-function generateCall(statement, indent = 0) {
-  const indentStr = '  '.repeat(indent);
-  const programName = toCamelCase(statement.program.replace(/['"]/g, ''));
-
-  const args = [];
-  if (statement.using) {
-    for (const param of statement.using) {
-      const argName = toCamelCase(param.name || param);
-      if (param.byContent) {
-        args.push(argName);
-      } else if (param.byValue) {
-        args.push(argName);
-      } else {
-        // BY REFERENCE - default
-        args.push(argName);
-      }
-    }
-  }
-
-  let call = `${indentStr}${programName}(${args.join(', ')})`;
-
-  if (statement.returning) {
-    const returnVar = toCamelCase(statement.returning);
-    call = `${indentStr}val ${returnVar} = ${programName}(${args.join(', ')})`;
-  }
-
-  // Handle ON EXCEPTION / NOT ON EXCEPTION
-  if (statement.onException || statement.notOnException) {
-    const lines = [`${indentStr}try`];
-    lines.push(`${indentStr}  ${programName}(${args.join(', ')})`);
-
-    if (statement.onException) {
-      lines.push(`${indentStr}catch`);
-      lines.push(`${indentStr}  case e: Exception =>`);
-      for (const stmt of statement.onException) {
-        lines.push(generateExpression(stmt, indent + 2));
-      }
-    }
-
-    return lines.join('\n');
-  }
-
-  return call;
-}
-
-/**
- * Generate a Scala method from a COBOL procedure/paragraph
+ * Generate a Scala method from a COBOL procedure/paragraph.
+ *
+ * The result type is *always* spelled out explicitly (never left for Scala
+ * to infer), even when it's the default `Unit`: a method body can contain a
+ * bare `return` (GOBACK, EXIT PROGRAM) or `return <call>()` (GO TO - see
+ * expression-gen.js's generateGoTo) anywhere inside it, and Scala rejects a
+ * `return` inside a method whose result type isn't explicitly declared
+ * ("method ... has a return statement; it needs a result type") - so
+ * omitting the annotation only for the common `Unit` case would make GO TO/
+ * GOBACK/EXIT PROGRAM support depend on never sharing a paragraph with them,
+ * which defeats the purpose.
  */
 export function generateMethod(procedure, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -444,12 +309,7 @@ export function generateMethod(procedure, indent = 0) {
   // Build parameter list
   const paramList = params.map(p => `${p.name}: ${p.type}`).join(', ');
 
-  // Build method signature
-  let signature = `${indentStr}def ${methodName}(${paramList})`;
-  if (returnType !== 'Unit') {
-    signature += `: ${returnType}`;
-  }
-  signature += ' =';
+  const signature = `${indentStr}def ${methodName}(${paramList}): ${returnType} =`;
 
   const lines = [signature];
 
@@ -461,35 +321,91 @@ export function generateMethod(procedure, indent = 0) {
 }
 
 /**
- * Generate PERFORM THRU wrapper method
+ * True when a paragraph's last statement unconditionally transfers control
+ * away from that paragraph on its own - a plain (non-DEPENDING-ON) GO TO, or
+ * STOP RUN/GOBACK/EXIT PROGRAM - so nothing after it in program order would
+ * ever be reached by falling off the end of this paragraph. Used by
+ * generatePerformThruMethod to decide whether a paragraph in a THRU range
+ * needs a synthesized fallthrough call appended after its own statements.
+ */
+function statementEndsInUnconditionalTransfer(statements) {
+  if (!statements || statements.length === 0) return false;
+  const last = statements[statements.length - 1];
+  if (!last) return false;
+  if (last.type === 'GoToStatement' && !last.dependingOn) return true;
+  if (last.type === 'StopStatement' || last.type === 'GobackStatement') return true;
+  if (last.type === 'ExitStatement' && String(last.exitType).toUpperCase() === 'PROGRAM') return true;
+  return false;
+}
+
+/**
+ * Generate a PERFORM ... THRU wrapper method.
+ *
+ * Each paragraph in the `fromParagraph`..`toParagraph` range becomes its own
+ * nested local `def` *inside* this wrapper method, rather than calling the
+ * already-generated top-level per-paragraph methods sequentially (the
+ * previous implementation) - that naive sequential-call approach silently
+ * ignored GO TO and DEPENDING-ON dispatch entirely (every paragraph in the
+ * range ran unconditionally, in source order, regardless of what any GO TO
+ * inside it said). Nesting the paragraphs as local defs makes two things
+ * possible at once:
+ *
+ *  - GO TO to another paragraph in this same range (rendered by
+ *    expression-gen.js's generateGoTo as `return <name>()`) resolves to the
+ *    sibling nested def by ordinary lexical scoping, and `return` exits only
+ *    that one paragraph's def - exactly COBOL's "transfer control, possibly
+ *    into the middle of a THRU range" semantics.
+ *  - a paragraph whose last statement is *not* itself an unconditional
+ *    transfer (see statementEndsInUnconditionalTransfer) automatically calls
+ *    the next paragraph's def after its own statements, mirroring COBOL's
+ *    natural fallthrough across paragraph boundaries - which is only
+ *    well-defined at all *within* a THRU-delimited span (a bare, non-THRU
+ *    `PERFORM x` executes only paragraph x and returns to its caller
+ *    regardless of fallthrough, so this behavior is intentionally scoped to
+ *    just this wrapper method, not applied to standalone paragraph methods).
+ *
+ * Every paragraph in the range is *also* still generated as its own
+ * standalone top-level method elsewhere (generateAllMethods generates one
+ * per procedure unconditionally) - those copies are simply unused (dead
+ * code) whenever a paragraph is only ever reached via this THRU range, which
+ * is harmless: they reference the same-named sibling top-level methods and
+ * compile fine on their own, just without this method's fallthrough/scoping.
  */
 export function generatePerformThruMethod(fromParagraph, toParagraph, paragraphs, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const fromName = toMethodName(fromParagraph);
-  const toName = toMethodName(toParagraph);
   const methodName = `${fromName}To${toPascalCase(toParagraph.replace(/^\d+[-_]?/, ''))}`;
 
-  // Find all paragraphs in the range
+  // Find all paragraphs in the range (inclusive), in program order.
   let inRange = false;
   const rangeParagraphs = [];
-
   for (const para of paragraphs) {
-    if (para.name === fromParagraph) {
-      inRange = true;
-    }
-    if (inRange) {
-      rangeParagraphs.push(para.name);
-    }
-    if (para.name === toParagraph) {
-      break;
-    }
+    if (para.name === fromParagraph) inRange = true;
+    if (inRange) rangeParagraphs.push(para);
+    if (para.name === toParagraph) break;
+  }
+
+  if (rangeParagraphs.length === 0) {
+    return `${indentStr}def ${methodName}(): Unit =\n${indentStr}  ()`;
   }
 
   const lines = [`${indentStr}def ${methodName}(): Unit =`];
+  const defIndent = indent + 1;
+  const defIndentStr = '  '.repeat(defIndent);
 
-  for (const paraName of rangeParagraphs) {
-    lines.push(`${indentStr}  ${toMethodName(paraName)}()`);
-  }
+  rangeParagraphs.forEach((para, i) => {
+    const name = toMethodName(para.name);
+    lines.push(`${defIndentStr}def ${name}(): Unit =`);
+    lines.push(generateMethodBody(para.statements, defIndent + 1));
+
+    const isLast = i === rangeParagraphs.length - 1;
+    if (!isLast && !statementEndsInUnconditionalTransfer(para.statements)) {
+      const nextName = toMethodName(rangeParagraphs[i + 1].name);
+      lines.push(`${'  '.repeat(defIndent + 1)}${nextName}() // implicit fall-through`);
+    }
+  });
+
+  lines.push(`${defIndentStr}${toMethodName(rangeParagraphs[0].name)}()`);
 
   return lines.join('\n');
 }
@@ -505,12 +421,14 @@ export function generateAllMethods(procedures, indent = 0) {
   const methods = [];
   const performThrus = new Set();
 
-  // First pass - collect PERFORM THRU targets
+  // First pass - collect PERFORM THRU targets (PerformStatement AST nodes
+  // use .targetParagraph/.throughParagraph - see parser/ast.js - not
+  // .target/.thru).
   for (const procedure of procedures) {
     if (procedure.statements) {
       for (const stmt of procedure.statements) {
-        if (stmt.type === 'PERFORM' && stmt.thru) {
-          performThrus.add(`${stmt.target}:${stmt.thru}`);
+        if (stmt.type === 'PerformStatement' && stmt.throughParagraph) {
+          performThrus.add(`${stmt.targetParagraph}:${stmt.throughParagraph}`);
         }
       }
     }

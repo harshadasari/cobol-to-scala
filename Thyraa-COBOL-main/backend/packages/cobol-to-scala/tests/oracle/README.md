@@ -105,9 +105,16 @@ For programs under `tests/corpus/data/` specifically, the suite also runs
   honest until the generator is actually fixed; only remove an entry once
   `oracleCompare()` genuinely matches.
 
-`tests/corpus/proc/` (Phase 2+) programs are exercised by the "every corpus program
-under cobc" pass above (compiled/run/diffed against `.expected.txt` if present) but are
-**not** yet run through `oracleCompare()` - that's out of Phase 1 scope by design.
+## Phase 2 scope: `tests/corpus/proc/`
+
+`tests/corpus/proc/` programs (SEARCH/SEARCH ALL, table/file SORT, MOVE
+CORRESPONDING, GO TO ... DEPENDING ON, intrinsic FUNCTIONs, PERFORM forms,
+EVALUATE, STRING/UNSTRING/INSPECT) go through the exact same `oracleCompare()`
+data-driven pattern as Phase 1, in a separate "Phase 2 oracle compare" suite:
+match -> hard `assert.ok`, mismatch -> `t.todo('Phase 2 work queue - ...')`.
+As of this writing every `tests/corpus/proc/*.cbl` program matches end-to-end
+(0 todo); a todo only reappears here if a new proc/ program is added ahead of
+the generator support it needs.
 
 ## Current inventory (last recorded run: 2026-07-11)
 

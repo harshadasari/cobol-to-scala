@@ -3,7 +3,9 @@
 **Run start:** 2026-07-11 ~01:30 UTC · **Branch:** claude/analyze-codebase-pdPSZ · **Budget:** orchestrator ≤2M own tokens, 48h wall clock
 
 ## Open questions / blockers
-_(none yet)_
+- **CRITIC BLOCKING #1:** oracle suite compares COBOL-vs-Scala for corpus/data/ ONLY; the 9 proc/ programs are never run through convertToScala in any test (7/9 crash or emit non-compiling Scala). The 170/0/0 green count is NOT evidence of Phase 2 codegen. Fix: extend oracle compare + t.todo discipline to proc/ (in-flight Phase 2 agent's mandate; verify on landing).
+- **CRITIC BLOCKING #2:** safeNodeString checks node.name before its TODO fallback, so unhandled FunctionCall nodes render as bare identifiers (silent garbage; FUNCTION MOD(17,5) emits wsModPos = 0). Violates the coverage-honesty rule. Must reorder: unknown statement/expression types -> visible ??? TODO marker.
+- **PHASE 1 STATUS CORRECTED: NOT DONE.** Adversarial refuter (12 new edge-case programs vs compiler oracle) REFUTED the Phase 1 milestone: 11/12 diverge. The 7-program corpus was a narrow slice. Fix wave queued behind the in-flight Phase 2 generator agent (same files). Full repros preserved in scratchpad/phase1-refutation/.
 
 ## Status snapshot
 - **Phase:** 1 (data-layer truth) — in progress
@@ -11,6 +13,53 @@ _(none yet)_
 - **Orchestrator token spend:** minimal (cycle 1)
 
 ## Activity
+
+### 2026-07-11 04:00 — Cycle 8: completeness critic report - claims verified, 2 blocking gaps
+- Critic verified: 170/0/0 reproduced independently; REDEFINES lazy views, ASCII 0x70 zoned scheme, 16/16 expected-vs-oracle all genuine; no out-of-scope work; no weakened assertions (one legitimate compiler-driven value correction); ODO deviation honestly disclosed; commit messages accurately worded.
+- Critic BLOCKING findings pinned above: proc/ corpus invisible to equivalence testing (7/9 broken in reality) and safeNodeString silent-garbage path for FunctionCall. Both merge into the Phase 2 agent's active mandate + the queued Phase 1b hardening wave.
+- Also noted for Phase 3 backlog: SQL->Doobie untouched; JCL flow diagrams/pipeline skeletons not done (lineage JSON only). Phase 4 untouched (correctly tracked).
+- In flight: Phase 2 generator (p10-p18 oracle equivalence is exactly its brief).
+
+### 2026-07-11 03:45 — Cycle 7: Phase 1 REFUTED by adversarial corpus - status corrected
+- Phase 1 refuter verdict: REFUTED (11/12 new programs diverge; only ROUNDED semantics survived). Finding clusters:
+  A) MOVE semantics: no fixed-width truncate/pad, JUSTIFIED RIGHT no-op, numeric->alpha and numeric->edited MOVE don't compile, group MOVE references undeclared identifiers.
+  B) Arithmetic subscripts silently dropped: WS-T(WS-I + 1) renders as WS-T(WS-I) - silent wrong data, worst class.
+  C) ON SIZE ERROR unimplemented (branches print unconditionally); DIVIDE REMAINDER emits double-BigDecimal wrap compile error.
+  D) 88-level condition names in IF/EVALUATE produce empty conditions (compile fail); EVALUATE TRUE arms dropped.
+  E) Edited pictures: all-Z suppression keeps anchored 0; BLANK WHEN ZERO ignored.
+  F) REDEFINES over OCCURS table: nonsensical divide/modulo accessor template, compile fail.
+- Response plan: single Phase 1b hardening agent gets all repro JSONs (scratchpad/phase1-refutation/), promotes the 12 programs into tests/corpus/data/ as oracle-gated cases, fixes A-F, flips todos to assertions. Dispatches when Phase 2 generator agent (same files) completes.
+- Milestone language in cycle 6 stands corrected: 7/7 was real but NOT generalizable; docs updated to reflect honest state.
+- In flight: Phase 2 generator (p10-p18), completeness critic.
+
+### 2026-07-11 03:25 — Cycle 6: PHASE 1 MILESTONE - 7/7 data programs oracle-equivalent
+- Corpus-pass agent complete: field registry for all WORKING-STORAGE depths, multi-dim OCCURS subscripts with .updated() writes, PERFORM bodies fixed, REDEFINES arithmetic view accessors, edited-picture MOVE formatting char-verified vs cobc, CobolFmt DISPLAY helper, decimal-aware DIVIDE. All p01-p07 match real compiler output exactly.
+- Codec hardening complete: all 7 refutation findings fixed in JS+Scala; cobc re-verification 22/22 previously-wrong bytes now match; 301-case parity fuzz clean.
+- Suite: 170 pass / 0 fail / 0 todo (verified independently by orchestrator).
+- Committed as 010aaa4 (byte-level I/O + hardened codecs + oracle suite) and 9251931 (procedure gen + parser Phase 2). Pushed.
+- Dispatched next wave: (a) Phase 2 generator - SEARCH/SORT/RELEASE/RETURN/CORRESPONDING/GO-TO-DEPENDING/intrinsics generation targeting p10-p18 oracle equivalence; (b) Phase 1 adversarial refuter - 8-12 NEW edge-case programs (MOVE truncation semantics, group MOVE, JUSTIFIED, nested table boundaries, REDEFINES cross-view writes, zero-iteration loops) vs oracle; (c) completeness critic - scope/claims/test-integrity audit incl. the ODO deviation question.
+- Orchestrator token spend: low (~60k of 2M est). Wall clock: ~2h of 48h.
+
+### 2026-07-11 03:00 — Cycle 5: JCL/DCLGEN committed; parser Phase 2 landed
+- JCL + DCLGEN parsers committed (b677aae): structural JCL (PROC expansion, referbacks, DISP-aware dataset lineage), DCLGEN column<->host mapping, 32 tests. Corpus reconciliation caught a real SYSOUT=&SYM substitution bug before it shipped.
+- Parser agent complete: inline PERFORM n TIMES fixed; FUNCTION intrinsic FunctionCall AST; SEARCH/SEARCH ALL/SORT/MERGE/RELEASE/RETURN statements; UnknownStatement anti-pollution (unknown verbs no longer corrupt neighboring statements). Corpus p10/p11/p12/p15/p16 parse with exact statement counts, zero unknowns. Known residual: other unimplemented verbs (GENERATE, ALTER...) still lack keyword treatment - documented.
+- Suite at ~156 pass/0 fail before hardening churn; oracle todos dropped 7 -> 3 (corpus-pass agent progressing live).
+- Commits for parser + generator + codec-hardening work held until both in-flight agents land and full suite is green (no committing red).
+- Next dispatch when corpus-pass lands: Phase 2 GENERATOR for the new AST nodes (SEARCH -> indexWhere/find, SORT -> sortBy, RELEASE/RETURN, FunctionCall -> Scala stdlib, MOVE CORRESPONDING expansion) targeting oracle passes on corpus/proc/.
+- In flight: corpus-pass generator fixes, codec hardening.
+
+### 2026-07-11 02:35 — Cycle 4: second refutation in; Phase 3 pipelined
+- Compiler-bytes refuter: VERDICT REFUTED. 46 compiler-verified value/type pairs. Two real bugs: (1) ASCII zoned sign scheme wrong - GnuCOBOL native ASCII uses zone-nibble swap (neg digit d -> 0x70+d), not translated EBCDIC letter overpunch; (2) COMP-5 is host-native little-endian, codecs treat it as big-endian -> silent corruption (32767 decodes as -129). SURVIVED: COMP-3 (13 variants), big-endian COMP/COMP-4 incl. all width thresholds, SIGN SEPARATE, unsigned zoned, EBCDIC sign scheme (-fsign=EBCDIC), full cp037 table (0 mismatches vs Python stdlib cp037). Report: tests/oracle/codec-refutation.md.
+- Consolidated codec-hardening queue now has 7 findings (2 compiler-verified + 5 robustness). Dispatches when codec-integration agent frees runtime/CobolCodecs.scala.
+- Dispatched Phase 3 groundwork agent (new files only): real JCL parser (steps/DD/PROC expansion/dataset lineage) + DCLGEN parser + synthetic JCL/DCLGEN corpus with hand-derived expected JSON.
+- In flight: corpus-pass generator fixes, codec integration, parser Phase 2, JCL/DCLGEN.
+
+### 2026-07-11 02:20 — Cycle 3: corpus committed; codec refutation #1 in
+- Corpus + oracle harness committed (b55156d, 56 files) and pushed. Corpus agent independently confirmed the harness's oracle outputs byte-identical to its own expected outputs.
+- Parser bugs discovered by corpus agent -> dedicated parser agent dispatched (exclusive owner of parser/): inline PERFORM n TIMES misparse, FUNCTION intrinsics AST, SEARCH/SEARCH ALL/SORT/MERGE/RELEASE/RETURN parsing, unknown-statement pollution fix. Roadmap corrections: MOVE CORRESPONDING and GO TO DEPENDING ON already parse.
+- Codec fuzz refuter: VERDICT REFUTED. Happy path clean (35,256 property cases, 290 JS<->Scala parity cases, cp037 tables identical) but 5 robustness defects: (1) binaryDecode unguarded >8-byte buffers, silent JS/Scala divergence; (2) zonedDecode empty+signSeparate JS-returns-0 vs Scala-crash; (3) inconsistent exception types on empty buffer; (4) packedDecode invalid-BCD-nibble check is dead code - garbage decodes to plausible numbers in BOTH langs (silent data corruption class); (5) JS toBigInt accepts Number with silent precision loss >2^53.
+- Plan: consolidated codec-hardening agent once codec-integration agent + compiler-bytes refuter complete (avoids CobolCodecs.scala edit conflicts, folds in all findings). Codecs NOT marked done.
+- In flight: corpus-pass generator fixes, codec integration, parser Phase 2, compiler-bytes refuter.
 
 ### 2026-07-11 02:15 — Cycle 2: oracle live, Phase 1 work queue identified
 - Toolchain agent: GnuCOBOL 4.0 + scala-cli 1.9.1 installed and verified (oracle path LIVE, no dual-derivation fallback needed). docs/toolchain-status.md.

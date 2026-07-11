@@ -10,7 +10,16 @@ import { fileURLToPath } from 'node:url';
 import { toPascalCase, toCamelCase, generateCaseClass } from './case-class-gen.js';
 import { getPicPattern, scalaBaseType, occursCount, hasOccurs } from './layout.js';
 import { generateAllEnums, groupLevel88sByParent } from './enum-gen.js';
-import { generateExpression, setFieldRegistry, generateCobolFmtHelper } from './expression-gen.js';
+import {
+  generateExpression,
+  setFieldRegistry,
+  setTableRegistry,
+  setGroupRegistry,
+  setSortFileRegistry,
+  setQualifiedRegistry,
+  generateCobolFmtHelper,
+  generateCobolInspectHelper,
+} from './expression-gen.js';
 import { generateMethod, generateAllMethods, toMethodName } from './method-gen.js';
 import { generateFileIO, generateFileStatusCheck } from './file-io-gen.js';
 import { generateSql, generateDoobieImports, generateTransactorSetup } from './sql-gen.js';
@@ -372,6 +381,23 @@ function getWorkingStorageItems(ast) {
   return [];
 }
 
+/**
+ * Collect every FD/SD record (01-level DataItem) in the FILE SECTION,
+ * regardless of parser output shape. Used so SORT work-file records (e.g. an
+ * SD's 01 SORT-REC) get flattened into addressable flat vars the same way
+ * WORKING-STORAGE items are - RELEASE/RETURN/plain statement generation all
+ * address record fields (SORT-KEY, SORT-NAME, ...) by their COBOL name, same
+ * as any other elementary item.
+ */
+function getFileSectionRecordItems(ast) {
+  const files = ast.dataItems?.fileSection?.files || ast.data?.fileSection?.files || [];
+  const records = [];
+  for (const f of files) {
+    if (Array.isArray(f.records)) records.push(...f.records);
+  }
+  return records;
+}
+
 function isLevel(item, n) {
   return item.level === n || item.level === String(n).padStart(2, '0') || item.level === String(n);
 }
@@ -524,14 +550,92 @@ function redefinesAccessorLines(item, registry) {
  * generated separately (generateAllCaseClasses) for record-layout purposes;
  * they are independent of - and never referenced by - these flat vars.
  */
-function buildFieldRegistry(ast) {
-  const items = getWorkingStorageItems(ast);
-  const registry = new Map();
-  const lines = [];
+/**
+ * Count how many distinct elementary (leaf, non-88, non-FILLER) DataItem
+ * nodes share each uppercased name anywhere in the given item trees. COBOL's
+ * data names are a single flat namespace disambiguated only by OF/IN
+ * qualification - two different groups are free to each declare a child
+ * named e.g. NAME - so a name occurring more than once here cannot safely
+ * become a single bare Scala identifier (buildFieldRegistry uses this to
+ * decide which leaf names need parent-qualified identifiers instead).
+ */
+function countLeafNameOccurrences(itemLists) {
+  const counts = new Map();
+  function walk(list) {
+    for (const item of list) {
+      if (isLevel(item, 88) || item.isFiller || !item.name) continue;
+      const realChildren = (item.children || []).filter(c => !isLevel(c, 88));
+      if (realChildren.length > 0) {
+        walk(realChildren);
+        continue;
+      }
+      const upper = item.name.toUpperCase();
+      counts.set(upper, (counts.get(upper) || 0) + 1);
+    }
+  }
+  for (const list of itemLists) walk(list);
+  return counts;
+}
 
-  function walk(list, occursChain) {
+function buildFieldRegistry(ast) {
+  const wsItems = getWorkingStorageItems(ast);
+  const fileItems = getFileSectionRecordItems(ast);
+  const leafNameCounts = countLeafNameOccurrences([wsItems, fileItems]);
+  const registry = new Map();
+  const tableRegistry = new Map();
+  const groupRegistry = new Map();
+  // "<name>::<immediate parent name>" (both upper) -> field info, for OF/IN
+  // qualified references (e.g. `NAME OF WS-TARGET-GROUP`) - populated for
+  // every leaf regardless of whether its bare name is globally ambiguous, so
+  // a qualified reference always resolves correctly even when the bare name
+  // happens to be unique too.
+  const qualifiedRegistry = new Map();
+  const lines = [];
+  const declaredIndexNames = new Set();
+
+  function walk(list, occursChain, parentNameUpper) {
     for (const item of list) {
       if (isLevel(item, 88)) continue;
+
+      // OCCURS metadata (times count, INDEXED BY names, ASCENDING/DESCENDING
+      // KEY names) is recorded for every OCCURS-bearing item - elementary or
+      // group - so SEARCH/SEARCH ALL generation can look up the table's
+      // bounds/index/key by the table (group) name referenced in the SEARCH
+      // statement. Each INDEXED BY name also becomes its own flat `Int` var
+      // (COBOL indexes are addressable data items in their own right, used
+      // both as subscripts and as ordinary MOVE/SET/DISPLAY operands).
+      if (hasOccurs(item)) {
+        const occ = item.occurs;
+        const idxCamels = (occ.indexedBy || []).map(toCamelCase);
+        tableRegistry.set((item.name || '').toUpperCase(), {
+          times: occursCount(item),
+          indexed: idxCamels,
+          // Raw (uppercased) COBOL key names, not camelCased - SEARCH ALL
+          // generation matches these against a WHEN condition's
+          // VariableReference.name (also raw COBOL text), and only
+          // camelCases when it needs an actual Scala identifier.
+          ascending: (occ.ascending || []).map(n => String(n).toUpperCase()),
+          descending: (occ.descending || []).map(n => String(n).toUpperCase()),
+        });
+
+        (occ.indexedBy || []).forEach((idxName, i) => {
+          const upperIdx = String(idxName).toUpperCase();
+          if (declaredIndexNames.has(upperIdx)) return;
+          declaredIndexNames.add(upperIdx);
+          lines.push(`  var ${idxCamels[i]}: Int = 1`);
+          registry.set(upperIdx, {
+            camel: idxCamels[i],
+            scalaType: 'Int',
+            dataType: 'numeric',
+            integerDigits: String(occursCount(item)).length,
+            decimalDigits: 0,
+            signed: false,
+            editPattern: null,
+            occursDepth: 0,
+            picLength: 0,
+          });
+        });
+      }
 
       if (item.redefines) {
         const accessorLines = redefinesAccessorLines(item, registry);
@@ -541,8 +645,27 @@ function buildFieldRegistry(ast) {
 
       const realChildren = (item.children || []).filter(c => !isLevel(c, 88));
       if (realChildren.length > 0) {
+        const parentUpper = (item.name || '').toUpperCase();
         const ownCount = hasOccurs(item) && occursCount(item) > 1 ? occursCount(item) : null;
-        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain);
+        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain, parentUpper);
+
+        // Group registry: immediate child names (COBOL name + camel), used
+        // by MOVE CORRESPONDING to match children between two group items by
+        // name at generation time. Built *after* recursing so each child's
+        // camel can be read back from qualifiedRegistry (keyed by this
+        // group's own name as parent) - the one identifier that's always
+        // correct for that child regardless of whether its bare name
+        // happens to collide with a same-named child under some other group.
+        groupRegistry.set(
+          parentUpper,
+          realChildren
+            .filter(c => !c.isFiller && c.name)
+            .map(c => {
+              const nameUpper = (c.name || '').toUpperCase();
+              const info = qualifiedRegistry.get(`${nameUpper}::${parentUpper}`);
+              return { nameUpper, camel: info ? info.camel : toCamelCase(c.name) };
+            })
+        );
         continue;
       }
 
@@ -551,7 +674,17 @@ function buildFieldRegistry(ast) {
       const ownCount = hasOccurs(item) && occursCount(item) > 1 ? occursCount(item) : null;
       const fullChain = ownCount ? [...occursChain, ownCount] : occursChain;
 
-      const camel = toCamelCase(item.name);
+      const nameUpper = item.name.toUpperCase();
+      const ambiguous = (leafNameCounts.get(nameUpper) || 0) > 1;
+      // Names that collide across sibling/cousin groups (only possible via
+      // OF/IN qualification in real COBOL - see countLeafNameOccurrences)
+      // get a parent-qualified identifier instead of the bare camelCase
+      // name every *unique* name still uses - preserves the existing,
+      // already-tested identifier scheme for the overwhelmingly common
+      // (unique-name) case.
+      const camel = ambiguous
+        ? `${toCamelCase(parentNameUpper || '')}${toPascalCase(item.name)}`
+        : toCamelCase(item.name);
       const baseType = scalaBaseType(item);
       let scalaType = baseType;
       for (let i = 0; i < fullChain.length; i++) scalaType = `Vector[${scalaType}]`;
@@ -564,7 +697,7 @@ function buildFieldRegistry(ast) {
       lines.push(`  var ${camel}: ${scalaType} = ${defaultExpr}`);
 
       const pic = item.pic && typeof item.pic === 'object' ? item.pic : null;
-      registry.set((item.name || '').toUpperCase(), {
+      const info = {
         camel,
         scalaType: baseType,
         dataType: pic?.dataType || (baseType === 'String' ? 'alphanumeric' : 'numeric'),
@@ -573,13 +706,86 @@ function buildFieldRegistry(ast) {
         signed: !!(pic && pic.signed),
         editPattern: pic?.editPattern || null,
         occursDepth: fullChain.length,
-      });
+        picLength: pic?.length || 0,
+      };
+      // Only an unambiguous name gets a bare-name registry entry - an
+      // ambiguous one would just silently overwrite whichever same-named
+      // sibling group's entry was registered first, corrupting lookups for
+      // *both* (a bare, unqualified reference to an ambiguous name isn't
+      // valid COBOL anyway - it always requires OF/IN - so nothing legit
+      // depends on a bare-key entry existing here).
+      if (!ambiguous) registry.set(nameUpper, info);
+      qualifiedRegistry.set(`${nameUpper}::${(parentNameUpper || '').toUpperCase()}`, info);
     }
   }
 
-  walk(items, []);
+  walk(wsItems, [], null);
+  walk(fileItems, [], null);
 
-  return { lines: lines.join('\n'), registry };
+  return { lines: lines.join('\n'), registry, tableRegistry, groupRegistry, qualifiedRegistry };
+}
+
+/**
+ * Build a registry of SD ("sort") work files -> the in-memory buffer support
+ * a generated SORT/RELEASE/RETURN needs: a dedicated row case class (one
+ * field per record child, independent of the byte-level case class
+ * `generateAllCaseClasses` may also emit for the same record - this one only
+ * ever lives in-process, so it carries none of the codec machinery), a
+ * `Vector`-backed buffer var, and a read-cursor var. Registered under both
+ * the SD's own name (what SORT/RETURN reference) and its 01 record's name
+ * (what RELEASE references), so either lookup key resolves to the same info.
+ */
+function buildSortFileRegistry(ast) {
+  const registry = new Map();
+  const files = ast.dataItems?.fileSection?.files || ast.data?.fileSection?.files || [];
+
+  for (const f of files) {
+    if (f.type !== 'SD') continue;
+    const record = (f.records || [])[0];
+    if (!record) continue;
+
+    const fields = (record.children || [])
+      .filter(c => !isLevel(c, 88) && !c.isFiller && c.name)
+      .map(c => ({ camel: toCamelCase(c.name), scalaType: scalaBaseType(c) }));
+    if (fields.length === 0) continue;
+
+    const info = {
+      caseClassName: `${toPascalCase(f.name)}Row`,
+      bufferVar: `${toCamelCase(f.name)}Buffer`,
+      idxVar: `${toCamelCase(f.name)}Idx`,
+      fields,
+    };
+
+    registry.set((f.name || '').toUpperCase(), info);
+    if (record.name) registry.set(record.name.toUpperCase(), info);
+  }
+
+  return registry;
+}
+
+/**
+ * Scala declarations (row case class + buffer/cursor vars) for every SD work
+ * file found by buildSortFileRegistry(). Returned separately (rather than
+ * folded into generateAllCaseClasses/buildFieldRegistry's own lines) since
+ * these are synthesized purely to support SORT/RELEASE/RETURN codegen, not
+ * derived from a WORKING-STORAGE/FILE SECTION item the way every other
+ * declaration in this file is.
+ */
+function generateSortFileSupport(sortFileRegistry) {
+  const caseClasses = [];
+  const decls = [];
+  const seen = new Set();
+
+  for (const info of sortFileRegistry.values()) {
+    if (seen.has(info)) continue;
+    seen.add(info);
+    const fieldList = info.fields.map(f => `${f.camel}: ${f.scalaType}`).join(', ');
+    caseClasses.push(`case class ${info.caseClassName}(${fieldList})`);
+    decls.push(`  var ${info.bufferVar}: scala.collection.mutable.ArrayBuffer[${info.caseClassName}] = scala.collection.mutable.ArrayBuffer.empty`);
+    decls.push(`  var ${info.idxVar}: Int = 0`);
+  }
+
+  return { caseClasses: caseClasses.join('\n\n'), decls: decls.join('\n') };
 }
 
 /**
@@ -767,8 +973,25 @@ export function generateScala(ast, options = {}) {
   // DIVIDE decimal coercion can all look field info up by COBOL name. Must
   // happen before generateMethods()/generateMainMethod() below, since those
   // generate the statements that consult the registry.
-  const { lines: workingFields, registry: fieldRegistry } = buildFieldRegistry(ast);
+  const {
+    lines: workingFields,
+    registry: fieldRegistry,
+    tableRegistry,
+    groupRegistry,
+    qualifiedRegistry,
+  } = buildFieldRegistry(ast);
   setFieldRegistry(fieldRegistry);
+  setTableRegistry(tableRegistry);
+  setGroupRegistry(groupRegistry);
+  setQualifiedRegistry(qualifiedRegistry);
+
+  // SD ("sort") work-file support: a dedicated row case class + in-memory
+  // buffer/cursor vars per SD, so SORT/RELEASE/RETURN can be generated as
+  // real (if in-process, not on-disk) buffer operations - see
+  // buildSortFileRegistry()/generateSortFileSupport() above.
+  const sortFileRegistry = buildSortFileRegistry(ast);
+  setSortFileRegistry(sortFileRegistry);
+  const sortFileSupport = generateSortFileSupport(sortFileRegistry);
 
   // Package declaration
   sections.push(generatePackageDeclaration(opts.packageName));
@@ -797,11 +1020,24 @@ export function generateScala(ast, options = {}) {
   sections.push(generateCobolFmtHelper());
   sections.push('');
 
+  // CobolInspect: INSPECT TALLYING/REPLACING helper (literal, non-overlapping
+  // substring counting/replacement) used by generated INSPECT statements.
+  sections.push('// CobolInspect: INSPECT TALLYING/REPLACING helpers');
+  sections.push(generateCobolInspectHelper());
+  sections.push('');
+
   // Generate case classes (outside the object for better organization)
   const caseClasses = generateAllCaseClasses(ast, 0, { charset: opts.charset });
   if (caseClasses) {
     sections.push('// Data structures');
     sections.push(caseClasses);
+    sections.push('');
+  }
+
+  // SD work-file row case classes (SORT/RELEASE/RETURN in-memory buffers).
+  if (sortFileSupport.caseClasses) {
+    sections.push('// SORT work-file row types (in-memory buffer support)');
+    sections.push(sortFileSupport.caseClasses);
     sections.push('');
   }
 
@@ -829,6 +1065,13 @@ export function generateScala(ast, options = {}) {
     sections.push('');
     sections.push('  // Working storage');
     sections.push(workingFields);
+  }
+
+  // SD work-file buffer/cursor vars.
+  if (sortFileSupport.decls) {
+    sections.push('');
+    sections.push('  // SORT work-file buffers');
+    sections.push(sortFileSupport.decls);
   }
 
   // SQL transactor setup if needed

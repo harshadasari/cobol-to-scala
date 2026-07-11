@@ -1,0 +1,12 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. V10-GROUP-VALUE.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-REC VALUE "AB1234".
+           05 WS-CODE   PIC X(2).
+           05 WS-NUM    PIC 9(4).
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           DISPLAY "CODE=" WS-CODE " NUM=" WS-NUM.
+           DISPLAY "REC=" WS-REC.
+           STOP RUN.

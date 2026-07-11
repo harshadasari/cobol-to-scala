@@ -1,0 +1,38 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. V04A.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-X        PIC 9(4) VALUE 1.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           CALL "V04B" USING BY REFERENCE WS-X.
+           DISPLAY "A: X=" WS-X.
+           STOP RUN.
+       END PROGRAM V04A.
+
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. V04B.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-Y        PIC 9(4) VALUE 10.
+       LINKAGE SECTION.
+       01 LK-X        PIC 9(4).
+       PROCEDURE DIVISION USING LK-X.
+       B-PARA.
+           ADD LK-X TO WS-Y.
+           CALL "V04C" USING BY REFERENCE WS-Y.
+           MOVE WS-Y TO LK-X.
+           GOBACK.
+       END PROGRAM V04B.
+
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. V04C.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       LINKAGE SECTION.
+       01 LK-Z        PIC 9(4).
+       PROCEDURE DIVISION USING LK-Z.
+       C-PARA.
+           MULTIPLY LK-Z BY 2 GIVING LK-Z.
+           GOBACK.
+       END PROGRAM V04C.

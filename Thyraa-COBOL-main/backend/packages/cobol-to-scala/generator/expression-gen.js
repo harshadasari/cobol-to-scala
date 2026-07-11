@@ -203,8 +203,22 @@ export function setGroupRegistry(registry, keyRegistry) {
  * own key always equals its bare name, so this is a no-op for the
  * overwhelmingly common case).
  */
-function resolveGroupKey(bareNameUpper) {
+export function resolveGroupKey(bareNameUpper) {
   return GROUP_KEY_REGISTRY.get(bareNameUpper) || bareNameUpper;
+}
+
+/**
+ * round-8 finding 1: true when `nameUpper` is a registered group (not a
+ * scalar elementary item) - used by generateCall/generateEntryMethod
+ * (scala-generator.js) to detect a CALL ... USING operand or LINKAGE
+ * SECTION PROCEDURE DIVISION USING parameter that names a whole group
+ * rather than an elementary field, which needs the concatenated-string
+ * in/scatter-back-out convention (groupDisplayValueExpr/
+ * scatterGroupFromString) instead of the ordinary scalar value-in/value-out
+ * one.
+ */
+export function isRegisteredGroupName(nameUpper) {
+  return GROUP_REGISTRY.has(resolveGroupKey(nameUpper));
 }
 
 export function setGroupByteLengthRegistry(registry) {
@@ -800,7 +814,18 @@ export function generateCobolFmtHelper() {
     '  // NUMVAL argument - they only ever separate a sign from its digits), the',
     '  // sign (wherever it ended up) is normalized to the front, and what',
     '  // remains is parsed as a plain signed decimal.',
-    '  def numval(s: String): BigDecimal =',
+    '  // round-8 finding 2: `decimalComma` (SPECIAL-NAMES\' DECIMAL-POINT IS',
+    '  // COMMA - same convention/flag as `num`/`edited` above) swaps which',
+    '  // punctuation character NUMVAL treats as the decimal point: under',
+    '  // DECIMAL-POINT IS COMMA, "," is the decimal point (normalized to "."',
+    '  // for BigDecimal\'s own parser, which only understands ".") and "." is',
+    '  // the digit-grouping separator (stripped, same as "," is stripped in',
+    '  // the default/non-comma mode) - compiler-verified against installed',
+    '  // GnuCOBOL (tests/oracle - v05c\'s oracle output, round-8 refutation:',
+    '  // NUMVAL("123,45") under DECIMAL-POINT IS COMMA is 123.45, not a parse',
+    '  // failure). Defaults to false, matching every call site that predates',
+    '  // this finding.',
+    '  def numval(s: String, decimalComma: Boolean = false): BigDecimal =',
     '    val compact = s.filterNot(_.isWhitespace)',
     '    val hasLeadingSign = compact.nonEmpty && (compact.head == \'+\' || compact.head == \'-\')',
     '    val hasTrailingSign = compact.nonEmpty && (compact.last == \'+\' || compact.last == \'-\')',
@@ -808,7 +833,9 @@ export function generateCobolFmtHelper() {
     '    var digits = compact',
     '    if hasLeadingSign then digits = digits.drop(1)',
     '    if hasTrailingSign then digits = digits.dropRight(1)',
-    '    if digits.isEmpty then BigDecimal(0) else BigDecimal((if negative then "-" else "") + digits)',
+    '    val normalized =',
+    '      if decimalComma then digits.filterNot(_ == \'.\').replace(\',\', \'.\') else digits.filterNot(_ == \',\')',
+    '    if normalized.isEmpty then BigDecimal(0) else BigDecimal((if negative then "-" else "") + normalized)',
     '',
     '  // Numeric MOVE truncation to a target\'s declared digit widths: extra',
     '  // low-order decimal digits are dropped (never rounded - MOVE truncates,',
@@ -1441,8 +1468,11 @@ function generateFunctionCall(fc) {
       // digits (e.g. '+  12.5') - a plain .trim only strips the outer edges,
       // so BigDecimal's own parser (which rejects internal whitespace
       // outright) still crashes on those. CobolFmt.numval strips every space
-      // and normalizes the sign first - see its doc comment.
-      return `CobolFmt.numval(${convertArithmeticExpression(args[0])})`;
+      // and normalizes the sign first - see its doc comment. `decimalComma`
+      // (round-8 finding 2) threads the current SPECIAL-NAMES' DECIMAL-POINT
+      // IS COMMA setting through so NUMVAL parses "," (not ".") as the
+      // decimal point when that dialect option is in effect.
+      return `CobolFmt.numval(${convertArithmeticExpression(args[0])}, ${DECIMAL_POINT_IS_COMMA})`;
     case 'MOD': {
       // COBOL FUNCTION MOD is floored-division modulo (result takes the
       // divisor's sign), not Scala/Java's truncating `%` (which takes the
@@ -2629,6 +2659,21 @@ function relationalOperandDescriptor(node) {
   return { scalaClass: 'numeric', semantic: 'numeric' };
 }
 
+/**
+ * round-8 finding 3: compile-time-known display width of a string-class
+ * relational operand - a registered field's own declared PIC length, or a
+ * string literal's own text length - or null when neither is known (e.g. a
+ * FunctionCall operand, whose result length isn't tracked at all). Used by
+ * renderRelationalCondition's string-vs-string branch to decide whether
+ * (and how much) space-padding COBOL's alphanumeric comparison rule
+ * requires before the two operands are safe to compare directly.
+ */
+function stringOperandWidth(desc) {
+  if (desc.info) return desc.info.picLength || 0;
+  if (desc.literalText != null) return desc.literalText.length;
+  return null;
+}
+
 /** Figurative-constant fill character - shared by MOVE's repeatedCharLiteralFor/zeroLiteralFor and the comparison rendering below. */
 function figurativeFillChar(figKind) {
   switch (String(figKind).toUpperCase()) {
@@ -2743,6 +2788,30 @@ function renderRelationalCondition(condition) {
     // alphanumeric/edited operands.
     if (subj.semantic === 'numeric-as-string' && obj.semantic === 'numeric-as-string') {
       return `CobolFmt.numval(${leftExpr}) ${op} CobolFmt.numval(${rightExpr})`;
+    }
+    // round-8 finding 3: a bare Scala string `==`/`.compareTo` assumes both
+    // operands are already the same length - untrue whenever two
+    // alphanumeric operands have different declared widths (two fields with
+    // different PIC X(n) lengths, or a literal compared against a field of a
+    // different length). COBOL always compares two alphanumeric operands as
+    // if the shorter one were first space-padded on the right to the
+    // longer's length (compiler-verified against installed GnuCOBOL - see
+    // tests/corpus/proc/v08-unequal-compare.cbl) - exactly the same padding
+    // rule the numeric-vs-alphanumeric branch below already applies, and
+    // both widths (a field's own info.picLength, or a literal's own text
+    // length) are compile-time constants, so the padding is spliced directly
+    // into the generated source here too. Left unpadded (falls through to
+    // the bare comparison) when either side's width can't be determined at
+    // all (e.g. a FunctionCall operand, whose result length is unknown at
+    // generation time) - not this fix's concern, and safer than guessing.
+    const leftWidth = stringOperandWidth(subj);
+    const rightWidth = stringOperandWidth(obj);
+    if (leftWidth != null && rightWidth != null && leftWidth !== rightWidth) {
+      const padLen = Math.abs(leftWidth - rightWidth);
+      const pad = `"${' '.repeat(padLen)}"`;
+      const leftFinal = leftWidth < rightWidth ? `(${leftExpr} + ${pad})` : leftExpr;
+      const rightFinal = rightWidth < leftWidth ? `(${rightExpr} + ${pad})` : rightExpr;
+      return cmp(leftFinal, rightFinal);
     }
     return cmp(leftExpr, rightExpr);
   }
@@ -3967,7 +4036,7 @@ function generateDivide(statement, indent = 0) {
  * scalar - whole-group DISPLAY concatenation of a table isn't modeled) or a
  * child with no registry info at all.
  */
-function groupDisplayValueExpr(groupKey) {
+export function groupDisplayValueExpr(groupKey) {
   const children = GROUP_REGISTRY.get(groupKey);
   if (!children || children.length === 0) return null;
 
@@ -3991,6 +4060,86 @@ function groupDisplayValueExpr(groupKey) {
     }
   }
   return parts.join(' + ');
+}
+
+/**
+ * round-8 finding 1: the inverse of groupDisplayValueExpr - scatters a
+ * previously-concatenated whole-group string (produced by
+ * groupDisplayValueExpr for this *same* group, byte-for-byte - see the
+ * call sites, which always pair the two) back out into each of the group's
+ * own child flat vars, at the same fixed offsets/widths
+ * groupDisplayValueExpr's own concatenation order and per-child width
+ * (CobolFmt.fitLeft's padding width for a String child, or
+ * integerDigits+decimalDigits digit width for a numeric child) establish.
+ *
+ * Used by generateCall's/generateEntryMethod's (scala-generator.js) BY
+ * REFERENCE CALL handling for a group-shaped USING/LINKAGE operand: Scala
+ * has no shared-storage / pass-by-reference mechanism, so the
+ * "value-in/tuple-out" convention this generator otherwise uses for a
+ * scalar BY REFERENCE parameter (pass the current value in, assign the
+ * callee's returned value back) is extended to a group operand by using its
+ * raw concatenated storage text (groupDisplayValueExpr) as that "value",
+ * with this function doing the reverse assignment.
+ *
+ * `sourceExpr` is any Scala String-valued expression of exactly this
+ * group's own byte width (a plain var, or - as at every call site here - a
+ * substring slice of an enclosing group's own sourceExpr, for a nested
+ * group). Returns null (the same "can't be represented this way" signal
+ * groupDisplayValueExpr itself uses, for exactly the same unsupported
+ * shapes - an OCCURS-bearing child, or a child with no registered field
+ * info at all) rather than emitting a partially-scattered, wrong result.
+ */
+export function scatterGroupFromString(groupKey, sourceExpr, indent) {
+  const indentStr = '  '.repeat(indent);
+  const children = GROUP_REGISTRY.get(groupKey);
+  if (!children || children.length === 0) return null;
+
+  const lines = [];
+  let offset = 0;
+  for (const c of children) {
+    if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) return null;
+
+    if (c.groupKey) {
+      const width = GROUP_BYTE_LENGTH_REGISTRY.get(c.nameUpper);
+      if (width == null) return null;
+      const nestedLines = scatterGroupFromString(
+        c.groupKey,
+        `(${sourceExpr}).substring(${offset}, ${offset + width})`,
+        indent
+      );
+      if (nestedLines == null) return null;
+      lines.push(...nestedLines);
+      offset += width;
+      continue;
+    }
+
+    const info = c.info;
+    if (!info) return null;
+
+    if (info.scalaType === 'String') {
+      const width = info.picLength || 0;
+      const sliceExpr = width > 0 ? `(${sourceExpr}).substring(${offset}, ${offset + width})` : sourceExpr;
+      lines.push(`${indentStr}${c.camel} = ${sliceExpr}`);
+      offset += width;
+      continue;
+    }
+
+    const intDigits = info.integerDigits || 0;
+    const decDigits = info.decimalDigits || 0;
+    const width = intDigits + decDigits;
+    const sliceExpr = `(${sourceExpr}).substring(${offset}, ${offset + width})`;
+    const bdExpr = decDigits > 0
+      ? `BigDecimal((${sliceExpr}).take(${intDigits}) + "." + (${sliceExpr}).drop(${intDigits}))`
+      : `BigDecimal(${sliceExpr})`;
+    const finalExpr = info.scalaType === 'BigDecimal' ? bdExpr
+      : info.scalaType === 'Long' ? `${bdExpr}.toLong`
+      : info.scalaType === 'Float' ? `${bdExpr}.toFloat`
+      : info.scalaType === 'Double' ? `${bdExpr}.toDouble`
+      : `${bdExpr}.toInt`;
+    lines.push(`${indentStr}${c.camel} = ${finalExpr}`);
+    offset += width;
+  }
+  return lines;
 }
 
 /**
@@ -5063,8 +5212,20 @@ function generateCall(statement, indent = 0) {
     return `${indentStr}() // TODO: CALL "${rawProgramName}" - external subprogram not available for conversion (no PROGRAM-ID "${nameUpper}" found in this source); call skipped - see tests/oracle/README.md known gaps`;
   }
 
+  // round-8 finding 1: a bare (no subscripts) reference to a registered
+  // GROUP name - as opposed to an elementary field - needs the same
+  // concatenated-raw-storage-text treatment DISPLAY/group MOVE already use
+  // (groupDisplayValueExpr): a group has no flat Scala var of its own to
+  // pass as an argument (see that function's own doc comment), only its
+  // children do.
   const argExprs = usingParams.map(param => {
-    if (param.value?.name) return toCamelCase(param.value.name);
+    const name = param.value?.name;
+    const hasSubscripts = Array.isArray(param.value?.subscripts) && param.value.subscripts.length > 0;
+    if (name && !hasSubscripts && isRegisteredGroupName(String(name).toUpperCase())) {
+      const groupExpr = groupDisplayValueExpr(resolveGroupKey(String(name).toUpperCase()));
+      if (groupExpr) return `(${groupExpr})`;
+    }
+    if (name) return toCamelCase(name);
     return convertArithmeticExpression(param.value || param);
   });
   const callExpr = `${target.objectName}.entry(${argExprs.join(', ')})`;
@@ -5073,25 +5234,56 @@ function generateCall(statement, indent = 0) {
   // post-call value back into: only a BY REFERENCE operand (COBOL's default
   // when no BY CONTENT/VALUE is written) that is itself a plain variable
   // reference (a literal/expression operand has nowhere to write back to,
-  // same as real COBOL - only a data-name can be passed BY REFERENCE).
-  const refTargets = usingParams.map(param => {
+  // same as real COBOL - only a data-name can be passed BY REFERENCE). A
+  // group-shaped operand (round-8 finding 1) gets a `{ kind: 'group',
+  // groupKey }` "scatter" writer instead of a plain `{ kind: 'scalar',
+  // camel }` one - see renderWriteback/scatterGroupFromString.
+  const refWriters = usingParams.map(param => {
     const mode = String(param.mode || 'REFERENCE').toUpperCase();
     if (mode !== 'REFERENCE') return null;
-    return param.value?.name ? toCamelCase(param.value.name) : null;
+    const name = param.value?.name;
+    if (!name) return null;
+    const hasSubscripts = Array.isArray(param.value?.subscripts) && param.value.subscripts.length > 0;
+    const nameUpperParam = String(name).toUpperCase();
+    if (!hasSubscripts && isRegisteredGroupName(nameUpperParam)) {
+      return { kind: 'group', groupKey: resolveGroupKey(nameUpperParam) };
+    }
+    return { kind: 'scalar', camel: toCamelCase(name) };
   });
 
-  if (target.paramCount === 0 || refTargets.every(t => t === null)) {
+  // Render one BY REFERENCE operand's writeback from `sourceExpr` - a plain
+  // Scala expression (a var name, or `_callRet`/`_callRet._n`) that is
+  // always cheap and side-effect-free to re-evaluate, since
+  // scatterGroupFromString may reference it more than once for a
+  // multi-child group (never the raw `callExpr`/method-call text itself -
+  // see the paramCount===1 group branch and the multi-param `_callRet`
+  // path below, both of which evaluate the call exactly once first).
+  const renderWriteback = (writer, sourceExpr) => {
+    if (writer.kind === 'scalar') return [`${indentStr}${writer.camel} = ${sourceExpr}`];
+    const scattered = scatterGroupFromString(writer.groupKey, sourceExpr, indent);
+    if (scattered == null) {
+      return [
+        `${indentStr}() // TODO: CALL ... USING BY REFERENCE ${writer.groupKey}: group writeback not ` +
+          'supported for this shape (an OCCURS child, or a child with no registered field info) - value left unchanged',
+      ];
+    }
+    return scattered;
+  };
+
+  if (target.paramCount === 0 || refWriters.every(w => w === null)) {
     return `${indentStr}${callExpr}`;
   }
 
   if (target.paramCount === 1) {
-    const t = refTargets.find(Boolean);
-    return t ? `${indentStr}${t} = ${callExpr}` : `${indentStr}${callExpr}`;
+    const w = refWriters.find(Boolean);
+    if (!w) return `${indentStr}${callExpr}`;
+    if (w.kind === 'scalar') return `${indentStr}${w.camel} = ${callExpr}`;
+    return [`${indentStr}val _callRet = ${callExpr}`, ...renderWriteback(w, '_callRet')].join('\n');
   }
 
   const lines = [`${indentStr}val _callRet = ${callExpr}`];
-  refTargets.forEach((t, i) => {
-    if (t) lines.push(`${indentStr}${t} = _callRet._${i + 1}`);
+  refWriters.forEach((w, i) => {
+    if (w) lines.push(...renderWriteback(w, `_callRet._${i + 1}`));
   });
   return lines.join('\n');
 }

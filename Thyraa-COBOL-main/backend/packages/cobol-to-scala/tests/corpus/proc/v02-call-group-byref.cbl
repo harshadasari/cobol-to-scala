@@ -1,0 +1,29 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. V02-CALL-GROUP.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-REC.
+           05 WS-A    PIC 9(4) VALUE 1.
+           05 WS-B    PIC X(4) VALUE "INIT".
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           DISPLAY "BEFORE A=" WS-A " B=" WS-B.
+           CALL "V02SUB" USING BY REFERENCE WS-REC.
+           DISPLAY "AFTER  A=" WS-A " B=" WS-B.
+           STOP RUN.
+
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. V02SUB.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       LINKAGE SECTION.
+       01 LK-REC.
+           05 LK-A    PIC 9(4).
+           05 LK-B    PIC X(4).
+       PROCEDURE DIVISION USING LK-REC.
+       SUB-PARA.
+           MOVE 99 TO LK-A.
+           MOVE "ZZZZ" TO LK-B.
+           GOBACK.
+       END PROGRAM V02SUB.
+       END PROGRAM V02-CALL-GROUP.

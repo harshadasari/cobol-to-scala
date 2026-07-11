@@ -38,7 +38,13 @@ test('Finding 1: FUNCTION NUMVAL routes through CobolFmt.numval (strips internal
            STOP RUN.
 `;
   const code = convertToScala(source, {}).scala;
-  assert.match(code, /wsRes = CobolFmt\.numval\(wsSrc\)/);
+  // round-8 finding 2: CobolFmt.numval gained a `decimalComma` parameter (see
+  // tests/round8-fixes.test.js) so FUNCTION NUMVAL can parse "," as the
+  // decimal point under SPECIAL-NAMES' DECIMAL-POINT IS COMMA - every call
+  // site (this one included) now threads the current setting through as a
+  // second argument, `false` here since this source has no SPECIAL-NAMES
+  // clause at all.
+  assert.match(code, /wsRes = CobolFmt\.numval\(wsSrc, false\)/);
   // A plain `.trim` alone (the pre-fix behavior) would leave the internal
   // space between '+' and '12.5' in place, which BigDecimal's own parser
   // rejects outright - the fix must not just re-wrap the same broken
@@ -48,7 +54,7 @@ test('Finding 1: FUNCTION NUMVAL routes through CobolFmt.numval (strips internal
 
 test('Finding 1: CobolFmt.numval strips every space and normalizes a leading or trailing sign', () => {
   const code = convertToScala('       IDENTIFICATION DIVISION.\n       PROGRAM-ID. T.\n       PROCEDURE DIVISION.\n       0000-MAIN.\n           STOP RUN.\n', {}).scala;
-  const match = code.match(/def numval\(s: String\): BigDecimal =\n([\s\S]*?)\n\n/);
+  const match = code.match(/def numval\(s: String, decimalComma: Boolean = false\): BigDecimal =\n([\s\S]*?)\n\n/);
   assert.ok(match, 'CobolFmt.numval helper should be embedded');
   // Evaluate the actual Scala logic's JS-equivalent behavior isn't practical
   // here without a Scala runtime, but the embedded source itself is the

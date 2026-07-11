@@ -29,6 +29,10 @@ import {
   generateCobolInspectHelper,
   generateCobolUnstringHelper,
   formatEditedPicture,
+  isRegisteredGroupName,
+  resolveGroupKey,
+  groupDisplayValueExpr,
+  scatterGroupFromString,
 } from './expression-gen.js';
 import {
   generateMethod,
@@ -602,6 +606,94 @@ function normalizeIntLiteralText(raw) {
 }
 
 /**
+ * round-8 finding 4: a group-level VALUE clause (`01 WS-REC VALUE
+ * "AB1234". 05 WS-CODE PIC X(2). 05 WS-NUM PIC 9(4).`) initializes the
+ * group's *storage bytes* as a whole - cobc lays the literal down across
+ * the group's full declared width (space-padding on the right when the
+ * literal is shorter, exactly like an elementary alphanumeric VALUE - see
+ * fitAlphanumericText) - and every child with no VALUE clause of its own
+ * simply reads back whichever slice of those bytes falls at its own
+ * position, the same way a REDEFINES child does (see
+ * characterSlicedGroupRedefinesLines below, the sibling mechanism for a
+ * REDEFINES-declared alias over the same bytes). This computes that raw
+ * "storage text" for one item's *own* VALUE clause (figurative constants
+ * ZERO/SPACE included), fitted/truncated to `width` bytes - callers pass it
+ * down through buildFieldRegistry's walk() as `parentValueText` so a
+ * VALUE-less descendant (leaf or nested group, arbitrarily deep) can slice
+ * out its own span. Returns null when the item has no VALUE clause at all
+ * (the ordinary case), leaving the caller's own inherited-from-an-ancestor
+ * text, if any, as the fallback.
+ */
+function ownValueStorageText(item, width) {
+  const v = item.value;
+  if (!v || typeof v !== 'object') return null;
+  let text = null;
+  if (v.type === 'string') text = String(v.value ?? '');
+  else if (v.type === 'numeric') text = String(v.value);
+  else if (v.type === 'figurative') {
+    if (v.value === 'SPACE') text = '';
+    else if (v.value === 'ZERO') text = '0';
+  }
+  if (text == null) return null;
+  return fitAlphanumericText(text, width, false);
+}
+
+/**
+ * round-8 finding 4 (continued): the actual per-leaf/per-FILLER Scala
+ * initializer, combining an item's own VALUE clause (defaultElementaryValue,
+ * unchanged and always taking priority) with `inheritedSlice` - the bytes
+ * this item's own span occupies within the nearest VALUE-bearing ancestor
+ * group's storage text, computed by buildFieldRegistry's walk() (null when
+ * there is no such ancestor, e.g. the overwhelmingly common case of a group
+ * with no group-level VALUE clause at all - behavior is then identical to
+ * plain defaultElementaryValue).
+ *
+ * The inherited slice is reused by constructing a synthetic VALUE clause
+ * (`{ type: 'string'|'numeric', value: ... }`) and handing it to the exact
+ * same defaultElementaryValue this item would already go through for its
+ * own VALUE clause, so every existing width/justify/edited-picture rule
+ * applies identically instead of being re-implemented:
+ *   - String target: the slice is already exactly this item's own declared
+ *     width (buildFieldRegistry's walk() sliced it that way), so it passes
+ *     through as a string VALUE clause unchanged (still routed through
+ *     fitAlphanumericText/JUSTIFIED RIGHT handling for symmetry with every
+ *     other VALUE-clause path).
+ *   - Numeric target: COBOL's DISPLAY-numeric storage is just the item's
+ *     digit characters with no punctuation (V is implied, never stored), so
+ *     the slice is only usable when it is *purely* digits - a group VALUE
+ *     literal shorter than the full group width space-pads the remainder
+ *     (see ownValueStorageText/fitAlphanumericText), and a numeric child
+ *     landing entirely or partly on that padding sees spaces, which are not
+ *     valid digit text; falling back to defaultElementaryValue's ordinary
+ *     zero-default in that case is exactly COBOL's own behavior for a
+ *     VALUE-less numeric item. When the slice is pure digits, the implied
+ *     decimal point is reinserted at this item's own declared
+ *     integerDigits/decimalDigits split before handing it to
+ *     defaultElementaryValue as a numeric VALUE clause.
+ *   - OCCURS items and any item whose own VALUE clause is already present
+ *     never reach the inheritance branch at all (see buildFieldRegistry's
+ *     walk(), which only computes a non-null inheritedSlice for a
+ *     VALUE-less, non-OCCURS item).
+ */
+function defaultElementaryValueWithInheritance(item, scalaType, inheritedSlice) {
+  if (item.value || inheritedSlice == null) return defaultElementaryValue(item, scalaType);
+
+  if (scalaType === 'String') {
+    return defaultElementaryValue({ ...item, value: { type: 'string', value: inheritedSlice } }, scalaType);
+  }
+
+  if (!/^\d+$/.test(inheritedSlice)) return defaultElementaryValue(item, scalaType);
+
+  const pic = item.pic && typeof item.pic === 'object' ? item.pic : null;
+  const intDigits = pic?.integerDigits ?? inheritedSlice.length;
+  const decDigits = pic?.decimalDigits || 0;
+  const numericText = decDigits > 0
+    ? `${inheritedSlice.slice(0, intDigits)}.${inheritedSlice.slice(intDigits)}`
+    : inheritedSlice;
+  return defaultElementaryValue({ ...item, value: { type: 'numeric', value: numericText } }, scalaType);
+}
+
+/**
  * Character-sliced group REDEFINES: used whenever the redefined target is
  * alphanumeric (String) - including REDEFINES over an OCCURS table (e.g.
  * `01 WS-TABLE-VIEW REDEFINES WS-FLAT-VIEW. 05 WS-CHUNK OCCURS 3 TIMES PIC
@@ -1066,7 +1158,20 @@ function buildFieldRegistry(ast) {
   // qualifier that names an ancestor *above* the immediate parent (`QTY OF
   // WS-B`, skipping the intermediate DTL-GROUP level entirely - equally
   // valid, common COBOL).
-  function walk(list, occursChain, ancestorNames) {
+  // round-8 finding 4: `parentValueText`, when non-null, is the raw storage
+  // text of the nearest VALUE-bearing ancestor group enclosing this whole
+  // `list` (already fitted/truncated to that ancestor's full byte width -
+  // see ownValueStorageText) - `offset` (reset per walk() call, since each
+  // invocation is scoped to one group's own children or the top-level item
+  // list) tracks how many bytes of it this loop has consumed so far, so each
+  // item can slice out exactly its own span for defaultElementaryValueWithInheritance
+  // (leaf) or to pass further down as its own nested group's parentValueText
+  // (see the group branch below). Stays undefined/null at the top level
+  // (`walk(wsItems, [], [])` and friends) and for every ordinary group with
+  // no group-level VALUE clause anywhere above it - the overwhelmingly common
+  // case - so no existing (VALUE-less-group) behavior changes at all.
+  function walk(list, occursChain, ancestorNames, parentValueText) {
+    let offset = 0;
     for (const item of list) {
       if (isLevel(item, 88)) continue;
 
@@ -1120,8 +1225,26 @@ function buildFieldRegistry(ast) {
       if (item.redefines) {
         const accessorLines = redefinesAccessorLines(item, registry, list);
         if (accessorLines.length) lines.push(...accessorLines);
-        continue;
+        continue; // shares storage with what it redefines - no offset advance
       }
+
+      // round-8 finding 4: this item's own span within `parentValueText`
+      // (null when there is no VALUE-bearing ancestor in scope at all - see
+      // walk()'s own doc comment). `itemWidth` (used to advance `offset` for
+      // the *next* sibling) always uses the item's full occupied storage,
+      // OCCURS multiplier included, exactly like itemByteLength's own
+      // documented contract; the slice handed to a VALUE-less descendant
+      // (`itemWidthSingle`/`inheritedSlice`) is deliberately left null for an
+      // OCCURS-bearing item - a table inheriting its initial contents from an
+      // enclosing group's VALUE clause is not a shape this fix (or any corpus
+      // program) exercises, and guessing at a per-element split would risk a
+      // wrong value rather than the safe, pre-existing zero/blank default.
+      const itemWidth = itemByteLength(item);
+      const itemWidthSingle = hasOccurs(item) ? null : itemWidth;
+      const inheritedSlice = (parentValueText != null && itemWidthSingle != null)
+        ? parentValueText.substr(offset, itemWidthSingle)
+        : null;
+      offset += itemWidth;
 
       const realChildren = (item.children || []).filter(c => !isLevel(c, 88));
       if (realChildren.length > 0) {
@@ -1139,7 +1262,20 @@ function buildFieldRegistry(ast) {
         // unaffected.
         const groupKey = [...ancestorNames, parentUpper].join('/');
         const ownCount = hasOccurs(item) && occursCount(item) > 1 ? occursCount(item) : null;
-        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain, [...ancestorNames, parentUpper]);
+        // round-8 finding 4: this group's own VALUE clause (if any) wins over
+        // whatever it may itself have inherited from a further-up ancestor -
+        // each level's own VALUE clause always overrides an ancestor's, exact
+        // same rule as an elementary item's own VALUE winning over inheritance
+        // (defaultElementaryValueWithInheritance). Computed even when this
+        // group has OCCURS (`itemByteLength({ ...item, occurs: null })` is
+        // already the established one-occurrence-width convention, see
+        // groupByteLengthRegistry below) so a group's *own* VALUE clause still
+        // reaches its children regardless - only *inheriting* an ancestor's
+        // VALUE across an OCCURS boundary is left unsupported (inheritedSlice
+        // is already null for an OCCURS item, above).
+        const ownGroupValueText = ownValueStorageText(item, itemByteLength({ ...item, occurs: null }));
+        const effectiveValueText = ownGroupValueText ?? inheritedSlice;
+        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain, [...ancestorNames, parentUpper], effectiveValueText);
 
         // Group registry: immediate child names (COBOL name + camel), used
         // by MOVE/ADD CORRESPONDING to match children between two group
@@ -1220,7 +1356,13 @@ function buildFieldRegistry(ast) {
         const baseType = scalaBaseType(item);
         let scalaType = baseType;
         for (let i = 0; i < fullChain.length; i++) scalaType = `Vector[${scalaType}]`;
-        let defaultExpr = defaultElementaryValue(item, baseType);
+        // round-8 finding 4: a FILLER between two named children of a
+        // VALUE-bearing group still occupies real storage bytes that a
+        // whole-group DISPLAY/MOVE must carry along correctly (same
+        // round-5 finding 3/s06 rationale as the flat-var mirroring above) -
+        // so it inherits its own slice of the ancestor's VALUE text exactly
+        // like a named leaf does, not just the plain zero/blank default.
+        let defaultExpr = defaultElementaryValueWithInheritance(item, baseType, inheritedSlice);
         for (let i = fullChain.length - 1; i >= 0; i--) {
           defaultExpr = `Vector.fill(${fullChain[i]})(${defaultExpr})`;
         }
@@ -1267,7 +1409,13 @@ function buildFieldRegistry(ast) {
       let scalaType = baseType;
       for (let i = 0; i < fullChain.length; i++) scalaType = `Vector[${scalaType}]`;
 
-      let defaultExpr = defaultElementaryValue(item, baseType);
+      // round-8 finding 4: fall back to the nearest VALUE-bearing ancestor
+      // group's own storage slice (defaultElementaryValueWithInheritance)
+      // when this leaf has no VALUE clause of its own - see that function's
+      // doc comment; a no-op (identical to the pre-existing
+      // defaultElementaryValue call) whenever `inheritedSlice` is null, i.e.
+      // no VALUE-bearing ancestor is in scope.
+      let defaultExpr = defaultElementaryValueWithInheritance(item, baseType, inheritedSlice);
       for (let i = fullChain.length - 1; i >= 0; i--) {
         defaultExpr = `Vector.fill(${fullChain[i]})(${defaultExpr})`;
       }
@@ -1950,6 +2098,21 @@ export function generateScala(ast, options = {}) {
  * LINKAGE SECTION items go through the identical buildFieldRegistry path);
  * falls back to `String` only if a parameter is somehow unregistered
  * (defensive - every corpus program's LINKAGE item is registered).
+ *
+ * round-8 finding 1: a USING parameter naming a whole GROUP LINKAGE item
+ * (rather than an elementary field) has no fieldRegistry entry of its own
+ * at all - a group never gets a flat Scala var, only its children do (see
+ * generator/expression-gen.js's groupDisplayValueExpr) - so it *already*
+ * falls back to `String` above, matching the caller side's own
+ * concatenated-raw-storage-text convention for such an operand
+ * (generateCall). What still needs to change for a group parameter is the
+ * assignment on both ends: instead of `<name> = _argN` (a hard "not found"
+ * compile error - there is no flat `<name>` var to assign) and a bare
+ * `<name>` return (same problem), a group parameter's incoming string is
+ * scattered into its own children's flat vars (scatterGroupFromString) and
+ * its outgoing value is its children's own concatenated storage text
+ * (groupDisplayValueExpr) - the exact inverse pairing generateCall uses on
+ * the caller side for the same operand.
  */
 function generateEntryMethod(ast, fieldRegistry, indent = 1) {
   const indentStr = '  '.repeat(indent);
@@ -1957,8 +2120,15 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
 
   const usingNames = (ast.procedures?.using || []).map(n => (typeof n === 'string' ? n : (n?.name || n)));
   const paramInfos = usingNames.map(name => {
-    const info = fieldRegistry.get(String(name).toUpperCase());
-    return { camel: toCamelCase(name), scalaType: info?.scalaType || 'String' };
+    const nameUpper = String(name).toUpperCase();
+    const info = fieldRegistry.get(nameUpper);
+    const isGroup = !info && isRegisteredGroupName(nameUpper);
+    return {
+      camel: toCamelCase(name),
+      scalaType: info?.scalaType || 'String',
+      isGroup,
+      groupKey: isGroup ? resolveGroupKey(nameUpper) : null,
+    };
   });
 
   const { topLevelParagraphs, sections } = splitProcedureDivision(ast);
@@ -1979,12 +2149,34 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
     `${indentStr}// "value-in/tuple-out" convention this pairs with.`,
     `${indentStr}def entry(${paramList}): ${returnType} =`,
   ];
-  paramInfos.forEach((p, i) => lines.push(`${bi}${p.camel} = _arg${i}`));
+  paramInfos.forEach((p, i) => {
+    if (!p.isGroup) {
+      lines.push(`${bi}${p.camel} = _arg${i}`);
+      return;
+    }
+    const scattered = scatterGroupFromString(p.groupKey, `_arg${i}`, indent + 1);
+    if (scattered == null) {
+      lines.push(
+        `${bi}() // TODO: CALL ... USING ${p.groupKey}: group parameter scatter not supported for this ` +
+          'shape (an OCCURS child, or a child with no registered field info) - value left unchanged'
+      );
+      return;
+    }
+    lines.push(...scattered);
+  });
   lines.push(...generateProgramFlowLines(units, indent + 1, ambiguousNames));
-  if (paramInfos.length === 1) {
-    lines.push(`${bi}${paramInfos[0].camel}`);
-  } else if (paramInfos.length > 1) {
-    lines.push(`${bi}(${paramInfos.map(p => p.camel).join(', ')})`);
+  if (paramInfos.length === 1 || paramInfos.length > 1) {
+    const returnExprs = paramInfos.map(p => {
+      if (!p.isGroup) return p.camel;
+      const groupExpr = groupDisplayValueExpr(p.groupKey);
+      // No flat `<name>` var exists for a group parameter (see this
+      // function's own doc comment), so the fallback for an unsupported
+      // group shape must still be a same-typed (String) placeholder, not a
+      // reference to a nonexistent variable - "" plus a visible comment,
+      // never a guessed/wrong value.
+      return groupExpr ? `(${groupExpr})` : `"" /* TODO: group return unsupported for this shape */`;
+    });
+    lines.push(paramInfos.length === 1 ? `${bi}${returnExprs[0]}` : `${bi}(${returnExprs.join(', ')})`);
   }
 
   return lines.join('\n');

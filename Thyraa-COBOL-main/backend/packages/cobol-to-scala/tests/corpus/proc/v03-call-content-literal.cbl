@@ -1,0 +1,26 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. V03A.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-N        PIC 9(2) VALUE 5.
+       01 WS-OUT      PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           CALL "V03SUB" USING BY CONTENT WS-N, BY REFERENCE WS-OUT.
+           DISPLAY "N=" WS-N " OUT=" WS-OUT.
+           STOP RUN.
+
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. V03SUB.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       LINKAGE SECTION.
+       01 LK-N        PIC 9(2).
+       01 LK-OUT      PIC 9(4).
+       PROCEDURE DIVISION USING LK-N LK-OUT.
+       SUB-PARA.
+           COMPUTE LK-OUT = LK-N * LK-N.
+           ADD 1 TO LK-N.
+           GOBACK.
+       END PROGRAM V03SUB.
+       END PROGRAM V03A.

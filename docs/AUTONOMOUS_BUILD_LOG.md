@@ -3,16 +3,20 @@
 **Run start:** 2026-07-11 ~01:30 UTC · **Branch:** claude/analyze-codebase-pdPSZ · **Budget:** orchestrator ≤2M own tokens, 48h wall clock
 
 ## Open questions / blockers
-- **PHASE 2 REFUTED (queued fix):** 16/20 new adversarial proc programs diverge, 14 root causes, ALL silent (no TODO markers): NUMVAL crash on '+  12.5', 88-level conditions unimplemented (confirms Phase 1b mandate), EVALUATE expression-subject collapse, recursive PERFORM emits 1000Recurse(), WITH TEST AFTER invalid Scala, duplicate nested group names collide in codegen, LENGTH of group, MAX over BigDecimal, SEARCH VARYING ignored, index-name DISPLAY format, multi-key mixed-direction SORT, RELEASE FROM / RETURN INTO no-ops, UNSTRING COUNT IN dropped. Repros: scratchpad/phase2-refutation/. Baseline 9 corpus programs re-confirmed passing (pinned to 01c2fdb). Also: stale known-gaps table in tests/oracle/README.md must be refreshed. Fix wave dispatches when Phase 1b agent frees generator/.
-- **CRITIC BLOCKING #2:** safeNodeString checks node.name before its TODO fallback, so unhandled FunctionCall nodes render as bare identifiers (silent garbage; FUNCTION MOD(17,5) emits wsModPos = 0). Violates the coverage-honesty rule. Must reorder: unknown statement/expression types -> visible ??? TODO marker.
-- **PHASE 1 STATUS CORRECTED: NOT DONE.** Adversarial refuter (12 new edge-case programs vs compiler oracle) REFUTED the Phase 1 milestone: 11/12 diverge. The 7-program corpus was a narrow slice. Fix wave queued behind the in-flight Phase 2 generator agent (same files). Full repros preserved in scratchpad/phase1-refutation/.
+_(none currently open - all prior pins resolved; see cycle entries. Tracked-OPEN roadmap items live in docs/CAPABILITY_AUDIT_AND_ROADMAP.md section 1.3 and tests/oracle/README.md known-gaps.)_
 
-## Status snapshot
-- **Phase:** 1 (data-layer truth) — in progress
-- **Tests:** 27/27 passing at run start
-- **Orchestrator token spend:** minimal (cycle 1)
+## Status snapshot (updated cycle 24)
+- **Phases:** 1+2 oracle-verified deep; 3 MVP done (SQL wire-in OPEN); 4 scaffolding done
+- **Tests:** 590/590, 118 oracle-gated corpus programs (started at 27 tests)
+- **Refutation rounds:** 8 so far (11,16,15,16,6,6,8,4 findings - all fixed through r7; r8 fix in flight)
 
 ## Activity
+
+### 2026-07-11 14:20 — Cycles 22-24: round-7 committed (23e74e2, verified 590/0/0); critic ALL-CLEAR; round-8 in fix
+- Round-7 fixes committed after orchestrator-run verification (590/0/0; one stale unit assertion reconciled against the a06 oracle before commit). 118 corpus programs.
+- Periodic completeness critic (independent, ran everything itself): NO BLOCKING findings. All 5 load-bearing claims reproduced exactly - incl. full re-capture of all 118 .oracle.txt from live cobc leaving the git tree byte-identical (fixture integrity proven). Advisories fixed in this entry: stale pinned blockers cleared, status snapshot updated, closing verification entry for 23e74e2 recorded (this entry), roadmap CALL/refmod gap placement to be folded into the final docs pass.
+- Round-8 refutation: NOT CONVERGED at 4 dishonest (trend 16->6->6->8->4): group BY REFERENCE in CALL, NUMVAL under DECIMAL-POINT COMMA, unequal-width alphanumeric comparison padding, group-level VALUE clause slicing. 9 hard survivals incl. nested CALL chains, CALL-loop static semantics, cross-CALL file I/O, INSPECT per-operand scoping.
+- Round-8 fix agent in flight (also promotes all 12 v-probes). Wall clock ~14.5h/48h; orchestrator spend well under budget.
 
 ### 2026-07-11 12:35 — Cycle 21: round-6 committed (68f762a); round-7 verdict + fix dispatched
 - Round-6 fixes committed after independent verification (545/0/0, 104 corpus programs).

@@ -1,0 +1,3 @@
+ELEM(01)=AAAAA
+ELEM(02)=*****
+ELEM(03)=CCCCC

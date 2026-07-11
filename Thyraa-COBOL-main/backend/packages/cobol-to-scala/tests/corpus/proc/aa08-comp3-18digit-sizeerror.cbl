@@ -1,0 +1,33 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. R1307.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-BIG    PIC S9(18) COMP-3 VALUE 999999999999999999.
+       01  WS-SMALL  PIC S9(16)V99 COMP-3
+           VALUE 1234567890123456.78.
+       01  WS-RESULT PIC S9(18) COMP-3.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           COMPUTE WS-RESULT ROUNDED = WS-BIG + 1
+               ON SIZE ERROR
+                   DISPLAY "OVERFLOW1"
+               NOT ON SIZE ERROR
+                   DISPLAY "OK1 RESULT=" WS-RESULT
+           END-COMPUTE.
+
+           MOVE 5 TO WS-RESULT.
+           COMPUTE WS-RESULT ROUNDED = WS-SMALL * 10
+               ON SIZE ERROR
+                   DISPLAY "OVERFLOW2"
+               NOT ON SIZE ERROR
+                   DISPLAY "OK2 RESULT=" WS-RESULT
+           END-COMPUTE.
+
+           MOVE 999999999999999998 TO WS-RESULT.
+           COMPUTE WS-RESULT ROUNDED = WS-RESULT + 1.4
+               ON SIZE ERROR
+                   DISPLAY "OVERFLOW3"
+               NOT ON SIZE ERROR
+                   DISPLAY "OK3 RESULT=" WS-RESULT
+           END-COMPUTE.
+           STOP RUN.

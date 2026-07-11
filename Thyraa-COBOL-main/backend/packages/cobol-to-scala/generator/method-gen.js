@@ -914,9 +914,6 @@ export function generateProgramFlowLines(units, indent, ambiguousNames) {
  */
 export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
   const units = flattenProcedureUnits(topLevelParagraphs, sections);
-  if (units.length === 0) {
-    return '';
-  }
 
   const ambiguousNames = collectAmbiguousParagraphNames(topLevelParagraphs, sections);
   // round-12 bonus finding: make this same ambiguity set available to
@@ -924,22 +921,64 @@ export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
   // call frames below inside generateMethodNamed/generateMethodBody, for any
   // PERFORM statement that carries an explicit OF/IN qualifier - see this
   // module's own setAmbiguousParagraphNamesForPerform doc comment.
+  //
+  // Installed unconditionally, BEFORE the units.length===0 early return just
+  // below (cross-call leak fix, same class as generateDeclarativeSupport's
+  // in scala-generator.js): a program with an empty PROCEDURE DIVISION (no
+  // paragraphs/sections at all) must still overwrite whatever ambiguity set
+  // a *previous* generateAllMethods call in the same process installed,
+  // rather than silently leaving it in place - AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM
+  // is module-level state in both this module and expression-gen.js.
   setAmbiguousParagraphNamesForPerform(ambiguousNames);
   // Same set, threaded to expression-gen.js's own generatePerform (the
   // sibling of generatePerformFromAST for a PERFORM nested inside an IF/
   // EVALUATE/SEARCH branch body, etc.) via its own identically-purposed
   // setter - see that module's paragraphMethodName/AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM.
   setAmbiguousParagraphNamesForPerformExpr(ambiguousNames);
+
+  if (units.length === 0) {
+    return '';
+  }
+
   const methods = [];
   const performThrus = new Set();
 
   // First pass - collect PERFORM THRU targets (PerformStatement AST nodes
   // use .targetParagraph/.throughParagraph - see parser/ast.js - not
   // .target/.thru).
+  //
+  // round-13 finding 2: a SORT statement's own INPUT PROCEDURE/OUTPUT
+  // PROCEDURE clauses (SortStatement.inputProcedure/.outputProcedure - a
+  // `{ procedure, through }` shape, parser/ast.js/parser/procedure-parser.js's
+  // parseSortProcedureClause) can ALSO name a THRU range (`INPUT PROCEDURE IS
+  // 1000-FILL THRU 1000-FILL-EXIT`), exactly like a PERFORM statement's own
+  // `x THRU y` - but this collection loop previously only ever looked at
+  // PerformStatement nodes, never SortStatement. expression-gen.js's
+  // generateSort/procedureCallExpr already assumes (and always has assumed)
+  // that a THRU-range procedure clause resolves to the same
+  // `<from>To<To>()` wrapper method generatePerformThruMethod builds for an
+  // ordinary PERFORM ... THRU - so a SORT with an INPUT/OUTPUT PROCEDURE ...
+  // THRU clause called a wrapper method that generateAllMethods never
+  // actually generated (a hard "not found" compile error) unless some
+  // *other*, unrelated PERFORM statement in the same program happened to
+  // request the identical THRU range coincidentally. Collecting THRU ranges
+  // from SortStatement here too - the exact same targetParagraph/through
+  // Set entries generatePerformThruMethod's loop below already consumes -
+  // is a pure addition: it only ever adds wrapper methods that a SORT ...
+  // THRU clause elsewhere in this same collection loop's file will actually
+  // call, never changes anything for a program with no such clause.
   for (const unit of units) {
     for (const stmt of unit.statements || []) {
       if (stmt.type === 'PerformStatement' && stmt.throughParagraph) {
         performThrus.add(`${stmt.targetParagraph}:${stmt.throughParagraph}`);
+      }
+      if (stmt.type === 'SortStatement') {
+        if (stmt.inputProcedure?.procedure && stmt.inputProcedure.through) {
+          performThrus.add(`${stmt.inputProcedure.procedure}:${stmt.inputProcedure.through}`);
+        }
+        if (stmt.outputProcedure?.procedure && stmt.outputProcedure.through) {
+          performThrus.add(`${stmt.outputProcedure.procedure}:${stmt.outputProcedure.through}`);
+        }
       }
     }
   }

@@ -1,0 +1,2 @@
+AB=[AAABBB]
+A=[XXX] B=[XXX] C=[CCC]

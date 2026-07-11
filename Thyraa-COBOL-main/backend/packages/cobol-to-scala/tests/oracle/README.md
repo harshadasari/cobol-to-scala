@@ -176,18 +176,19 @@ through this data-driven suite.
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 187 corpus programs found
-(19 under `data/`, 168 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+**cobc oracle capture / expected-vs-oracle check** - 198 corpus programs found
+(19 under `data/`, 179 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
 excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
 precompiler, see `tests/sql.test.js` instead; two round-9 repros, `w09`/`w12`, are
 deliberately excluded entirely - see the round-9 table below - since cobc itself
-rejects them), all 187 compiled and ran cleanly under cobc (exit 0). 28 of the 187
+rejects them), all 198 compiled and ran cleanly under cobc (exit 0). 28 of the 198
 (19 `data/` + 9 `proc/` baseline programs) already have a hand-written `.expected.txt`
 that matches the captured `.oracle.txt` exactly - 0 mismatches. The 20 `r01`-`r14*`,
 15 `n01`-`n16*`, 16 `q01`-`q12*`, 14 `s01`-`s12*`, 11 `t01`-`t12*` (`t09` excluded),
 14 `u01`-`u13*`, 12 `v01`-`v12*`, 12 `w01`-`w14*` (`w09`/`w12` excluded), 12
 `x01`-`x12`, 16 `y01`-`y17*` (see the round-11 table below for the exact subset),
-and 15 `z01`-`z15*` (see the round-12 table below for the exact subset) programs
+15 `z01`-`z15*` (see the round-12 table below for the exact subset), and 11
+`aa01`-`aa10*` (see the round-13 table above for the exact subset) programs
 have no hand-written `.expected.txt` by design (they're verified directly against
 cobc via `oracleCompare()` below, not a separately hand-authored expectation) and
 show up here as a diagnostic-only capture ("no `<name>.expected.txt` alongside ...
@@ -196,12 +197,12 @@ yet").
 **Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
 end-to-end (0 todo).
 
-**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 168/168 programs
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 179/179 programs
 match end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
 `q01`-`q12*`, all 14 `s01`-`s12*`, all 11 `t01`-`t12*` (`t09` excluded), all 14
 `u01`-`u13*`, all 12 `v01`-`v12*`, all 12 `w01`-`w14*` (`w09`/`w12` excluded), all
-12 `x01`-`x12`, all 16 `y01`-`y17*`, and all 15 `z01`-`z15*` adversarial-refutation
-programs below.
+12 `x01`-`x12`, all 16 `y01`-`y17*`, all 15 `z01`-`z15*`, and all 11 `aa01`-`aa10*`
+adversarial-refutation programs below.
 
 ### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
@@ -618,6 +619,61 @@ conversion in a child process with a hard wall-clock timeout, since a
 synchronous infinite loop cannot be interrupted from within the same
 process/thread the way an ordinary assertion failure can.
 
+### Round-13 adversarial-refutation findings (aa01-aa10, aa02b) and their fixes
+
+A round-13 refuter found 5 more root-cause dishonest divergences - one of
+them (finding 3) **SEVERE** (a whole class of DECLARATIVES reentrancy - a
+handler retrying its own failed OPEN, or one handler's body triggering
+another - saw empty/partial registries, not merely one wrong value). Three
+findings (2, 3, 4) are fixed in full; every promoted program for those hard-
+passes `oracleCompare()`. Two findings (1, 5) are fixed only as far as an
+honest, visible, compiling degradation - the underlying capability (byte-
+level marshalling of an OCCURS table across a CALL boundary; a true
+byte-slice table view for a REDEFINES of one OCCURS-bearing group by
+another) is genuinely not implemented, and the round's own instructions
+explicitly anticipated this as an acceptable outcome - see "Known gaps"
+below for both; their own repro programs (`r1303c`/`r1313` in the
+adversarial-refutation scratch history) are deliberately **not promoted**
+into this corpus (same reasoning as every other documented gap here: a
+program that actually exercises a known, intentional gap would fail
+`oracleCompare()` by design).
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 2 | `SORT ... INPUT PROCEDURE`/`OUTPUT PROCEDURE ... THRU <para>` (a THRU range on a SORT's own procedure clause, not an ordinary PERFORM) never had its THRU range collected at all - `generateAllMethods`' (`generator/method-gen.js`) THRU-range collection pass only ever scanned `PerformStatement` nodes for `.throughParagraph`, never `SortStatement.inputProcedure`/`.outputProcedure` (a `{ procedure, through }` shape parsed by `parseSortProcedureClause`) - so `generateSort`'s own `procedureCallExpr` (`generator/expression-gen.js`, pre-existing) called a `<from>To<To>()` wrapper method that `generatePerformThruMethod` was never actually asked to build: a hard "not found" compile error, unless some unrelated ordinary PERFORM elsewhere in the same program happened to request the identical THRU range by coincidence | `generateAllMethods`'s THRU-collection loop (`generator/method-gen.js`) now also inspects every `SortStatement` in the program and adds its `inputProcedure`/`outputProcedure` THRU ranges (when present) to the exact same `performThrus` Set the ordinary PERFORM scan already builds - a pure addition, since it only ever adds wrapper methods a SORT statement elsewhere in the same file will actually call. Verified against installed GnuCOBOL (aa01): a `SORT ... INPUT PROCEDURE IS 1000-FILL THRU 1000-FILL-EXIT` (with `1000-FILL` itself doing a nested `PERFORM 3000-A THRU 3000-C`) now RELEASEs the exact rows cobc's own run produces, byte-for-byte | aa01 |
+| 3 (SEVERE) | DECLARATIVES handler registries (`DECL_FILE_HANDLERS`/`DECL_MODE_HANDLERS`, consulted by `declarativeHandlerFor` in both `generator/expression-gen.js` and `generator/file-io-gen.js`) were installed via `setDeclarativeHandlersExpr`/`FileIO` only AFTER `generateDeclarativeSupport` had already generated every declarative SECTION's own method body (`scala-generator.js` ~2110-2112, pre-fix) - a single-pass loop that generated each `decl`'s body via `generateSectionMethod` and only added ITS OWN registry entries at the very END of that same iteration. Any file operation generated INSIDE a DECLARATIVES body - a handler retrying its own failed OPEN (the file it's itself the handler for), or handler A's body triggering handler B (regardless of which one is declared textually first) - resolved against an empty (self-retrigger) or partially-populated (cross-handler, declaration-order-dependent) registry, silently generating an unconditional/no-handler OPEN instead of the correct recursive call into the right handler method | Split `generateDeclarativeSupport` into a genuine two-pass pipeline: new `collectDeclarativeHandlers` walks every DECLARATIVES section's `useClause.targets` ONLY (zero codegen, so nothing downstream can ever observe a partial registry) and returns the COMPLETE `fileHandlers`/`modeHandlers` maps; the caller (`convertProgramAst`) installs those via `setDeclarativeHandlersExpr`/`FileIO` BEFORE the second pass (new `generateDeclarativeMethodBodies`) generates a single declarative body - so by the time ANY declarative body (or the ordinary PROCEDURE DIVISION body after it) is generated, every handler - including a handler's own file, and every OTHER handler in the same DECLARATIVES block regardless of textual order - is already visible. Verified against installed GnuCOBOL: a single self-retriggering handler (`aa02b`) fires exactly twice (`HANDLER FIRED N=1`, retries its own OPEN, `HANDLER FIRED N=2`, then terminates - matching cobc's own `COUNT=2` exactly, not an infinite loop and not a single mis-resolved fire); a two-handler reentrancy case (`aa02`, handler B declared BEFORE handler A but B's own body triggers A) fires both handlers in the correct nested order regardless of declaration order | aa02, aa02b |
+| 4 | Level-66 `RENAMES` (`item.renames`/`.renamesThrough`, parsed by `parser/data-division-parser.js` but with **zero codegen anywhere**) fell through `buildFieldRegistry`'s ordinary elementary-leaf branch like any plain field - it got its own disconnected flat var (default-initialized, PIC-less) that never aliased the sibling range it was supposed to rename at all; DISPLAY of it showed nothing meaningful and a MOVE into it never touched the fields it renames | `buildFieldRegistry` (`generator/scala-generator.js`) now tracks a flat, whole-WORKING-STORAGE-section `flatLeafOrder` (every elementary leaf/FILLER registered so far, in physical declaration order - deliberately flattened past any intermediate GROUP_REGISTRY nesting, since RENAMES is defined purely by byte position and can legally cross a group boundary) and, on a level-66 item, slices the contiguous run between its FROM/THRU endpoints (inclusive) into a synthetic GROUP_REGISTRY entry keyed by the RENAMES name itself - from that point on it IS "just another group" to every existing consumer: `groupDisplayValueExpr` already handles its DISPLAY for free. MOVE INTO it needed one new piece - `generateMove` (`generator/expression-gen.js`) only handled a group-to-group MOVE and a group-as-CALL-argument before this fix, never "scalar/literal source INTO a bare group target" - so new `generateScalarIntoGroupMove` fits the source to the target group's total byte width (`GROUP_BYTE_LENGTH_REGISTRY`) and reuses `scatterGroupFromString` (the exact inverse of `groupDisplayValueExpr`, previously only used for CALL BY REFERENCE marshalling) to split it across the covered fields. Verified against installed GnuCOBOL (aa03): `AB=[AAABBB]` then, after `MOVE "XXXXXX" TO WS-AB`, `A=[XXX] B=[XXX] C=[CCC]` (WS-C, outside the renamed range, is untouched) | aa03 |
+
+**Honest-degradation findings** (not hard-passing `oracleCompare()` by design - see "Known gaps" below for each):
+
+| # | Finding | Route taken | Program (not promoted) |
+|---|---|---|---|
+| 1 | `CALL ... USING BY REFERENCE` of a GROUP containing an OCCURS table (`generateCall`'s `argExprs`, `generator/expression-gen.js`) fell through to a bare `toCamelCase(name)` whenever `groupDisplayValueExpr` returned `null` for an OCCURS-bearing group (it has no scalar concatenation - see that function's own doc comment) - an undeclared-identifier hard COMPILE error, since a group has no flat Scala var of its own | **Honest TODO route** (not true marshalling): mirrored the pre-existing writeback-side fallback (`renderWriteback`'s own `scatterGroupFromString == null` branch, already a visible TODO) onto the argument-construction side - a same-typed (`String`) `""` placeholder plus a visible, compiling comment, matching `generateEntryMethod`'s own callee-side return-expression fallback exactly. Compiles and runs to completion (verified: no crash), but does not reproduce cobc's actual cross-CALL byte marshalling - the callee sees empty/default data instead of the caller's actual table contents | `r1303c` (scratch-only) |
+| 5 | REDEFINES of a group-with-OCCURS by another group-with-OCCURS (`WS-TAB-BY-NAME REDEFINES WS-TAB-BY-NUM`, both sides' single child itself `OCCURS ... INDEXED BY ...`): three registries disagreed about whether the redefining group's OCCURS child was a table at all - `todoStubRedefinesLines` (`generator/scala-generator.js`) recursed into its elementary children as bare, `occursDepth: 0` scalar `def`s (no OCCURS-awareness, unlike `buildFieldRegistry`'s own main walk), while `TABLE_REGISTRY` (subscripting, and `generateSearch`'s own `lookupTable`) had NO entry for it at all. Two dishonest, disagreeing outcomes followed: a subscripted reference to one of these fields (`WS-NAME-KEY(1)`, including `generateSearchAll`'s own generated comparisons) compiled as `String#apply(Int): Char` instead of a table subscript - a hard, mismatched-type Scala COMPILE error (r1313's own failure: `value padTo is not a member of Char`) - and even where that happened not to trip, `SEARCH ALL` silently degraded to "no metadata found" and never ran at all | **"All three registries honestly agree" route** (not a true byte-slice table view - that would need per-element packed/binary-aware byte codecs threaded through a REDEFINES-of-REDEFINES chain, out of scope for this fix): `todoStubRedefinesLines` now registers the SAME `TABLE_REGISTRY` entry (times/indexed/ascending/descending/dependingOn) `buildFieldRegistry`'s own OCCURS registration would give a real item - fixing the "SEARCH ALL's no-metadata-found gap for a redefining table" half of this finding on its own (verified: the generated code now contains a real binary-search loop, `var idxS: Int`/`_lo`/`_hi`, not a bare no-op comment) - and declares each elementary child a `Vector[<baseType>]` honest `???` stub (matching the Vector-per-OCCURS-dimension shape every other table-child registry entry has, so a subscripted reference type-checks) instead of a bare scalar. Compiles cleanly (verified: no compile error); throws `NotImplementedError` only if the table is actually read at runtime (the established convention this whole REDEFINES-stub subsystem already uses elsewhere - see `todoStubRedefinesLines`'s own pre-existing doc comment) - r1313's own SEARCH ALL is reached (real metadata now exists for it), so it does throw at runtime rather than silently producing wrong search results | `r1313` (scratch-only) |
+
+11 valid round-13 probes were promoted: 4 files backing the 3 fully-fixed
+findings (`aa01` finding 2, `aa02`/`aa02b` finding 3's two-handler/self-
+retrigger shapes, `aa03` finding 4) plus 7 survivors that already passed
+unmodified before this round: `aa04` DECLARATIVES precedence (an ordinary
+paragraph's own file operation is unaffected by an unrelated DECLARATIVES
+section), `aa05` a CALL combined with a DECLARATIVES handler on the same
+file, `aa06` a 3-level table with 2 INDEXED BY names under `SEARCH ...
+VARYING`, `aa07` a nested `FUNCTION` call used directly as an `EVALUATE`
+subject, `aa08` an 18-digit COMP-3 field with both `ROUNDED` and `ON SIZE
+ERROR`, `aa09` a `STRING` result used directly as a `SEARCH ALL` key, and
+`aa10` a mid-statement (not just mid-line) COBOL comment. The 2
+honest-degradation findings' own repro programs (`r1303c`/`r1313`) are
+deliberately **not promoted** - see the table above and "Known gaps" below.
+`r13-04` (a REDEFINES-of-an-ODO-table repro) is also excluded - cobc itself
+rejects it (compile error, not a runtime divergence) - same reasoning as
+every other cobc-rejected repro this refutation process has found.
+
+See `tests/round13-fixes.test.js` for focused, toolchain-independent unit
+tests of all 5 findings above, including a termination/reentrancy test for
+finding 3 (a self-retriggering handler resolves to itself instead of an
+empty registry; a two-handler reentrancy case resolves the second handler
+regardless of declaration order).
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -867,3 +923,43 @@ process/thread the way an ordinary assertion failure can.
   oracle-verified. Revisit by modeling an actual WRITE/CLOSE failure
   scenario (and wiring its own handler invocation) if a future program needs
   it.
+
+- **CALL ... USING BY REFERENCE of a GROUP containing an OCCURS table,
+  round-13 finding 1** - `generateCall`'s `argExprs` (`generator/
+  expression-gen.js`) now degrades to a visible, compiling TODO placeholder
+  instead of an undeclared-identifier compile error (see the round-13 table
+  above), but true byte-level marshalling of the table's own elements across
+  the CALL boundary (matching `scatterGroupFromString`'s existing writeback-
+  side convention, extended to concatenate/re-split each element rather than
+  bailing to `null` the instant any OCCURS child is present) is NOT
+  implemented. A program that actually passes such a group BY REFERENCE
+  compiles and runs to completion, but the callee sees a default (empty)
+  value instead of the caller's actual table contents - not a crash, but not
+  byte-accurate either. Deliberately **not promoted** into
+  `tests/corpus/proc/` (the repro, `r1303c`, stays in the adversarial-
+  refutation scratch history only) - same reasoning as every other
+  documented gap here: a program exercising this gap would fail
+  `oracleCompare()` by design. Revisit by extending `groupDisplayValueExpr`/
+  `scatterGroupFromString`'s table-child branch (already built for
+  `odoDisplayValueExpr`'s DISPLAY/WRITE use - see round-10/11's table-aware
+  concatenation) into the CALL BY REFERENCE marshalling channel specifically,
+  if a future pass has time.
+
+- **REDEFINES of a group-with-OCCURS by another group-with-OCCURS, round-13
+  finding 5** - `todoStubRedefinesLines` (`generator/scala-generator.js`) now
+  keeps `TABLE_REGISTRY`/the elementary-child registry/`generateSearchAll`'s
+  own metadata lookup all consistent (Vector-typed stubs, real OCCURS
+  metadata - see the round-13 table above), so the generated Scala always
+  compiles and a `SEARCH ALL` against the redefining table actually runs
+  real (if ultimately unimplemented) search code - but there is still no
+  true byte-slice table VIEW: each elementary child is an honest `???` stub
+  that throws `NotImplementedError` the instant it's actually read (a DISPLAY
+  of one of its elements, or the SEARCH ALL that reaches into it). A program
+  exercising this shape therefore compiles cleanly but throws at runtime
+  instead of producing cobc's actual (correct) output. Deliberately **not
+  promoted** into `tests/corpus/proc/` (the repro, `r1313`, stays in the
+  adversarial-refutation scratch history only) - same reasoning as every
+  other documented gap here. Revisit by threading real packed/binary-aware
+  byte codecs (`generator/codecs.js`, already used for genuine COMP-3/BINARY
+  file-record storage elsewhere) through a per-element byte-slice view over
+  the target's own underlying storage, if a future pass has time.

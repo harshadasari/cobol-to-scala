@@ -886,7 +886,7 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
  *   characterSlicedGroupRedefinesLines above - character-position slicing,
  *   including REDEFINES over an OCCURS table.
  */
-function redefinesAccessorLines(item, registry, siblingList) {
+function redefinesAccessorLines(item, registry, siblingList, tableRegistry) {
   const targetUpper = String(item.redefines || '').toUpperCase();
   const targetInfo = registry.get(targetUpper);
   const lines = [];
@@ -907,7 +907,7 @@ function redefinesAccessorLines(item, registry, siblingList) {
     const targetItem = (siblingList || []).find(i => !isLevel(i, 88) && (i.name || '').toUpperCase() === targetUpper);
     const targetRealChildren = targetItem ? (targetItem.children || []).filter(c => !isLevel(c, 88)) : [];
     if (targetItem && targetRealChildren.length > 0) {
-      return groupOverGroupRedefinesLines(item, targetItem, registry);
+      return groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry);
     }
     lines.push(`  // REDEFINES ${item.redefines}: target not found - ${item.name} not accessible`);
     return lines;
@@ -1043,26 +1043,98 @@ function flattenRedefinesLeaves(groupItem) {
  * crash on the (very plausible) MOVE-before-first-read pattern. This is
  * strictly better than the pre-fix behavior (no declaration at all - a hard
  * compile error the instant the field was referenced anywhere).
+ *
+ * round-13 finding 5: a child that is ITSELF an OCCURS-bearing group (e.g.
+ * r1313's `WS-TAB-BY-NAME REDEFINES WS-TAB-BY-NUM` where both sides' single
+ * child - `WS-ENTRY-NAME`/`WS-ENTRY-NUM` - is `OCCURS 3 ... INDEXED BY ...`)
+ * used to fall into the plain `real.length > 0 -> walk(real)` branch below
+ * with NO OCCURS-awareness at all - its own elementary children (WS-NAME-KEY/
+ * WS-NAME-VAL) were declared as bare scalar `def`s (occursDepth 0, plain
+ * String/Int), while every OTHER registry that cares about this same name -
+ * TABLE_REGISTRY (subscripting, SEARCH/SEARCH ALL's lookupTable) - had NO
+ * entry for it at all (buildFieldRegistry's own OCCURS registration, in its
+ * `walk()`, is only ever reached for an *ordinary* item, never one buried
+ * inside this fallback). Two dishonest, disagreeing outcomes followed: (a) a
+ * subscripted reference to one of these fields (`WS-NAME-KEY(1)`, or
+ * generateSearchAll's own generated comparisons) called the bare scalar
+ * `def` as if it were a 1-argument function - `String#apply(Int): Char` -
+ * i.e. `wsNameKey(0)` compiled as "index into the string", not "subscript
+ * into a table", a straight-up Scala compile error the instant the shape
+ * being indexed didn't even line up (`value padTo is not a member of Char`,
+ * r1313's actual failure); (b) even where that accidentally type-checked,
+ * `generateSearch`'s own `lookupTable(tableName)` found nothing in
+ * TABLE_REGISTRY and silently degraded to "no metadata found" - the SEARCH
+ * ALL never ran at all.
+ *
+ * Fixed via the "all three registries honestly agree" route (documented
+ * choice - see tests/oracle/README.md's round-13 table): a real byte-slice
+ * table VIEW over the target's own storage is NOT implemented (this would
+ * need per-element packed/binary-aware byte codecs threaded through a
+ * REDEFINES-of-REDEFINES chain - out of scope for this fix), but every
+ * registry that discovers this name now agrees on its SHAPE. This branch:
+ *   - registers the exact same TABLE_REGISTRY entry (times/indexed/
+ *     ascending/descending/dependingOn) buildFieldRegistry's own walk()
+ *     would give a real OCCURS item - so lookupTable/generateSearch finds
+ *     real metadata (the "SEARCH ALL's no-metadata-found gap" half of this
+ *     fix: the redefining table no longer silently no-ops) and each
+ *     INDEXED BY name gets its own real `Int` var, exactly like an ordinary
+ *     table;
+ *   - declares each of ITS elementary children as a `Vector[<baseType>]`
+ *     honest stub (matching the Vector-per-OCCURS-dimension shape every
+ *     other table-child registry entry has - occursDepth: 1) rather than a
+ *     bare scalar, so a subscripted reference type-checks (`Vector#apply`,
+ *     not `String#apply`) and only throws `NotImplementedError` if the
+ *     table is actually walked/searched at runtime - never a compile error,
+ *     never silently-wrong data.
+ * A deeper nesting (a table-of-tables, or a named FILLER row) is not
+ * exercised by any probe/corpus program - falls back to the original plain
+ * scalar-stub walk for its own leaves instead of guessing.
  */
-function todoStubRedefinesLines(redefiningItem, registry) {
+function todoStubRedefinesLines(redefiningItem, registry, tableRegistry) {
   const lines = [];
-  function walk(children) {
-    for (const child of children) {
-      if (isLevel(child, 88) || child.isFiller || !child.name) continue;
-      const real = (child.children || []).filter(c => !isLevel(c, 88));
-      if (real.length > 0) {
-        walk(real);
-        continue;
-      }
+
+  function scalarStub(child) {
+    const camel = toCamelCase(child.name);
+    const baseType = scalaBaseType(child);
+    lines.push(
+      `  // REDEFINES ${redefiningItem.redefines}: ??? TODO - this group-over-group REDEFINES shape ` +
+      `(FILLER gap / nested OCCURS / signed numeric / unsupported type) is not supported; ${child.name} ` +
+      `is declared but not aliased to real storage`
+    );
+    lines.push(`  def ${camel}: ${baseType} = ??? // TODO REDEFINES ${redefiningItem.redefines}: unsupported group shape`);
+    lines.push(`  def ${camel}_=(v: ${baseType}): Unit = () // TODO REDEFINES ${redefiningItem.redefines}: write discarded (unsupported group shape)`);
+    registry.set((child.name || '').toUpperCase(), {
+      camel,
+      scalaType: baseType,
+      dataType: baseType === 'String' ? 'alphanumeric' : 'numeric',
+      integerDigits: (child.pic && child.pic.integerDigits) || 0,
+      decimalDigits: (child.pic && child.pic.decimalDigits) || 0,
+      signed: !!(child.pic && child.pic.signed),
+      editPattern: null,
+      occursDepth: 0,
+      picLength: (child.pic && child.pic.length) || 0,
+      justified: false,
+      blankWhenZero: false,
+    });
+  }
+
+  // A table-child's own elementary rows (WS-NAME-KEY/WS-NAME-VAL) as honest
+  // Vector-typed stubs - see this function's own doc comment above for why
+  // Vector (not a bare scalar) is required for consistency with
+  // TABLE_REGISTRY/generateSearchAll's own expectations.
+  function occursRowStub(child) {
+    const rowReal = (child.children || []).filter(c => !isLevel(c, 88));
+    if (rowReal.length === 0) {
+      // An elementary OCCURS item redefining an elementary OCCURS item (no
+      // row structure at all) - same Vector-stub treatment, one level.
       const camel = toCamelCase(child.name);
       const baseType = scalaBaseType(child);
       lines.push(
-        `  // REDEFINES ${redefiningItem.redefines}: ??? TODO - this group-over-group REDEFINES shape ` +
-        `(FILLER gap / nested OCCURS / signed numeric / unsupported type) is not supported; ${child.name} ` +
-        `is declared but not aliased to real storage`
+        `  // REDEFINES ${redefiningItem.redefines}: ??? TODO - group-over-group REDEFINES with an OCCURS ` +
+        `child (${child.name}) is not implemented as a true byte-slice table view; every element throws if read`
       );
-      lines.push(`  def ${camel}: ${baseType} = ??? // TODO REDEFINES ${redefiningItem.redefines}: unsupported group shape`);
-      lines.push(`  def ${camel}_=(v: ${baseType}): Unit = () // TODO REDEFINES ${redefiningItem.redefines}: write discarded (unsupported group shape)`);
+      lines.push(`  def ${camel}: Vector[${baseType}] = ??? // TODO REDEFINES ${redefiningItem.redefines}: unsupported OCCURS shape`);
+      lines.push(`  def ${camel}_=(v: Vector[${baseType}]): Unit = () // TODO REDEFINES ${redefiningItem.redefines}: write discarded (unsupported OCCURS shape)`);
       registry.set((child.name || '').toUpperCase(), {
         camel,
         scalaType: baseType,
@@ -1071,11 +1143,88 @@ function todoStubRedefinesLines(redefiningItem, registry) {
         decimalDigits: (child.pic && child.pic.decimalDigits) || 0,
         signed: !!(child.pic && child.pic.signed),
         editPattern: null,
-        occursDepth: 0,
+        occursDepth: 1,
         picLength: (child.pic && child.pic.length) || 0,
         justified: false,
         blankWhenZero: false,
       });
+      return;
+    }
+    for (const row of rowReal) {
+      if (isLevel(row, 88) || row.isFiller || !row.name) continue;
+      const rowRealChildren = (row.children || []).filter(c => !isLevel(c, 88));
+      if (rowRealChildren.length > 0 || hasOccurs(row)) {
+        // Row-of-groups or nested table - deeper than any probe/corpus shape
+        // exercises; fall back to the plain scalar walk for its own leaves
+        // (still avoids THIS function's actual bug - the outer table's own
+        // OCCURS-ness - even though this inner shape stays unsupported too).
+        scalarStub(row);
+        continue;
+      }
+      const camel = toCamelCase(row.name);
+      const baseType = scalaBaseType(row);
+      lines.push(
+        `  // REDEFINES ${redefiningItem.redefines}: ??? TODO - group-over-group REDEFINES with an OCCURS ` +
+        `child (${child.name}) is not implemented as a true byte-slice table view; every element throws if read`
+      );
+      lines.push(`  def ${camel}: Vector[${baseType}] = ??? // TODO REDEFINES ${redefiningItem.redefines}: unsupported OCCURS shape`);
+      lines.push(`  def ${camel}_=(v: Vector[${baseType}]): Unit = () // TODO REDEFINES ${redefiningItem.redefines}: write discarded (unsupported OCCURS shape)`);
+      registry.set((row.name || '').toUpperCase(), {
+        camel,
+        scalaType: baseType,
+        dataType: baseType === 'String' ? 'alphanumeric' : 'numeric',
+        integerDigits: (row.pic && row.pic.integerDigits) || 0,
+        decimalDigits: (row.pic && row.pic.decimalDigits) || 0,
+        signed: !!(row.pic && row.pic.signed),
+        editPattern: null,
+        occursDepth: 1,
+        picLength: (row.pic && row.pic.length) || 0,
+        justified: false,
+        blankWhenZero: false,
+      });
+    }
+  }
+
+  function walk(children) {
+    for (const child of children) {
+      if (isLevel(child, 88) || child.isFiller || !child.name) continue;
+
+      if (hasOccurs(child)) {
+        const occ = child.occurs || {};
+        const idxCamels = (occ.indexedBy || []).map(toCamelCase);
+        tableRegistry.set((child.name || '').toUpperCase(), {
+          times: occursCount(child),
+          indexed: idxCamels,
+          ascending: (occ.ascending || []).map(n => String(n).toUpperCase()),
+          descending: (occ.descending || []).map(n => String(n).toUpperCase()),
+          dependingOn: occ.dependingOn ? toCamelCase(occ.dependingOn) : null,
+        });
+        (occ.indexedBy || []).forEach((idxName, i) => {
+          const upperIdx = String(idxName).toUpperCase();
+          if (registry.has(upperIdx)) return;
+          lines.push(`  var ${idxCamels[i]}: Int = 1`);
+          registry.set(upperIdx, {
+            camel: idxCamels[i],
+            scalaType: 'Int',
+            dataType: 'numeric',
+            integerDigits: 9,
+            decimalDigits: 0,
+            signed: true,
+            editPattern: null,
+            occursDepth: 0,
+            picLength: 0,
+          });
+        });
+        occursRowStub(child);
+        continue;
+      }
+
+      const real = (child.children || []).filter(c => !isLevel(c, 88));
+      if (real.length > 0) {
+        walk(real);
+        continue;
+      }
+      scalarStub(child);
     }
   }
   walk((redefiningItem.children || []).filter(c => !isLevel(c, 88)));
@@ -1099,12 +1248,12 @@ function todoStubRedefinesLines(redefiningItem, registry) {
  * variable reference to that helper's generated code without any changes to
  * it at all.
  */
-function groupOverGroupRedefinesLines(item, targetItem, registry) {
+function groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry) {
   const redefiningRealChildren = (item.children || []).filter(c => !isLevel(c, 88));
   const leaves = flattenRedefinesLeaves(targetItem);
 
   if (!leaves) {
-    return todoStubRedefinesLines(item, registry);
+    return todoStubRedefinesLines(item, registry, tableRegistry);
   }
 
   const flatName = `${toCamelCase(item.name)}BaseFlat`;
@@ -1260,6 +1409,31 @@ function buildFieldRegistry(ast) {
   // (`walk(wsItems, [], [])` and friends) and for every ordinary group with
   // no group-level VALUE clause anywhere above it - the overwhelmingly common
   // case - so no existing (VALUE-less-group) behavior changes at all.
+  //
+  // round-13 finding 4: flat, whole-WORKING-STORAGE-section ordered list of
+  // every elementary leaf (and FILLER) this walk has registered so far, in
+  // physical declaration order - i.e. exactly the linear byte-layout order a
+  // whole-group DISPLAY/MOVE concatenation (groupDisplayValueExpr/
+  // scatterGroupFromString) already assumes for an ordinary group's own
+  // children. A level-66 RENAMES item (parsed into item.renames/
+  // renamesThrough - see parser/data-division-parser.js - but previously with
+  // *zero* codegen anywhere: it fell through into the plain elementary-leaf
+  // branch below like any ordinary field, getting its own disconnected flat
+  // var that never actually aliased the fields it renames) is resolved by
+  // finding its FROM/THRU endpoint names in this same flat list and slicing
+  // the contiguous run between them (inclusive) - deliberately flattened
+  // past any intermediate GROUP_REGISTRY nesting (not just the immediate
+  // enclosing group's own children), since real COBOL RENAMES is defined
+  // purely in terms of physical byte position and can legally span a nested
+  // group boundary (e.g. renaming the tail of one 05-level group through the
+  // head of the next) - a per-group-only child list couldn't represent that
+  // at all. Each entry has the same `{ nameUpper, camel, info, groupKey:
+  // null, isFiller }` shape groupRegistry's own child descriptors use, so the
+  // resulting synthetic group (see the level-66 branch in the loop below)
+  // slots directly into groupDisplayValueExpr/scatterGroupFromString/
+  // generateGroupMove with no changes to any of them - RENAMES becomes "just
+  // another group" from their point of view.
+  const flatLeafOrder = [];
   function walk(list, occursChain, ancestorNames, parentValueText) {
     let offset = 0;
     for (const item of list) {
@@ -1320,9 +1494,49 @@ function buildFieldRegistry(ast) {
       }
 
       if (item.redefines) {
-        const accessorLines = redefinesAccessorLines(item, registry, list);
+        const accessorLines = redefinesAccessorLines(item, registry, list, tableRegistry);
         if (accessorLines.length) lines.push(...accessorLines);
         continue; // shares storage with what it redefines - no offset advance
+      }
+
+      // round-13 finding 4: level-66 RENAMES - shares storage with the
+      // contiguous run of sibling elementary items it renames (see
+      // flatLeafOrder's own doc comment above), so - exactly like REDEFINES
+      // just above - it consumes no `offset` of its own and gets no flat var
+      // of its own; it is registered as a synthetic GROUP_REGISTRY entry
+      // instead (its own bare name -> the sliced child list), which is all
+      // groupDisplayValueExpr (DISPLAY of the renamed name) and
+      // scatterGroupFromString (MOVE INTO the renamed name, wired in
+      // generateMove - generator/expression-gen.js) need.
+      if (isLevel(item, 66) && item.renames) {
+        const renameNameUpper = (item.name || '').toUpperCase();
+        const fromUpper = String(item.renames).toUpperCase();
+        const toUpper = String(item.renamesThrough || item.renames).toUpperCase();
+        const fromIdx = flatLeafOrder.findIndex(e => e.nameUpper === fromUpper);
+        const toIdx = flatLeafOrder.findIndex(e => e.nameUpper === toUpper);
+        if (fromIdx !== -1 && toIdx !== -1 && fromIdx <= toIdx) {
+          const children = flatLeafOrder.slice(fromIdx, toIdx + 1);
+          groupRegistry.set(renameNameUpper, children);
+          groupKeyRegistry.set(renameNameUpper, renameNameUpper);
+          const totalWidth = children.reduce((sum, c) => {
+            if (!c.info) return sum;
+            return sum + (c.info.picLength || (c.info.integerDigits || 0) + (c.info.decimalDigits || 0));
+          }, 0);
+          groupByteLengthRegistry.set(renameNameUpper, totalWidth);
+        } else {
+          // FROM/THRU endpoint not found as a registered elementary sibling
+          // (e.g. it names an OCCURS table member, or a group rather than an
+          // elementary item - not a shape any corpus program or this fix
+          // targets) - an honest, visible comment; no accessor is generated,
+          // so any later reference to this RENAMES name falls through to
+          // whatever generic fallback that call site already has for an
+          // unregistered name (never a guessed/wrong value).
+          lines.push(
+            `  // RENAMES ${item.name}: unsupported range (THRU endpoint(s) not found as ` +
+            'contiguous registered elementary sibling(s)) - no accessor generated'
+          );
+        }
+        continue; // shares storage with what it renames - no offset advance
       }
 
       // round-8 finding 4: this item's own span within `parentValueText`
@@ -1480,6 +1694,15 @@ function buildFieldRegistry(ast) {
           justified: false,
           blankWhenZero: false,
         };
+        // round-13 finding 4: only a non-OCCURS FILLER (fullChain.length ===
+        // 0) is added to flatLeafOrder - a FILLER *inside* a table has no
+        // single scalar byte position for a RENAMES range to land on (same
+        // restriction groupDisplayValueExpr already applies to a table child
+        // via TABLE_REGISTRY, see the level-66 branch's own fallback comment
+        // above for what happens when a RENAMES endpoint can't be found).
+        if (fullChain.length === 0) {
+          flatLeafOrder.push({ nameUpper: null, camel: fillerCamel, info: item._fillerInfo, groupKey: null, isFiller: true });
+        }
         continue;
       }
 
@@ -1584,6 +1807,14 @@ function buildFieldRegistry(ast) {
           values: cond.values || [],
           falseValue: cond.falseValue || null,
         });
+      }
+
+      // round-13 finding 4: only a non-OCCURS elementary leaf (fullChain.length
+      // === 0) is added to flatLeafOrder - same restriction as the FILLER
+      // branch above (a table member has no single scalar byte position a
+      // RENAMES range's FROM/THRU endpoint can land on).
+      if (fullChain.length === 0) {
+        flatLeafOrder.push({ nameUpper, camel, info, groupKey: null, isFiller: false });
       }
     }
   }
@@ -1895,14 +2126,16 @@ function generateMethods(ast, indent = 1) {
 }
 
 /**
- * round-10 finding 1: generate one Scala method per DECLARATIVES SECTION
- * (reusing generateSectionMethod exactly as an ordinary section would use
- * it - a DECLARATIVES section is structurally identical, just excluded from
- * `sections`/the normal fall-through chain, see splitProcedureDivision), plus
- * the two lookup registries (fileName -> method name, mode -> method name)
- * file-io-gen.js's generateOpen and expression-gen.js's generateReadStatement
- * consult to invoke the right one on a file-operation failure - see those
- * modules' own setDeclarativeHandlers/declarativeHandlerFor.
+ * round-10 finding 1 (registry-population ordering fixed by round-13 finding
+ * 3 - see collectDeclarativeHandlers's doc comment below): generate one
+ * Scala method per DECLARATIVES SECTION (reusing generateSectionMethod
+ * exactly as an ordinary section would use it - a DECLARATIVES section is
+ * structurally identical, just excluded from `sections`/the normal
+ * fall-through chain, see splitProcedureDivision), plus the two lookup
+ * registries (fileName -> method name, mode -> method name) file-io-gen.js's
+ * generateOpen and expression-gen.js's generateReadStatement consult to
+ * invoke the right one on a file-operation failure - see those modules' own
+ * setDeclarativeHandlers/declarativeHandlerFor.
  *
  * Only a `USE AFTER [STANDARD] ERROR PROCEDURE ON ...` clause (useClause.kind
  * === 'ERROR') is wired into either registry; any other USE form
@@ -1912,22 +2145,89 @@ function generateMethods(ast, indent = 1) {
  * dropping the section or guessing at a wiring this generator doesn't
  * understand.
  *
+ * round-13 finding 3 (SEVERE): this used to be a single pass - walk each
+ * `decl` in order, generate its method body via generateSectionMethod/
+ * generateMethod, THEN (only at the very end of that same iteration) add its
+ * own fileHandlers/modeHandlers entries. The caller (convertProgramAst,
+ * below) only calls setDeclarativeHandlersExpr/FileIO - which install the
+ * registries expression-gen.js's/file-io-gen.js's declarativeHandlerFor
+ * actually reads from - AFTER this whole function returns. That meant ANY
+ * file operation generated *inside* a DECLARATIVES body saw registries that
+ * were empty (for a single self-retriggering handler: r13-09b's
+ * FILE-A-HANDLER-PARA's own `OPEN INPUT FILE-A` retry, generated before its
+ * own entry existed yet) or only partially populated (for a two-handler
+ * reentrancy case where handler A's body triggers handler B, and B is
+ * declared textually after A - r13-09's shape - B's entry didn't exist yet
+ * either when A's body was generated). Every corpus-covered case that
+ * "happened to work" only did so because either the retriggered file
+ * operation's own compile-time codegen doesn't actually consult
+ * declarativeHandlerFor (a bare OPEN with no FILE STATUS/AT END/USE wiring
+ * at all), or no DECLARATIVES body in the corpus ever itself performed a
+ * file operation on a file with a declarative handler.
+ *
+ * Fixed with a genuine two-pass split: collectDeclarativeHandlers walks
+ * every `decl`'s own useClause.targets ONLY (no codegen at all, so nothing
+ * downstream can observe a partial registry) and returns the complete
+ * fileHandlers/modeHandlers maps; the caller installs those via
+ * setDeclarativeHandlersExpr/FileIO BEFORE calling
+ * generateDeclarativeMethodBodies (the actual codegen pass, below) - so by
+ * the time ANY declarative body (or, per the existing round-10 finding 1
+ * comment above, the ordinary PROCEDURE DIVISION body too) is generated,
+ * every handler - including a handler's own file, and every OTHER handler in
+ * the same DECLARATIVES block, regardless of textual order - is already
+ * visible to declarativeHandlerFor.
+ *
  * Returns `{ methods: '', fileHandlers: new Map(), modeHandlers: new Map() }`
- * for the overwhelmingly common case (no DECLARATIVES at all) - a pure
- * no-op, so every one of the 144 pre-existing corpus programs (none of which
- * use DECLARATIVES) is completely unaffected.
+ * for the overwhelmingly common case (no DECLARATIVES at all) - harmless for
+ * every one of the 187 pre-existing corpus programs (which don't use
+ * DECLARATIVES, or whose DECLARATIVES bodies happen not to perform a file
+ * operation on a handler-guarded file) *within a single conversion*.
+ *
+ * IMPORTANT (cross-call state leak, found post-round-13): this must NOT skip
+ * installing the (empty) registries in this no-DECLARATIVES case. Earlier,
+ * generateDeclarativeSupport's early-return branch below returned the empty
+ * maps to its own caller but never called setDeclarativeHandlersExpr/FileIO
+ * with them - leaving whatever fileHandlers/modeHandlers a *previous*
+ * convertToScala() call in the same process had installed (DECL_FILE_HANDLERS/
+ * DECL_MODE_HANDLERS in expression-gen.js and file-io-gen.js are module-level
+ * `let`s, not per-call state) still active. A program with no DECLARATIVES at
+ * all converted right after one that has them would then have its OPEN/READ
+ * failure paths incorrectly resolve to the *previous* program's declarative
+ * handler method (which doesn't even exist in this program's generated
+ * object) - a hard compile error. Every branch of generateDeclarativeSupport
+ * must call both setters, even when the maps are empty, so each conversion
+ * starts from a clean slate regardless of what ran before it in-process.
  */
-function generateDeclarativeSupport(ast, indent = 1) {
-  const { declaratives } = splitProcedureDivision(ast);
+function collectDeclarativeHandlers(declaratives) {
   const fileHandlers = new Map();
   const modeHandlers = new Map();
-  if (!declaratives || declaratives.length === 0) {
-    return { methods: '', fileHandlers, modeHandlers };
-  }
-
-  const methodTexts = [];
-  for (const decl of declaratives) {
+  for (const decl of declaratives || []) {
     const methodName = toMethodName(decl.name);
+    const useClause = decl.useClause;
+    if (!useClause || useClause.kind !== 'ERROR') continue;
+    for (const target of useClause.targets || []) {
+      if (target.kind === 'FILE' && target.name) {
+        fileHandlers.set(String(target.name).toUpperCase(), methodName);
+      } else if (target.kind) {
+        modeHandlers.set(String(target.kind).toUpperCase(), methodName);
+      }
+    }
+  }
+  return { fileHandlers, modeHandlers };
+}
+
+/**
+ * Second pass - generate every DECLARATIVES SECTION's own method body. Must
+ * only be called AFTER the caller has already installed
+ * collectDeclarativeHandlers's registries via
+ * setDeclarativeHandlersExpr/FileIO (round-13 finding 3 - see
+ * collectDeclarativeHandlers's doc comment above), so any file operation
+ * inside a declarative body itself resolves against the complete registry,
+ * not a partial or empty one.
+ */
+function generateDeclarativeMethodBodies(declaratives, indent = 1) {
+  const methodTexts = [];
+  for (const decl of declaratives || []) {
     const useClause = decl.useClause;
 
     if (!useClause || useClause.kind !== 'ERROR') {
@@ -1952,19 +2252,35 @@ function generateDeclarativeSupport(ast, indent = 1) {
         methodTexts.push(generateMethod(para, indent));
       }
     }
-
-    if (useClause && useClause.kind === 'ERROR') {
-      for (const target of useClause.targets || []) {
-        if (target.kind === 'FILE' && target.name) {
-          fileHandlers.set(String(target.name).toUpperCase(), methodName);
-        } else if (target.kind) {
-          modeHandlers.set(String(target.kind).toUpperCase(), methodName);
-        }
-      }
-    }
   }
+  return methodTexts.join('\n\n');
+}
 
-  return { methods: methodTexts.join('\n\n'), fileHandlers, modeHandlers };
+/**
+ * round-13 finding 3: orchestrates the two-pass split above -
+ * collectDeclarativeHandlers (no codegen) THEN, only after the caller
+ * installs its result, generateDeclarativeMethodBodies (real codegen). Kept
+ * as a single entry point so convertProgramAst's own call site only changes
+ * from one call to a short, explicit three-step sequence - see its own call
+ * site below for why the registry-install step must sit in between.
+ */
+function generateDeclarativeSupport(ast, indent = 1) {
+  const { declaratives } = splitProcedureDivision(ast);
+  if (!declaratives || declaratives.length === 0) {
+    // Must still (re)install the (empty) registries - see this function's
+    // doc comment above for the cross-call leak this guards against. Do NOT
+    // early-return before calling the setters.
+    const fileHandlers = new Map();
+    const modeHandlers = new Map();
+    setDeclarativeHandlersExpr(fileHandlers, modeHandlers);
+    setDeclarativeHandlersFileIO(fileHandlers, modeHandlers);
+    return { methods: '', fileHandlers, modeHandlers };
+  }
+  const { fileHandlers, modeHandlers } = collectDeclarativeHandlers(declaratives);
+  setDeclarativeHandlersExpr(fileHandlers, modeHandlers);
+  setDeclarativeHandlersFileIO(fileHandlers, modeHandlers);
+  const methods = generateDeclarativeMethodBodies(declaratives, indent);
+  return { methods, fileHandlers, modeHandlers };
 }
 
 /**
@@ -2018,6 +2334,35 @@ export function generateScala(ast, options = {}) {
   const filename = `${objectName}.scala`;
 
   const sections = [];
+
+  // Cross-program CALL_PROGRAM_REGISTRY (round-7 finding 1) - populated only
+  // for a multi-PROGRAM-ID source, via `opts.callProgramRegistry` which
+  // generateMultiProgramScala below passes through on every one of its
+  // per-program generateScala calls (the *same* full-source registry each
+  // time, so a forward CALL reference still resolves - see that function's
+  // own doc comment). Always (re)installed here - explicitly to `new Map()`
+  // for the ordinary case (no callProgramRegistry option, ie. every
+  // standalone single-program conversion, which is what index.js's
+  // convertToScala calls for any non-multi-PROGRAM-ID source) - rather than
+  // relying on generateMultiProgramScala to clean up after itself once it's
+  // done with its own per-source registry. This is what actually closes the
+  // leak: previously CALL_PROGRAM_REGISTRY was only ever set by
+  // generateMultiProgramScala (populated before its per-program loop, reset
+  // to an empty Map after it), so an exception partway through that loop
+  // (before the post-loop reset ran) - or simply this module never having
+  // run generateMultiProgramScala's reset step for some other reason - would
+  // leave a *previous, unrelated* multi-program conversion's registry
+  // visible to every later plain generateScala() call in the same process,
+  // exactly the same class of cross-call leak as the DECLARATIVES handler
+  // registries (see generateDeclarativeSupport's doc comment below). Passing
+  // the registry through as an explicit per-call value instead of leaving it
+  // as ambient module state that only one caller sets/clears removes the
+  // leak vector entirely - every generateScala call now installs the
+  // registry it actually wants, unconditionally, regardless of what any
+  // earlier call in the process left behind.
+  setCallProgramRegistry(
+    opts.callProgramRegistry instanceof Map ? opts.callProgramRegistry : new Map()
+  );
 
   // Flatten WORKING-STORAGE into Scala var/accessor declarations plus a
   // name -> metadata registry, and hand the registry to expression-gen.js
@@ -2103,13 +2448,17 @@ export function generateScala(ast, options = {}) {
   setFileStatusRegistryFileIO(fileStatusRegistry);
 
   // DECLARATIVES `USE AFTER STANDARD ERROR PROCEDURE` handler methods +
-  // registries (round-10 finding 1) - built before generateMethods/
-  // generateMainMethod below (which generate the OPEN/READ statements that
-  // consult these registries) and before file-io-gen.js's generateOpen is
-  // ever invoked for this program.
+  // registries (round-10 finding 1, registry-population ordering fixed by
+  // round-13 finding 3) - generateDeclarativeSupport itself now installs the
+  // fileHandlers/modeHandlers registries (via setDeclarativeHandlersExpr/
+  // FileIO) BEFORE generating any declarative method body, so a file
+  // operation inside a DECLARATIVES section - including a handler retrying
+  // its own OPEN, or one handler's body triggering another - already sees
+  // the complete registry; see generateDeclarativeSupport's own doc comment
+  // for the full two-pass fix. This also still runs before generateMethods/
+  // generateMainMethod below (the ordinary PROCEDURE DIVISION body) and
+  // before file-io-gen.js's generateOpen is ever invoked for this program.
   const declarativeSupport = generateDeclarativeSupport(ast, 1);
-  setDeclarativeHandlersExpr(declarativeSupport.fileHandlers, declarativeSupport.modeHandlers);
-  setDeclarativeHandlersFileIO(declarativeSupport.fileHandlers, declarativeSupport.modeHandlers);
 
   // Package declaration, imports, and the embedded runtime helper objects
   // (CobolCodecs/CobolFmt/CobolInspect/CobolUnstring) - skipped when
@@ -2436,6 +2785,16 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
  * method bodies are generated, specifically so a CALL to a program declared
  * later in the same source (a forward reference - again, u01's own shape:
  * its first program calls "ADDER", declared second) still resolves.
+ *
+ * Post-leak-fix: this registry is threaded through to each per-program
+ * generateScala() call explicitly, via `programOpts.callProgramRegistry`,
+ * rather than left as ambient module state this function alone sets before
+ * its loop and clears after. generateScala itself now (re)installs
+ * CALL_PROGRAM_REGISTRY unconditionally on every call (defaulting to an empty
+ * Map when no callProgramRegistry option is given) - see its own doc comment
+ * for the cross-call leak this closes (a prior multi-program conversion's
+ * registry bleeding into a later, unrelated single-program one, including via
+ * an exception skipping this function's old post-loop reset).
  */
 export function generateMultiProgramScala(programs, options = {}) {
   const opts = { ...DEFAULT_OPTIONS, ...options };
@@ -2458,7 +2817,6 @@ export function generateMultiProgramScala(programs, options = {}) {
       paramTypes,
     });
   }
-  setCallProgramRegistry(callRegistry);
 
   const codeSections = [];
   programs.forEach(({ programId, ast }, i) => {
@@ -2469,18 +2827,14 @@ export function generateMultiProgramScala(programs, options = {}) {
       skipPreamble: i > 0,
       emitEntryPoint: true,
       generateMain: i === 0 && opts.generateMain,
+      // Threaded through explicitly rather than set as ambient module state
+      // (see this function's own doc comment above) - generateScala installs
+      // it unconditionally on every call.
+      callProgramRegistry: callRegistry,
     };
     const result = generateScala(ast, programOpts);
     codeSections.push(result.code);
   });
-
-  // Reset the shared registry immediately after use so a later, unrelated
-  // single-program conversion in the same process never sees stale entries
-  // from this multi-program run (setFieldRegistry/etc. are all reset the
-  // same way by every ordinary generateScala call already - this is the one
-  // registry generateScala itself never touches, since only this function
-  // populates it).
-  setCallProgramRegistry(new Map());
 
   const firstName = programs[0]?.programId || extractProgramName(programs[0]?.ast || {});
   const objectName = toPascalCase(firstName);

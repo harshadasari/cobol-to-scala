@@ -2495,6 +2495,53 @@ function generateSubscriptedGroupMove(groupKey, targetSubscripts, sourceSubscrip
 }
 
 /**
+ * round-13 finding 4: MOVE of a non-group source (a literal, figurative
+ * constant, or plain elementary field/expression - anything groupRefNameUpper
+ * doesn't recognize as a group) INTO a bare group target - most notably a
+ * level-66 RENAMES name (scala-generator.js's buildFieldRegistry registers it
+ * as a synthetic GROUP_REGISTRY entry over the contiguous sibling range it
+ * renames), but this works for any ordinary group target the same way, since
+ * it's just "the inverse of groupDisplayValueExpr" applied to a MOVE's own
+ * source instead of a CALL's current parameter value - exactly the same
+ * value-as-concatenated-raw-storage-text convention generateCall/
+ * generateEntryMethod already use for a group CALL BY REFERENCE operand (see
+ * scatterGroupFromString's own doc comment), reused here for MOVE.
+ *
+ * Fits/pads the source to the target group's own total byte width (via
+ * GROUP_BYTE_LENGTH_REGISTRY, a synthetic all-String/alphanumeric `info` so
+ * renderMoveSource's existing literal/figurative/variable rendering paths -
+ * fitAlphanumericText, repeatedCharLiteralFor, etc. - apply unchanged), binds
+ * it to a block-scoped `val` (so a non-trivial source expression is
+ * evaluated exactly once even though scatterGroupFromString may reference it
+ * once per child), then scatters it across the group's own children.
+ *
+ * Returns null (not a guessed/wrong assignment) when the target group's total
+ * width isn't known (no GROUP_BYTE_LENGTH_REGISTRY entry) or scatterGroupFromString
+ * itself can't represent the shape (an OCCURS child, or a child with no
+ * registered field info) - the caller falls back to a visible, compiling TODO
+ * marker instead.
+ */
+function generateScalarIntoGroupMove(source, targetNameUpper, indent) {
+  const indentStr = '  '.repeat(indent);
+  const groupKey = resolveGroupKey(targetNameUpper);
+  const totalWidth = GROUP_BYTE_LENGTH_REGISTRY.get(targetNameUpper);
+  if (totalWidth == null) return null;
+
+  const syntheticInfo = {
+    scalaType: 'String',
+    dataType: 'alphanumeric',
+    picLength: totalWidth,
+    justified: false,
+  };
+  const sourceExpr = renderMoveSource(source, syntheticInfo);
+  const bi = '  '.repeat(indent + 1);
+  const scattered = scatterGroupFromString(groupKey, '_src', indent + 1);
+  if (scattered == null) return null;
+
+  return [`${indentStr}{`, `${bi}val _src = ${sourceExpr}`, ...scattered, `${indentStr}}`].join('\n');
+}
+
+/**
  * Generate MOVE statement
  */
 export function generateMove(statement, indent = 0) {
@@ -2529,6 +2576,26 @@ export function generateMove(statement, indent = 0) {
       lines.push(
         `${indentStr}() // MOVE ${source.name}(...) TO ${target.name}(...): ??? TODO - whole-row MOVE with a ` +
         'nested-OCCURS or multi-dimensional row child is not supported; row left unchanged'
+      );
+      continue;
+    }
+
+    // round-13 finding 4: MOVE of a non-group source (literal, figurative
+    // constant, or plain elementary field/expression) INTO a bare group
+    // target - most notably a level-66 RENAMES name, but any ordinary group
+    // target the same way - see generateScalarIntoGroupMove's own doc
+    // comment. The group-to-group branch above already handles the case
+    // where BOTH sides are groups; this handles "only the target is".
+    if (targetGroupUpper && !sourceGroupUpper) {
+      const scatterLines = generateScalarIntoGroupMove(source, targetGroupUpper, indent);
+      if (scatterLines != null) {
+        lines.push(scatterLines);
+        continue;
+      }
+      lines.push(
+        `${indentStr}() // MOVE ... TO ${targetGroupUpper}: ??? TODO - group target marshalling not supported ` +
+        'for this shape (an OCCURS child, a child with no registered field info, or an unknown group byte width); ' +
+        'value left unchanged'
       );
       continue;
     }
@@ -5944,6 +6011,27 @@ function generateCall(statement, indent = 0) {
     if (name && !hasSubscripts && isRegisteredGroupName(String(name).toUpperCase())) {
       const groupExpr = groupDisplayValueExpr(resolveGroupKey(String(name).toUpperCase()));
       if (groupExpr) return `(${groupExpr})`;
+      // round-13 finding 1: groupDisplayValueExpr bails to null for a group
+      // containing an OCCURS table (it has no scalar concatenation - see its
+      // own doc comment), and there was previously no fallback here at all:
+      // execution fell through to the plain `if (name) return
+      // toCamelCase(name)` branch below, which for a GROUP name (as opposed
+      // to an elementary field) references a Scala identifier that was never
+      // declared (a group has no flat var of its own - only its children
+      // do), a hard "not found" compile error at the CALL's own call site
+      // (r1303c: `CALL ... USING BY REFERENCE WS-TABLE` where WS-TABLE is a
+      // group whose only child is an OCCURS table). generateEntryMethod
+      // (scala-generator.js) already has exactly this same fallback on the
+      // callee side (its own return-expression branch: `"" /* TODO: group
+      // return unsupported for this shape */`) - mirrored here so the
+      // argument-construction side degrades the same honest way: a
+      // same-typed (String) placeholder plus a visible, compiling TODO
+      // comment, never an undeclared-identifier crash. True marshalling of
+      // an OCCURS-bearing group across a CALL boundary (concatenating the
+      // table elements' own display forms, then scattering them back out
+      // symmetrically on writeback) is left as a documented gap - see
+      // tests/oracle/README.md's known gaps.
+      return `("" /* TODO: CALL "${rawProgramName}" USING ${name}: group argument marshalling not supported for a group containing an OCCURS table - see tests/oracle/README.md known gaps */)`;
     }
     if (name) return toCamelCase(name);
     return convertArithmeticExpression(param.value || param);

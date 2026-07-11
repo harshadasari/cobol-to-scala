@@ -12,6 +12,13 @@ _(none currently open - all prior pins resolved; see cycle entries. Tracked-OPEN
 
 ## Activity
 
+### 2026-07-11 20:55 — Cycle: round-13 self-verification caught a real cross-conversion state-leak bug
+- User re-engaged mid-loop (asked status, then said keep hunting + wanted a dashboard file - both done: docs/PROGRESS_STATUS.md created and kept in sync).
+- Round-13 fix agent's own verification run showed 1 fail + 5 todo (not clean). Orchestrator investigation (not the fix agent) found: the 1 failing unit test was NOT stale - it exposed a genuine bug. The round-13 DECLARATIVES two-pass registry fix left module-level handler-registry state unreset between separate convertToScala() calls in the same process: converting program A (with a DECLARATIVES handler for file IN-FILE) then program B (unrelated, also names a file IN-FILE, no handler) causes B to incorrectly call A's handler method, which doesn't exist in B's own generated code. Reproduced deterministically via direct two-call script.
+- Hypothesis: this same leak, not scala-cli cache racing, likely explains the "flaky" x02/y04-y07 failures in the full-suite run (test files run many convertToScala calls in one process; order-dependent leakage would look exactly like this) - individually each passed clean.
+- Did NOT commit red. Dispatched a targeted fix agent: locate the module-level registry, fix via per-call reset or (preferred) eliminate the module-level mutable state entirely; audit FIELD_REGISTRY/GROUP_REGISTRY/TABLE_REGISTRY/CALL_PROGRAM_REGISTRY for the same class of bug; add a cross-conversion isolation regression test; re-verify full suite to true 0/0/0 before commit.
+- This is exactly the kind of bug the adversarial-loop methodology exists to catch - caught here by the orchestrator's own verification discipline (never commit on a subagent's say-so) rather than by an adversarial refuter, showing the layered verification is working as designed.
+
 ### 2026-07-11 20:40 — Cycles 28-31: rounds 10-11 committed; round-12 verdict + fix in flight
 - Round-10 committed (a3724cf, 705/0/0, 156 programs): DECLARATIVES support, OPEN-failure FILE STATUS, byte-true LINE SEQUENTIAL WRITE (verified byte-exact vs cobc's packed bytes), ODO record WRITE, ADD/SUBTRACT CORRESPONDING ROUNDED, multi-target COMPUTE (never worked before - inverted parser break).
 - Round-11 committed (1c78ba3, 747/0/0, 172 programs) after a second container restart survived: ODO group DISPLAY wiring, composite-key SEARCH ALL, subscripted INITIALIZE. 13 survivors locked in.

@@ -1,5 +1,9 @@
 # Thyraa: Unified COBOL Modernization Platform
 
+**Originally authored: 2026-02-08** · **Status annotated: 2026-07-11**
+
+> This document is the product vision and system architecture for Thyraa, written five months ago as a forward-looking design. It remains legitimately aspirational in large part — that framing is kept intact below. What changed on 2026-07-11 is that the conversion engine at the center of this architecture went from "designed" to "built and independently verified" via a 14-round adversarial-verification campaign, while the platform layers around it (UI, gateway, orchestration, auth, deployment) are still exactly as aspirational as they were in February. The sections below are annotated throughout with **✅ Built & verified**, **🟡 Partial**, or **⬜ Vision (not yet built)** so the built/aspirational line is unmissable. See the new "Implementation Status" section immediately below for the full picture, `docs/ADVERSARIAL_ROUNDS_REPORT.md` for the campaign detail, and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` for the statement-level engine capability audit.
+
 ## Product Vision
 
 **Thyraa** is an enterprise-grade platform that transforms legacy COBOL systems into modern Scala applications through a human-in-the-loop, AI-assisted pipeline.
@@ -14,6 +18,48 @@
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Implementation Status (2026-07-11)
+
+*Added 2026-07-11, five months after original authoring. This section — and the ✅/🟡/⬜ tags used throughout the rest of the document — reflect what has actually been built and verified since, versus what remains architecture/product vision. Full detail: `docs/ADVERSARIAL_ROUNDS_REPORT.md` (14-round adversarial-verification campaign narrative) and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (statement-by-statement engine capability audit and roadmap).*
+
+### ✅ BUILT & VERIFIED
+
+The COBOL→Scala **conversion engine** (`Thyraa-COBOL-main/backend/packages/cobol-to-scala/`) is real, tested, and verified against a real compiler oracle — not a prototype or a mock:
+
+- **Real architecture**: lexer → parser → AST → Scala generator. Note this is a **Node.js/JavaScript package**, not a separate JVM/Scala microservice as the "Scala Engine Integration" section below envisions — see the annotation there.
+- **Byte-level codecs**: packed decimal/COMP-3, binary/COMP (including COMP-5 little-endian), zoned/overpunch numerics, EBCDIC cp037.
+- Field/group/table/CALL registries, DECLARATIVES support (including reentrancy and cross-conversion state isolation), multi-program `CALL`, SORT SD work-file model.
+- **209 oracle-verified COBOL programs** (grown from 48 pre-campaign): 19 under `tests/corpus/data/`, 190 under `tests/corpus/proc/`.
+- **879/879 automated tests passing**, 0 failing, 0 skipped.
+- **110 silent-divergence bugs found and fixed at root cause** across 14 adversarial rounds — each finding verified byte-for-byte against real GnuCOBOL (`cobc`) compiler output, not a hand-written expectation.
+- Four engine phases built: (1) data layer + codecs, (2) full PROCEDURE DIVISION logic, (3) `EXEC SQL` → Doobie generation + JCL parsing (MVP — compile-verified in isolation but **not yet spliced into the main generator's output path**), (4) CICS scaffolding (classification/BMS parsing/skeleton generation only — **not** behavioral conversion).
+- A minimal **analysis platform** (React frontend + Express backend + Bull/Redis job queue + regex-level dependency parsing) also exists and predates this campaign — see "Partial" below.
+
+### ⬜ STILL VISION (not built)
+
+The platform layers *around* the engine were **not** part of this campaign (which was engine-only) and remain architectural vision, confirmed by direct filesystem search of this repo:
+
+- Human-in-the-loop review workflow (the "👤 HUMAN REVIEW" checkpoints in the User Journey below)
+- Authentication / authorization: OAuth 2.0/OIDC, SAML, JWT, RBAC, API keys — all API endpoints today are unauthenticated and open, `cors()` allows all origins
+- Multi-tenancy, project management, audit trail persistence
+- Job orchestration for conversion/validation specifically (conversion runs synchronously in-process today; only the pre-existing *analysis* pipeline has a real queue)
+- Deployment/infra: Docker, Docker Compose, Kubernetes manifests — none exist anywhere in this repo
+- Observability: logging/metrics/tracing infrastructure
+- Persistence/database: no PostgreSQL; Redis exists only for the analysis job queue, not for conversion/validation results
+- Packaging / release process
+- A customer-facing **Validation Engine** (dual-run comparison as a *product feature* — the oracle-comparison harness in `tests/oracle/` is a developer test tool internal to the engine repo, not a service)
+- The **AI Layer** (Claude-powered documentation/explanation/business-rule-extraction as a product feature) — no such integration exists in the backend today
+- VS Code Extension, standalone CLI
+- Engine-internal gaps also still open: SQL wire-in, CICS behavioral conversion, reference-modification codegen, REWRITE/DELETE/START, SORT USING/GIVING, external/dynamic CALL, OCCURS DEPENDING ON dynamic sizing, general GO TO webs, JCL→sbt skeletons. The oracle is GnuCOBOL, not IBM Enterprise COBOL.
+
+### 🟡 PARTIAL (exists already, predates this campaign, narrower than the vision below)
+
+- **Web UI**: a real React frontend exists (`Thyraa-COBOL-main/src/`) with an analysis-results page (`AnalysisResults.tsx`) and a conversion page (`ScalaConverter.tsx`) — functional but far narrower than the Presentation Layer pictured below (no validation-results UI, no review workflow, no VS Code extension, no CLI).
+- **API Gateway**: a real Express API exists (`backend/api/`) with working `/analyze` and `/convert/{parse,scala,batch,runtime}` routes — but no `/api/projects`, no `/validate`, no `/api/ai` endpoints, and none of the security features (auth, rate limiting, CORS whitelisting) called for in the Security Architecture section.
+- **Job Queue**: Bull + Redis is real, but wired only to the *analysis* pipeline; the conversion engine is called in-process/synchronously from the controller, not queued.
 
 ---
 
@@ -101,6 +147,19 @@
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+**Layer-by-layer status (2026-07-11):**
+
+| Layer | Status | Notes |
+|---|---|---|
+| Presentation Layer (Web UI, VS Code Extension, CLI) | 🟡 Partial | React web UI exists for analysis + a basic conversion page; no VS Code extension, no CLI |
+| API Gateway (REST) | 🟡 Partial | `/api/analyze` and `/api/convert/*` are real; `/api/validate` and `/api/ai` do not exist |
+| Orchestration Layer (Job Queue, Workflow Engine, Event Bus) | 🟡 Partial | Bull/Redis queue is real for analysis only; no workflow engine, no event bus, conversion is synchronous in-process |
+| Analysis Engine (Node.js) | 🟡 Partial | Real and working, but its COBOL "parsing" is regex-level (`packages/cobol-analysis/parsers/cobol.parser.js`) — it does not build a full AST the way the conversion engine does |
+| Conversion Engine | ✅ Built & verified | The real, hardened lexer→parser→AST→generator described in "Implementation Status" above — but it's a Node.js package, not the separate "Scala/JVM" service pictured here (see annotation under "Scala Engine Integration") |
+| Validation Engine | ⬜ Vision | No customer-facing dual-run/comparison service exists; the oracle harness (`tests/oracle/`) is a developer test tool inside the conversion-engine repo, not a product feature |
+| AI Layer (Documentation, Rule Extraction, Explanation) | ⬜ Vision | No Claude integration exists in the backend |
+| Data Layer (PostgreSQL, Redis, File Store) | ⬜ Vision / 🟡 Partial | No PostgreSQL anywhere in the repo; Redis exists only as the analysis job queue/cache, not as a general data layer |
+
 ---
 
 ## User Journey & Workflow
@@ -174,6 +233,8 @@
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+**Status per step (2026-07-11):** STEP 1 (Ingest) and STEP 2 (Analyze) are 🟡 Partial — the analysis pipeline is real, but "Generate documentation with AI" is ⬜ Vision (no AI integration exists). STEP 3 (Convert) is the strongest part of the whole journey: the actual COBOL parsing/type-mapping/case-class/enum/runtime generation is ✅ Built & verified (and far more capable than this five-month-old bullet list suggests — see "Implementation Status" above for the real internal architecture); "AI-enhanced documentation" in this step is still ⬜ Vision. STEP 4 (Validate) is ⬜ Vision as a product step — real oracle-comparison logic exists but only as an internal developer test harness (`tests/oracle/`), not a report/dashboard a user triggers. All 👤 HUMAN REVIEW checkpoints are ⬜ Vision — no review workflow UI exists. STEP 5 (Deploy) is entirely ⬜ Vision — no packaging, Docker, or CI/CD exists anywhere in the repo.
+
 ---
 
 ## Component Integration
@@ -236,9 +297,13 @@
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+**Reality check (2026-07-11):** 🟡 Partial, and structured differently than pictured. `POST /analyze` is real and does queue through Bull. `POST /convert` is real (`/api/convert/parse`, `/api/convert/scala`, `/api/convert/batch`) but is **not** queued — the controller calls the conversion engine's `convertToScala()` directly, in-process, synchronously (`backend/api/controllers/conversion.controller.js`), and the "CONVERSION ENGINE (Scala JVM)" box does not exist as a separate JVM process — see the note under "Scala Engine Integration" below. `POST /validate` does not exist at all — ⬜ Vision. There is no PostgreSQL and no shared "SHARED DATA STORE" beyond the analysis job queue's Redis instance.
+
 ---
 
 ## Scala Engine Integration
+
+> **⬜ Vision — none of Options A/B/C below are how the system actually works today.** The real conversion engine (`Thyraa-COBOL-main/backend/packages/cobol-to-scala/`) is a **plain Node.js/JavaScript package** (see its `package.json`: `"main": "index.js"`), imported and called directly, in-process, by the Express backend (`import { convertToScala, parseCobol } from '../../packages/cobol-to-scala/index.js'` in `conversion.controller.js`). It is not a Scala/JVM program at all — it is a JS lexer/parser/generator that *emits Scala source text as its output*. There is no separate JVM service, no http4s, no GraalVM native image, and no node-java bridge anywhere in this repo. If the platform ever needs the engine to run as an isolated service (for scaling, sandboxing, or a genuine polyglot rewrite), the three options below remain a reasonable menu of future choices — they are just not what exists.
 
 ### Option A: HTTP Microservice (Recommended)
 
@@ -299,6 +364,8 @@ Direct JVM calls from Node.js using node-java bridge.
 ---
 
 ## Data Models
+
+⬜ **Vision.** None of the interfaces below are implemented as a formal shared contract today — there is no `Project`/`ProjectStatus` model, no persisted `AnalysisResult`/`ConversionResult` records, and no `projectId`-scoped data flow. The real `/api/convert/*` endpoints (see "API Specification" below) take a raw `source` string and `options` object and return an ad hoc JSON shape directly from the conversion engine's return value — not this typed contract. This section is worth keeping as a target schema for whenever the platform layer gets built.
 
 ### Shared Data Contract
 
@@ -392,6 +459,8 @@ interface GeneratedFile {
 
 ## API Specification
 
+🟡 **Partial — real endpoints exist but not these ones.** No `/api/projects*` resource exists (⬜ Vision — there is no project model at all, see "Data Models" above). The real, working conversion endpoints today are `POST /api/convert/parse`, `POST /api/convert/scala`, `POST /api/convert/batch`, and `GET /api/convert/runtime` (`Thyraa-COBOL-main/backend/api/routes/conversion.routes.js`) — synchronous, not job-queued, and not scoped to a project ID. The real analysis endpoints are `POST /api/analyze`, `DELETE /api/analyze/cache`, `GET /api/analyze/:jobId/status`, `GET /api/analyze/:jobId/result` (`analysis.routes.js`) — these *are* queued via Bull. `/api/projects/{id}/validate`, `/api/projects/{id}/conversion`-as-a-resource, and the entire `/api/ai/*` family below are ⬜ Vision — none exist in the codebase.
+
 ### New Endpoints for Unified Platform
 
 ```yaml
@@ -459,81 +528,88 @@ POST /api/ai/extract-rules
 
 ## Directory Structure (Unified)
 
+🟡 **Partial — real layout differs in important ways.** The actual repo layout is `Thyraa-COBOL-main/src/` (frontend), `Thyraa-COBOL-main/backend/` (API + engine), with no top-level `thyraa/` monorepo root. Marked below: ✅ = exists as pictured, 🟡 = exists but different in kind, ⬜ = does not exist.
+
 ```
 thyraa/
-├── frontend/                    # React Web UI (existing Thyraa)
+├── frontend/                    # ✅ exists, as Thyraa-COBOL-main/src/
 │   ├── src/
 │   │   ├── pages/
-│   │   │   ├── Index.tsx
-│   │   │   ├── GetStarted.tsx
-│   │   │   ├── AnalysisResults.tsx
-│   │   │   ├── ConversionResults.tsx    # NEW
-│   │   │   └── ValidationResults.tsx    # NEW
+│   │   │   ├── Index.tsx                # ✅ exists
+│   │   │   ├── GetStarted.tsx           # ✅ exists
+│   │   │   ├── AnalysisResults.tsx      # ✅ exists
+│   │   │   ├── ConversionResults.tsx    # 🟡 exists as ScalaConverter.tsx (different name/shape)
+│   │   │   └── ValidationResults.tsx    # ⬜ does not exist
 │   │   ├── components/
 │   │   │   ├── analysis/
-│   │   │   ├── conversion/              # NEW
-│   │   │   └── validation/              # NEW
+│   │   │   ├── conversion/              # ⬜ NEW — not present
+│   │   │   └── validation/              # ⬜ NEW — not present
 │   │   └── lib/
 │   ├── package.json
 │   └── vite.config.ts
 │
-├── backend/                     # Node.js API (existing Thyraa)
+├── backend/                     # ✅ exists, as Thyraa-COBOL-main/backend/
 │   ├── src/
-│   │   └── server.js
+│   │   └── server.js                    # ✅ exists
 │   ├── api/
 │   │   ├── routes/
-│   │   │   ├── analyze.routes.js
-│   │   │   ├── convert.routes.js        # NEW
-│   │   │   └── validate.routes.js       # NEW
-│   │   └── controllers/
+│   │   │   ├── analyze.routes.js        # ✅ exists
+│   │   │   ├── convert.routes.js        # ✅ exists, as conversion.routes.js
+│   │   │   └── validate.routes.js       # ⬜ NEW — does not exist
+│   │   └── controllers/                 # ✅ exists (analysis.controller.js, conversion.controller.js)
 │   ├── packages/
-│   │   ├── github-ingestion/
-│   │   └── cobol-analysis/
+│   │   ├── github-ingestion/            # ✅ exists
+│   │   ├── cobol-analysis/              # ✅ exists (regex-level parsing)
+│   │   └── cobol-to-scala/              # ✅ exists — this is the real, hardened engine (see "Implementation Status"); NOT pictured in this original diagram at all, which only anticipated it living under scala-engine/
 │   ├── services/
-│   │   └── scala-engine.service.js      # NEW - calls Scala service
+│   │   └── scala-engine.service.js      # ⬜ NEW — does not exist; conversion is called in-process, no service-call layer needed because there's no separate service
 │   └── package.json
 │
-├── scala-engine/                # Scala Conversion Engine (cobol2scala)
-│   ├── build.sbt
+├── scala-engine/                # ⬜ Vision — this entire directory/service does not exist. The real conversion engine
+│   ├── build.sbt                #   lives at backend/packages/cobol-to-scala/ and is plain JavaScript (see "Scala
+│   │                             #   Engine Integration" above) — there is no build.sbt, no Main.scala HTTP server,
+│   │                             #   and no separate Dockerfile for it. Its real files are parser/lexer.js,
+│   │                             #   parser/*-parser.js, generator/*.js, runtime/*.scala (only the *emitted runtime
+│   │                             #   helpers* are Scala — the engine itself is not).
 │   ├── src/main/scala/
 │   │   └── com/thyraa/
-│   │       ├── Main.scala               # HTTP server entry
+│   │       ├── Main.scala               # ⬜ does not exist
 │   │       ├── api/
-│   │       │   └── ConversionApi.scala  # REST endpoints
+│   │       │   └── ConversionApi.scala  # ⬜ does not exist
 │   │       ├── parser/
-│   │       │   ├── Lexer.scala
-│   │       │   ├── CopybookParser.scala
-│   │       │   └── Ast.scala
+│   │       │   ├── Lexer.scala          # ⬜ does not exist as Scala; real equivalent is parser/lexer.js
+│   │       │   ├── CopybookParser.scala # ⬜ does not exist as Scala; real equivalent is parser/copybook-resolver.js + data-division-parser.js
+│   │       │   └── Ast.scala            # ⬜ does not exist as Scala; AST is plain JS objects
 │   │       ├── analyzer/
-│   │       │   └── TypeMapper.scala
+│   │       │   └── TypeMapper.scala     # ⬜ does not exist as Scala; type mapping lives in generator/*.js
 │   │       ├── generator/
-│   │       │   └── ScalaGenerator.scala
+│   │       │   └── ScalaGenerator.scala # ⬜ does not exist as Scala; real equivalent is generator/scala-generator.js (JS emitting Scala text)
 │   │       └── runtime/
-│   │           └── CobolTypes.scala
-│   └── Dockerfile
+│   │           └── CobolTypes.scala     # ✅ this one is real — runtime/CobolTypes.scala and runtime/CobolCodecs.scala exist and are genuine Scala, embedded into generated output
+│   └── Dockerfile                       # ⬜ does not exist
 │
-├── ai-service/                  # AI Enhancement Service (optional)
+├── ai-service/                  # ⬜ Vision — does not exist, no Python AI service anywhere in repo
 │   ├── src/
 │   │   ├── documentation.py
 │   │   ├── explanation.py
 │   │   └── rule_extraction.py
 │   └── Dockerfile
 │
-├── docker/
+├── docker/                      # ⬜ Vision — no docker/ directory, no compose files anywhere in repo
 │   ├── docker-compose.yml
 │   ├── docker-compose.prod.yml
 │   └── nginx/
 │       └── nginx.conf
 │
-├── k8s/                         # Kubernetes manifests
+├── k8s/                         # ⬜ Vision — no k8s/ directory or manifests anywhere in repo
 │   ├── frontend.yaml
 │   ├── backend.yaml
 │   ├── scala-engine.yaml
 │   ├── redis.yaml
 │   └── postgres.yaml
 │
-└── docs/
-    ├── architecture.md
+└── docs/                        # ✅ exists (this docs/ directory), though with different filenames than pictured —
+    ├── architecture.md          #   see this file, ADVERSARIAL_ROUNDS_REPORT.md, CAPABILITY_AUDIT_AND_ROADMAP.md, etc.
     ├── api.md
     └── deployment.md
 ```
@@ -541,6 +617,8 @@ thyraa/
 ---
 
 ## Deployment Architecture
+
+⬜ **Vision — entirely unbuilt.** Confirmed by filesystem search: there is no `Dockerfile`, no `docker-compose.yml`, and no Kubernetes manifest anywhere in this repo as of 2026-07-11. No container image has ever been built for any component. Both subsections below (Docker Compose and Kubernetes) describe a deployment model that does not exist yet in any form, not even a partial one.
 
 ### Docker Compose (Development/Small Scale)
 
@@ -640,6 +718,8 @@ volumes:
 
 ## Security Architecture
 
+⬜ **Vision — entirely unbuilt, and today's actual posture is the opposite of this diagram.** Per `docs/ENTERPRISE_READINESS_GAP_ANALYSIS.md` §1 (confirmed independently in this pass): all API endpoints are completely open with **zero authentication**, CORS is configured as `cors()` with no origin restriction (`server.js`), there is no TLS/HTTPS termination, no RBAC, no encryption at rest, no PII detection, and no compliance program of any kind. None of NETWORK SECURITY, AUTHENTICATION, AUTHORIZATION, DATA PROTECTION, or COMPLIANCE below exist in even a partial form.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         SECURITY LAYERS                                     │
@@ -686,65 +766,69 @@ volumes:
 
 ## Implementation Phases
 
+> **Note (2026-07-11):** these are the *platform-integration* phases (1–6, below) — do not confuse them with the conversion engine's own internal build phases referenced in "Implementation Status" above (data layer, procedure logic, EXEC SQL/JCL, CICS scaffolding), which are a completely different numbering scheme and are already built. Everything below is still ⬜ Vision except where noted.
+
 ### Phase 1: Integration Foundation (2-3 weeks)
-- [ ] Set up monorepo structure
-- [ ] Create Scala HTTP service wrapper around cobol2scala
-- [ ] Add conversion endpoints to Node.js backend
-- [ ] Create service communication layer
-- [ ] Docker Compose for local development
+- [ ] Set up monorepo structure — ⬜ not done, repo is not structured as pictured
+- [x] ~~Create Scala HTTP service wrapper around cobol2scala~~ — superseded: the engine is called in-process instead (see "Scala Engine Integration"); no wrapper service exists or is needed for the current architecture
+- [x] Add conversion endpoints to Node.js backend — ✅ done (`/api/convert/parse`, `/scala`, `/batch`, `/runtime`), though synchronous, not job-queued
+- [ ] Create service communication layer — ⬜ not applicable/not done (no separate service to communicate with)
+- [ ] Docker Compose for local development — ⬜ not done
 
 ### Phase 2: Unified UI (2-3 weeks)
-- [ ] Add conversion workflow to React UI
-- [ ] Create code review component
-- [ ] Add side-by-side COBOL/Scala view
-- [ ] Implement conversion progress tracking
-- [ ] Add download/export functionality
+- [x] Add conversion workflow to React UI — 🟡 partial: a conversion page (`ScalaConverter.tsx`) exists, but not the full workflow pictured
+- [ ] Create code review component — ⬜ not done
+- [ ] Add side-by-side COBOL/Scala view — ⬜ not done
+- [ ] Implement conversion progress tracking — ⬜ not done
+- [ ] Add download/export functionality — ⬜ not done
 
 ### Phase 3: AI Enhancement (1-2 weeks)
-- [ ] Integrate Claude API for documentation
-- [ ] Add "Explain this code" feature
-- [ ] Implement business rule extraction
-- [ ] Create inline documentation generation
+- [ ] Integrate Claude API for documentation — ⬜ not done, no AI integration exists in the backend
+- [ ] Add "Explain this code" feature — ⬜ not done
+- [ ] Implement business rule extraction — ⬜ not done
+- [ ] Create inline documentation generation — ⬜ not done
 
 ### Phase 4: Validation Engine (2-3 weeks)
-- [ ] Build Scala test runner
-- [ ] Implement dual-run comparison
-- [ ] Create validation dashboard
-- [ ] Add metrics and reporting
+- [x] Build Scala test runner — 🟡 partial, but not the product feature pictured: `tests/oracle/` is a real, working oracle-comparison harness against GnuCOBOL, used internally by the engine's own adversarial-verification campaign (879/879 tests, 209 programs) — it is a developer test tool, not a UI-facing "Validation Engine" a customer triggers per-project
+- [x] Implement dual-run comparison — ✅ done, but as above: internal to the engine's own test suite, not exposed as a platform feature
+- [ ] Create validation dashboard — ⬜ not done
+- [ ] Add metrics and reporting — ⬜ not done (as a product feature; the engine's own `docs/ADVERSARIAL_ROUNDS_REPORT.md` is a report, but a human-authored one, not a generated dashboard)
 
 ### Phase 5: Enterprise Features (2-3 weeks)
-- [ ] Add user authentication (OAuth/SAML)
-- [ ] Implement RBAC
-- [ ] Create audit logging
-- [ ] Add project management features
-- [ ] Kubernetes deployment manifests
+- [ ] Add user authentication (OAuth/SAML) — ⬜ not done
+- [ ] Implement RBAC — ⬜ not done
+- [ ] Create audit logging — ⬜ not done
+- [ ] Add project management features — ⬜ not done
+- [ ] Kubernetes deployment manifests — ⬜ not done
 
 ### Phase 6: Polish & Launch (1-2 weeks)
-- [ ] Documentation
-- [ ] Performance optimization
-- [ ] Security audit
-- [ ] Beta testing with pilot customer
+- [ ] Documentation — 🟡 partial: extensive engine-side docs exist (`docs/ADVERSARIAL_ROUNDS_REPORT.md`, `docs/CAPABILITY_AUDIT_AND_ROADMAP.md`, this document); platform-side docs (api.md, deployment.md) do not
+- [ ] Performance optimization — ⬜ not evaluated at platform level
+- [ ] Security audit — ⬜ not done (informal gap analysis exists: `docs/ENTERPRISE_READINESS_GAP_ANALYSIS.md`, but no formal audit)
+- [ ] Beta testing with pilot customer — ⬜ not done
 
 ---
 
 ## Technology Summary
 
-| Component | Technology | Purpose |
-|-----------|------------|---------|
-| Frontend | React + TypeScript + Tailwind | User interface |
-| API Gateway | Express.js | Route handling, orchestration |
-| Analysis Engine | Node.js | GitHub ingestion, dependency analysis |
-| Conversion Engine | Scala 3 + http4s | COBOL parsing, Scala generation |
-| Job Queue | Bull + Redis | Async job processing |
-| Database | PostgreSQL | Project data, results, audit |
-| Cache | Redis | API caching, session store |
-| AI | Claude API | Documentation, explanation |
+| Component | Technology | Purpose | Status (2026-07-11) |
+|-----------|------------|---------|---|
+| Frontend | React + TypeScript + Tailwind | User interface | 🟡 Partial — real, narrower than pictured |
+| API Gateway | Express.js | Route handling, orchestration | 🟡 Partial — real routes, no gateway-grade features (auth, rate limiting) |
+| Analysis Engine | Node.js | GitHub ingestion, dependency analysis | 🟡 Partial — real, but regex-level parsing, not a full COBOL AST |
+| Conversion Engine | ~~Scala 3 + http4s~~ Node.js/JavaScript, emitting Scala 3 source | COBOL parsing, Scala generation | ✅ Built & verified — 209 oracle-verified programs, 879/879 tests; see "Implementation Status" |
+| Job Queue | Bull + Redis | Async job processing | 🟡 Partial — real for analysis only; conversion is not queued |
+| Database | PostgreSQL | Project data, results, audit | ⬜ Vision — no PostgreSQL anywhere in the repo |
+| Cache | Redis | API caching, session store | 🟡 Partial — real, used by the analysis pipeline |
+| AI | Claude API | Documentation, explanation | ⬜ Vision — no integration exists |
 | Container | Docker | Packaging |
 | Orchestration | Kubernetes | Production deployment |
 
 ---
 
 ## Success Metrics
+
+⬜ **Vision — these are unmeasured targets, not reported results.** None of these have an instrumented measurement pipeline (no telemetry, no dashboard). The one row with a real, closely-related, *independently measured* number is "Conversion success rate": the actual engine-side result as of 2026-07-11 is **209/209 oracle-verified corpus programs producing byte-identical output to real GnuCOBOL** and **879/879 automated tests passing** — a stronger and more specific claim than the "95%/85%" estimate below, but it is a corpus-verification statistic (measured against a curated, growing adversarial test corpus), not a measurement of "success rate on arbitrary customer programs," so the two numbers aren't directly comparable. All other rows (analysis accuracy, processing speed, UI/API response time, validation pass rate, customer satisfaction) remain aspirational targets with no measurement in place.
 
 | Metric | Target |
 |--------|--------|
@@ -759,6 +843,8 @@ volumes:
 ---
 
 ## Next Steps
+
+*(Original 2026-02-08 next-steps list, kept as-is below for the historical record. As of 2026-07-11, items 3–5 have effectively been superseded: no monorepo was created, and rather than a separate Scala HTTP service, the conversion engine was built and hardened in-place as a Node.js package inside the existing `backend/packages/` structure — see "Scala Engine Integration" above. The real next step today is the platform work in "STILL VISION" at the top of this document: auth, job orchestration for conversion, a real validation product feature, and deployment infra, now that the engine itself is no longer the risky part.)*
 
 1. **Share this architecture with your friend**
 2. **Agree on the integration approach** (HTTP microservice recommended)

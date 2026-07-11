@@ -96,7 +96,10 @@ test('generated Scala has no duplicate case class parameter names', () => {
 
 test('COMPUTE generates an assignment to each target', () => {
   const result = convertToScala(SIMPLE_PROGRAM, {});
-  assert.match(result.scala, /custBalance = \(\(custBalance \* 1\.05\) \+ 10\)/);
+  // Round-3 findings 8/13: the computed result is now truncated (no ROUNDED
+  // here) to CUST-BALANCE's own declared digit widths (7 integer, 2 decimal)
+  // at store time via CobolFmt.truncNumeric, rather than assigned bare.
+  assert.match(result.scala, /custBalance = CobolFmt\.truncNumeric\(\(\(custBalance \* BigDecimal\("1\.05"\)\) \+ BigDecimal\("10"\)\), 7, 2\)/);
 });
 
 test('IF condition converts relational operators', () => {

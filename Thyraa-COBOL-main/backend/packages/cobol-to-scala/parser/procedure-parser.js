@@ -63,6 +63,11 @@ class ParserContext {
     this.tokens = tokens;
     this.position = 0;
     this.errors = [];
+    // Tracks the nearest preceding relation-condition's {subject, operator}
+    // within the current AND/OR chain, for abbreviated combined relation
+    // condition support (`A = 1 OR 2`, `A > 1 AND < 5`) - see
+    // parseAbbreviatedRelationTerm/parseCondition's save/restore.
+    this.lastRelation = null;
   }
 
   current() {
@@ -221,14 +226,40 @@ function parseVariableReference(ctx) {
   // fell through to `break`. subscriptIndexExpr (generator/expression-gen.js)
   // still fast-paths the common bare-literal/bare-variable shapes for
   // readability; anything else (this included) renders as a full expression.
+  // This first parenthesized group is EITHER a subscript list OR reference
+  // modification (start:length) - both share the identical `(` lookahead,
+  // and only diverge once a `:` shows up right after the first expression
+  // (a subscript list is comma-separated arithmetic expressions; a bare `:`
+  // can never appear inside one). The previous implementation parsed this
+  // group as subscripts unconditionally: `WS-FIELD(3:5)` got the `3` parsed
+  // and consumed as a lone subscript (via parseArithmeticExpression, which
+  // stops right before the `:` it doesn't recognize), left the cursor
+  // sitting on `:5)` since neither the subscript loop nor the *separate*
+  // refMod block below (which only ever ran when *this* first `(...)` was
+  // untouched) expected a dangling `:` there, and silently corrupted every
+  // token read after it for the rest of the statement - refMod was never
+  // actually reachable through a bare `identifier(start:length)` reference
+  // at all. Detecting the `:` here - reusing the very expression already
+  // parsed as the refMod start, rather than a bare literal/identifier only
+  // (COBOL allows any arithmetic expression in either refMod slot, e.g.
+  // `WS-FIELD(WS-START:WS-LEN)`) - fixes both the corruption and the
+  // previous start/length TODO of "just a literal or identifier".
   if (ctx.check(TokenType.OP_LPAREN)) {
     ctx.advance();
+    let sawRefMod = false;
     while (!ctx.isAtEnd() && !ctx.check(TokenType.OP_RPAREN)) {
       if (ctx.check(TokenType.COMMA)) {
         ctx.advance();
         continue;
       }
       const sub = parseArithmeticExpression(ctx);
+      if (ctx.check(TokenType.OP_COLON)) {
+        ctx.advance();
+        const length = ctx.check(TokenType.OP_RPAREN) ? null : parseArithmeticExpression(ctx);
+        ref.refMod = { start: sub, length };
+        sawRefMod = true;
+        break;
+      }
       if (sub) {
         ref.subscripts.push(sub);
       } else {
@@ -236,27 +267,21 @@ function parseVariableReference(ctx) {
       }
     }
     ctx.match(TokenType.OP_RPAREN);
-  }
 
-  // Parse reference modification (start:length)
-  if (ctx.check(TokenType.OP_LPAREN)) {
-    ctx.advance();
-    let start = null;
-    let length = null;
-
-    if (ctx.check(TokenType.NUMERIC_LITERAL) || ctx.check(TokenType.IDENTIFIER)) {
-      start = ctx.advance().value;
-    }
-
-    if (ctx.check(TokenType.OP_COLON)) {
+    // A subscripted table element can *also* carry its own reference
+    // modification in a second, separate parenthesized group immediately
+    // after the subscript list, e.g. `WS-TABLE(WS-I)(WS-START:WS-LEN)`.
+    if (!sawRefMod && ctx.check(TokenType.OP_LPAREN)) {
       ctx.advance();
-      if (ctx.check(TokenType.NUMERIC_LITERAL) || ctx.check(TokenType.IDENTIFIER)) {
-        length = ctx.advance().value;
+      const start = ctx.check(TokenType.OP_RPAREN) ? null : parseArithmeticExpression(ctx);
+      let length = null;
+      if (ctx.check(TokenType.OP_COLON)) {
+        ctx.advance();
+        length = ctx.check(TokenType.OP_RPAREN) ? null : parseArithmeticExpression(ctx);
       }
+      ctx.match(TokenType.OP_RPAREN);
+      ref.refMod = { start, length };
     }
-
-    ctx.match(TokenType.OP_RPAREN);
-    ref.refMod = { start, length };
   }
 
   return ref;
@@ -467,10 +492,25 @@ function parsePrimary(ctx) {
 }
 
 /**
- * Parse a condition expression
+ * Parse a condition expression.
+ *
+ * Isolates ctx.lastRelation (the abbreviated-combined-relation chain state -
+ * see parseNotCondition/isAbbreviatedRelationContinuation) to exactly this
+ * condition's own scope: reset to null on entry (a fresh chain starts here,
+ * regardless of whatever an *enclosing* condition's chain state was - this
+ * matters because parsePrimaryCondition's parenthesized-condition branch
+ * recurses back into parseCondition for the inner group, which must not
+ * inherit the outer group's dangling relation state) and restored on exit
+ * (so a parenthesized sub-condition's chain never leaks back out either -
+ * COBOL's abbreviation never reaches across a `(...)` boundary in either
+ * direction).
  */
 function parseCondition(ctx) {
-  return parseOrCondition(ctx);
+  const savedLastRelation = ctx.lastRelation;
+  ctx.lastRelation = null;
+  const result = parseOrCondition(ctx);
+  ctx.lastRelation = savedLastRelation;
+  return result;
 }
 
 function parseOrCondition(ctx) {
@@ -507,10 +547,69 @@ function parseAndCondition(ctx) {
   return left;
 }
 
+/**
+ * True when the tokens right here (immediately after an AND/OR and an
+ * optional NOT) can only be the continuation object of an *abbreviated
+ * combined relation condition* (`A = 1 OR 2`, `A > 1 AND < 5`) - never the
+ * start of a brand new, independent combinable-condition - so
+ * parseNotCondition knows to reuse ctx.lastRelation's carried subject
+ * (always) and operator (unless a new one is given right here) instead of
+ * calling parsePrimaryCondition. Per the COBOL abbreviation grammar:
+ *   - a relational-operator token here unambiguously means "elided subject,
+ *     explicit new operator" - no COBOL condition can otherwise *start* with
+ *     a bare relational operator.
+ *   - a literal / figurative constant / FUNCTION call here unambiguously
+ *     means "elided subject AND operator" - none of those can themselves
+ *     start a standalone condition (only an IDENTIFIER-led class/sign/
+ *     condition-name/relation condition, or a parenthesized one, can).
+ *   - an IDENTIFIER or `(` here is deliberately left to the normal,
+ *     non-abbreviated path: it might be a level-88 condition-name
+ *     conjunction (`A = 1 AND WS-FLAG-DONE`, a genuine second condition) or
+ *     the start of a brand new full relation condition (`A > 1 AND B < 2`);
+ *     telling those apart from an elided-subject continuation needs the data
+ *     dictionary (is the identifier a registered condition-name?), which
+ *     isn't available at parse time - CONDITION_REGISTRY is only built later,
+ *     from the Data Division (see generator/expression-gen.js) - so this
+ *     parser conservatively always treats a bare IDENTIFIER/`(` as starting
+ *     its own new combinable-condition, matching how abbreviation is
+ *     actually written in practice (with literals/bare operators, not bare
+ *     condition-name identifiers immediately after AND/OR).
+ */
+function isAbbreviatedRelationContinuation(ctx) {
+  if (
+    ctx.check(TokenType.OP_EQUAL) || ctx.check(TokenType.OP_GREATER) || ctx.check(TokenType.OP_LESS) ||
+    ctx.check(TokenType.OP_GREATER_EQUAL) || ctx.check(TokenType.OP_LESS_EQUAL) || ctx.check(TokenType.OP_NOT_EQUAL)
+  ) {
+    return true;
+  }
+  if (['EQUAL', 'EQUALS', 'GREATER', 'LESS'].some(v => ctx.checkValue(v))) return true;
+  if (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.OP_LPAREN)) return false;
+  return (
+    ctx.check(TokenType.STRING_LITERAL) || ctx.check(TokenType.NUMERIC_LITERAL) ||
+    ['ZERO', 'ZEROS', 'ZEROES', 'SPACE', 'SPACES', 'HIGH-VALUE', 'HIGH-VALUES',
+     'LOW-VALUE', 'LOW-VALUES', 'QUOTE', 'QUOTES', 'FUNCTION'].some(v => ctx.checkValue(v))
+  );
+}
+
 function parseNotCondition(ctx) {
   let negated = false;
   if (ctx.matchValue('NOT')) {
     negated = true;
+  }
+
+  // Abbreviated combined relation condition continuation - see
+  // isAbbreviatedRelationContinuation's doc comment. Only reachable when a
+  // relation-condition earlier in this same AND/OR chain left its
+  // {subject, operator} in ctx.lastRelation (set by parsePrimaryCondition).
+  if (ctx.lastRelation && isAbbreviatedRelationContinuation(ctx)) {
+    const chain = ctx.lastRelation;
+    const explicitOperator = matchRelationalOperator(ctx, false);
+    const operator = explicitOperator || chain.operator;
+    const object = parseEvaluateValue(ctx);
+    const condition = new RelationalCondition({ subject: chain.subject, relationalOperator: operator, object });
+    if (negated) condition.negated = true;
+    ctx.lastRelation = { subject: chain.subject, operator };
+    return condition;
   }
 
   const condition = parsePrimaryCondition(ctx);
@@ -597,17 +696,33 @@ function matchRelationalOperator(ctx, notMod) {
 }
 
 function parsePrimaryCondition(ctx) {
-  // Parenthesized condition
+  // Parenthesized condition - always terminates any abbreviated-relation
+  // chain from an enclosing AND/OR (COBOL abbreviation never reaches across
+  // a `(...)` boundary): parseCondition itself isolates the *inner* group's
+  // chain state, but the outer chain must also not treat this whole
+  // parenthesized (possibly compound) condition as a fresh relation to
+  // abbreviate from afterwards.
   if (ctx.check(TokenType.OP_LPAREN)) {
     ctx.advance();
     const cond = parseCondition(ctx);
     ctx.match(TokenType.OP_RPAREN);
+    ctx.lastRelation = null;
     return cond;
   }
 
   // Class condition
   if (ctx.check(TokenType.IDENTIFIER)) {
-    const subject = parseOperand(ctx);
+    // The condition's subject is a full arithmetic expression, not just a
+    // single term - COBOL allows e.g. `IF WS-A * WS-B > WS-C` - so this uses
+    // parseEvaluateValue (parseOperand plus any following arithmetic
+    // continuation) rather than a bare parseOperand, which silently
+    // truncated the subject to just its first operand. An IDENTIFIER
+    // followed immediately by an arithmetic operator can only be an
+    // expression subject here (no COBOL class/sign/condition-name test ever
+    // has one), so reusing the same "leading operand + arithmetic
+    // continuation" parser EVALUATE subjects/objects already use is exactly
+    // right for every condition shape below, not just the relational one.
+    const subject = parseEvaluateValue(ctx);
 
     // Check for IS [NOT]
     ctx.matchValue('IS');
@@ -615,6 +730,7 @@ function parsePrimaryCondition(ctx) {
 
     // Class test
     if (ctx.matchValue('NUMERIC')) {
+      ctx.lastRelation = null;
       return makeCondition({
         conditionType: 'class',
         subject,
@@ -623,6 +739,7 @@ function parsePrimaryCondition(ctx) {
       });
     }
     if (ctx.matchValue('ALPHABETIC')) {
+      ctx.lastRelation = null;
       return makeCondition({
         conditionType: 'class',
         subject,
@@ -631,6 +748,7 @@ function parsePrimaryCondition(ctx) {
       });
     }
     if (ctx.matchValue('ALPHABETIC-LOWER')) {
+      ctx.lastRelation = null;
       return makeCondition({
         conditionType: 'class',
         subject,
@@ -639,6 +757,7 @@ function parsePrimaryCondition(ctx) {
       });
     }
     if (ctx.matchValue('ALPHABETIC-UPPER')) {
+      ctx.lastRelation = null;
       return makeCondition({
         conditionType: 'class',
         subject,
@@ -649,6 +768,7 @@ function parsePrimaryCondition(ctx) {
 
     // Sign test
     if (ctx.matchValue('POSITIVE')) {
+      ctx.lastRelation = null;
       return makeCondition({
         conditionType: 'sign',
         subject,
@@ -657,6 +777,7 @@ function parsePrimaryCondition(ctx) {
       });
     }
     if (ctx.matchValue('NEGATIVE')) {
+      ctx.lastRelation = null;
       return makeCondition({
         conditionType: 'sign',
         subject,
@@ -665,6 +786,7 @@ function parsePrimaryCondition(ctx) {
       });
     }
     if (ctx.matchValue('ZERO', 'ZEROS', 'ZEROES')) {
+      ctx.lastRelation = null;
       return makeCondition({
         conditionType: 'sign',
         subject,
@@ -677,7 +799,15 @@ function parsePrimaryCondition(ctx) {
     const operator = matchRelationalOperator(ctx, notMod);
 
     if (operator) {
-      const object = parseOperand(ctx);
+      // The object is likewise a full expression (`IF WS-A > WS-B + 1`),
+      // and may itself be a literal/figurative constant/FUNCTION call -
+      // parseEvaluateValue handles all of those exactly like parseOperand
+      // did, plus the arithmetic continuation.
+      const object = parseEvaluateValue(ctx);
+      // Record this relation for abbreviated combined relation condition
+      // support (`A > 1 AND < 5` / `A = 1 OR 2`) - see
+      // isAbbreviatedRelationContinuation/parseNotCondition.
+      ctx.lastRelation = { subject, operator };
       return new RelationalCondition({
         subject,
         relationalOperator: operator,
@@ -686,12 +816,14 @@ function parsePrimaryCondition(ctx) {
     }
 
     // Condition name (88 level)
+    ctx.lastRelation = null;
     return makeCondition({
       conditionType: 'simple',
       subject,
     });
   }
 
+  ctx.lastRelation = null;
   return null;
 }
 

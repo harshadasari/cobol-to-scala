@@ -1,0 +1,14 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. N09ADDGV.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-A           PIC S9(3)V99 VALUE 10.36.
+       01 WS-B           PIC S9(3)V99 VALUE 5.50.
+       01 WS-SUM1        PIC S9(3)V9  VALUE 0.
+       01 WS-SUM2        PIC S9(3)     VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           ADD WS-A WS-B GIVING WS-SUM1 ROUNDED WS-SUM2 ROUNDED
+           DISPLAY "SUM1=" WS-SUM1
+           DISPLAY "SUM2=" WS-SUM2
+           STOP RUN.

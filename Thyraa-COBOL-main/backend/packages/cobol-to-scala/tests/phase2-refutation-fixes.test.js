@@ -224,8 +224,12 @@ test('Finding 5: PERFORM WITH TEST AFTER UNTIL never emits a postfix do/while', 
 `;
   const code = convertToScala(source, {}).scala;
   // Body+test folded into the while-condition block; the loop's own `do`
-  // body is empty - see method-gen.js's generatePerformFromAST.
-  assert.match(code, /while\n\s+wsI = wsI \+ 1\n\s+!\(wsI > 5\)\n\s+do \(\)/);
+  // body is empty - see method-gen.js's generatePerformFromAST. The whole
+  // loop is now also wrapped in `scala.util.boundary { ... }` (round-3
+  // finding 1, EXIT PERFORM support) and the increment is stored through
+  // the same ROUNDED-or-truncated coercion every arithmetic statement now
+  // uses (round-3 findings 8/13) instead of a bare `wsI = wsI + 1`.
+  assert.match(code, /scala\.util\.boundary \{\n\s+while\n\s+wsI = \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsI\) \+ \(BigDecimal\("1"\)\)\), 3, 0\)\)\.toInt\n\s+!\(wsI > 5\)\n\s+do \(\)\n\s+\}/);
   assert.doesNotMatch(code, /^\s*do\s*$/m);
 });
 
@@ -247,8 +251,12 @@ test('Finding 5: PERFORM WITH TEST AFTER VARYING tests before incrementing (matc
   // The increment must be inside the `do` body (skipped after the final,
   // test-failing round) while the test itself uses the still-current value -
   // verified against real GnuCOBOL to run body for i=1,2,3,4 (SUM=10), not
-  // i=1,2,3 (SUM=6) - see tests/corpus/proc/r07-perf-negafter.cbl.
-  assert.match(code, /while\n\s+wsSum = wsSum \+ wsI\n\s+!\(wsI > 3\)\n\s+do\n\s+wsI = wsI \+ 1/);
+  // i=1,2,3 (SUM=6) - see tests/corpus/proc/r07-perf-negafter.cbl. The whole
+  // loop is now also wrapped in `scala.util.boundary { ... }` (round-3
+  // finding 1) and both ADD targets are stored through the same ROUNDED-or-
+  // truncated coercion every arithmetic statement now uses (round-3
+  // findings 8/13) instead of a bare `x = x + y`.
+  assert.match(code, /scala\.util\.boundary \{\n\s+wsI = 1\n\s+while\n\s+wsSum = \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsSum\) \+ \(BigDecimal\(wsI\)\)\), 3, 0\)\)\.toInt\n\s+!\(wsI > 3\)\n\s+do\n\s+wsI = wsI \+ 1\n\s+\}/);
 });
 
 // ---------------------------------------------------------------------------

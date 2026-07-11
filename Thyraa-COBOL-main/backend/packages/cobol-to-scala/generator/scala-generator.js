@@ -585,13 +585,26 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
       lines.push(
         `  def ${camel}_=(v: String): Unit = ${targetCamel} = ${targetCamel}.substring(0, ${start}) + CobolFmt.fitLeft(v, ${elementWidth}) + ${targetCamel}.substring(${end})`
       );
+      // A character-sliced child can itself be numeric-dataType (a PIC 9
+      // child of a group REDEFINES over a flat/String target, or - see
+      // groupOverGroupRedefinesLines, round-3 finding 6 - a numeric child of
+      // a synthetic group-over-group flat view) even though its own storage
+      // is represented as a Scala String here; DISPLAY (renderDisplayOperand)
+      // keys off `dataType === 'numeric'` to decide whether to route through
+      // CobolFmt.num(..., integerDigits, decimalDigits, ...) - leaving both
+      // hardcoded at 0 (the pre-fix behavior) rendered every such numeric
+      // child as an empty string (0 total digits) instead of its actual
+      // value, since this branch was previously only ever exercised with
+      // alphanumeric children.
+      const childPic = child.pic && typeof child.pic === 'object' ? child.pic : null;
+      const childDataType = (childPic && childPic.dataType) || 'alphanumeric';
       registry.set((child.name || '').toUpperCase(), {
         camel,
         scalaType: 'String',
-        dataType: (child.pic && child.pic.dataType) || 'alphanumeric',
-        integerDigits: 0,
-        decimalDigits: 0,
-        signed: false,
+        dataType: childDataType,
+        integerDigits: childDataType === 'numeric' ? (childPic?.integerDigits || elementWidth) : 0,
+        decimalDigits: childDataType === 'numeric' ? (childPic?.decimalDigits || 0) : 0,
+        signed: !!(childPic && childPic.signed),
         editPattern: null,
         occursDepth: 0,
         picLength: elementWidth,
@@ -620,12 +633,29 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
  *   characterSlicedGroupRedefinesLines above - character-position slicing,
  *   including REDEFINES over an OCCURS table.
  */
-function redefinesAccessorLines(item, registry) {
+function redefinesAccessorLines(item, registry, siblingList) {
   const targetUpper = String(item.redefines || '').toUpperCase();
   const targetInfo = registry.get(targetUpper);
   const lines = [];
 
   if (!targetInfo) {
+    // The target has no flat-var registry entry of its own - either it
+    // genuinely doesn't exist (typo/bad COBOL), or (round-3 finding 6) it's
+    // a GROUP: a group never gets an elementary registry entry (only its own
+    // *children* do - see the walk() call site below), yet REDEFINES a
+    // group-level item is completely ordinary COBOL (e.g. reshuffling a
+    // date group's YEAR/MONTH/DAY into a differently-shaped view, or a view
+    // containing an OCCURS). The pre-fix behavior left every one of this
+    // redefining item's own children entirely undeclared - a hard compile
+    // error the moment the generated program referenced any of them, not
+    // merely a missing-alias comment. REDEFINES requires the target to be
+    // the immediately-preceding same-level item in this same list (COBOL
+    // rule), so it's always findable in `siblingList`.
+    const targetItem = (siblingList || []).find(i => !isLevel(i, 88) && (i.name || '').toUpperCase() === targetUpper);
+    const targetRealChildren = targetItem ? (targetItem.children || []).filter(c => !isLevel(c, 88)) : [];
+    if (targetItem && targetRealChildren.length > 0) {
+      return groupOverGroupRedefinesLines(item, targetItem, registry);
+    }
     lines.push(`  // REDEFINES ${item.redefines}: target not found - ${item.name} not accessible`);
     return lines;
   }
@@ -693,6 +723,173 @@ function redefinesAccessorLines(item, registry) {
     });
   }
 
+  return lines;
+}
+
+/**
+ * Recursively flatten a REDEFINES target GROUP's own real (non-88, named)
+ * children into a flat, ordered list of leaf descriptors suitable for
+ * building a synthetic "flat character view" over them (see
+ * groupOverGroupRedefinesLines) - or `null` when this concatenation model
+ * can't represent the shape at all: a FILLER (an inert byte-width gap this
+ * generator's flat-var model has no value for at all - unlike an ordinary
+ * elementary item, nothing here tracks what bytes it actually holds), a
+ * nested OCCURS-bearing group child, a numeric child with a SIGN (real
+ * signed DISPLAY storage overpunches the sign into the last digit's zone
+ * nibble - modeling that correctly here would need byte-level codecs, not
+ * plain digit-text concatenation), an OCCURS-bearing *numeric* child (this
+ * model only tiles character/String elements), or any child whose Scala
+ * type isn't one of Int/String (Float/Double/Long from COMP-1/COMP-2/
+ * 9-18-digit fields - out of scope, same as the numeric-sibling REDEFINES
+ * branch above).
+ */
+function flattenRedefinesLeaves(groupItem) {
+  const leaves = [];
+  function walk(children) {
+    for (const child of children) {
+      if (isLevel(child, 88)) continue;
+      if (child.isFiller || !child.name) return false;
+      const real = (child.children || []).filter(c => !isLevel(c, 88));
+      if (real.length > 0) {
+        if (hasOccurs(child)) return false;
+        if (!walk(real)) return false;
+        continue;
+      }
+      const baseType = scalaBaseType(child);
+      if (baseType !== 'Int' && baseType !== 'String') return false;
+      const pic = child.pic && typeof child.pic === 'object' ? child.pic : null;
+      if (!pic || !pic.length) return false;
+      if (baseType === 'Int' && pic.signed) return false;
+      const count = hasOccurs(child) && occursCount(child) > 1 ? occursCount(child) : 1;
+      if (count > 1 && baseType !== 'String') return false;
+      leaves.push({
+        camel: toCamelCase(child.name),
+        baseType,
+        count,
+        elementWidth: pic.length,
+        totalWidth: pic.length * count,
+        intDigits: pic.integerDigits || pic.length,
+      });
+    }
+    return true;
+  }
+  const ok = walk((groupItem.children || []).filter(c => !isLevel(c, 88)));
+  return ok ? leaves : null;
+}
+
+/**
+ * Declare every one of a REDEFINES entry's own children as a compiling but
+ * honestly-unimplemented `def`/`def_=` pair - used only when
+ * flattenRedefinesLeaves reports the target group's shape isn't one this
+ * generator's character-concatenation view can represent (see its doc
+ * comment). The getter throws `NotImplementedError` only if actually
+ * *read* at runtime (never at declaration time - a `def`, not a `var` with
+ * an eagerly-evaluated `???` initializer, which would crash every program
+ * containing this fallback regardless of whether the field is ever
+ * touched); the setter silently discards a write rather than also risking a
+ * crash on the (very plausible) MOVE-before-first-read pattern. This is
+ * strictly better than the pre-fix behavior (no declaration at all - a hard
+ * compile error the instant the field was referenced anywhere).
+ */
+function todoStubRedefinesLines(redefiningItem, registry) {
+  const lines = [];
+  function walk(children) {
+    for (const child of children) {
+      if (isLevel(child, 88) || child.isFiller || !child.name) continue;
+      const real = (child.children || []).filter(c => !isLevel(c, 88));
+      if (real.length > 0) {
+        walk(real);
+        continue;
+      }
+      const camel = toCamelCase(child.name);
+      const baseType = scalaBaseType(child);
+      lines.push(
+        `  // REDEFINES ${redefiningItem.redefines}: ??? TODO - this group-over-group REDEFINES shape ` +
+        `(FILLER gap / nested OCCURS / signed numeric / unsupported type) is not supported; ${child.name} ` +
+        `is declared but not aliased to real storage`
+      );
+      lines.push(`  def ${camel}: ${baseType} = ??? // TODO REDEFINES ${redefiningItem.redefines}: unsupported group shape`);
+      lines.push(`  def ${camel}_=(v: ${baseType}): Unit = () // TODO REDEFINES ${redefiningItem.redefines}: write discarded (unsupported group shape)`);
+      registry.set((child.name || '').toUpperCase(), {
+        camel,
+        scalaType: baseType,
+        dataType: baseType === 'String' ? 'alphanumeric' : 'numeric',
+        integerDigits: (child.pic && child.pic.integerDigits) || 0,
+        decimalDigits: (child.pic && child.pic.decimalDigits) || 0,
+        signed: !!(child.pic && child.pic.signed),
+        editPattern: null,
+        occursDepth: 0,
+        picLength: (child.pic && child.pic.length) || 0,
+        justified: false,
+        blankWhenZero: false,
+      });
+    }
+  }
+  walk((redefiningItem.children || []).filter(c => !isLevel(c, 88)));
+  return lines;
+}
+
+/**
+ * Group-over-group REDEFINES (round-3 finding 6): `item.redefines` names
+ * another GROUP (not a plain elementary item - the case redefinesAccessorLines
+ * otherwise handles), which has no single flat Scala var of its own to alias
+ * onto. Synthesizes one: a `<item>BaseFlat` getter/setter pair that
+ * concatenates/redistributes the *target* group's own already-registered
+ * children's display text (numeric children zero-padded to their own digit
+ * width via CobolFmt.digitsOf, alphanumeric children fitted to their own
+ * width via CobolFmt.fitLeft - the exact same convention MOVE numeric-to-
+ * alphanumeric already uses), then reuses characterSlicedGroupRedefinesLines
+ * completely unchanged for the redefining item's own children, exactly as if
+ * `<item>BaseFlat` were a real flat String var - Scala's setter-call sugar
+ * (`foo = x` desugars to `foo_=(x)` whenever both a `def foo` and a
+ * `def foo_=` are in scope) makes a getter/setter pair usable as a plain
+ * variable reference to that helper's generated code without any changes to
+ * it at all.
+ */
+function groupOverGroupRedefinesLines(item, targetItem, registry) {
+  const redefiningRealChildren = (item.children || []).filter(c => !isLevel(c, 88));
+  const leaves = flattenRedefinesLeaves(targetItem);
+
+  if (!leaves) {
+    return todoStubRedefinesLines(item, registry);
+  }
+
+  const flatName = `${toCamelCase(item.name)}BaseFlat`;
+
+  const getterParts = leaves.map(l => (l.baseType === 'String'
+    ? (l.count > 1
+      ? `${l.camel}.map(s => CobolFmt.fitLeft(s, ${l.elementWidth})).mkString`
+      : `CobolFmt.fitLeft(${l.camel}, ${l.elementWidth})`)
+    : `CobolFmt.digitsOf(BigDecimal(${l.camel}), ${l.intDigits}, 0)`));
+
+  const setterLines = [];
+  let offset = 0;
+  for (const l of leaves) {
+    const start = offset;
+    const end = offset + l.totalWidth;
+    offset = end;
+    if (l.baseType === 'String' && l.count > 1) {
+      setterLines.push(
+        `    ${l.camel} = (0 until ${l.count}).map(i => v.substring(${start} + i * ${l.elementWidth}, ${start} + (i + 1) * ${l.elementWidth})).toVector`
+      );
+    } else if (l.baseType === 'String') {
+      setterLines.push(`    ${l.camel} = CobolFmt.fitLeft(v.substring(${start}, ${end}), ${l.elementWidth})`);
+    } else {
+      setterLines.push(`    ${l.camel} = v.substring(${start}, ${end}).toInt`);
+    }
+  }
+
+  const lines = [
+    `  // REDEFINES ${item.redefines}: ${item.redefines} is a GROUP, not an elementary item - ${flatName}`,
+    `  // is a synthetic flat-character view over its own children's storage (concatenated in`,
+    `  // declaration order), so ${item.name}'s children below can character-slice it exactly`,
+    `  // like a REDEFINES over a real PIC X target.`,
+    `  def ${flatName}: String = ${getterParts.join(' + ')}`,
+    `  def ${flatName}_=(v: String): Unit =`,
+    ...setterLines,
+  ];
+
+  lines.push(...characterSlicedGroupRedefinesLines(redefiningRealChildren, flatName, registry));
   return lines;
 }
 
@@ -845,7 +1042,7 @@ function buildFieldRegistry(ast) {
       }
 
       if (item.redefines) {
-        const accessorLines = redefinesAccessorLines(item, registry);
+        const accessorLines = redefinesAccessorLines(item, registry, list);
         if (accessorLines.length) lines.push(...accessorLines);
         continue;
       }

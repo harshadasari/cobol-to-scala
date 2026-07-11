@@ -1,0 +1,20 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. N06BREDOC.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-CODES.
+           05 WS-CODE PIC X(2) OCCURS 3 TIMES.
+       01 WS-CODES-ALT REDEFINES WS-CODES.
+           05 WS-PART1 PIC X(4).
+           05 WS-PART2 PIC X(2).
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           MOVE "AA" TO WS-CODE(1)
+           MOVE "BB" TO WS-CODE(2)
+           MOVE "CC" TO WS-CODE(3)
+           DISPLAY "PART1=" WS-PART1
+           DISPLAY "PART2=" WS-PART2
+           MOVE "ZZZZ" TO WS-PART1
+           DISPLAY "CODE1=" WS-CODE(1) " CODE2=" WS-CODE(2)
+           DISPLAY "CODE3=" WS-CODE(3)
+           STOP RUN.

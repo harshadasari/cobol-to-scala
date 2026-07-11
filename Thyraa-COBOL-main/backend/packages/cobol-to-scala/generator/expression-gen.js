@@ -358,6 +358,21 @@ function renderAssignment(targetRef, valueExpr) {
     return `${toCamelCase(targetRef)} = ${valueExpr}`;
   }
 
+  if (targetRef.refMod) {
+    // Reference modification write (`MOVE ... TO WS-FIELD(start:length)`) -
+    // round-3 finding 3, a documented gap: this generator has no byte-level
+    // substring-patch model for a WORKING-STORAGE flat var, so rather than
+    // (the pre-fix behavior) silently mis-dispatching into the ordinary
+    // subscript codegen path above and emitting invalid Scala (a stray
+    // dangling `:length)` the parser previously failed to consume at all -
+    // see parser/procedure-parser.js's parseVariableReference), this
+    // degrades to a visible, compiling `???` marker: it throws only if this
+    // exact assignment is ever actually reached at runtime, never at
+    // declaration/compile time, and is grep-able as an honest, undone gap
+    // rather than a silent wrong write.
+    return `${targetCamelFor(targetRef)} = ??? // ??? TODO: reference modification (write) not implemented - see tests/oracle/README.md known gaps`;
+  }
+
   const camel = targetCamelFor(targetRef);
   const subscripts = Array.isArray(targetRef.subscripts) ? targetRef.subscripts : [];
   if (subscripts.length === 0) {
@@ -389,6 +404,16 @@ function convertIdentifier(cobolId) {
   // Handle VariableReference objects
   if (cobolId.type === 'VariableReference' || cobolId.name) {
     const name = cobolId.name || '';
+
+    if (cobolId.refMod) {
+      // Reference modification read (`WS-FIELD(start:length)`) - round-3
+      // finding 3, a documented gap (see renderAssignment's mirror-image
+      // comment for the write side): degrades to a visible, compiling `???`
+      // marker rather than silently ignoring the (start:length) and reading
+      // the whole field instead.
+      return `??? /* TODO: reference modification (read) not implemented - ${toCamelCase(name)}(...) - see tests/oracle/README.md known gaps */`;
+    }
+
     const subscripts = Array.isArray(cobolId.subscripts) ? cobolId.subscripts : [];
     if (subscripts.length > 0) {
       const idxChain = subscripts.map(s => `(${subscriptIndexExpr(s)})`).join('');
@@ -593,6 +618,20 @@ export function generateCobolFmtHelper() {
     '  // matches BigDecimal\'s `%` remainder, which truncates toward zero).',
     '  def truncNumeric(v: BigDecimal, intDigits: Int, decDigits: Int): BigDecimal =',
     '    val scaled = v.setScale(decDigits, BigDecimal.RoundingMode.DOWN)',
+    '    val whole = scaled.setScale(0, BigDecimal.RoundingMode.DOWN)',
+    '    val frac = scaled - whole',
+    '    val mod = BigDecimal(10).pow(math.max(intDigits, 0))',
+    '    (whole % mod) + frac',
+    '',
+    '  // Arithmetic-assignment store-time semantics for a ROUNDED target',
+    '  // (COMPUTE/ADD/SUBTRACT/MULTIPLY/DIVIDE ... ROUNDED): HALF_UP rounding',
+    '  // to the target\'s declared decimal digits (COBOL\'s ROUNDED clause),',
+    '  // then the same high-order integer-digit truncation truncNumeric applies',
+    '  // (a ROUNDED result can still overflow the target\'s integer capacity,',
+    '  // and COBOL truncates the high-order digits exactly the same way with',
+    '  // or without ROUNDED).',
+    '  def roundNumeric(v: BigDecimal, intDigits: Int, decDigits: Int): BigDecimal =',
+    '    val scaled = v.setScale(decDigits, BigDecimal.RoundingMode.HALF_UP)',
     '    val whole = scaled.setScale(0, BigDecimal.RoundingMode.DOWN)',
     '    val frac = scaled - whole',
     '    val mod = BigDecimal(10).pow(math.max(intDigits, 0))',
@@ -1149,6 +1188,44 @@ function generateFunctionCall(fc) {
  * means the top-level operator strings (`+`/`-`/`*`) are combined directly
  * without ever re-wrapping an already-BigDecimal sub-expression.
  */
+/**
+ * BigDecimal-guaranteed rendering of a FUNCTION call used as an operand
+ * inside toBigDecimalOperand - NOT a blind `BigDecimal(generateFunctionCall(fc))`
+ * wrap, because that double-wraps (and fails to compile - `BigDecimal.apply`
+ * has no overload accepting a `scala.math.BigDecimal`) whenever
+ * generateFunctionCall's own rendering is *already* BigDecimal-typed:
+ *   - NUMVAL/NUMVAL-C: CobolFmt.numval always returns BigDecimal - never wrap.
+ *   - MAX/MIN: List(...).max/.min's result type follows its *operands'*
+ *     natural Scala type (see generateFunctionCall's MAX/MIN cases - not
+ *     forced to BigDecimal there, so an Int-typed COMPUTE/MOVE target isn't
+ *     broken by an unwanted coercion elsewhere). Here, a guaranteed-BigDecimal
+ *     result is exactly what's needed, so each argument is coerced through
+ *     toBigDecimalOperand *before* building the List - same numeric value,
+ *     now guaranteed BigDecimal, with no separate wrap needed afterward
+ *     (mirrors toBigDecimalOperand's own operator-recursion approach above:
+ *     coerce the leaves, never the already-composed expression text).
+ *   - everything else (MOD, ABS, SQRT, INTEGER, ...): generateFunctionCall
+ *     renders these as plain Int/Long/Double Scala expressions, so they still
+ *     need the same wrap-if-not-already-BigDecimal fallback as any other
+ *     shape this function doesn't specifically recognize.
+ */
+function functionCallToBigDecimalOperand(fc) {
+  const name = String(fc?.name || '').toUpperCase();
+
+  if (name === 'NUMVAL' || name === 'NUMVAL-C') {
+    return generateFunctionCall(fc);
+  }
+
+  if (name === 'MAX' || name === 'MIN') {
+    const args = fc?.arguments || [];
+    const method = name === 'MAX' ? 'max' : 'min';
+    return `List(${args.map(toBigDecimalOperand).join(', ')}).${method}`;
+  }
+
+  const rendered = generateFunctionCall(fc);
+  return /^BigDecimal\(/.test(rendered) ? rendered : `BigDecimal(${rendered})`;
+}
+
 function toBigDecimalOperand(node) {
   if (node === null || node === undefined) return 'BigDecimal(0)';
 
@@ -1170,7 +1247,7 @@ function toBigDecimalOperand(node) {
 
   if (node.type === 'ArithmeticExpression') {
     if (node.unaryMinus) return `(-${toBigDecimalOperand(node.right)})`;
-    if (node.functionCall) return `BigDecimal(${generateFunctionCall(node.functionCall)})`;
+    if (node.functionCall) return functionCallToBigDecimalOperand(node.functionCall);
     if (node.operator && node.left != null && node.right != null) {
       const left = toBigDecimalOperand(node.left);
       const right = toBigDecimalOperand(node.right);
@@ -1190,6 +1267,55 @@ function toBigDecimalOperand(node) {
   // shape produced by this parser's own AST.
   const rendered = convertArithmeticExpression(node);
   return /^BigDecimal\(/.test(rendered) ? rendered : `BigDecimal(${rendered})`;
+}
+
+/**
+ * Store-time coercion for an arithmetic-assignment target (COMPUTE/ADD/
+ * SUBTRACT/MULTIPLY/DIVIDE - round-3 findings 8/9/10/13): `bdExpr` must
+ * already be a `scala.math.BigDecimal`-valued Scala expression (see
+ * toBigDecimalOperand) representing the *exact* mathematical result: this
+ * applies COBOL's real store-time semantics on top of it rather than
+ * assigning that exact result directly (the pre-fix behavior for every
+ * arithmetic statement - `ROUNDED` was rendered as a no-op trailing
+ * comment, and its absence never truncated to the target's declared decimal
+ * digits either) -
+ *   - ROUNDED: HALF_UP rounding to the target's declared decimal digits.
+ *   - no ROUNDED: truncation (toward zero) to the same decimal digits - COBOL
+ *     never keeps more fractional precision than the receiving field
+ *     declares, with or without ROUNDED.
+ *   - either way: any surplus high-order integer digit is then dropped, the
+ *     same high-order truncation MOVE already applies (CobolFmt.truncNumeric/
+ *     roundNumeric both do this in one step).
+ * `rawExpr` (the exact Scala expression this statement would have generated
+ * before this fix - built via convertIdentifier/convertArithmeticExpression
+ * over the target's *natural* declared Scala type, no BigDecimal coercion)
+ * is the fallback used whenever the target isn't a plain registered
+ * Int/Long/BigDecimal field (e.g. an unregistered/ambiguous name) - safer
+ * than assigning a bare BigDecimal expression to a target whose actual
+ * declared Scala type this function couldn't confirm, which would risk a
+ * new compile error instead of preserving the previous (untruncated, but at
+ * least type-correct) behavior for that edge case.
+ */
+function storeNumericByInfo(info, bdExpr, rawExpr, rounded) {
+  if (!info || !['Int', 'Long', 'BigDecimal'].includes(info.scalaType)) {
+    return rawExpr;
+  }
+  const intDigits = info.integerDigits > 0 ? info.integerDigits : 18;
+  const decDigits = info.decimalDigits || 0;
+  const fn = rounded ? 'roundNumeric' : 'truncNumeric';
+  const stored = `CobolFmt.${fn}(${bdExpr}, ${intDigits}, ${decDigits})`;
+  if (info.scalaType === 'BigDecimal') return stored;
+  if (info.scalaType === 'Long') return `(${stored}).toLong`;
+  return `(${stored}).toInt`;
+}
+
+function storeNumericExpr(targetRef, bdExpr, rawExpr, rounded) {
+  return storeNumericByInfo(lookupFieldForRef(targetRef), bdExpr, rawExpr, rounded);
+}
+
+/** BigDecimal-valued Scala expression for an already-resolved field (camel identifier + registry info), mirroring toBigDecimalOperand's VariableReference leaf case but for CORRESPONDING pairs, which carry pre-resolved camel/info rather than an AST node. */
+function fieldRefToBigDecimalExpr(camel, info) {
+  return info?.scalaType === 'BigDecimal' ? camel : `BigDecimal(${camel})`;
 }
 
 /**
@@ -1259,7 +1385,6 @@ function hasSizeErrorClause(statement) {
  */
 export function generateCompute(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
-  const expression = convertArithmeticExpression(statement.expression);
 
   // COMPUTE supports multiple targets: COMPUTE A B = expression
   const targets = Array.isArray(statement.targets) && statement.targets.length > 0
@@ -1267,19 +1392,32 @@ export function generateCompute(statement, indent = 0) {
     : [statement.target].filter(Boolean);
 
   if (targets.length === 0) {
-    return `${indentStr}// COMPUTE with no resolvable target: ${expression}`;
+    return `${indentStr}// COMPUTE with no resolvable target: ${convertArithmeticExpression(statement.expression)}`;
   }
 
+  // Every target shares the same computed result, but each is stored with
+  // its *own* ROUNDED-or-truncated coercion to its own declared digit
+  // widths (round-3 findings 8/13 - `expression` used to be assigned raw,
+  // with ROUNDED rendered as a no-op trailing comment) - see
+  // storeNumericExpr. The exact (unrounded, untruncated) BigDecimal result
+  // (resultBD) is reused both for that per-target coercion and for the ON
+  // SIZE ERROR digit-capacity test below.
+  const resultBD = toBigDecimalOperand(statement.expression);
+  const rawExpr = convertArithmeticExpression(statement.expression);
+  const rounded = !!statement.rounded;
+  const keyword = statement.isNew ? 'val ' : '';
+  const entries = targets.map(target => ({
+    target,
+    resultBD,
+    finalExpr: storeNumericExpr(target, resultBD, rawExpr, rounded),
+  }));
+
   if (!hasSizeErrorClause(statement)) {
-    const keyword = statement.isNew ? 'val ' : '';
-    const rounded = statement.rounded ? ' // ROUNDED' : '';
-    return targets
-      .map(target => `${indentStr}${keyword}${renderAssignment(target, expression)}${rounded}`)
+    return entries
+      .map(e => `${indentStr}${keyword}${renderAssignment(e.target, e.finalExpr)}`)
       .join('\n');
   }
 
-  const resultBD = toBigDecimalOperand(statement.expression);
-  const entries = targets.map(target => ({ target, resultBD, finalExpr: expression }));
   return generateArithmeticSizeErrorCheck(indent, statement, entries);
 }
 
@@ -1302,6 +1440,22 @@ function zeroLiteralFor(info) {
 function repeatedCharLiteralFor(ch, info) {
   const width = info && info.scalaType === 'String' ? Math.max(info.picLength || 0, 1) : 1;
   return `"${escapeScalaStringLiteral(ch.repeat(width))}"`;
+}
+
+/**
+ * Fill `width` characters by repeating `text` (COBOL's `MOVE ALL 'literal'
+ * TO target` - round-3 finding 11): the literal tiles across the entire
+ * receiving field, truncating the final repetition if it doesn't divide
+ * evenly, rather than being padded with trailing spaces the way a plain
+ * (non-ALL) MOVE of the same literal would be - see fitAlphanumericText,
+ * which this deliberately does not reuse for the ALL case.
+ */
+function repeatToWidthText(text, width) {
+  const s = String(text ?? '');
+  if (!width || width <= 0) return s;
+  if (s.length === 0) return ' '.repeat(width);
+  if (s.length >= width) return s.slice(0, width);
+  return s.repeat(Math.ceil(width / s.length)).slice(0, width);
 }
 
 /**
@@ -1419,7 +1573,14 @@ function renderLiteralForTarget(lit, info) {
       return `"${escapeScalaStringLiteral(formatEditedPicture(info.editPattern, text, info.blankWhenZero))}"`;
     }
     if (info?.scalaType === 'String' && info.dataType !== 'edited') {
-      return `"${escapeScalaStringLiteral(fitAlphanumericText(text, info.picLength, info.justified))}"`;
+      // MOVE ALL 'literal' (round-3 finding 11): the literal tiles across
+      // the whole receiving field width instead of being space-padded once
+      // - a plain (non-ALL) MOVE keeps fitAlphanumericText's pad-once
+      // behavior.
+      const filled = lit.all
+        ? repeatToWidthText(text, info.picLength)
+        : fitAlphanumericText(text, info.picLength, info.justified);
+      return `"${escapeScalaStringLiteral(filled)}"`;
     }
     return `"${escapeScalaStringLiteral(text)}"`;
   }
@@ -1433,9 +1594,12 @@ function renderLiteralForTarget(lit, info) {
     // Numeric literal -> alphanumeric target: COBOL stores the literal's own
     // digit text (unsigned - a numeric-to-alphanumeric MOVE never carries a
     // sign character), fitted to the target's declared width exactly like an
-    // alphanumeric source.
+    // alphanumeric source (or tiled across it for MOVE ALL - see above).
     const unsigned = raw.replace(/^[+-]/, '');
-    return `"${escapeScalaStringLiteral(fitAlphanumericText(unsigned, info.picLength, info.justified))}"`;
+    const filled = lit.all
+      ? repeatToWidthText(unsigned, info.picLength)
+      : fitAlphanumericText(unsigned, info.picLength, info.justified);
+    return `"${escapeScalaStringLiteral(filled)}"`;
   }
   if (info?.scalaType === 'BigDecimal') {
     return `BigDecimal("${truncateNumericLiteralTextForMove(raw, info)}")`;
@@ -1918,9 +2082,240 @@ function generateAddCorresponding(statement, indent = 0) {
     return `${indentStr}() // ADD CORRESPONDING ${sourceUpper} TO ${targetUpper}: no matching child field names found in the group registry`;
   }
 
+  // Each matched pair is stored through the same ROUNDED-or-truncated
+  // store-time coercion every other arithmetic statement now uses (round-3
+  // findings 8/13) - ADD CORRESPONDING has no ROUNDED clause support in this
+  // parser (see parseAddStatement's CORRESPONDING branch), so this always
+  // truncates rather than rounds, same as any other unrounded arithmetic
+  // target.
   return pairs
-    .map(pair => `${indentStr}${pair.targetCamel} = ${pair.targetCamel} + (${coerceCorrespondingValue(pair)})`)
+    .map(pair => {
+      const sumBD = `(${fieldRefToBigDecimalExpr(pair.targetCamel, pair.targetInfo)} + ${fieldRefToBigDecimalExpr(pair.sourceCamel, pair.sourceInfo)})`;
+      const rawExpr = `${pair.targetCamel} + (${coerceCorrespondingValue(pair)})`;
+      return `${indentStr}${pair.targetCamel} = ${storeNumericByInfo(pair.targetInfo, sumBD, rawExpr, false)}`;
+    })
     .join('\n');
+}
+
+/**
+ * Generate SUBTRACT CORRESPONDING statement (round-3 finding 10 - previously
+ * unimplemented: `generateSubtract` never checked `statement.corresponding`
+ * at all, so `SUBTRACT CORRESPONDING group-1 FROM group-2` fell through to
+ * the plain-operand path, which tried to treat a *group* reference as a
+ * single elementary operand). Mirrors generateAddCorresponding exactly,
+ * subtracting instead of adding: `SUBTRACT CORRESPONDING group-1 FROM
+ * group-2` subtracts every matching (by name, recursing into a nested
+ * same-named group on both sides - correspondingPairs) elementary child of
+ * group-1 from group-2's own value; group-1 is left unchanged and any field
+ * without a same-named counterpart on either side is left untouched.
+ */
+function generateSubtractCorresponding(statement, indent = 0) {
+  const indentStr = '  '.repeat(indent);
+  const sourceRef = (Array.isArray(statement.subtrahends) && statement.subtrahends[0]) || statement.source;
+  const targetRef = (Array.isArray(statement.from) && statement.from[0]) || statement.target;
+  const sourceUpper = String(sourceRef?.name || sourceRef || '').toUpperCase();
+  const targetUpper = String(targetRef?.name || targetRef || '').toUpperCase();
+  const pairs = correspondingPairs(resolveGroupKey(sourceUpper), resolveGroupKey(targetUpper));
+
+  if (pairs.length === 0) {
+    return `${indentStr}() // SUBTRACT CORRESPONDING ${sourceUpper} FROM ${targetUpper}: no matching child field names found in the group registry`;
+  }
+
+  return pairs
+    .map(pair => {
+      const diffBD = `(${fieldRefToBigDecimalExpr(pair.targetCamel, pair.targetInfo)} - ${fieldRefToBigDecimalExpr(pair.sourceCamel, pair.sourceInfo)})`;
+      const rawExpr = `${pair.targetCamel} - (${coerceCorrespondingValue(pair)})`;
+      return `${indentStr}${pair.targetCamel} = ${storeNumericByInfo(pair.targetInfo, diffBD, rawExpr, false)}`;
+    })
+    .join('\n');
+}
+
+/**
+ * FUNCTION intrinsics whose generated Scala expression is String-valued -
+ * shared by renderRelationalCondition (relational type-coercion) and
+ * stringSourceSegmentExpr (STRING numeric-segment coercion): every other
+ * intrinsic (LENGTH, MOD, MAX, MIN, NUMVAL, NUMVAL-C, ...) returns a Scala
+ * numeric value (Int/Long/BigDecimal).
+ */
+const FUNCTION_RETURNS_STRING = new Set(['UPPER-CASE', 'LOWER-CASE', 'REVERSE', 'TRIM']);
+
+/**
+ * Normalize a relational-condition subject/object node back down to the
+ * simplest shape that still identifies what it fundamentally *is* - a
+ * Literal / VariableReference / FunctionCall - so relationalOperandDescriptor
+ * doesn't need to duplicate ArithmeticExpression-unwrapping logic. Returns
+ * null for a genuine computed expression (an operator or unary minus is
+ * present) - COBOL arithmetic expressions are always numeric, so callers
+ * treat null as "numeric, unknown further detail".
+ * (parsePrimaryCondition/parseEvaluateValue wrap a bare operand in an
+ * ArithmeticExpression only when the parser had to fold in an arithmetic
+ * continuation - see their doc comments - so this mirrors exactly what
+ * convertArithmeticExpression itself already unwraps for rendering, just
+ * exposing the *identity* of the leaf instead of rendering it.)
+ */
+function unwrapSimpleConditionOperand(node) {
+  if (!node || typeof node !== 'object') return null;
+  if (node.type === 'ArithmeticExpression') {
+    if (node.operator || node.unaryMinus) return null;
+    if (node.functionCall) return unwrapSimpleConditionOperand(node.functionCall) || node.functionCall;
+    if (node.variable) return unwrapSimpleConditionOperand(node.variable) || node.variable;
+    if (node.value !== null && node.value !== undefined) {
+      return { type: 'Literal', literalType: /^-?\d+(\.\d+)?$/.test(String(node.value)) ? 'numeric' : 'string', value: node.value };
+    }
+    return null;
+  }
+  return node;
+}
+
+/**
+ * Classify one relational-condition operand for type-coercion purposes
+ * (round-3 finding 5): `scalaClass` is what convertArithmeticExpression will
+ * actually render it as at the Scala level (String vs a numeric type) -
+ * comparing mismatched scalaClasses is a hard Scala 3 compile error
+ * ("Values of types Int and String cannot be compared with == or !="),
+ * which the pre-fix generator emitted unconditionally for e.g. a numeric
+ * REDEFINES character-sliced-view field (String-typed, see
+ * scala-generator.js's redefinesAccessorLines) compared against a plain Int
+ * field. `semantic` distinguishes three COBOL comparison categories that can
+ * all render as Scala String: genuinely alphanumeric (PIC X, string
+ * literals), numeric-EDITED (PIC Z/9,999/etc.), and a *plain numeric* item
+ * that only happens to be Scala-String-typed because of this generator's
+ * REDEFINES character-slicing (`numeric-as-string`) -
+ * compiler-verified (probe1.cbl/probe2.cbl, and n05-relation-typecoercion's
+ * WS-EDITED case) that GnuCOBOL treats numeric-edited operands as
+ * ALPHANUMERIC for comparison purposes (byte comparison against the *other*
+ * side's own raw storage text, NOT a numeric extraction) - despite looking
+ * "numeric" in the source, `WS-EDITED = WS-N` compares literal characters,
+ * not values. Only the REDEFINES numeric-as-string case is genuinely
+ * numeric at the COBOL semantic level (it's an ordinary `PIC 9` child - this
+ * generator's flat-var model is just representing its shared storage as a
+ * String), so extraction-and-numeric-compare is reserved for that case
+ * alone.
+ */
+function relationalOperandDescriptor(node) {
+  const simple = unwrapSimpleConditionOperand(node);
+
+  if (simple && simple.type === 'Literal') {
+    if (simple.literalType === 'string') {
+      return { scalaClass: 'string', semantic: 'alphanumeric', literalText: String(simple.value ?? '') };
+    }
+    if (simple.literalType === 'figurative') {
+      const fig = String(simple.value || '').toUpperCase();
+      const isAlnumFig = fig === 'SPACE' || fig === 'HIGH-VALUE' || fig === 'LOW-VALUE' || fig === 'QUOTE';
+      return { scalaClass: isAlnumFig ? 'string' : 'numeric', semantic: isAlnumFig ? 'alphanumeric' : 'numeric' };
+    }
+    return { scalaClass: 'numeric', semantic: 'numeric', literalText: String(simple.value ?? '0') };
+  }
+
+  if (simple && simple.type === 'VariableReference') {
+    const info = lookupFieldForRef(simple);
+    if (info) {
+      const isString = info.scalaType === 'String';
+      const semantic = !isString ? 'numeric' : (info.dataType === 'numeric' ? 'numeric-as-string' : 'alphanumeric');
+      return { scalaClass: isString ? 'string' : 'numeric', semantic, info };
+    }
+  }
+
+  if (simple && simple.type === 'FunctionCall') {
+    const isStr = FUNCTION_RETURNS_STRING.has(String(simple.name || '').toUpperCase());
+    return { scalaClass: isStr ? 'string' : 'numeric', semantic: isStr ? 'alphanumeric' : 'numeric' };
+  }
+
+  return { scalaClass: 'numeric', semantic: 'numeric' };
+}
+
+/**
+ * Render a RelationalCondition to Scala, coercing operand types per COBOL's
+ * class-of-operand comparison rules instead of emitting a bare `left op
+ * right` regardless of type (round-3 finding 5):
+ *   - alphanumeric vs alphanumeric (incl. numeric-EDITED, which GnuCOBOL
+ *     treats as alphanumeric for comparison - see relationalOperandDescriptor's
+ *     doc comment): string comparison (`==`/`.compareTo`) - already what a
+ *     bare `left op right` produces (String has a working `<`/`>` via
+ *     Predef's Ordering), so left untouched.
+ *   - numeric vs numeric, including a *plain numeric* operand that only
+ *     happens to be String-typed (a REDEFINES character-sliced view - see
+ *     scala-generator.js): extract the String side's numeric value
+ *     (CobolFmt.numval) and compare numerically - a bare `==` between an
+ *     Int/BigDecimal and a String operand is a hard Scala 3 compile error.
+ *   - genuine numeric vs alphanumeric (incl. numeric-edited): COBOL treats
+ *     the numeric operand as if converted to alphanumeric - compiler-
+ *     verified (probe1.cbl) this means the numeric operand contributes its
+ *     own *unpadded* digit text if it's a literal, or its own
+ *     zero-padded-to-its-own-declared-width digit text if it's a field
+ *     (CobolFmt.digitsOf/numericDigitsExpr - the same convention numeric-to-
+ *     alphanumeric MOVE already uses) - critically, NOT padded to the
+ *     *other* operand's width, which was this fix's first (wrong, un-
+ *     verified) draft. Whichever of the two final byte-strings is then
+ *     shorter is space-padded on the right to the longer's length (the
+ *     ordinary alphanumeric comparison rule) - both widths are compile-time
+ *     constants, so that padding is applied directly in the generated
+ *     source rather than via a runtime helper.
+ */
+function renderRelationalCondition(condition) {
+  const rawOp = condition.relationalOperator || '=';
+  const op = rawOp === '<>' ? '!=' : (COMPARISON_OPERATORS[rawOp] || rawOp);
+  const isEq = op === '==' || op === '!=';
+  const cmp = (l, r) => (isEq ? `${l} ${op} ${r}` : `(${l}.compareTo(${r}) ${op} 0)`);
+
+  const subj = relationalOperandDescriptor(condition.subject);
+  const obj = relationalOperandDescriptor(condition.object);
+  const leftExpr = convertArithmeticExpression(condition.subject);
+  const rightExpr = convertArithmeticExpression(condition.object);
+
+  if (subj.scalaClass === obj.scalaClass) {
+    if (subj.scalaClass !== 'string') {
+      // Both numeric Scala types (Int/Long/BigDecimal freely compare with
+      // each other) - no coercion needed.
+      return `${leftExpr} ${op} ${rightExpr}`;
+    }
+    // Both Scala String - only extract-and-compare-numerically when *both*
+    // sides are semantically plain-numeric-as-string (e.g. two REDEFINES
+    // views); a numeric-as-string vs a genuinely alphanumeric/edited operand
+    // has no well-defined COBOL numeric-extraction rule (numeric-edited
+    // itself compares as alphanumeric - see the doc comment above), so it
+    // falls through to the ordinary string comparison, same as two plain
+    // alphanumeric/edited operands.
+    if (subj.semantic === 'numeric-as-string' && obj.semantic === 'numeric-as-string') {
+      return `CobolFmt.numval(${leftExpr}) ${op} CobolFmt.numval(${rightExpr})`;
+    }
+    return cmp(leftExpr, rightExpr);
+  }
+
+  // Mismatched Scala representation: one String, one numeric.
+  if (subj.semantic === 'numeric-as-string' || obj.semantic === 'numeric-as-string') {
+    const leftNum = subj.scalaClass === 'string' ? `CobolFmt.numval(${leftExpr})` : leftExpr;
+    const rightNum = obj.scalaClass === 'string' ? `CobolFmt.numval(${rightExpr})` : rightExpr;
+    return `${leftNum} ${op} ${rightNum}`;
+  }
+
+  // Genuine numeric vs alphanumeric/edited (compiler-verified rule - see
+  // above): each side's own width is a compile-time constant, so the
+  // shorter final text is space-padded to match right here.
+  const numericIsSubject = subj.scalaClass === 'numeric';
+  const numericDesc = numericIsSubject ? subj : obj;
+  const stringDesc = numericIsSubject ? obj : subj;
+  const stringExpr = numericIsSubject ? rightExpr : leftExpr;
+
+  let numericText, numericWidth;
+  if (numericDesc.info) {
+    numericText = numericDigitsExpr(numericIsSubject ? leftExpr : rightExpr, numericDesc.info);
+    numericWidth = (numericDesc.info.integerDigits || 0) + (numericDesc.info.decimalDigits || 0);
+  } else {
+    const digits = String(numericDesc.literalText ?? '0').replace(/^[+-]/, '');
+    numericText = `"${escapeScalaStringLiteral(digits)}"`;
+    numericWidth = digits.length;
+  }
+  const stringWidth = stringDesc.info?.picLength || (stringDesc.literalText ? stringDesc.literalText.length : 0);
+
+  const padLen = Math.abs(numericWidth - stringWidth);
+  const pad = padLen > 0 ? ` + "${' '.repeat(padLen)}"` : '';
+  const numericFinal = numericWidth < stringWidth ? `${numericText}${pad}` : numericText;
+  const stringFinal = stringWidth < numericWidth ? `${stringExpr}${pad}` : stringExpr;
+
+  const leftFinal = numericIsSubject ? numericFinal : stringFinal;
+  const rightFinal = numericIsSubject ? stringFinal : numericFinal;
+  return cmp(leftFinal, rightFinal);
 }
 
 /**
@@ -1940,11 +2335,12 @@ export function convertCondition(condition) {
 
   // Nodes produced by the procedure parser (parser/ast.js shapes)
   if (condition.type === 'RelationalCondition') {
-    const left = convertArithmeticExpression(condition.subject);
-    const right = convertArithmeticExpression(condition.object);
-    const rawOp = condition.relationalOperator || '=';
-    const op = rawOp === '<>' ? '!=' : (COMPARISON_OPERATORS[rawOp] || rawOp);
-    return `${left} ${op} ${right}`;
+    // `.negated` (set by parseNotCondition for `IF NOT A > B`, or directly
+    // by parseNotCondition's abbreviated-relation-continuation branch) was
+    // previously never consulted here at all - a plain NOT-prefixed
+    // relational condition silently rendered as if the NOT weren't there.
+    const rendered = renderRelationalCondition(condition);
+    return condition.negated ? `!(${rendered})` : rendered;
   }
 
   if (condition.type === 'Condition') {
@@ -2271,6 +2667,49 @@ function delimiterNeedleExpr(node) {
 }
 
 /**
+ * Scala expression for one STRING source operand's *character* contribution
+ * - always String-valued, even when the COBOL operand is numeric (round-3
+ * finding 7). STRING concatenates character data; a numeric operand
+ * contributes its digit-display text, exactly like MOVE numeric-to-
+ * alphanumeric already does (CobolFmt.digitsOf) for a registered numeric
+ * field, its own literal digit text (unpadded - it has no declared
+ * PICTURE) for a numeric literal, and `.toString` for any other computed
+ * numeric expression (arithmetic, or a numeric-returning intrinsic like
+ * FUNCTION LENGTH/MOD/MAX/MIN/NUMVAL). Before this fix, every numeric
+ * operand rendered as a bare Scala Int/Long/BigDecimal value, and the
+ * segment-copy loop below (`.indices`/`.take` on `_v`) doesn't even compile
+ * against one - this wasn't just wrong output, it was a hard compile error
+ * for any STRING statement with a numeric segment.
+ */
+function stringSegmentValueExpr(node) {
+  const rawExpr = convertArithmeticExpression(node);
+
+  if (node && node.type === 'Literal' && node.literalType === 'numeric') {
+    return `"${escapeScalaStringLiteral(String(node.value))}"`;
+  }
+
+  if (node && node.type === 'VariableReference') {
+    const info = lookupFieldForRef(node);
+    if (info && info.scalaType !== 'String') {
+      return numericDigitsExpr(rawExpr, info);
+    }
+    return rawExpr;
+  }
+
+  if (node && node.type === 'FunctionCall') {
+    const isStr = FUNCTION_RETURNS_STRING.has(String(node.name || '').toUpperCase());
+    return isStr ? rawExpr : `(${rawExpr}).toString`;
+  }
+
+  if (node && node.type === 'ArithmeticExpression' && (node.operator || node.unaryMinus)) {
+    // A genuine computed arithmetic expression - always numeric in COBOL.
+    return `(${rawExpr}).toString`;
+  }
+
+  return rawExpr;
+}
+
+/**
  * Scala expression for one STRING source's contribution, honoring its
  * DELIMITED BY clause: SIZE (or absent - COBOL defaults to SIZE) takes the
  * whole value; DELIMITED BY <value> truncates at the first occurrence of
@@ -2278,7 +2717,7 @@ function delimiterNeedleExpr(node) {
  * delimiters work the same as the single-character common case like SPACE).
  */
 function stringSourceSegmentExpr(source) {
-  const valueExpr = convertArithmeticExpression(source.value);
+  const valueExpr = stringSegmentValueExpr(source.value);
   const d = source.delimitedBy;
   if (!d || d.type === 'SIZE') return valueExpr;
   const needle = delimiterNeedleExpr(d.value);
@@ -2582,6 +3021,7 @@ function generateAdd(statement, indent = 0) {
   // Get addends (values being added)
   const addendNodes = statement.addends || statement.operands || [];
   const addends = addendNodes.map(a => convertArithmeticExpression(a));
+  const rounded = !!statement.rounded;
 
   // TO/GIVING targets (raw refs - kept unstringified so renderAssignment can
   // see their subscripts; convertIdentifier is used separately for reading
@@ -2592,37 +3032,44 @@ function generateAdd(statement, indent = 0) {
 
   const lines = [];
 
+  // Every target below is stored through storeNumericExpr - ROUNDED applied
+  // (or, absent ROUNDED, truncated) to *its own* declared digit widths at
+  // store time, and any surplus high-order integer digit dropped the same
+  // way MOVE already does (round-3 findings 8/9/13: ROUNDED used to be a
+  // no-op trailing comment, and every target - GIVING's multiple targets
+  // very much included - was assigned the exact raw sum with no truncation
+  // at all, regardless of its own declared decimal digits).
   if (givingTargets.length > 0) {
     // ADD ... GIVING - result goes to giving targets
     const toExprs = toTargets.map(t => convertIdentifier(t));
     const sum = [...addends, ...toExprs].join(' + ');
+    const sumBD = `(${[...addendNodes, ...toTargets].map(toBigDecimalOperand).join(' + ')})`;
+    const entries = givingTargets.map(target => ({
+      target,
+      resultBD: sumBD,
+      finalExpr: storeNumericExpr(target, sumBD, sum, rounded),
+    }));
     if (!withSizeError) {
-      for (const target of givingTargets) {
-        lines.push(`${indentStr}${renderAssignment(target, sum)}`);
-      }
+      lines.push(...entries.map(e => `${indentStr}${renderAssignment(e.target, e.finalExpr)}`));
     } else {
-      const sumBD = `(${[...addendNodes, ...toTargets].map(toBigDecimalOperand).join(' + ')})`;
-      const entries = givingTargets.map(target => ({ target, resultBD: sumBD, finalExpr: sum }));
       lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
   } else if (toTargets.length > 0 && addends.length > 0) {
     // ADD ... TO - adds to each TO target
     const addendSum = addends.join(' + ');
+    const addendSumBD = `(${addendNodes.map(toBigDecimalOperand).join(' + ')})`;
+    const entries = toTargets.map(target => {
+      const current = convertIdentifier(target);
+      const sumBD = `(${toBigDecimalOperand(target)} + ${addendSumBD})`;
+      return {
+        target,
+        resultBD: sumBD,
+        finalExpr: storeNumericExpr(target, sumBD, `${current} + ${addendSum}`, rounded),
+      };
+    });
     if (!withSizeError) {
-      for (const target of toTargets) {
-        const current = convertIdentifier(target);
-        lines.push(`${indentStr}${renderAssignment(target, `${current} + ${addendSum}`)}`);
-      }
+      lines.push(...entries.map(e => `${indentStr}${renderAssignment(e.target, e.finalExpr)}`));
     } else {
-      const addendSumBD = `(${addendNodes.map(toBigDecimalOperand).join(' + ')})`;
-      const entries = toTargets.map(target => {
-        const current = convertIdentifier(target);
-        return {
-          target,
-          resultBD: `(${toBigDecimalOperand(target)} + ${addendSumBD})`,
-          finalExpr: `${current} + ${addendSum}`,
-        };
-      });
       lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
   } else {
@@ -2630,7 +3077,8 @@ function generateAdd(statement, indent = 0) {
     const target = statement.target;
     const current = convertIdentifier(target);
     if (current && addends.length > 0) {
-      lines.push(`${indentStr}${renderAssignment(target, `${current} + ${addends.join(' + ')}`)}`);
+      const sumBD = `(${toBigDecimalOperand(target)} + ${addendNodes.map(toBigDecimalOperand).join(' + ')})`;
+      lines.push(`${indentStr}${renderAssignment(target, storeNumericExpr(target, sumBD, `${current} + ${addends.join(' + ')}`, rounded))}`);
     }
   }
 
@@ -2645,9 +3093,14 @@ function generateAdd(statement, indent = 0) {
 function generateSubtract(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
 
+  if (statement.corresponding) {
+    return generateSubtractCorresponding(statement, indent);
+  }
+
   // Get subtrahends (values being subtracted)
   const subtrahendNodes = statement.subtrahends || statement.operands || [];
   const subtrahends = subtrahendNodes.map(s => convertArithmeticExpression(s));
+  const rounded = !!statement.rounded;
 
   const fromTargets = statement.from || [];
   const givingTargets = statement.giving || [];
@@ -2655,40 +3108,43 @@ function generateSubtract(statement, indent = 0) {
 
   const lines = [];
 
+  // See generateAdd's doc comment - the same store-time ROUNDED/truncation
+  // coercion (round-3 findings 8/9/13) applies here, per target.
   if (givingTargets.length > 0) {
     // SUBTRACT ... GIVING
     const fromExprs = fromTargets.map(f => convertIdentifier(f));
     const fromExpr = fromExprs.join(' + ');
     const subExpr = subtrahends.join(' + ');
-    const finalExpr = `${fromExpr} - (${subExpr})`;
+    const rawExpr = `${fromExpr} - (${subExpr})`;
+    const fromBD = `(${fromTargets.map(toBigDecimalOperand).join(' + ')})`;
+    const subBD = `(${subtrahendNodes.map(toBigDecimalOperand).join(' + ')})`;
+    const resultBD = `(${fromBD} - ${subBD})`;
+    const entries = givingTargets.map(target => ({
+      target,
+      resultBD,
+      finalExpr: storeNumericExpr(target, resultBD, rawExpr, rounded),
+    }));
     if (!withSizeError) {
-      for (const target of givingTargets) {
-        lines.push(`${indentStr}${renderAssignment(target, finalExpr)}`);
-      }
+      lines.push(...entries.map(e => `${indentStr}${renderAssignment(e.target, e.finalExpr)}`));
     } else {
-      const fromBD = `(${fromTargets.map(toBigDecimalOperand).join(' + ')})`;
-      const subBD = `(${subtrahendNodes.map(toBigDecimalOperand).join(' + ')})`;
-      const entries = givingTargets.map(target => ({ target, resultBD: `(${fromBD} - ${subBD})`, finalExpr }));
       lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
   } else if (fromTargets.length > 0) {
     // SUBTRACT ... FROM - subtracts from each FROM target
     const subExpr = subtrahends.join(' + ');
+    const subBD = `(${subtrahendNodes.map(toBigDecimalOperand).join(' + ')})`;
+    const entries = fromTargets.map(target => {
+      const current = convertIdentifier(target);
+      const resultBD = `(${toBigDecimalOperand(target)} - ${subBD})`;
+      return {
+        target,
+        resultBD,
+        finalExpr: storeNumericExpr(target, resultBD, `${current} - (${subExpr})`, rounded),
+      };
+    });
     if (!withSizeError) {
-      for (const target of fromTargets) {
-        const current = convertIdentifier(target);
-        lines.push(`${indentStr}${renderAssignment(target, `${current} - (${subExpr})`)}`);
-      }
+      lines.push(...entries.map(e => `${indentStr}${renderAssignment(e.target, e.finalExpr)}`));
     } else {
-      const subBD = `(${subtrahendNodes.map(toBigDecimalOperand).join(' + ')})`;
-      const entries = fromTargets.map(target => {
-        const current = convertIdentifier(target);
-        return {
-          target,
-          resultBD: `(${toBigDecimalOperand(target)} - ${subBD})`,
-          finalExpr: `${current} - (${subExpr})`,
-        };
-      });
       lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
   }
@@ -2708,44 +3164,47 @@ function generateMultiply(statement, indent = 0) {
   // Get multiplicand (the first operand)
   const multiplicandNode = statement.multiplicand || statement.left;
   const multiplicand = convertArithmeticExpression(multiplicandNode);
+  const rounded = !!statement.rounded;
 
   // Get by operands (what we multiply by)
   const byOperands = statement.by || [];
   const withSizeError = hasSizeErrorClause(statement);
   const lines = [];
 
+  // See generateAdd's doc comment - the same store-time ROUNDED/truncation
+  // coercion (round-3 findings 8/9/13) applies here, per target.
   if (statement.giving && statement.giving.length > 0) {
     // MULTIPLY A BY B GIVING C - result goes to C
     const byNode = byOperands.length > 0 ? byOperands[0] : statement.right;
     const byExpr = convertArithmeticExpression(byNode);
-    const finalExpr = `${multiplicand} * ${byExpr}`;
+    const rawExpr = `${multiplicand} * ${byExpr}`;
+    const resultBD = `(${toBigDecimalOperand(multiplicandNode)} * ${toBigDecimalOperand(byNode)})`;
+    const entries = statement.giving.map(target => ({
+      target,
+      resultBD,
+      finalExpr: storeNumericExpr(target, resultBD, rawExpr, rounded),
+    }));
 
     if (!withSizeError) {
-      for (const target of statement.giving) {
-        lines.push(`${indentStr}${renderAssignment(target, finalExpr)}`);
-      }
+      lines.push(...entries.map(e => `${indentStr}${renderAssignment(e.target, e.finalExpr)}`));
     } else {
-      const resultBD = `(${toBigDecimalOperand(multiplicandNode)} * ${toBigDecimalOperand(byNode)})`;
-      const entries = statement.giving.map(target => ({ target, resultBD, finalExpr }));
       lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
   } else if (byOperands.length > 0) {
     // MULTIPLY A BY B - result stored in B
+    const multiplicandBD = toBigDecimalOperand(multiplicandNode);
+    const entries = byOperands.map(by => {
+      const byExpr = convertIdentifier(by);
+      const resultBD = `(${multiplicandBD} * ${toBigDecimalOperand(by)})`;
+      return {
+        target: by,
+        resultBD,
+        finalExpr: storeNumericExpr(by, resultBD, `${multiplicand} * ${byExpr}`, rounded),
+      };
+    });
     if (!withSizeError) {
-      for (const by of byOperands) {
-        const byExpr = convertIdentifier(by);
-        lines.push(`${indentStr}${renderAssignment(by, `${multiplicand} * ${byExpr}`)}`);
-      }
+      lines.push(...entries.map(e => `${indentStr}${renderAssignment(e.target, e.finalExpr)}`));
     } else {
-      const multiplicandBD = toBigDecimalOperand(multiplicandNode);
-      const entries = byOperands.map(by => {
-        const byExpr = convertIdentifier(by);
-        return {
-          target: by,
-          resultBD: `(${multiplicandBD} * ${toBigDecimalOperand(by)})`,
-          finalExpr: `${multiplicand} * ${byExpr}`,
-        };
-      });
       lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
   } else {
@@ -2754,9 +3213,11 @@ function generateMultiply(statement, indent = 0) {
     const target = statement.target || statement.giving;
     const targetExpr = convertIdentifier(target);
     if (statement.giving) {
-      lines.push(`${indentStr}${renderAssignment(target, `${multiplicand} * ${right}`)}`);
+      const resultBD = `(${toBigDecimalOperand(multiplicandNode)} * ${toBigDecimalOperand(statement.right)})`;
+      lines.push(`${indentStr}${renderAssignment(target, storeNumericExpr(target, resultBD, `${multiplicand} * ${right}`, rounded))}`);
     } else {
-      lines.push(`${indentStr}${renderAssignment(target, `${targetExpr} * ${multiplicand}`)}`);
+      const resultBD = `(${toBigDecimalOperand(target)} * ${toBigDecimalOperand(multiplicandNode)})`;
+      lines.push(`${indentStr}${renderAssignment(target, storeNumericExpr(target, resultBD, `${targetExpr} * ${multiplicand}`, rounded))}`);
     }
   }
 
@@ -2778,6 +3239,7 @@ function generateDivide(statement, indent = 0) {
   const giving = Array.isArray(statement.giving) ? statement.giving : [statement.giving].filter(Boolean);
   const into = Array.isArray(statement.into) ? statement.into : [statement.into].filter(Boolean);
   const withSizeError = hasSizeErrorClause(statement);
+  const rounded = !!statement.rounded;
 
   if (giving.length > 0) {
     // Parser fields: "DIVIDE A BY B"   -> dividend=A, divisor=B
@@ -2786,40 +3248,36 @@ function generateDivide(statement, indent = 0) {
     const divisorNode = statement.divisor;
     const dividend = convertArithmeticExpression(dividendNode);
     const divisor = convertArithmeticExpression(divisorNode);
+    const dividendBD = toBigDecimalOperand(dividendNode);
+    const divisorBD = toBigDecimalOperand(divisorNode);
+    const resultBD = `(${dividendBD} / ${divisorBD})`;
 
-    function givingValueExpr(target) {
-      const info = lookupFieldForRef(target);
-      // A BigDecimal GIVING target needs decimal-precision division - plain
-      // Scala Int/Int division truncates (COBOL's DIVIDE ... GIVING into a
-      // field with decimal places does not), so both operands are coerced
-      // to BigDecimal before dividing whenever the target calls for it.
-      return info?.scalaType === 'BigDecimal'
-        ? `(${toBigDecimalOperand(dividendNode)} / ${toBigDecimalOperand(divisorNode)})`
-        : `${dividend} / ${divisor}`;
+    // Every GIVING target is now stored through storeNumericExpr - real
+    // (non-truncating) BigDecimal division, then ROUNDED-or-truncated to
+    // the target's own declared digit widths at store time (round-3
+    // findings 8/9/13: ROUNDED was a complete no-op for DIVIDE before this
+    // fix, e.g. `DIVIDE 7 BY 2 GIVING X ROUNDED` into a 0-decimal target
+    // must yield 4, not the 3 plain truncating-Int-division gave). The
+    // plain `${dividend} / ${divisor}` fallback (natural Scala type, no
+    // BigDecimal) is kept only for an unregistered/ambiguous target -
+    // storeNumericExpr's own fallback path.
+    const entries = giving.map(target => ({
+      target,
+      resultBD,
+      finalExpr: storeNumericExpr(target, resultBD, `${dividend} / ${divisor}`, rounded),
+    }));
+    if (statement.remainder) {
+      const remainderBD = `(${dividendBD} % ${divisorBD})`;
+      entries.push({
+        target: statement.remainder,
+        resultBD: remainderBD,
+        finalExpr: storeNumericExpr(statement.remainder, remainderBD, `${dividend} % ${divisor}`, false),
+      });
     }
 
     if (!withSizeError) {
-      for (const target of giving) {
-        lines.push(`${indentStr}${renderAssignment(target, givingValueExpr(target))}`);
-      }
-      if (statement.remainder) {
-        lines.push(`${indentStr}${renderAssignment(statement.remainder, `${dividend} % ${divisor}`)}`);
-      }
+      lines.push(...entries.map(e => `${indentStr}${renderAssignment(e.target, e.finalExpr)}`));
     } else {
-      const dividendBD = toBigDecimalOperand(dividendNode);
-      const divisorBD = toBigDecimalOperand(divisorNode);
-      const entries = giving.map(target => ({
-        target,
-        resultBD: `(${dividendBD} / ${divisorBD})`,
-        finalExpr: givingValueExpr(target),
-      }));
-      if (statement.remainder) {
-        entries.push({
-          target: statement.remainder,
-          resultBD: `(${dividendBD} % ${divisorBD})`,
-          finalExpr: `${dividend} % ${divisor}`,
-        });
-      }
       // DIVIDE BY ZERO: BigDecimal division would raise ArithmeticException
       // before any digit-capacity check could even run, so it must be
       // tested (and short-circuit into the ON SIZE ERROR branch) ahead of -
@@ -2831,22 +3289,21 @@ function generateDivide(statement, indent = 0) {
     // DIVIDE A INTO B  -> b = b / a
     const divisorNode = statement.divisor || statement.dividend;
     const divisor = convertArithmeticExpression(divisorNode);
+    const divisorBD = toBigDecimalOperand(divisorNode);
+
+    const entries = into.map(target => {
+      const name = convertIdentifier(target);
+      const resultBD = `(${toBigDecimalOperand(target)} / ${divisorBD})`;
+      return {
+        target,
+        resultBD,
+        finalExpr: storeNumericExpr(target, resultBD, `${name} / ${divisor}`, rounded),
+      };
+    });
 
     if (!withSizeError) {
-      for (const target of into) {
-        const name = convertIdentifier(target);
-        lines.push(`${indentStr}${renderAssignment(target, `${name} / ${divisor}`)}`);
-      }
+      lines.push(...entries.map(e => `${indentStr}${renderAssignment(e.target, e.finalExpr)}`));
     } else {
-      const divisorBD = toBigDecimalOperand(divisorNode);
-      const entries = into.map(target => {
-        const name = convertIdentifier(target);
-        return {
-          target,
-          resultBD: `(${toBigDecimalOperand(target)} / ${divisorBD})`,
-          finalExpr: `${name} / ${divisor}`,
-        };
-      });
       const zeroCheck = `(${divisorBD}) == BigDecimal(0)`;
       lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries, zeroCheck));
     }
@@ -3429,29 +3886,48 @@ function generatePerform(statement, indent = 0) {
     return bodyLines.join('\n');
   }
 
+  // Every looping/bodied form below (times/until/varying/bare-inline) wraps
+  // its body in `scala.util.boundary { ... }` so EXIT PERFORM (generateExit)
+  // can render as `scala.util.boundary.break()`: that unwinds to exactly
+  // this nearest lexically-enclosing boundary block (nested PERFORMs each
+  // get their own, so an EXIT PERFORM inside a nested loop only ever exits
+  // the innermost one), then execution simply continues with whatever
+  // follows this whole PERFORM statement - unlike a bare `return` (the
+  // pre-fix behavior), which incorrectly unwound all the way out of the
+  // enclosing paragraph/method, skipping every statement after END-PERFORM
+  // too. The out-of-line 'simple' form has no body of its own here (it just
+  // calls the target paragraph's method) and an EXIT PERFORM textually
+  // inside that *paragraph* is a separate, out-of-scope case (see
+  // generateExit's doc comment) - so it needs no boundary.
   if (statement.performType === 'simple') {
     lines.push(`${indentStr}${paragraphMethodName(statement.targetParagraph || 'procedure')}()`);
   } else if (statement.performType === 'times') {
     const times = statement.times?.value || statement.times || '1';
-    lines.push(`${indentStr}(1 to ${times}).foreach { _ =>`);
-    lines.push(body(indent + 1));
+    const bi = '  '.repeat(indent + 1);
+    lines.push(`${indentStr}scala.util.boundary {`);
+    lines.push(`${bi}(1 to ${times}).foreach { _ =>`);
+    lines.push(body(indent + 2));
+    lines.push(`${bi}}`);
     lines.push(`${indentStr}}`);
   } else if (statement.performType === 'until') {
     const condition = convertCondition(statement.until);
+    const bi = '  '.repeat(indent + 1);
+    lines.push(`${indentStr}scala.util.boundary {`);
     if (testBefore) {
-      lines.push(`${indentStr}while !(${condition}) do`);
-      lines.push(body(indent + 1));
+      lines.push(`${bi}while !(${condition}) do`);
+      lines.push(body(indent + 2));
     } else {
       // WITH TEST AFTER: Scala 3 has no do-while postfix loop syntax at all
       // (removed, not just restyled) - see method-gen.js's generatePerformFromAST
       // for the identical rewrite this mirrors: fold the body into the
       // while-condition block itself (so it always runs at least once before
       // the first test) and leave the loop's own `do` body empty.
-      lines.push(`${indentStr}while`);
-      lines.push(body(indent + 1));
-      lines.push(`${'  '.repeat(indent + 1)}!(${condition})`);
-      lines.push(`${indentStr}do ()`);
+      lines.push(`${bi}while`);
+      lines.push(body(indent + 2));
+      lines.push(`${'  '.repeat(indent + 2)}!(${condition})`);
+      lines.push(`${bi}do ()`);
     }
+    lines.push(`${indentStr}}`);
   } else if (statement.performType === 'varying') {
     const varying = statement.varying;
     const varName = toCamelCase(varying?.variable || 'i');
@@ -3459,16 +3935,18 @@ function generatePerform(statement, indent = 0) {
     const by = varyingOperandExprLocal(varying?.by, 1);
     const until = convertCondition(varying?.until);
     const bi = '  '.repeat(indent + 1);
+    const bi2 = '  '.repeat(indent + 2);
 
     // The loop-control variable is a WORKING-STORAGE item (declared once as
     // a flat var elsewhere) - assign it here rather than redeclaring with
     // `var`, so repeated PERFORM VARYING over the same variable in one
     // method body doesn't produce a duplicate-declaration compile error.
-    lines.push(`${indentStr}${varName} = ${from}`);
+    lines.push(`${indentStr}scala.util.boundary {`);
+    lines.push(`${bi}${varName} = ${from}`);
     if (testBefore) {
-      lines.push(`${indentStr}while !(${until}) do`);
-      lines.push(body(indent + 1));
-      lines.push(`${bi}${varName} = ${varName} + ${by}`);
+      lines.push(`${bi}while !(${until}) do`);
+      lines.push(body(indent + 2));
+      lines.push(`${bi2}${varName} = ${varName} + ${by}`);
     } else {
       // WITH TEST AFTER VARYING: the UNTIL test happens *before* the
       // increment, against the still-current value - the increment only
@@ -3477,17 +3955,22 @@ function generatePerform(statement, indent = 0) {
       // full trace). Body+test fold into the while-condition block; the
       // increment moves into the `do` body so it's skipped after the final,
       // test-failing round.
-      lines.push(`${indentStr}while`);
-      lines.push(body(indent + 1));
-      lines.push(`${bi}!(${until})`);
-      lines.push(`${indentStr}do`);
-      lines.push(`${bi}${varName} = ${varName} + ${by}`);
+      lines.push(`${bi}while`);
+      lines.push(body(indent + 2));
+      lines.push(`${bi2}!(${until})`);
+      lines.push(`${bi}do`);
+      lines.push(`${bi2}${varName} = ${varName} + ${by}`);
     }
+    lines.push(`${indentStr}}`);
   } else if (statement.statements) {
-    // Inline PERFORM
+    // Inline PERFORM with no TIMES/UNTIL/VARYING clause: executes its body
+    // exactly once, like a scope - still boundary-wrapped so a bare EXIT
+    // PERFORM inside it only skips the rest of this one execution.
+    lines.push(`${indentStr}scala.util.boundary {`);
     for (const stmt of statement.statements) {
-      lines.push(generateExpression(stmt, indent));
+      lines.push(generateExpression(stmt, indent + 1));
     }
+    lines.push(`${indentStr}}`);
   } else if (statement.targetParagraph) {
     lines.push(`${indentStr}${paragraphMethodName(statement.targetParagraph)}()`);
   }
@@ -3612,11 +4095,34 @@ function generateExit(statement, indent = 0) {
     case 'PROGRAM':
       return `${indentStr}return // EXIT PROGRAM`;
     case 'PERFORM':
-      return `${indentStr}return // EXIT PERFORM`;
+      // Exits only the nearest enclosing *inline* PERFORM loop, not the
+      // whole paragraph/method (round-3 finding 1) - generatePerform's
+      // times/until/varying/bare-inline branches each wrap their body in
+      // `scala.util.boundary { ... }`; break() unwinds to exactly that
+      // nearest lexically-enclosing boundary (nested loops each get their
+      // own, so a nested EXIT PERFORM only ever exits the innermost one),
+      // after which execution simply falls through to whatever statement
+      // follows this whole PERFORM - unlike the pre-fix bare `return`, which
+      // incorrectly unwound all the way out of the enclosing method,
+      // skipping every statement after END-PERFORM too. An EXIT PERFORM
+      // textually inside an out-of-line performed paragraph (no lexically
+      // enclosing boundary at all in that paragraph's own method) is a
+      // separate, narrower COBOL usage this fix intentionally does not
+      // cover - see generatePerform's 'simple' branch.
+      return `${indentStr}scala.util.boundary.break() // EXIT PERFORM`;
     case 'SECTION':
       return `${indentStr}return // EXIT SECTION`;
     default:
-      return `${indentStr}// EXIT PARAGRAPH`;
+      // EXIT PARAGRAPH: every paragraph is its own Scala method (see
+      // method-gen.js's generateMethod, and generateGoTo's doc comment for
+      // why `return` is exactly the right translation for "transfer/skip
+      // within this paragraph") - `return` here skips only the rest of
+      // *this* paragraph's own statements (correct - distinct from EXIT
+      // PERFORM above, which must NOT unwind the whole method since a loop
+      // is not a paragraph boundary). The pre-fix behavior emitted a no-op
+      // comment, so nothing after an EXIT PARAGRAPH was ever actually
+      // skipped (round-3 finding 2).
+      return `${indentStr}return // EXIT PARAGRAPH`;
   }
 }
 

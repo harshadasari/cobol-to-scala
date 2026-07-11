@@ -114,11 +114,21 @@ function generateMethodBody(statements, indent = 1) {
       case 'EXIT':
         if (stmt.exitType === 'PROGRAM') {
           lines.push('  '.repeat(indent) + 'return');
+        } else if (String(stmt.exitType).toUpperCase() === 'PERFORM') {
+          // EXIT PERFORM at the top level of a paragraph body (not nested in
+          // an IF/EVALUATE - that path goes through expression-gen.js's
+          // generateExit instead): exits only the nearest enclosing inline
+          // PERFORM loop - see generatePerformFromAST/generateVaryingNest's
+          // boundary-wrapped bodies below - never the whole method (round-3
+          // finding 1).
+          lines.push('  '.repeat(indent) + 'scala.util.boundary.break() // EXIT PERFORM');
         } else {
-          // `()` (not just a comment) so this compiles even when EXIT is the
-          // only statement in its paragraph - a common THRU-range-endpoint
-          // idiom (e.g. "1900-EXIT-PARA. EXIT.").
-          lines.push('  '.repeat(indent) + '() // EXIT');
+          // EXIT PARAGRAPH: every paragraph is its own Scala method, so
+          // `return` skips only the rest of *this* paragraph (round-3
+          // finding 2 - the pre-fix `()` no-op skipped nothing). Still
+          // compiles even when EXIT is the only statement in its paragraph -
+          // a common THRU-range-endpoint idiom (e.g. "1900-EXIT-PARA. EXIT.").
+          lines.push('  '.repeat(indent) + 'return // EXIT PARAGRAPH');
         }
         break;
 
@@ -184,11 +194,21 @@ function generatePerformFromAST(stmt, indent = 0) {
     return `${indentStr}${target}()`;
   }
 
+  // Every looping/bodied form below wraps its body in
+  // `scala.util.boundary { ... }` so a top-level EXIT PERFORM
+  // (generateMethodBody's 'EXIT' case) can `break()` out of exactly this
+  // loop - see that case's doc comment and expression-gen.js's
+  // generatePerform (the nested-statement sibling of this function) for the
+  // full rationale (round-3 finding 1).
+
   // PERFORM TIMES
   if (stmt.performType === 'times') {
     const times = stmt.times?.value || stmt.times || 1;
-    return `${indentStr}(1 to ${times}).foreach { _ =>
-${performBodyLines(stmt, indent + 1)}
+    const bi = '  '.repeat(indent + 1);
+    return `${indentStr}scala.util.boundary {
+${bi}(1 to ${times}).foreach { _ =>
+${performBodyLines(stmt, indent + 2)}
+${bi}}
 ${indentStr}}`;
   }
 
@@ -196,11 +216,14 @@ ${indentStr}}`;
   if (stmt.performType === 'until') {
     const condition = convertConditionToScala(stmt.until);
     const testBefore = stmt.testBefore !== false;
-    const body = performBodyLines(stmt, indent + 1);
+    const bi = '  '.repeat(indent + 1);
+    const body = performBodyLines(stmt, indent + 2);
 
     if (testBefore) {
-      return `${indentStr}while !(${condition}) do
-${body}`;
+      return `${indentStr}scala.util.boundary {
+${bi}while !(${condition}) do
+${body}
+${indentStr}}`;
     }
 
     // WITH TEST AFTER (post-condition loop - body must run at least once
@@ -214,10 +237,12 @@ ${body}`;
     // body empty - the condition block runs unconditionally every time
     // (including the first, before any test), which is exactly do-while
     // semantics: body, then test, repeat while true.
-    return `${indentStr}while
+    return `${indentStr}scala.util.boundary {
+${bi}while
 ${body}
-${'  '.repeat(indent + 1)}!(${condition})
-${indentStr}do ()`;
+${'  '.repeat(indent + 2)}!(${condition})
+${bi}do ()
+${indentStr}}`;
   }
 
   // PERFORM VARYING [AFTER ...]
@@ -228,14 +253,24 @@ ${indentStr}do ()`;
     // written - PERFORM VARYING a ... AFTER b ... AFTER c loops `a` in the
     // outermost position and `c` innermost, matching COBOL's left-to-right
     // AFTER nesting (the innermost variable completes its whole UNTIL range
-    // before the next-outer one advances).
+    // before the next-outer one advances). EXIT PERFORM inside *any* AFTER
+    // level exits the whole multi-level construct (one PERFORM ... END-
+    // PERFORM range, not one range per level) - so the boundary wraps here,
+    // once, around the outermost level only, not inside generateVaryingNest's
+    // own per-level recursion.
     const levels = [stmt.varying, ...(stmt.varying.after || [])];
-    return generateVaryingNest(levels, 0, stmt, indent);
+    return `${indentStr}scala.util.boundary {
+${generateVaryingNest(levels, 0, stmt, indent + 1)}
+${indentStr}}`;
   }
 
-  // Inline PERFORM with statements (no VARYING/UNTIL/TIMES clause)
+  // Inline PERFORM with statements (no VARYING/UNTIL/TIMES clause): executes
+  // its body exactly once, like a scope - still boundary-wrapped so a bare
+  // EXIT PERFORM inside it only skips the rest of this one execution.
   if (stmt.statements && stmt.statements.length > 0) {
-    return generateMethodBody(stmt.statements, indent);
+    return `${indentStr}scala.util.boundary {
+${generateMethodBody(stmt.statements, indent + 1)}
+${indentStr}}`;
   }
 
   return `${indentStr}${target}()`;

@@ -261,10 +261,13 @@ test('generator: MULTIPLY ON SIZE ERROR checks digit capacity and leaves the tar
   const mainBody = code.slice(code.indexOf('def main'));
   assert.match(mainBody, /if \(!CobolFmt\.fitsDigits\(\(wsA \* wsB\), 18\)\) then/);
   // The assignment to wsR must only happen in the else (not-on-size-error)
-  // branch, after the error check - not unconditionally.
+  // branch, after the error check - not unconditionally. The stored value
+  // itself is now (round-3 findings 8/13) truncated to WS-R's own declared
+  // digit widths at store time via CobolFmt.truncNumeric (no ROUNDED here),
+  // not the bare exact product.
   const ifIdx = mainBody.indexOf('if (!CobolFmt.fitsDigits');
   const elseIdx = mainBody.indexOf('else', ifIdx);
-  const assignIdx = mainBody.indexOf('wsR = wsA * wsB');
+  const assignIdx = mainBody.indexOf('wsR = CobolFmt.truncNumeric((wsA * wsB), 18, 0)');
   assert.ok(assignIdx > elseIdx && elseIdx > ifIdx, 'assignment must be inside the else (no-size-error) branch');
 });
 
@@ -304,7 +307,12 @@ test('generator: DIVIDE GIVING into a BigDecimal target does not double-wrap Big
            STOP RUN.
 `;
   const code = convertToScala(source, {}).scala;
-  assert.match(code, /wsQuot = \(wsDividend \/ wsDivisor\)/);
+  // The exact quotient is now (round-3 findings 8/13) truncated to WS-QUOT's
+  // own declared digit widths at store time (CobolFmt.truncNumeric, no
+  // ROUNDED here) rather than assigned bare - but the division itself must
+  // still be the single, non-double-wrapped `(wsDividend / wsDivisor)` this
+  // test guards against regressing.
+  assert.match(code, /wsQuot = CobolFmt\.truncNumeric\(\(wsDividend \/ wsDivisor\), 5, 0\)/);
   assert.ok(!code.includes('BigDecimal(wsDividend / wsDivisor)'), 'must not wrap an already-BigDecimal expression in BigDecimal(...)');
 });
 

@@ -11,6 +11,20 @@ _(none currently open - all prior pins resolved; see cycle entries. Tracked-OPEN
 - **Refutation rounds:** 8 so far (11,16,15,16,6,6,8,4 findings - all fixed through r7; r8 fix in flight)
 
 ## Activity
+### Cycle: RUN WRAP-UP — final state (2026-07-11 ~23:30 UTC)
+**The run is wrapped.** Owner instruction: stop adversarial hunting at round 14, produce detailed reports, resume rounds in a later session.
+
+**What shipped (honest summary):**
+- All 4 roadmap phases built. Phases 1–2 (data layer + procedure logic) are the deep, adversarially-hardened core; Phase 3 (SQL→Doobie, JCL parsing) is a verified MVP whose SQL generator is NOT yet wired into the main pipeline; Phase 4 (CICS) is honest scaffolding, not behavioral conversion.
+- 14 adversarial rounds, 110 dishonest findings fixed, corpus 48→209 oracle-verified programs, suite 879/879 green, 27 commits, all independently verified before push. ~22h wall clock of the 48h budget, orchestrator well under its 2M token cap.
+- Full campaign report: `docs/ADVERSARIAL_ROUNDS_REPORT.md`. Capability roadmap truth-passed to match. Dashboard (`docs/PROGRESS_STATUS.md`) synced.
+
+**What is explicitly NOT done:**
+- NOT converged — plateau at 3–5 findings/round vs the 0–2 bar; round 15+ should be expected to find real bugs (resume plan in report §7).
+- 16 documented Known Gaps (visible degradation, not silent bugs) plus roadmap-level opens: reference-modification codegen, REWRITE/DELETE/START, SORT USING/GIVING, external/dynamic CALL, SQL wire-in, JCL→sbt skeletons, CICS behavior, ODO dynamic sizing, general GO TO webs.
+
+**Process lessons that paid off (keep for the resumed run):** never commit red + independent orchestrator re-verification (caught the round-13 state leak); explicit-path git adds while agents are in flight; completeness-critic audits (first one caught a real corpus-wiring hole); oracle fixtures live-recaptured every run.
+
 ### Cycle: Round 14 committed — hunting paused at 14 rounds by owner decision (2026-07-11 ~23:05 UTC)
 - Independent full-suite verification of the round-14 fixes: **879 tests, 879 pass, 0 fail, 0 todo** (log: r14-verify.log). Committed as `062ce37` and pushed.
 - Round 14 closed 4 dishonest findings: the sentence-scope PERIOD parser flaw (most general finding of the campaign — every unterminated conditional clause affected), qualified PERFORM THRU wrong-section resolution, INSPECT REPLACING cascade vs snapshot semantics, and dead SYNC alignment. 11 programs promoted (b1–b6, c1, c3, c4b, c5, c6); corpus now 209.

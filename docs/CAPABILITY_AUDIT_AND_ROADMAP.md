@@ -3,6 +3,8 @@
 **Date:** 2026-07-11
 **Companion docs:** `MARKET_ANALYSIS_COBOL_MODERNIZATION.md` (why), `ENTERPRISE_READINESS_GAP_ANALYSIS.md` (platform gaps)
 
+> **Status note (2026-07-11):** an autonomous adversarial-verification campaign ran 14 rounds against this engine, fixing 110 dishonest findings and growing the oracle-verified corpus from 48 to 209 programs (879/879 automated tests passing). Hunting was paused at round 14 by owner decision (~22h into a 48h budget), not because the engine converged — the finding-count plateaued at 3–5/round against the campaign's own 0–2 convergence bar, so a round-15 run should be expected to find more real bugs. See `docs/ADVERSARIAL_ROUNDS_REPORT.md` for the full campaign report (methodology, all 14 rounds, impact analysis, and the §7 resume plan); the numbers and gap statuses throughout this document have been updated to match it.
+
 This document answers two questions precisely:
 1. **What does this codebase actually do today?** (audited at source level, statement by statement)
 2. **What would "not missing any aspect of COBOL" actually require?** (a staged plan grounded in what real mainframe estates contain)
@@ -30,12 +32,12 @@ Two loosely-coupled products live in this repo:
 | Control flow | PERFORM (inline/thru/times/until/varying), IF/ELSE, EVALUATE (incl. TRUE/FALSE/ANY/ranges/NOT/arithmetic-expression subjects), GO TO (incl. DEPENDING ON), CONTINUE, NEXT SENTENCE, EXIT, STOP RUN, GOBACK |
 | Data movement | MOVE (multi-target, figurative constants, CORRESPONDING), INITIALIZE, SET (incl. `SET condition-name TO TRUE`) |
 | Arithmetic | COMPUTE (with precedence & **, ROUNDED), ADD/SUBTRACT (incl. CORRESPONDING), MULTIPLY, DIVIDE (INTO/GIVING/REMAINDER) |
-| String handling | STRING, UNSTRING (incl. COUNT IN), INSPECT (tallying/replacing/converting) |
-| Table handling | SEARCH, SEARCH ALL (real binary search), incl. VARYING other-index |
-| Batch/sort | SORT (multi-key, mixed ASCENDING/DESCENDING), MERGE, RELEASE, RETURN |
+| String handling | STRING, UNSTRING (incl. COUNT IN), INSPECT (tallying/replacing/converting, incl. correct multi-clause REPLACING snapshot semantics — round 14) |
+| Table handling | SEARCH, SEARCH ALL (real binary search), incl. VARYING other-index and composite/multi-key tie-breaking |
+| Batch/sort | SORT (multi-key, mixed ASCENDING/DESCENDING, `THRU` ranges), MERGE, RELEASE, RETURN, via INPUT/OUTPUT PROCEDURE — the whole-file `SORT ... USING <file> GIVING <file>` form (no procedure) is not yet implemented (visible TODO marker) |
 | File I/O | OPEN, CLOSE, READ, WRITE for LINE SEQUENTIAL files are now oracle-equivalent (round-5 fix: `convertToScala()`'s own entry point never parsed the ENVIRONMENT DIVISION at all before this — FILE-CONTROL/SELECT...ASSIGN never reached the generator, so every OPEN/WRITE/READ silently referenced undeclared variables; see `tests/corpus/proc/s01-fileio-roundtrip.cbl`). REWRITE, DELETE, START, and any non-LINE-SEQUENTIAL organization (INDEXED, RELATIVE) remain unimplemented comment-only stubs |
 | Intrinsics | Full FUNCTION set exercised by the corpus: NUMVAL/NUMVAL-C, LENGTH (incl. of a GROUP), MAX/MIN, date functions, REVERSE, ORD/CHR, and others — see `tests/oracle/README.md` for the exact list a given run has verified |
-| Interop | CALL (BY REFERENCE/CONTENT/VALUE), EXEC SQL (parsed + compile-verified Doobie generation, not yet wired into the main generator — see Phase 3), EXEC CICS (parsed + classified; skeleton generation only — see Phase 4) |
+| Interop | CALL (BY REFERENCE/CONTENT/VALUE), incl. full same-file multi-`PROGRAM-ID` interop (round 7) — a genuinely external or dynamic-name subprogram not defined in the same source emits a visible TODO marker rather than converting; EXEC SQL (parsed + compile-verified Doobie generation, not yet wired into the main generator — see Phase 3), EXEC CICS (parsed + classified; skeleton generation only — see Phase 4) |
 | Terminal | ACCEPT, DISPLAY |
 | Conditions | relational (all operator spellings), class tests (NUMERIC/ALPHABETIC…), sign tests, level-88 condition names, AND/OR/NOT compounds |
 
@@ -68,7 +70,7 @@ writing:
 | Gap | Status | Real-world weight |
 |---|---|---|
 | OCCURS DEPENDING ON dynamic `parse`/`format` | **OPEN** — sized at a fixed max for round-trip stability; live counter field not honored; every occurrence carries a `// TODO(ODO)` marker (`generator/case-class-gen.js`) | High — variable-length records are common in batch |
-| General inter-paragraph GO TO (outside a PERFORM THRU range) | **OPEN** — deliberately not attempted; see Phase 2 below | Medium/legacy — arbitrary GO TO webs are a known-hard COBOL problem everywhere, not just here |
+| General inter-paragraph GO TO (outside a PERFORM THRU range) | **OPEN** — deliberately not attempted; see Phase 2 below. (Note: an explicitly *qualified* `PERFORM x OF/IN section`, including the THRU form, is fully supported since rounds 12 and 14 — this row is only about bare/unqualified `GO TO`/`PERFORM` and true GO TO webs, not the qualified-PERFORM case.) | Medium/legacy — arbitrary GO TO webs are a known-hard COBOL problem everywhere, not just here |
 | ALTER | **OPEN** — not implemented | Low/legacy (rare, and deprecated in modern COBOL) |
 | EXEC CICS behavioral conversion | **OPEN** — classified and turned into an honest `???`-bodied service skeleton (Phase 4), not a working translation | High for online systems |
 | EXEC SQL wired into the main generator | **OPEN** — Doobie generation exists and is compile-verified in isolation (`generator/sql-gen.js`) but is not yet spliced into `generator/scala-generator.js`'s own output path | High |
@@ -113,7 +115,12 @@ diverging and every finding was fixed) produce byte-identical stdout to real
 DISPLAY-numeric fields through `options.charset: 'ebcdic'`; for COMP-3/binary
 numeric fields EBCDIC is verified at the codec level, not through a
 generated-class round trip (packed decimal is charset-independent BCD, so
-this is a narrower gap than it sounds, but it is real — see 1.3).
+this is a narrower gap than it sounds, but it is real — see 1.3). One narrow
+REDEFINES shape remains a stub rather than a true view: REDEFINES of a
+group-with-OCCURS by another group-with-OCCURS (round 13) compiles and runs
+real `SEARCH ALL` code against the redefining table, but each elementary
+child is an honest `???` stub that throws at runtime if actually read — see
+`tests/oracle/README.md`'s Known Gaps.
 
 **Still OPEN:**
 1. OCCURS DEPENDING ON: `parse`/`format` are sized at a fixed maximum, not
@@ -131,20 +138,25 @@ this is a narrower gap than it sounds, but it is real — see 1.3).
 
 SEARCH/SEARCH ALL (real binary search), SORT/MERGE/RELEASE/RETURN,
 MOVE/ADD CORRESPONDING, GO TO DEPENDING ON, the intrinsic function set the
-corpus exercises, STRING/UNSTRING/INSPECT, and EVALUATE (incl. arithmetic
-and full-condition subjects) are all built and **oracle-verified**: 29
-`tests/corpus/proc/` programs (9 baseline + 20 adversarial-refutation
-programs) produce byte-identical stdout to real `cobc`. The adversarial round
-found 14 root-cause silent-divergence gaps (NUMVAL crashing on internal
-whitespace, `SET condition-name TO TRUE`, EVALUATE expression-subject
-collapse, recursive PERFORM naming, `WITH TEST AFTER` emitting invalid
-Scala 3, duplicate nested group name collisions, `LENGTH` of a GROUP,
-`MAX`/`MIN` on `BigDecimal`, `SEARCH ... VARYING`, index-name `DISPLAY`
-format, multi-key mixed-direction `SORT`, `RELEASE`/`RETURN` name-vs-position
-matching, `UNSTRING ... COUNT IN`) — every one is fixed, and the 20 refuting
-programs are permanently in the corpus so none can silently regress. See
-`tests/oracle/README.md`'s finding table for the full finding → fix → program
-mapping.
+corpus exercises, STRING/UNSTRING/INSPECT, DECLARATIVES (incl. reentrancy
+and cross-conversion state isolation), and EVALUATE (incl. arithmetic
+and full-condition subjects) are all built and **oracle-verified**: 190
+`tests/corpus/proc/` programs (9 baseline plus 13 further rounds of
+adversarial-refutation programs, rounds 2–14) produce byte-identical stdout
+to real `cobc`. Round 2 alone (20 probe programs) found 14 root-cause
+silent-divergence gaps (NUMVAL crashing on internal whitespace,
+`SET condition-name TO TRUE`, EVALUATE expression-subject collapse, recursive
+PERFORM naming, `WITH TEST AFTER` emitting invalid Scala 3, duplicate nested
+group name collisions, `LENGTH` of a GROUP, `MAX`/`MIN` on `BigDecimal`,
+`SEARCH ... VARYING`, index-name `DISPLAY` format, multi-key mixed-direction
+`SORT`, `RELEASE`/`RETURN` name-vs-position matching, `UNSTRING ... COUNT IN`)
+— every one is fixed, and the refuting programs are permanently in the corpus
+so none can silently regress. Rounds 3–14 continued the same discipline
+against SECTION organization, CALL/interop, DECLARATIVES, file I/O byte
+models, and more — 110 dishonest findings fixed across all 14 rounds in
+total. See `tests/oracle/README.md`'s finding table for the full finding →
+fix → program mapping, and `docs/ADVERSARIAL_ROUNDS_REPORT.md` for the full
+campaign narrative and impact analysis.
 
 **Paragraph control flow, done honestly rather than completely:** the
 generator builds a CFG-aware scheme scoped specifically to PERFORM-THRU
@@ -152,6 +164,13 @@ ranges — every paragraph inside a `PERFORM x THRU y` becomes a nested local
 `def` inside that wrapper method, so GO TO to a sibling paragraph in the same
 range resolves by ordinary lexical scoping and natural fallthrough across
 paragraph boundaries is reproduced (`generator/method-gen.js#generatePerformThruMethod`).
+Since round 12, and extended to the THRU form in round 14, an explicitly
+**qualified** `PERFORM x OF/IN section` — including `PERFORM x OF secA THRU
+y OF secB` — resolves correctly across section boundaries via the same
+collision-aware resolver used to *declare* a qualified method; only a bare,
+**unqualified** reference to a paragraph name that is ambiguous across
+sections remains unaddressed (and such a reference is already invalid COBOL
+without qualification, so no corpus program is affected either way).
 **General inter-paragraph GO TO — an arbitrary paragraph-to-paragraph GO TO
 web outside any THRU range — was not attempted.** Each paragraph is still
 also generated as an independent top-level method (for the plain, non-THRU
@@ -223,62 +242,65 @@ Report Writer, Screen Section (console apps), OO-COBOL, Assembler subroutines, I
 
 ### Verification record
 
-What "verified" means, precisely, as of this writing (2026-07-11):
+What "verified" means, precisely, as of this writing (2026-07-11, after round
+14 of the adversarial campaign — full detail in
+`docs/ADVERSARIAL_ROUNDS_REPORT.md`):
 
-- **48 oracle-gated corpus programs** compile and run cleanly under real
-  GnuCOBOL (`cobc`, exit 0 for all 48): 19 under `tests/corpus/data/`
-  (Phase 1) and 29 under `tests/corpus/proc/` (Phase 2). All 48 also pass
+- **209 oracle-gated corpus programs** compile and run cleanly under real
+  GnuCOBOL (`cobc`, exit 0 for all 209): 19 under `tests/corpus/data/`
+  (Phase 1) and 190 under `tests/corpus/proc/` (Phase 2). All 209 also pass
   `oracleCompare()` — the generated Scala's stdout matches `cobc`'s stdout
   byte-for-byte — with **0 outstanding `t.todo()` work-queue entries** on
   either side. (`tests/corpus/sql/`'s 5 EXEC-SQL programs are verified by a
   separate compile-check against real `doobie-core`, not the `cobc` sweep,
-  since plain GnuCOBOL can't compile embedded SQL without a precompiler.)
-- **3 adversarial refutation rounds**, each a dedicated pass whose only job
+  since plain GnuCOBOL can't compile embedded SQL without a precompiler —
+  214 `.cbl` files on disk in total.)
+- **14 adversarial refutation rounds**, each a dedicated pass whose only job
   is to write new programs designed to break the generator, run them against
   the same compiler oracle, and report divergences without fixing them
-  itself:
-  - **Round 1 (Phase 1 / data layer):** 12 new edge-case programs — 11/12
-    diverged. Every finding was root-caused and fixed (MOVE truncation/
-    JUSTIFIED/group-MOVE semantics, arithmetic subscripts silently dropped,
-    ON SIZE ERROR unimplemented, 88-level conditions, edited-picture
-    zero-suppression/BLANK WHEN ZERO, REDEFINES-over-OCCURS); all 12
-    programs promoted into the permanent corpus.
-  - **Round 2 (Phase 2 / procedure layer):** 20 new edge-case programs —
-    16/20 diverged, 14 distinct root causes (see Phase 2 above and
-    `tests/oracle/README.md`'s finding table). Every finding was fixed; all
-    20 programs promoted into the permanent corpus.
-  - **Round 3: OPEN / pending.** Not yet run as of this writing. Until it
-    runs (and its findings, if any, are fixed), treat every claim in this
-    document as "survived two adversarial passes," not "adversarially
-    exhausted." Two rounds is meaningfully more scrutiny than an unaudited
-    corpus, and meaningfully less than a closed question.
-- **379 automated tests, 0 failing, 0 skipped, 0 todo** at the current
+  itself. Across all 14 rounds: 110 dishonest findings fixed (trend:
+  11, 16, 15, 16, 6, 6, 8, 4, 6, 6, 3, 4, 5, 4 per round), spanning the data
+  layer (round 1), the procedure layer (rounds 2–4, 6–9, 11–12, 14), file
+  I/O and DECLARATIVES (rounds 5, 10, 13), and CALL/interop (rounds 7, 12–13).
+  The finding-count **plateaued at 3–5 per round in rounds 11–14**, short of
+  the campaign's own 0–2 convergence bar — hunting was **paused at round 14
+  by owner decision** (~22h into a 48h budget), not because the refuter ran
+  dry. Treat every claim in this document as "survived 14 rounds of
+  adversarial refutation, with a real-compiler oracle, on 209 specific
+  programs," not "adversarially exhausted on arbitrary COBOL." See
+  `docs/ADVERSARIAL_ROUNDS_REPORT.md` for the round-by-round narrative,
+  impact analysis, and the resume plan (§7), and
+  `tests/oracle/README.md` for the per-round finding → fix → program tables.
+- **879/879 automated tests, 0 failing, 0 skipped, 0 todo** at the current
   commit (`npm test` inside
   `Thyraa-COBOL-main/backend/packages/cobol-to-scala/`), spanning parser
   unit tests, codec property/parity tests, generator tests, the oracle
-  harness described above, JCL/DCLGEN/SQL/CICS/BMS corpus tests, and
-  focused regression tests for each adversarial-round finding
-  (`tests/phase2-refutation-fixes.test.js`, `tests/adversarial-fixes.test.js`).
+  harness described above, JCL/DCLGEN/SQL/CICS/BMS corpus tests, a dedicated
+  state-isolation regression suite (`tests/state-isolation.test.js`, added in
+  round 13), and focused regression tests for each adversarial-round finding.
 - **What "verified" does not mean:** it does not mean every COBOL construct
-  in the language works, only that the specific constructs in the 48-program
+  in the language works, only that the specific constructs in the 209-program
   corpus (plus the units the codec/parser test files exercise directly) do,
   against a real compiler, as of this commit. It also does not mean
-  adversarially exhausted (see Round 3 above), and it does not mean IBM
-  Enterprise COBOL-verified — the oracle throughout is GnuCOBOL, a different
-  (though closely compatible) dialect/implementation. One further,
-  previously undocumented gap was found and disclosed while preparing this
-  document itself: COMPUTE/ADD/SUBTRACT/MULTIPLY/DIVIDE without ROUNDED does
-  not truncate to the target's declared decimal digits at assignment time
-  (see 1.3) — a concrete illustration of exactly why "N programs pass" and
-  "the construct is fully correct" are different claims, and why a third
-  refutation round is still on the roadmap rather than considered optional.
+  adversarially exhausted — the plateau at 3–5 findings/round (not 0–2) is
+  direct evidence a round 15 would likely find more real bugs, not less —
+  and it does not mean IBM Enterprise COBOL-verified — the oracle throughout
+  is GnuCOBOL, a different (though closely compatible) dialect/implementation.
+  See the Known Gaps list in `tests/oracle/README.md` (also summarized in
+  `docs/ADVERSARIAL_ROUNDS_REPORT.md` §6) for every documented, visible
+  degradation still open — e.g. reference modification still degrades to a
+  `???` marker, `SORT ... USING/GIVING` and external/dynamic `CALL` still emit
+  TODO markers, REWRITE/DELETE/START remain unimplemented stubs, and two
+  narrow SYNC/nested-group combinations (round 14) are unverified. This is a
+  concrete illustration of exactly why "N programs pass" and "the construct
+  is fully correct" are different claims.
 
 ### Cross-cutting engineering rules
 
 1. **Coverage honesty:** every construct the engine sees but cannot convert must surface in the analysis report and as a `??? /* TODO */` marker in output — never silent garbage. (Started today with `safeNodeString`.)
 2. **Dialect switches:** IBM Enterprise COBOL first; GnuCOBOL for test-oracle runs; flag extensions per dialect.
 3. **Multi-target ready:** keep AST → emitter boundary clean; a Java emitter reuses ~95% of the pipeline and unlocks the mainstream buyer per the market analysis.
-4. **Golden corpus:** done for the batch/data shapes — `tests/corpus/` now holds 48 oracle-gated programs (data/proc) plus JCL/DCLGEN/SQL/CICS/BMS fixtures, all compiler- or compile-verified, growing via adversarial refutation rather than hand-curation alone (see the Verification record above). Real-world-shaped scenarios beyond what the corpus covers (e.g. a full VSAM maintenance job, a multi-cursor DB2 batch program) remain a valid way to grow it further. (Enterprise-platform items — auth, CI, Docker — are tracked in `ENTERPRISE_READINESS_GAP_ANALYSIS.md`.)
+4. **Golden corpus:** done for the batch/data shapes — `tests/corpus/` now holds 209 oracle-gated programs (data/proc, after 14 adversarial rounds) plus 5 SQL fixtures and JCL/DCLGEN/CICS/BMS fixtures, all compiler- or compile-verified, growing via adversarial refutation rather than hand-curation alone (see the Verification record above and `docs/ADVERSARIAL_ROUNDS_REPORT.md`). Real-world-shaped scenarios beyond what the corpus covers (e.g. a full VSAM maintenance job, a multi-cursor DB2 batch program, or the feature-intersection probes recommended in the campaign report's §7 resume plan) remain a valid way to grow it further. (Enterprise-platform items — auth, CI, Docker — are tracked in `ENTERPRISE_READINESS_GAP_ANALYSIS.md`.)
 
 ### The pitch that falls out of this plan
 

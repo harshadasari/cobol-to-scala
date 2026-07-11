@@ -1,0 +1,36 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. Y02HFOP.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT FILE-A ASSIGN TO "Y02A.DAT"
+               ORGANIZATION IS LINE SEQUENTIAL
+               FILE STATUS IS FS-A.
+           SELECT FILE-C ASSIGN TO "Y02C.DAT"
+               ORGANIZATION IS LINE SEQUENTIAL
+               FILE STATUS IS FS-C.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  FILE-A.
+       01  REC-A               PIC X(10).
+       FD  FILE-C.
+       01  REC-C               PIC X(10).
+       WORKING-STORAGE SECTION.
+       01  FS-A                PIC X(2).
+       01  FS-C                PIC X(2).
+       PROCEDURE DIVISION.
+       DECLARATIVES.
+       A-HANDLER SECTION.
+           USE AFTER STANDARD ERROR PROCEDURE ON FILE-A.
+       A-HANDLER-PARA.
+           DISPLAY "A-HANDLER FIRED FS-A=" FS-A.
+           OPEN OUTPUT FILE-C.
+           MOVE "FALLBACK-REC" TO REC-C.
+           WRITE REC-C.
+           CLOSE FILE-C.
+           DISPLAY "A-HANDLER WROTE FALLBACK".
+       END DECLARATIVES.
+       MAIN-PARA.
+           OPEN INPUT FILE-A.
+           DISPLAY "AFTER OPEN A FS-A=" FS-A.
+           STOP RUN.

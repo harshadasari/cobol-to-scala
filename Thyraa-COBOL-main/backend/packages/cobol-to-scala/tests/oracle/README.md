@@ -176,17 +176,18 @@ through this data-driven suite.
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 156 corpus programs found
-(19 under `data/`, 137 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+**cobc oracle capture / expected-vs-oracle check** - 172 corpus programs found
+(19 under `data/`, 153 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
 excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
 precompiler, see `tests/sql.test.js` instead; two round-9 repros, `w09`/`w12`, are
 deliberately excluded entirely - see the round-9 table below - since cobc itself
-rejects them), all 156 compiled and ran cleanly under cobc (exit 0). 28 of the 156
+rejects them), all 172 compiled and ran cleanly under cobc (exit 0). 28 of the 172
 (19 `data/` + 9 `proc/` baseline programs) already have a hand-written `.expected.txt`
 that matches the captured `.oracle.txt` exactly - 0 mismatches. The 20 `r01`-`r14*`,
 15 `n01`-`n16*`, 16 `q01`-`q12*`, 14 `s01`-`s12*`, 11 `t01`-`t12*` (`t09` excluded),
-14 `u01`-`u13*`, 12 `v01`-`v12*`, 12 `w01`-`w14*` (`w09`/`w12` excluded), and 12
-`x01`-`x12` programs have no hand-written `.expected.txt` by design (they're
+14 `u01`-`u13*`, 12 `v01`-`v12*`, 12 `w01`-`w14*` (`w09`/`w12` excluded), 12
+`x01`-`x12`, and 16 `y01`-`y17*` (see the round-11 table below for the exact
+subset) programs have no hand-written `.expected.txt` by design (they're
 verified directly against cobc via `oracleCompare()` below, not a separately
 hand-authored expectation) and show up here as a diagnostic-only capture ("no
 `<name>.expected.txt` alongside ... yet").
@@ -194,11 +195,11 @@ hand-authored expectation) and show up here as a diagnostic-only capture ("no
 **Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
 end-to-end (0 todo).
 
-**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 137/137 programs
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 153/153 programs
 match end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
 `q01`-`q12*`, all 14 `s01`-`s12*`, all 11 `t01`-`t12*` (`t09` excluded), all 14
-`u01`-`u13*`, all 12 `v01`-`v12*`, all 12 `w01`-`w14*` (`w09`/`w12` excluded), and
-all 12 `x01`-`x12` adversarial-refutation programs below.
+`u01`-`u13*`, all 12 `v01`-`v12*`, all 12 `w01`-`w14*` (`w09`/`w12` excluded), all
+12 `x01`-`x12`, and all 16 `y01`-`y17*` adversarial-refutation programs below.
 
 ### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
@@ -467,6 +468,73 @@ VARYING` where only the innermost loop's own `EXIT PERFORM` unwinds, plus
 these lock in existing behavior as regression guards, not new fixes. See
 `tests/round10-fixes.test.js` for focused, toolchain-independent unit tests
 of all 6 fixes above.
+
+### Round-11 adversarial-refutation findings (y01-y17) and their fixes
+
+A round-11 refuter found 3 more root-cause dishonest divergences, each
+precisely isolated to a minimal repro before the fix: DISPLAY of a GROUP
+containing an OCCURS child (fixed-size OR `... DEPENDING ON`) referenced a
+nonexistent bare Scala identifier, `SEARCH ALL` against a table declared
+with a MULTI-field composite key silently discarded every key past the
+first (a wrong-*match* bug, not just an incompleteness), and `INITIALIZE` of
+a subscripted table element ignored the subscript entirely and wiped the
+WHOLE table. All 3 are now fixed; every promoted program hard-passes
+`oracleCompare()`.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | `DISPLAY` of a GROUP containing an OCCURS child fell through every branch of `renderDisplayOperand` to a bare `expr` at the bottom - a reference to a nonexistent Scala identifier (a group has no flat var of its own). Round-10 had already built `odoDisplayValueExpr` for exactly this table-aware raw-storage concatenation, but wired it ONLY into `writeRecordPlan` (the WRITE path); `renderDisplayOperand` (the DISPLAY path) still only tried `groupDisplayValueExpr`, which unconditionally bails (`null`) the instant ANY OCCURS child is present, fixed-size or ODO alike | `odoDisplayValueExpr` (`generator/expression-gen.js`) is extended to also handle a FIXED-size OCCURS child (not just `DEPENDING ON` - the count expression is now `tableInfo.dependingOn ? "(<counter>).toInt" : "<literal times>"`), and `renderDisplayOperand` now tries it FIRST, before `groupDisplayValueExpr` - every other `groupDisplayValueExpr` caller (READ's group-mode fallback text, the CALL BY REFERENCE group-marshalling convention) is untouched. Verified byte-exact against cobc's own y11b oracle: `GROUP=[3123]` for a 3-element ODO table (a 1-digit counter holding 3, elements 1/2/3) | y11b |
+| 2 | `SEARCH ALL` against a table declared `ASCENDING KEY IS WS-K1 WS-K2` (a genuine multi-field composite key) drove the binary search off WS-K1 ALONE - `findKeyEquality` only ever extracted the FIRST key's equality test out of the WHEN's AND-chain, silently discarding every conjunct past it. This was a wrong-**match** bug: a WHEN testing `WS-K1(x) = 20 AND WS-K2(x) = 9` (no such row exists in the table) matched purely on `WS-K1 = 20` and returned whichever of the several same-K1 rows binary search happened to land on - a fabricated match where cobc reports "not found" | New `flattenAndChain`/`extractKeyPrefix` (`generator/expression-gen.js`) extract the full ordered PREFIX of the table's declared composite key that has an equality conjunct in the WHEN (stopping at the first declared key with none - a legitimate "search on a leading prefix" COBOL usage), driving a genuine composite-key binary search (`compositeShouldNarrowLowerExpr` - the direct multi-key generalization of the pre-existing single-key ternary, tuple-comparing in declared key order); any residual conjunct (an un-prefixed trailing key, or an ordinary non-key test) is re-verified at the narrowed candidate index before declaring a match - a composite-key match can only occur at ONE table position, so a residual failure there is force-terminated as "not found," not "keep narrowing." A WHEN with no equality on even the table's FIRST declared key still falls back to the pre-existing, honestly-noted linear scan. Verified against cobc's own y12 oracle: `FOUND1=DDD` (the true match), `FOUND2=AAA` (a valid one-key-prefix search), `FOUND3=NONE` (the fabricated-match case above, now correctly "not found") | y12 |
+| 3 | `INITIALIZE` of a SUBSCRIPTED table element (`INITIALIZE WS-ENTRY(WS-I)`) completely ignored the target's own subscript - `generateInitialize`/`initializeAssignmentLines` always emitted a bare `<child camel> = Vector.fill(<full count>)(...)` for every leaf, wiping EVERY row of the table exactly as if the INITIALIZE had named the bare (unsubscripted) table name | The target's own subscript list is now threaded through both the group-recursion path (`initializeAssignmentLines`) and the direct-elementary-OCCURS path (`generateInitialize`), rebuilding only the indexed row/element via the same subscripted-MOVE-target `.updated(idx, value)` convention (`renderAssignment`) any other subscripted write already uses - never a fresh whole-table `Vector.fill`. `wrapInitializeOccurs` gained a `skipDims` parameter so a *further* nested OCCURS dimension inside a partially-subscripted multi-dimensional target still gets its own remaining structure reset via `Vector.fill`, not a bare scalar. Verified against cobc's own y17 oracle: `INITIALIZE WS-ENTRY(2)` resets only row 2 (`E2=      /0000`), leaving rows 1 and 3 (`E1=AAAAAA/0111`, `E3=CCCCCC/0333`) completely untouched | y17 |
+
+16 valid round-11 probes were promoted (3 fixed divergers - `y11b`, `y12`,
+`y17` - plus 13 survivors that already passed unmodified before this
+round's fixes, locking in existing behavior as regression guards: `y01`
+DECLARATIVES two-file mode-form, `y02` a DECLARATIVES handler that itself
+performs a file operation, `y03` a retry-after-OPEN-failure-succeeds path,
+`y04` a COMP (binary) file WRITE/READ round trip, `y05` a SIGN IS LEADING
+SEPARATE file WRITE/READ round trip, `y06` trailing-space byte-path
+preservation on a mixed record, `y07` READ INTO landing in the SECOND
+record of a file, `y08` a COMPUTE with mixed ROUNDED/unrounded subscripted
+targets, `y10` SUBTRACT CORRESPONDING ROUNDED recursing into a NESTED group
+while also skipping non-corresponding sibling fields (partial-and-nested
+CORRESPONDING in one program), `y13` SORT with an INPUT PROCEDURE spanning
+multiple SECTIONs, `y14` EVALUATE TRUE ALSO a numeric subject with 88-level
+condition-name WHEN operands (including `ALSO ANY`), `y15` a compound
+(AND-of-two-88s) PERFORM UNTIL condition, and `y16` a recursive (nested-
+group) MOVE CORRESPONDING).
+
+4 probes were deliberately **not promoted**:
+
+- `y09` (`ADD CORRESPONDING` between two flat groups with a partial
+  field-name overlap) - not a new fix or a distinct capability from what
+  `r13-addcorresponding-nested.cbl` (round-4) already locks in end-to-end
+  (partial overlap AND nested-group recursion, for the same `ADD
+  CORRESPONDING` verb); kept out of the promoted set as redundant with
+  existing coverage rather than double-counted.
+- `y11` (`OUT-COUNT`/`OUT-ELEM` WRITE-then-DISPLAY across three WRITEs, the
+  last of which SHRINKS the live `OCCURS ... DEPENDING ON` counter after
+  previously extending it) - the "UB fall-through probe": COBOL's own
+  standard does not mandate what happens to storage beyond the *current*
+  `DEPENDING ON` count once it has shrunk (there is no requirement that a
+  compiler clear or preserve those bytes) - this generator's Vector-based
+  storage model happens to retain the original values (and happens to
+  match this installed GnuCOBOL's own behavior for this exact repro), but
+  that agreement is a property of two SPECIFIC implementations, not a
+  portable COBOL guarantee an oracle-based regression suite should
+  permanently pin down. Its well-defined half (a single ODO WRITE) is
+  already covered by round-10's `x04-odo-record-write.cbl`.
+- `y11probe` and `y18` are both rejected by cobc itself at COMPILE time
+  (`y11probe`: a second `OCCURS ... DEPENDING ON` field in the same record
+  - "`WS-TAB1` cannot have OCCURS DEPENDING because of `WS-CNT2`";
+  `y18`: a numeric-edited item (`PIC ZZ,ZZ9.99`) used directly as a
+  `COMPUTE` arithmetic operand - "`'WS-EDITED' is not a numeric value`") -
+  same reasoning as every other cobc-rejected repro this refutation
+  process has found: a program real COBOL itself refuses to compile is not
+  a meaningful oracle comparison target.
+
+See `tests/round11-fixes.test.js` for focused, toolchain-independent unit
+tests of all 3 fixes above.
 
 ### Known gaps
 

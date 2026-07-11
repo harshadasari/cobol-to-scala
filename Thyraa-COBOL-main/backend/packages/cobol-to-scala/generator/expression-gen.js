@@ -4353,23 +4353,39 @@ function groupChildConstructorExpr(groupKey) {
 }
 
 /**
- * round-10 finding 4: the DISPLAY-only-ODO variant of groupDisplayValueExpr -
- * identical for every plain child, but a TABLE_REGISTRY child with a live
- * OCCURS ... DEPENDING ON counter (`tableInfo.dependingOn`, see
- * scala-generator.js's tableRegistry construction) contributes exactly
- * `dependingOn`-many elements' worth of digit text (the table's *current*
- * runtime length), not the fixed max occurrence count
- * groupDisplayValueExpr's own unconditional bail-out on any OCCURS child
- * refuses to guess at. A fixed-size (no DEPENDING ON) OCCURS child, or one
- * whose own USAGE is non-DISPLAY (packed+ODO - see writeRecordPlan, an
- * honest TODO instead), still bails out to `null` exactly like
- * groupDisplayValueExpr always has - only the ODO+DISPLAY combination is new
- * here. A separate function (not folded into groupDisplayValueExpr itself)
- * specifically so this new ODO-aware behavior is scoped to the WRITE path
- * (writeRecordPlan) alone - every other groupDisplayValueExpr caller (bare
- * whole-group DISPLAY, READ's group-mode fallback text) is completely
- * unaffected, since cobc's own DISPLAY-of-an-ODO-group behavior has not been
- * independently oracle-verified the way the WRITE case has (x04).
+ * round-10 finding 4 (extended by round-11 finding 1): the table-aware
+ * variant of groupDisplayValueExpr - identical for every plain child, but a
+ * TABLE_REGISTRY child (an OCCURS-bearing elementary field) contributes its
+ * elements' worth of digit text concatenated back-to-back, exactly like
+ * cobc's own raw-storage DISPLAY of a group containing a table:
+ *   - OCCURS ... DEPENDING ON (`tableInfo.dependingOn`, see
+ *     scala-generator.js's tableRegistry construction): the table's
+ *     *current* runtime length (round-10 finding 4 - verified against
+ *     installed GnuCOBOL's y11b oracle, `GROUP=[3123]` for a 3-element ODO
+ *     table holding 1/2/3 with a 1-digit counter holding 3).
+ *   - fixed-size OCCURS (no DEPENDING ON, round-11 finding 1): every
+ *     declared element (`tableInfo.times`), unconditionally - this is the
+ *     piece round-10 left as an unconditional bail-out
+ *     (groupDisplayValueExpr's own restriction), which meant DISPLAY of a
+ *     group with a *fixed*-size OCCURS child fell all the way through to a
+ *     bare, undeclared-identifier Scala reference (renderDisplayOperand had
+ *     no fallback at all for that shape) rather than a compiling, correct
+ *     concatenation.
+ * Both cases share the same `(0 until <count>).map(i => <elem>).mkString`
+ * shape; only the count expression differs (a runtime `.toInt` conversion of
+ * the counter field vs. a literal element count).
+ *
+ * A table child whose own USAGE is non-DISPLAY (packed+OCCURS - see
+ * writeRecordPlan, an honest TODO instead) still bails out to `null` exactly
+ * like groupDisplayValueExpr always has. A separate function (not folded
+ * into groupDisplayValueExpr itself) specifically so this table-aware
+ * behavior is scoped to callers that have actually been oracle-verified for
+ * it (writeRecordPlan's WRITE path, and renderDisplayOperand's bare
+ * whole-group DISPLAY path per y11b) rather than silently changing every
+ * groupDisplayValueExpr caller's behavior (e.g. READ's group-mode fallback
+ * text, or the CALL BY REFERENCE group-marshalling convention
+ * scatterGroupFromString pairs with) which remain on the original,
+ * table-bailing function untouched.
  */
 function odoDisplayValueExpr(groupKey) {
   const children = GROUP_REGISTRY.get(groupKey);
@@ -4379,14 +4395,15 @@ function odoDisplayValueExpr(groupKey) {
   for (const c of children) {
     if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) {
       const tableInfo = TABLE_REGISTRY.get(c.nameUpper);
-      if (!tableInfo || !tableInfo.dependingOn || !c.info || isNonDisplayUsage(c.info.usage)) return null;
+      if (!tableInfo || !c.info || isNonDisplayUsage(c.info.usage)) return null;
       const info = c.info;
+      const countExpr = tableInfo.dependingOn ? `(${tableInfo.dependingOn}).toInt` : `${tableInfo.times}`;
       const asBDExpr = info.scalaType === 'BigDecimal' ? `${c.camel}(i)` : `BigDecimal(${c.camel}(i))`;
       const digitsText = `CobolFmt.digitsOf(${asBDExpr}, ${info.integerDigits || 0}, ${info.decimalDigits || 0})`;
       const elemExpr = info.signed
         ? `((if ${asBDExpr} < BigDecimal(0) then "-" else "+") + ${digitsText})`
         : digitsText;
-      parts.push(`(0 until (${tableInfo.dependingOn}).toInt).map(i => ${elemExpr}).mkString`);
+      parts.push(`(0 until ${countExpr}).map(i => ${elemExpr}).mkString`);
       continue;
     }
     if (c.groupKey) {
@@ -4509,7 +4526,19 @@ export function scatterGroupFromString(groupKey, sourceExpr, indent) {
  * renderLiteralForTarget/formatEditedPicture) and print as-is. A bare group
  * reference (round-5 finding 3 - `info` is null because a group never gets
  * its own elementary FIELD_REGISTRY entry, only its children do) falls back
- * to groupDisplayValueExpr's raw-storage concatenation.
+ * to odoDisplayValueExpr's table-aware raw-storage concatenation first
+ * (round-11 finding 1: this handles a group containing an OCCURS child,
+ * fixed-size or DEPENDING ON, the exact shape groupDisplayValueExpr itself
+ * always bails out of - previously DISPLAY of such a group fell through
+ * every branch here to the bare `expr` at the bottom, a reference to a
+ * nonexistent Scala identifier, since a group has no flat var of its own;
+ * verified against installed GnuCOBOL's y11b oracle, `GROUP=[3123]`), then
+ * groupDisplayValueExpr's raw-storage concatenation for every other group
+ * shape (odoDisplayValueExpr is a strict superset of groupDisplayValueExpr's
+ * own non-table branches, so the two calls are non-overlapping only in the
+ * table-child case; groupDisplayValueExpr is still tried second rather than
+ * dropped, so a group shape neither function can render still degrades to
+ * the same bare-`expr` fallback as before, not a thrown error).
  */
 function renderDisplayOperand(ref) {
   const expr = convertIdentifier(ref);
@@ -4518,7 +4547,10 @@ function renderDisplayOperand(ref) {
     const hasSubscripts = ref && typeof ref === 'object' && Array.isArray(ref.subscripts) && ref.subscripts.length > 0;
     const nameUpper = ref && typeof ref === 'object' ? String(ref.name || '').toUpperCase() : String(ref || '').toUpperCase();
     if (nameUpper && !hasSubscripts) {
-      const groupExpr = groupDisplayValueExpr(resolveGroupKey(nameUpper));
+      const groupKey = resolveGroupKey(nameUpper);
+      const tableAwareExpr = odoDisplayValueExpr(groupKey);
+      if (tableAwareExpr) return `(${tableAwareExpr})`;
+      const groupExpr = groupDisplayValueExpr(groupKey);
       if (groupExpr) return `(${groupExpr})`;
     }
   }
@@ -4736,43 +4768,133 @@ function generateSearch(statement, indent = 0) {
 }
 
 /**
- * Find a `<key field>(<index>) = <value>` equality test for `keyNameUpper`
- * inside a SEARCH ALL WHEN condition (recursing through AND-compound
- * conditions only - COBOL's SEARCH ALL WHEN phrase is defined as one or more
- * AND-ed equality tests against the table's declared key(s)). Returns the
- * matched RHS AST node (the value the key is being searched for), or null
- * if the condition doesn't have this shape.
+ * Flatten a SEARCH ALL WHEN condition's top-level AND-chain into its
+ * individual conjuncts (round-11 finding 2). COBOL's SEARCH ALL WHEN phrase
+ * is defined as one or more AND-ed tests; recurses through nested compound
+ * AND nodes only (any other node - a bare RelationalCondition, an OR, a NOT,
+ * ...) is returned as a single opaque leaf, never decomposed further. Order
+ * is preserved left-to-right so key-equality extraction below can match the
+ * table's own declared key ordering deterministically when a field name
+ * appears more than once.
  */
-function findKeyEquality(condition, keyNameUpper) {
-  if (!condition) return null;
-  if (condition.type === 'RelationalCondition') {
-    if (
-      condition.relationalOperator === '=' &&
-      condition.subject &&
-      String(condition.subject.name).toUpperCase() === keyNameUpper
-    ) {
-      return condition.object;
-    }
-    return null;
-  }
+function flattenAndChain(condition) {
+  if (!condition) return [];
   if (condition.type === 'Condition' && condition.conditionType === 'compound' && String(condition.operator).toUpperCase() === 'AND') {
-    return findKeyEquality(condition.left, keyNameUpper) || findKeyEquality(condition.right, keyNameUpper);
+    return [...flattenAndChain(condition.left), ...flattenAndChain(condition.right)];
   }
-  return null;
+  return [condition];
+}
+
+/**
+ * From a WHEN clause's flattened AND-chain (`leaves`), pick out the
+ * contiguous *prefix* of the table's declared composite key
+ * (`declaredKeysUpper`, in ASCENDING/DESCENDING declaration order) that has
+ * a `<key>(<index>) = <value>` equality conjunct - round-11 finding 2. A
+ * multi-key SEARCH ALL (`ASCENDING KEY IS WS-K1 WS-K2`) must be driven by
+ * the FULL composite key it was declared with, in that order, not just the
+ * first key: the old single-key findKeyEquality() silently discarded every
+ * conjunct past the first, so a WHEN testing `WS-K1(x) = 20 AND WS-K2(x) =
+ * 9` (no such row - only (20,1) and (20,2) exist) matched purely on
+ * WS-K1 = 20 and returned whichever of those two rows binary search landed
+ * on, a wrong match where cobc reports "not found" (verified against
+ * installed GnuCOBOL's y12 oracle: FOUND3=NONE).
+ *
+ * Stops at the first declared key with no equality conjunct (a legitimate
+ * COBOL usage - SEARCH ALL may test just a leading prefix of a composite
+ * key, since the table is primarily ordered by that prefix). Returns
+ * `{ prefixKeys, residualLeaves }` where `prefixKeys` is the (possibly
+ * shorter-than-declared) ordered list of `{ nameUpper, camel, targetExpr }`
+ * consumed this way, and `residualLeaves` is every other conjunct (an
+ * un-consumed trailing key, or any non-key test entirely) that must still be
+ * re-verified once the composite key narrows to a candidate index (see
+ * generateSearchAll's use of it) rather than silently ignored. `prefixKeys`
+ * is empty when even the FIRST declared key has no equality conjunct -
+ * callers treat that as "cannot be decomposed to a key-prefix equality set"
+ * and fall back to a linear scan.
+ */
+function extractKeyPrefix(leaves, declaredKeysUpper) {
+  const eqByKey = new Map();
+  for (const leaf of leaves) {
+    if (
+      leaf &&
+      leaf.type === 'RelationalCondition' &&
+      leaf.relationalOperator === '=' &&
+      leaf.subject &&
+      !eqByKey.has(String(leaf.subject.name).toUpperCase())
+    ) {
+      const nm = String(leaf.subject.name).toUpperCase();
+      if (declaredKeysUpper.includes(nm)) eqByKey.set(nm, leaf);
+    }
+  }
+
+  const prefixKeys = [];
+  const consumed = new Set();
+  for (const k of declaredKeysUpper) {
+    const leaf = eqByKey.get(k);
+    if (!leaf) break;
+    prefixKeys.push({ nameUpper: k, camel: toCamelCase(k), targetExpr: convertArithmeticExpression(leaf.object) });
+    consumed.add(leaf);
+  }
+  const residualLeaves = leaves.filter(l => !consumed.has(l));
+  return { prefixKeys, residualLeaves };
+}
+
+/**
+ * Scala expression for the `_hi = idx - 1` ("narrow to the lower half")
+ * branch of the composite-key binary search - the direct multi-key
+ * generalization of the pre-existing single-key ternary
+ * (`isDescending ? _key < target : _key > target`), lexicographically
+ * ("dictionary order") tuple-comparing the current candidate index's
+ * composite key (`_key0, _key1, ...`, one per `prefixKeys` entry, already
+ * bound by generateSearchAll) against the searched-for composite target:
+ * the first key decides unless the two are equal, in which case the next
+ * key breaks the tie, and so on. Applies only per the table's own single
+ * declared direction (`isDescending` - this generator only models a table
+ * whose *entire* declared key list shares one direction, ASCENDING or
+ * DESCENDING, matching the pre-existing single-key isDescending convention;
+ * see tinfo.ascending/tinfo.descending) - true for an ASCENDING table
+ * exactly when the current composite key sorts AFTER the target (so the
+ * target, if present, must be at a lower index), the mirror-image sense for
+ * DESCENDING.
+ *
+ * NOTE: this is deliberately NOT a generic "current < target" comparison -
+ * an earlier draft of this function built exactly that (reusing the
+ * single-key ascending-case comparator character for every recursion level
+ * regardless of which binary-search branch it fed), which silently inverted
+ * the search direction the moment a second key was compared and made every
+ * multi-key SEARCH ALL that reached this branch return the wrong entry (or
+ * none at all) - caught by re-running the isolated y12 repro after the
+ * initial implementation, not assumed correct from the code shape alone.
+ */
+function compositeShouldNarrowLowerExpr(prefixKeys, isDescending, i = 0) {
+  const cmp = isDescending ? '<' : '>';
+  const keyVar = `_key${i}`;
+  const target = `(${prefixKeys[i].targetExpr})`;
+  if (i === prefixKeys.length - 1) return `${keyVar} ${cmp} ${target}`;
+  return `(${keyVar} ${cmp} ${target}) || (${keyVar} == ${target} && ${compositeShouldNarrowLowerExpr(prefixKeys, isDescending, i + 1)})`;
 }
 
 /**
  * Generate SEARCH ALL (binary search). The COBOL standard requires a SEARCH
  * ALL's WHEN condition to test the table's declared ASCENDING/DESCENDING
- * KEY with equality, and requires the table's contents to already be in
+ * KEY(s) with equality, and requires the table's contents to already be in
  * that key order - i.e. any conforming SEARCH ALL WHEN clause has exactly
  * the shape a real binary search can be driven from directly, which is what
- * findKeyEquality() detects. When present, this generates a genuine
- * O(log n) binary search that narrows on the extracted key field vs. the
- * extracted target-value expression.
+ * extractKeyPrefix() detects (round-11 finding 2 - extended from a
+ * single-key-only extraction to the table's FULL declared composite key,
+ * see extractKeyPrefix's own doc comment for why single-key extraction was
+ * an outright wrong-match bug, not just an incompleteness). When present,
+ * this generates a genuine O(log n) binary search that narrows on the
+ * extracted composite key (compared in declared key order via
+ * compositeLessThanExpr) vs. the extracted target-value expressions, with
+ * any residual (non-key, or trailing-key-without-equality) WHEN conjunct
+ * re-verified at the narrowed candidate index before declaring a match -
+ * an exact composite-key match can only occur at one table position (the
+ * table is sorted uniquely by that key), so a residual-conjunct failure at
+ * that position means "not found" outright, not "keep narrowing".
  *
- * If the WHEN clause doesn't have that shape (multiple WHEN clauses, or a
- * condition this generator doesn't recognize as a key equality), a linear
+ * If the WHEN clause doesn't have that shape (multiple WHEN clauses, or not
+ * even the table's first declared key has an equality conjunct), a linear
  * scan over the whole table is generated instead, honestly noted as such: it
  * still reproduces cobc's observable stdout for a single-match search (the
  * table is - by the same SEARCH ALL precondition - already sorted per its
@@ -4789,32 +4911,52 @@ function generateSearchAll(statement, indent, tinfo) {
   const idxVar = tinfo.indexed[0];
   const times = tinfo.times;
   const isDescending = tinfo.ascending.length === 0 && tinfo.descending.length > 0;
-  const keyNameUpper = (tinfo.ascending[0] || tinfo.descending[0] || '').toUpperCase();
+  const declaredKeysUpper = (tinfo.ascending.length > 0 ? tinfo.ascending : tinfo.descending).map(k => String(k).toUpperCase());
 
   const whenClauses = statement.whenClauses || [];
   const singleWhen = whenClauses.length === 1 ? whenClauses[0] : null;
-  const keyTargetNode = singleWhen && keyNameUpper ? findKeyEquality(singleWhen.condition, keyNameUpper) : null;
+  const { prefixKeys, residualLeaves } = singleWhen && declaredKeysUpper.length > 0
+    ? extractKeyPrefix(flattenAndChain(singleWhen.condition), declaredKeysUpper)
+    : { prefixKeys: [], residualLeaves: [] };
 
   const lines = [`${indentStr}{`];
   const atEnd = statement.atEnd || [];
   const atEndLines = atEnd.length > 0 ? atEnd.map(s => generateExpression(s, indent + 2)).join('\n') : `${bi}()`;
 
-  if (keyTargetNode) {
-    const keyExpr = tinfo.indexed.length > 0 ? findTableKeyCamel(tinfo, keyNameUpper) : null;
-    const targetExpr = convertArithmeticExpression(keyTargetNode);
+  if (prefixKeys.length > 0) {
     lines.push(`${bi}var _lo = 1`);
     lines.push(`${bi}var _hi = ${times}`);
     lines.push(`${bi}var _searchDone = false`);
     lines.push(`${bi}while !_searchDone && _lo <= _hi do`);
     lines.push(`${wi}${idxVar} = (_lo + _hi) / 2`);
-    lines.push(`${wi}val _key = ${keyExpr}(${idxVar} - 1)`);
-    lines.push(`${wi}if _key == (${targetExpr}) then`);
+    prefixKeys.forEach((pk, i) => {
+      lines.push(`${wi}val _key${i} = ${pk.camel}(${idxVar} - 1)`);
+    });
+    const keyEqExpr = prefixKeys.map((pk, i) => `_key${i} == (${pk.targetExpr})`).join(' && ');
     const body = singleWhen.statements && singleWhen.statements.length > 0
-      ? singleWhen.statements.map(s => generateExpression(s, indent + 3)).join('\n')
-      : `${si}()`;
-    lines.push(body);
-    lines.push(`${si}_searchDone = true`);
-    lines.push(`${wi}else if (${isDescending ? `_key < (${targetExpr})` : `_key > (${targetExpr})`}) then`);
+      ? singleWhen.statements.map(s => generateExpression(s, indent + (residualLeaves.length > 0 ? 4 : 3))).join('\n')
+      : `${'  '.repeat(indent + (residualLeaves.length > 0 ? 4 : 3))}()`;
+    lines.push(`${wi}if (${keyEqExpr}) then`);
+    if (residualLeaves.length > 0) {
+      // round-11 finding 2: the composite key alone matched, but this WHEN
+      // has one or more further conjuncts (an un-prefixed trailing declared
+      // key, or an ordinary non-key test) that must ALSO hold - re-verify
+      // them here. Since the table is sorted uniquely by its full composite
+      // key, this is the only position that could ever match; a residual
+      // failure here is an outright "not found", not "keep narrowing" (the
+      // while loop is force-terminated by pinning _lo/_hi past each other,
+      // same as any other exhausted binary search).
+      const residualExpr = residualLeaves.map(l => `(${convertCondition(l)})`).join(' && ');
+      lines.push(`${si}if (${residualExpr}) then`);
+      lines.push(body);
+      lines.push(`${'  '.repeat(indent + 4)}_searchDone = true`);
+      lines.push(`${si}else`);
+      lines.push(`${'  '.repeat(indent + 4)}_lo = _hi + 1`);
+    } else {
+      lines.push(body);
+      lines.push(`${si}_searchDone = true`);
+    }
+    lines.push(`${wi}else if (${compositeShouldNarrowLowerExpr(prefixKeys, isDescending)}) then`);
     lines.push(`${si}_hi = ${idxVar} - 1`);
     lines.push(`${wi}else`);
     lines.push(`${si}_lo = ${idxVar} + 1`);
@@ -4823,7 +4965,7 @@ function generateSearchAll(statement, indent, tinfo) {
   } else {
     lines.push(`${bi}// SEARCH ALL fallback: linear scan - the WHEN clause here isn't a single`);
     lines.push(`${bi}// key-equality test this generator can drive a binary search from directly`);
-    lines.push(`${bi}// (see findKeyEquality's doc comment); result is identical, only the`);
+    lines.push(`${bi}// (see extractKeyPrefix's doc comment); result is identical, only the`);
     lines.push(`${bi}// O(log n) vs O(n) search-order difference is invisible to stdout.`);
     lines.push(`${bi}${idxVar} = 1`);
     lines.push(`${bi}var _searchDone = false`);
@@ -4845,11 +4987,6 @@ function generateSearchAll(statement, indent, tinfo) {
 
   lines.push(`${indentStr}}`);
   return lines.join('\n');
-}
-
-/** camelCase name of the table's declared key field (ascending or descending). */
-function findTableKeyCamel(tinfo, keyNameUpper) {
-  return keyNameUpper ? toCamelCase(keyNameUpper) : null;
 }
 
 /**
@@ -5926,38 +6063,74 @@ function initializeLeafValueExpr(info, replacing) {
  * exactly (same `occursCounts` array, same fold direction), so every element
  * of a table nested inside (or itself) an INITIALIZE target is set, not just
  * a single scalar assigned to what is actually a `Vector[...]`-typed var.
+ *
+ * `skipDims` (round-11 finding 3) is the count of *outermost* OCCURS
+ * dimensions to leave un-wrapped - i.e. already consumed by an explicit
+ * subscript on the INITIALIZE target itself (`INITIALIZE WS-ENTRY(WS-I)`),
+ * for which renderAssignment's own `.updated(...)` rebuild (not a fresh
+ * `Vector.fill`) supplies that dimension instead - see
+ * initializeAssignmentLines/generateInitialize's subscripted branches. `0`
+ * (the default) wraps every dimension, exactly the prior unconditional
+ * behavior for an un-subscripted target.
  */
-function wrapInitializeOccurs(scalarExpr, info) {
+function wrapInitializeOccurs(scalarExpr, info, skipDims = 0) {
   let expr = scalarExpr;
   const counts = info.occursCounts || [];
-  for (let i = counts.length - 1; i >= 0; i--) {
+  for (let i = counts.length - 1; i >= skipDims; i--) {
     expr = `Vector.fill(${counts[i]})(${expr})`;
   }
   return expr;
 }
 
 /**
- * One `camel = <value>` assignment line per elementary leaf reachable from
- * `groupKey` (recursing into any nested-group child via GROUP_REGISTRY,
- * exactly like correspondingPairs' own recursion). A FILLER child (round-5
- * finding 3's `isFiller` GROUP_REGISTRY entries) is skipped entirely - COBOL
- * INITIALIZE never touches FILLER, it has no addressable identity to assign
- * through in the first place.
+ * One assignment line per elementary leaf reachable from `groupKey`
+ * (recursing into any nested-group child via GROUP_REGISTRY, exactly like
+ * correspondingPairs' own recursion). A FILLER child (round-5 finding 3's
+ * `isFiller` GROUP_REGISTRY entries) is skipped entirely - COBOL INITIALIZE
+ * never touches FILLER, it has no addressable identity to assign through in
+ * the first place.
+ *
+ * `subscripts` (round-11 finding 3) is the INITIALIZE target's own subscript
+ * list when the target itself is a subscripted OCCURS group element
+ * (`INITIALIZE WS-ENTRY(WS-I)` - `WS-ENTRY` is the OCCURS-bearing group,
+ * `WS-I` selects ONE row of it). Previously this recursion always emitted a
+ * bare `<child camel> = Vector.fill(<full count>)(...)` for every leaf -
+ * i.e. it silently ignored the target's own subscript entirely and wiped
+ * EVERY row of the table, ready for the INITIALIZE to have been of the
+ * table's bare (unsubscripted) name - ` INITIALIZE WS-ENTRY(2)` produced
+ * exactly the same generated code as `INITIALIZE WS-ENTRY`, ignoring the row
+ * a real cobc INITIALIZE targets. When `subscripts` is present, each leaf's
+ * assignment instead goes through renderAssignment (the same `.updated(idx,
+ * value)` per-row rebuild any subscripted MOVE target uses) so only the
+ * selected row's copy of that leaf changes, wrapping the value in
+ * Vector.fill for any *further* nested OCCURS dimension inside this leaf
+ * beyond what `subscripts` already selects (wrapInitializeOccurs's
+ * `skipDims`) - this is what makes a multi-dimensional OCCURS (an
+ * INITIALIZE target subscripted only down to an outer dimension, leaving an
+ * inner OCCURS dimension unindexed) reset that leaf's entire remaining
+ * inner structure, not a single scalar.
  */
-function initializeAssignmentLines(groupKey, replacing, indentStr) {
+function initializeAssignmentLines(groupKey, replacing, indentStr, subscripts) {
   const children = GROUP_REGISTRY.get(groupKey) || [];
   const lines = [];
+  const hasSubscripts = Array.isArray(subscripts) && subscripts.length > 0;
   for (const c of children) {
     if (c.isFiller) continue;
     if (c.groupKey) {
-      lines.push(...initializeAssignmentLines(c.groupKey, replacing, indentStr));
+      lines.push(...initializeAssignmentLines(c.groupKey, replacing, indentStr, subscripts));
       continue;
     }
     const info = c.info || lookupField(c.nameUpper);
     if (!info) continue;
     const scalarExpr = initializeLeafValueExpr(info, replacing);
     if (scalarExpr == null) continue; // REPLACING present but this leaf's category wasn't mentioned - leave it untouched
-    lines.push(`${indentStr}${c.camel} = ${wrapInitializeOccurs(scalarExpr, info)}`);
+    if (hasSubscripts) {
+      const wrapped = wrapInitializeOccurs(scalarExpr, info, subscripts.length);
+      const syntheticTarget = { name: c.nameUpper, subscripts };
+      lines.push(`${indentStr}${renderAssignment(syntheticTarget, wrapped)}`);
+    } else {
+      lines.push(`${indentStr}${c.camel} = ${wrapInitializeOccurs(scalarExpr, info)}`);
+    }
   }
   return lines;
 }
@@ -5973,6 +6146,14 @@ function initializeAssignmentLines(groupKey, replacing, indentStr) {
  * initializeLeafValueExpr) for both a GROUP target (recursing over its
  * children through GROUP_REGISTRY, honoring OCCURS/FILLER/REPLACING - see
  * initializeAssignmentLines) and a plain elementary target.
+ *
+ * round-11 finding 3: a target's own subscript list (`INITIALIZE
+ * WS-ENTRY(WS-I)` for an OCCURS group, or `INITIALIZE WS-ELEM(WS-I)` for a
+ * directly OCCURS-bearing elementary item) is threaded through to both the
+ * group-recursion path (initializeAssignmentLines) and the elementary path
+ * below, so only the ONE indexed row/element is rebuilt via renderAssignment
+ * (the same subscripted-MOVE-target `.updated(idx, value)` convention),
+ * never the whole table.
  */
 function generateInitialize(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -5982,9 +6163,12 @@ function generateInitialize(statement, indent = 0) {
   for (const target of targets) {
     const nameUpper = String(target?.name || target || '').toUpperCase();
     const groupKey = resolveGroupKey(nameUpper);
+    const subscripts = target && typeof target === 'object' && Array.isArray(target.subscripts) && target.subscripts.length > 0
+      ? target.subscripts
+      : null;
 
     if (GROUP_REGISTRY.has(groupKey)) {
-      const groupLines = initializeAssignmentLines(groupKey, statement.replacing, indentStr);
+      const groupLines = initializeAssignmentLines(groupKey, statement.replacing, indentStr, subscripts);
       lines.push(...(groupLines.length > 0 ? groupLines : [`${indentStr}() // INITIALIZE ${nameUpper}: no addressable children found`]));
       continue;
     }
@@ -5999,7 +6183,8 @@ function generateInitialize(statement, indent = 0) {
       lines.push(`${indentStr}() // INITIALIZE ${nameUpper}: REPLACING present, this item's category not mentioned - left untouched`);
       continue;
     }
-    lines.push(`${indentStr}${renderAssignment(target, wrapInitializeOccurs(scalarExpr, info))}`);
+    const skipDims = subscripts ? subscripts.length : 0;
+    lines.push(`${indentStr}${renderAssignment(target, wrapInitializeOccurs(scalarExpr, info, skipDims))}`);
   }
 
   return lines.length > 0 ? lines.join('\n') : `${indentStr}()`;

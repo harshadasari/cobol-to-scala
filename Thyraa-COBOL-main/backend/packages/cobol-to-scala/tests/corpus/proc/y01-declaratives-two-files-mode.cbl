@@ -1,0 +1,33 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. Y01DECL2.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT FILE-A ASSIGN TO "Y01A.DAT"
+               ORGANIZATION IS LINE SEQUENTIAL
+               FILE STATUS IS FS-A.
+           SELECT FILE-B ASSIGN TO "Y01B.DAT"
+               ORGANIZATION IS LINE SEQUENTIAL
+               FILE STATUS IS FS-B.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  FILE-A.
+       01  REC-A               PIC X(10).
+       FD  FILE-B.
+       01  REC-B               PIC X(10).
+       WORKING-STORAGE SECTION.
+       01  FS-A                PIC X(2).
+       01  FS-B                PIC X(2).
+       PROCEDURE DIVISION.
+       DECLARATIVES.
+       INPUT-HANDLER SECTION.
+           USE AFTER STANDARD ERROR PROCEDURE ON INPUT.
+       INPUT-HANDLER-PARA.
+           DISPLAY "INPUT-HANDLER FIRED FS-A=" FS-A " FS-B=" FS-B.
+       END DECLARATIVES.
+       MAIN-PARA.
+           OPEN INPUT FILE-A.
+           DISPLAY "AFTER OPEN A FS-A=" FS-A.
+           OPEN INPUT FILE-B.
+           DISPLAY "AFTER OPEN B FS-B=" FS-B.
+           STOP RUN.

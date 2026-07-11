@@ -1,9 +1,9 @@
 # COBOL-to-Scala Autonomous Build — Progress Status
 
-**Last updated:** 2026-07-11 ~19:45 UTC (run started ~01:30 UTC — **~18.5 hours elapsed** of the 2-day window)
+**Last updated:** 2026-07-11 ~20:15 UTC (run started ~01:30 UTC — **~19 hours elapsed** of the 2-day window)
 **Branch:** `claude/analyze-codebase-pdPSZ` — all work below is **committed and pushed**
 **Orchestrator token budget:** well under the 2M cap (orchestrator only dispatches/reviews; all coding happens in delegated Sonnet subagents whose tokens don't count against it)
-**Status:** 🟢 Running — actively hunting for round 13
+**Status:** 🟢 Running — round 13 found 5 more genuine bugs (fix in progress); 187 verified programs committed so far
 
 ---
 
@@ -36,6 +36,7 @@ This is expensive on purpose: it's the only way to catch the class of bug that *
 - **187 real COBOL test programs**, each compiled with genuine GnuCOBOL and diffed byte-for-byte against the generated Scala's output
 - **790 automated tests**, all passing
 - **12 completed adversarial rounds** — dishonest-bug counts per round: `11, 16, 15, 16, 6, 6, 8, 4, 6, 6, 3, 4`
+- **Round 13 in progress**: found 5 more genuine bugs by testing *combinations* of previously-tested features rather than single features (expected, since single-feature bugs are increasingly scarce). Most notable: DECLARATIVES error-handler registries were only wired up *after* generating the handler bodies themselves — meaning a handler that retries its own failed operation, or one handler triggering another, silently couldn't fire. Fix in progress.
 - **28 commits**, each independently verified green before being pushed (never committed red)
 
 ### Notable bugs this process actually caught

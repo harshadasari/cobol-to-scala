@@ -11,6 +11,12 @@ _(none currently open - all prior pins resolved; see cycle entries. Tracked-OPEN
 - **Refutation rounds:** 8 so far (11,16,15,16,6,6,8,4 findings - all fixed through r7; r8 fix in flight)
 
 ## Activity
+### Cycle: Round 14 committed — hunting paused at 14 rounds by owner decision (2026-07-11 ~23:05 UTC)
+- Independent full-suite verification of the round-14 fixes: **879 tests, 879 pass, 0 fail, 0 todo** (log: r14-verify.log). Committed as `062ce37` and pushed.
+- Round 14 closed 4 dishonest findings: the sentence-scope PERIOD parser flaw (most general finding of the campaign — every unterminated conditional clause affected), qualified PERFORM THRU wrong-section resolution, INSPECT REPLACING cascade vs snapshot semantics, and dead SYNC alignment. 11 programs promoted (b1–b6, c1, c3, c4b, c5, c6); corpus now 209.
+- Owner instruction received: stop at 14 rounds, proceed to wrap-up, produce detailed reports on the rounds; adversarial hunting will resume in a later session. NOT CONVERGED at 4 findings — round 15+ deferred, not concluded.
+- Wrap-up begun: `docs/ADVERSARIAL_ROUNDS_REPORT.md` written (full 14-round campaign report: methodology, round-by-round narrative, impact analysis by bug class, top-10 blast-radius ranking, convergence analysis, Known Gaps, resume recommendations). PROGRESS_STATUS.md re-synced. Next: capability-roadmap truth-pass, then closing summary.
+
 
 ### 2026-07-11 21:50 — Cycle: round-13 committed (1469d23, 828/828, 198 programs); round-14 verdict + fix in flight
 - Round-13 + state-leak fix committed after independent full-suite verification (828/0/0 - the leak fix also eliminated the 5 'flaky' todos, confirming the leak was their root cause, not scala-cli races). Dashboard synced (e47034a).

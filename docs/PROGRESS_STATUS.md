@@ -1,9 +1,9 @@
 # COBOL-to-Scala Autonomous Build — Progress Status
 
-**Last updated:** 2026-07-11 ~21:20 UTC (run started ~01:30 UTC — **~20 hours elapsed** of the 2-day window)
+**Last updated:** 2026-07-11 ~23:05 UTC (run started ~01:30 UTC — **~22 hours elapsed**)
 **Branch:** `claude/analyze-codebase-pdPSZ` — all work below is **committed and pushed**
 **Orchestrator token budget:** well under the 2M cap (orchestrator only dispatches/reviews; all coding happens in delegated Sonnet subagents whose tokens don't count against it)
-**Status:** 🟢 Running — round 13 complete and committed (198 verified programs, 828/828 tests); round 14 next
+**Status:** 🟡 Adversarial hunting **paused at round 14 by your decision** — wrap-up phase in progress (detailed reports, docs truth-pass, final summary). Rounds resume whenever you say so.
 
 ---
 
@@ -11,68 +11,58 @@
 
 You asked whether Fable, running autonomously with subagents, could take this COBOL→Scala conversion engine from "looks complete but silently produces wrong output" to something genuinely verified against real COBOL semantics — across all 4 roadmap phases — over your 2-day window. This is that run.
 
-**The core method (repeats every round):**
+**The core method (repeated every round):**
 1. An adversarial subagent writes 10–14 new, deliberately hostile COBOL programs targeting whatever hasn't been tested yet, compiles each with the *real* GnuCOBOL compiler, and runs `oracleCompare()` — diffing GnuCOBOL's actual output against the generated Scala's actual output.
 2. Every mismatch is triaged **HONEST** (a documented, visible gap) or **DISHONEST** (silent wrong output, a crash, or an infinite loop on a claimed-supported feature).
 3. A fix subagent closes every dishonest finding, and the winning adversarial programs are **permanently promoted** into the test corpus with the compiler's real output captured as the pass/fail oracle.
 4. I (the orchestrator) independently re-run the full suite myself before ever committing — nothing gets marked "done" on a subagent's say-so alone.
-5. Repeat until a round finds 0–2 dishonest bugs (convergence) or time/budget runs out.
-
-This is expensive on purpose: it's the only way to catch the class of bug that *looks* fine (compiles, runs, prints something plausible) but is quietly wrong — which is exactly what made the original codebase's fixes unreliable before this run started.
+5. Repeat until a round finds 0–2 dishonest bugs (convergence) or you call it — **you called it at round 14**.
 
 ---
 
 ## 2. What's completed
 
+### ⭐ NEW: the full campaign report
+**`docs/ADVERSARIAL_ROUNDS_REPORT.md`** — the detailed report you asked for on all 14 rounds: methodology, round-by-round narrative, bug-impact analysis by category, the 10 most consequential bugs ranked by real-world blast radius, the convergence-trend analysis (and an honest statement that it did *not* converge — you paused it), the full Known Gaps list, and concrete recommendations for when you resume rounds later.
+
 ### The 4 roadmap phases (all built)
 | Phase | What it covers | State |
 |---|---|---|
-| **1 — Data layer** | Lexer/parser fixes, COBOL PIC/COMP/COMP-3 byte-level codecs (packed decimal, binary, zoned, EBCDIC), copybook expansion, record layouts | ✅ Built + hardened across 12 refutation rounds |
-| **2 — Procedure logic** | Full statement set: PERFORM (all forms), IF/EVALUATE, SEARCH/SEARCH ALL, SORT, STRING/UNSTRING/INSPECT, arithmetic (COMPUTE/ADD/SUBTRACT/MULTIPLY/DIVIDE with ROUNDED), MOVE (incl. CORRESPONDING), file I/O, DECLARATIVES/error handling, multi-program CALL | ✅ Built + hardened |
-| **3 — SQL/JCL** | EXEC SQL → typed Doobie code (compile-verified against the real doobie library), JCL job-step parsing | ✅ MVP done; **SQL generator not yet wired into the main code path** (still stands alone) |
-| **4 — CICS** | CICS command classification, BMS screen-map parsing, service-skeleton generation | ✅ Scaffolding done (intentionally not a full behavioral CICS runtime — see roadmap doc) |
+| **1 — Data layer** | Lexer/parser fixes, COBOL PIC/COMP/COMP-3 byte-level codecs (packed decimal, binary, zoned, EBCDIC), copybook expansion, record layouts | ✅ Built + hardened across 14 refutation rounds |
+| **2 — Procedure logic** | Full statement set: PERFORM (all forms), IF/EVALUATE, SEARCH/SEARCH ALL, SORT, STRING/UNSTRING/INSPECT, arithmetic with ROUNDED, MOVE (incl. CORRESPONDING), file I/O, DECLARATIVES, multi-program CALL | ✅ Built + hardened |
+| **3 — SQL/JCL** | EXEC SQL → typed Doobie code (compile-verified against the real doobie library), JCL job-step parsing | ✅ MVP done; **SQL generator not yet wired into the main code path** |
+| **4 — CICS** | CICS command classification, BMS screen-map parsing, service-skeleton generation | ✅ Scaffolding done (intentionally not a full behavioral CICS runtime) |
 
 ### The verification record (the actual proof of correctness)
-- **198 real COBOL test programs**, each compiled with genuine GnuCOBOL and diffed byte-for-byte against the generated Scala's output
-- **828 automated tests**, all passing
-- **12 completed adversarial rounds** — dishonest-bug counts per round: `11, 16, 15, 16, 6, 6, 8, 4, 6, 6, 3, 4`
-- **Round 13 complete**: 5 more genuine bugs found and fixed (DECLARATIVES handler wiring order, SORT THRU wrappers, RENAMES support, CALL of table-bearing groups, redefining-table registries). Bonus: the orchestrator's own pre-commit verification caught a **state-leak bug** the fix itself introduced — converting two different COBOL programs in one process let the first program's error-handler wiring contaminate the second. That leak also explained earlier intermittent test failures that had looked like tooling flakiness. Fixed with per-conversion isolation + dedicated regression tests.
-- **28 commits**, each independently verified green before being pushed (never committed red)
+- **209 real COBOL test programs**, each compiled with genuine GnuCOBOL and diffed byte-for-byte against the generated Scala's output
+- **879 automated tests, all passing** (879/879, 0 fail, 0 todo — independently verified before the round-14 commit)
+- **14 completed adversarial rounds** — dishonest-bug counts per round: `11, 16, 15, 16, 6, 6, 8, 4, 6, 6, 3, 4, 5, 4` = **110 real bugs found and fixed**
+- **Round 14 (final round of this run) — committed**: 4 bugs fixed, the biggest being a **general parser flaw**: a period after an unterminated IF/READ AT END/ON SIZE ERROR silently swallowed every following statement into the wrong scope — ordinary period-terminated COBOL style, not an edge case. Also fixed: qualified `PERFORM ... THRU` resolving the wrong section, INSPECT REPLACING multi-clause cascading, and dead SYNC alignment (now matches cobc record layouts byte-for-byte).
+- **26 commits**, each independently verified green before being pushed (never committed red)
 
-### Notable bugs this process actually caught
-These are the kind of thing that would have shipped silently broken without this process:
-- A **parser infinite loop** on a rare-but-valid COBOL clause (`88-level ... WHEN SET TO FALSE`) — would have hung forever on real customer code
-- `ADD CORRESPONDING`/`SUBTRACT CORRESPONDING` silently ignoring `ROUNDED`
-- Multi-target `COMPUTE A B C = expr` never worked at all (inverted logic bug in the original parser)
-- File WRITE and READ using two *different, incompatible* byte encodings for the same record — silent data corruption for any packed-decimal field written to a file
-- `SEARCH ALL` (binary search) returning false matches/non-matches on multi-key tables
-- Numeric literals that looked like digits (e.g. `"10"`) being silently typed as integers instead of strings, breaking common patterns like `IF FILE-STATUS = "10"`
-- Group-level `CALL BY REFERENCE` silently dropping the sign off negative packed-decimal fields crossing a subroutine boundary
-
-Full details of every finding and fix are in `Thyraa-COBOL-main/backend/packages/cobol-to-scala/tests/oracle/README.md` (869 lines — the complete verification ledger).
+### Notable bugs this process caught (top of the list — full ranking in the report)
+- A **parser infinite loop** on valid COBOL (`88-level ... WHEN SET TO FALSE`) — would have hung forever on real customer code
+- File WRITE and READ using two *incompatible* byte encodings for the same record — silent data corruption for packed-decimal (money) fields
+- The round-14 **sentence-scope period bug** — silently mis-scoped statements in any old-style COBOL without END-IF/END-READ
+- A cross-conversion **state leak** — converting two programs in one process let program A's error handler contaminate program B
+- Bare `READ file.` silently swallowing the next statement — unbounded damage by construction
+- Multi-target `COMPUTE A B C = expr` never worked at all; `SEARCH ALL` returning false matches on multi-key tables; `"10"` literals typed as Int breaking `FILE STATUS = "10"`
 
 ---
 
-## 3. What's still pending / open
+## 3. What's pending
 
-### Actively in progress right now
-- **Round 14** adversarial hunting — 13 rounds complete, all committed
+### Wrap-up phase (in progress right now)
+- ✅ Round 14 committed + pushed (879/879 green)
+- ✅ `docs/ADVERSARIAL_ROUNDS_REPORT.md` written
+- ⏳ Truth-pass on `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (bring every claim in line with the round-14 state)
+- ⏳ Final closing summary in `docs/AUTONOMOUS_BUILD_LOG.md`
 
-### Documented, intentional gaps (not bugs — known and clearly marked)
-These are real COBOL features the engine doesn't fully handle yet. Each one degrades **visibly** (a clear `???` marker or documented skip) rather than silently producing wrong output:
-- **Reference modification** (`field(start:length)` substring syntax) — parses correctly now, but read/write codegen is a visible placeholder, not real substring logic
-- **Bare unqualified PERFORM/GO TO into an ambiguous paragraph name** — round 12 fixed the *qualified* form (`PERFORM x OF section-y`); the rare bare-ambiguous case remains
-- **GO TO into the middle of a fall-through chain that must keep cascading** — a narrow control-flow corner
-- **REWRITE / DELETE / START** file operations — stubbed, not implemented
-- **SORT USING/GIVING** (file-to-file sort without an input/output procedure) — documented TODO
-- **External/dynamic CALL** (calling a program not present in the same source) — visible TODO marker
-- **SQL generator wiring** — Doobie code generation works and is tested, but isn't yet spliced into the main COBOL→Scala pipeline
-- **JCL → sbt/pipeline skeleton generation** — JCL parsing works; generating actual build skeletons from it does not yet
-- **CICS behavioral conversion** — only scaffolding/classification, not a working CICS runtime translation
-- **OCCURS DEPENDING ON dynamic parse/format** — sized at a fixed maximum rather than truly dynamic
+### Paused (resumable whenever you want)
+- **Adversarial rounds 15+** — the campaign had NOT converged (plateau at 3–5 bugs/round vs the 0–2 bar). The report's §7 has a concrete plan for where round 15 should aim: feature-combination probes (DECLARATIVES × CALL × file I/O in one program, SYNC × nested groups × OCCURS), plus the cheapest Known-Gap promotions first.
 
-### Where this goes next
-Round 14 dispatching now. The finding trend (3→4→5-per-round) is holding steady in the "combinations of features" regime — each round still pays for itself with real bugs. I'll keep running rounds, verifying, committing, and pushing after each one, and will update this file at the next natural checkpoint.
+### Documented, intentional gaps (visible degradation, not silent bugs)
+Full 16-item list with precise scope in the report §6. Highlights: reference modification codegen, REWRITE/DELETE/START, SORT USING/GIVING, external/dynamic CALL, SQL wire-in, JCL→sbt skeletons, CICS behavioral conversion, OCCURS DEPENDING ON dynamic sizing, general inter-paragraph GO TO.
 
 ---
 
@@ -80,8 +70,9 @@ Round 14 dispatching now. The finding trend (3→4→5-per-round) is holding ste
 
 | What | Where |
 |---|---|
-| Full phase-by-phase capability roadmap | `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` |
+| ⭐ **Full 14-round campaign report (impact, analysis, recommendations)** | `docs/ADVERSARIAL_ROUNDS_REPORT.md` |
 | Complete verification ledger (every round, every finding, every fix) | `Thyraa-COBOL-main/backend/packages/cobol-to-scala/tests/oracle/README.md` |
 | Full autonomous run activity log (every cycle) | `docs/AUTONOMOUS_BUILD_LOG.md` |
+| Phase-by-phase capability roadmap | `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` |
 | Runnable demo (COBOL in → verified-equivalent Scala out) | `demo/convert-demo.sh` + `demo/README.md` |
 | Market analysis (why this matters commercially) | `docs/MARKET_ANALYSIS_COBOL_MODERNIZATION.md` |

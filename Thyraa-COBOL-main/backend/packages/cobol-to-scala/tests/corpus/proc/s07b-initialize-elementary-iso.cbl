@@ -1,0 +1,10 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. VINITELEM.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-NUM              PIC 9(3) VALUE 42.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           INITIALIZE WS-NUM.
+           DISPLAY "NUM=" WS-NUM.
+           STOP RUN.

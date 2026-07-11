@@ -532,29 +532,44 @@ function statementEndsInUnconditionalTransfer(statements) {
  * code) whenever a paragraph is only ever reached via this THRU range, which
  * is harmless: they reference the same-named sibling top-level methods and
  * compile fine on their own, just without this method's fallthrough/scoping.
+ *
+ * Takes the whole program's flattened `units` list (name/statements/
+ * sectionName - see flattenProcedureUnits) and the whole program's
+ * `ambiguousNames` set (collectAmbiguousParagraphNames), not a bare
+ * paragraph list, so each nested def's own name is resolved via
+ * resolveParagraphMethodName exactly like generateAllMethods/
+ * generateSectionMethod/generateProgramFlowLines already do - round-5
+ * finding 2: a THRU range can span multiple SECTIONs (see this function's
+ * own doc-comment fix above renderNestedFallthroughDefs), so two paragraphs
+ * inside the very same range can share a bare post-numeric-prefix-strip name
+ * (`1000-PARA-A`/`2000-PARA-A` both -> `paraA`) - plain toMethodName produced
+ * two identically-named nested `def`s in that case (a hard compile error);
+ * resolveParagraphMethodName qualifies only the genuinely-colliding ones by
+ * their own enclosing section, leaving every unique name exactly as before.
  */
-export function generatePerformThruMethod(fromParagraph, toParagraph, paragraphs, indent = 0) {
+export function generatePerformThruMethod(fromParagraph, toParagraph, units, ambiguousNames, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const fromName = toMethodName(fromParagraph);
   const methodName = `${fromName}To${toPascalCase(toParagraph.replace(/^\d+[-_]?/, ''))}`;
+  const nameFor = (u) => resolveParagraphMethodName(u.name, u.sectionName, ambiguousNames);
 
-  // Find all paragraphs in the range (inclusive), in program order.
+  // Find all units in the range (inclusive), in program order.
   let inRange = false;
-  const rangeParagraphs = [];
-  for (const para of paragraphs) {
-    if (para.name === fromParagraph) inRange = true;
-    if (inRange) rangeParagraphs.push(para);
-    if (para.name === toParagraph) break;
+  const rangeUnits = [];
+  for (const u of units) {
+    if (u.name === fromParagraph) inRange = true;
+    if (inRange) rangeUnits.push(u);
+    if (u.name === toParagraph) break;
   }
 
-  if (rangeParagraphs.length === 0) {
+  if (rangeUnits.length === 0) {
     return `${indentStr}def ${methodName}(): Unit =\n${indentStr}  ()`;
   }
 
   const defIndent = indent + 1;
   const lines = [`${indentStr}def ${methodName}(): Unit =`];
-  lines.push(...renderNestedFallthroughDefs(rangeParagraphs, defIndent, p => toMethodName(p.name)));
-  lines.push(`${'  '.repeat(defIndent)}${toMethodName(rangeParagraphs[0].name)}()`);
+  lines.push(...renderNestedFallthroughDefs(rangeUnits, defIndent, nameFor));
+  lines.push(`${'  '.repeat(defIndent)}${nameFor(rangeUnits[0])}()`);
 
   return lines.join('\n');
 }
@@ -569,11 +584,22 @@ export function generatePerformThruMethod(fromParagraph, toParagraph, paragraphs
  * one SECTION's own paragraphs, for PERFORM-of-a-section-name - round-4
  * finding 7), and generateProgramFlowLines (the *whole* PROCEDURE DIVISION,
  * for the program's true entry point - round-4 finding 9). `nameFor` computes
- * each paragraph's local def name; callers needing collision-safe names across
- * a scope that spans multiple sections pass resolveParagraphMethodName,
- * everyone else (a single section, or a single THRU range - inherently
- * collision-free, since paragraph names are unique within either) just passes
- * plain toMethodName.
+ * each paragraph's local def name; callers needing collision-safe names pass
+ * resolveParagraphMethodName, everyone else (a single section - inherently
+ * collision-free, since paragraph names are unique within one section) just
+ * passes plain toMethodName. A single PERFORM ... THRU range is NOT
+ * inherently collision-free the way one section is, despite the earlier
+ * (wrong) version of this comment claiming otherwise: a THRU range can span
+ * multiple SECTIONs (e.g. `PERFORM 1000-PARA-A THRU 2000-PARA-B` where
+ * 1000-PARA-A lives in one SECTION and 2000-PARA-B in a later one - see
+ * tests/corpus/proc/s02-perform-thru-section-span.cbl), and two paragraphs in
+ * different sections can legitimately share a bare post-numeric-prefix-strip
+ * name (`1000-PARA-A` and `2000-PARA-A` both strip to `paraA`) while still
+ * both falling inside the same THRU range - generatePerformThruMethod
+ * therefore also passes resolveParagraphMethodName (round-5 finding 2), not
+ * plain toMethodName as an earlier version of this generator did (which
+ * produced two identically-named nested `def paraA(): Unit` siblings in the
+ * same wrapper method - a hard "paraA is already defined" compile error).
  */
 function renderNestedFallthroughDefs(paragraphs, defIndent, nameFor) {
   const defIndentStr = '  '.repeat(defIndent);
@@ -774,16 +800,15 @@ export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
     }
   }
 
-  // PERFORM THRU wrapper methods, over the flattened paragraph-only list
-  // (top-level paragraphs + every section's own paragraphs, in order) -
-  // unchanged from before this fix.
-  const paragraphsOnly = [...(topLevelParagraphs || [])];
-  for (const section of sections || []) {
-    paragraphsOnly.push(...(section.paragraphs || []));
-  }
+  // PERFORM THRU wrapper methods, over the same whole-program flattened
+  // `units` list (name/statements/sectionName) generateAllMethods already
+  // built above - round-5 finding 2 needs each unit's own sectionName here
+  // (not just its bare paragraph list) so generatePerformThruMethod can
+  // resolve collision-safe nested-def names via resolveParagraphMethodName,
+  // exactly like the flat top-level methods above already do.
   for (const thru of performThrus) {
     const [from, to] = thru.split(':');
-    methods.push(generatePerformThruMethod(from, to, paragraphsOnly, indent));
+    methods.push(generatePerformThruMethod(from, to, units, ambiguousNames, indent));
   }
 
   return methods.join('\n\n');

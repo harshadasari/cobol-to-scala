@@ -1,0 +1,5 @@
+NAME=[Q    ]
+AMOUNT=9999
+ITEM1=[Q  ]
+ITEM2=[Q  ]
+ITEM3=[Q  ]

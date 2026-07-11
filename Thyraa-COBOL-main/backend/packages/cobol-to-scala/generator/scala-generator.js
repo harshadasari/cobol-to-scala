@@ -20,9 +20,11 @@ import {
   setQualifiedRegistry,
   setConditionRegistry,
   setAmbiguousGroupClassNames,
+  setRecordFileRegistry,
   generateCobolFmtHelper,
   generateCobolInspectHelper,
   generateCobolUnstringHelper,
+  formatEditedPicture,
 } from './expression-gen.js';
 import {
   generateMethod,
@@ -32,7 +34,7 @@ import {
   collectAmbiguousParagraphNames,
   generateProgramFlowLines,
 } from './method-gen.js';
-import { generateFileIO, generateFileStatusCheck } from './file-io-gen.js';
+import { generateFileIO, generateFileStatusCheck, generateFileHandleDeclarations } from './file-io-gen.js';
 import { generateSql, generateDoobieImports, generateTransactorSetup } from './sql-gen.js';
 
 /**
@@ -172,6 +174,9 @@ function generateImports(ast, options) {
  * Check if AST contains file operations
  */
 function hasFileOperations(ast) {
+  if (ast.environmentDivision?.fileControls?.length > 0) {
+    return true;
+  }
   if (ast.environment?.inputOutput?.fileControl) {
     return true;
   }
@@ -353,13 +358,30 @@ function collectDataItems(ast) {
 }
 
 /**
+ * FILE-CONTROL entries (SELECT ... ASSIGN TO ...) from the ENVIRONMENT
+ * DIVISION - the only place a file's on-disk path comes from. Handles both
+ * this parser's actual shape (`ast.environmentDivision.fileControls`, from
+ * parser/index.js's parseEnvironmentDivision - now wired into the root
+ * index.js's parseCobol, round-5 finding 1a) and the never-actually-produced
+ * `ast.environment.inputOutput.fileControl` shape this file's functions
+ * previously (and only ever) checked, kept as a fallback in case some other
+ * caller supplies that shape directly.
+ */
+function getFileControls(ast) {
+  if (Array.isArray(ast.environmentDivision?.fileControls) && ast.environmentDivision.fileControls.length > 0) {
+    return ast.environmentDivision.fileControls;
+  }
+  return ast.environment?.inputOutput?.fileControl || [];
+}
+
+/**
  * Generate file path constants from file control
  */
 function generateFileConstants(ast, indent = 1) {
   const indentStr = '  '.repeat(indent);
   const lines = [];
 
-  const fileControl = ast.environment?.inputOutput?.fileControl || [];
+  const fileControl = getFileControls(ast);
 
   for (const file of fileControl) {
     const fileName = toCamelCase(file.name || file.fileName);
@@ -499,6 +521,18 @@ function defaultElementaryValue(item, scalaType) {
   const pic = item.pic && typeof item.pic === 'object' ? item.pic : null;
 
   if (scalaType === 'String') {
+    // A numeric-edited item's own VALUE clause (or lack of one) must go
+    // through the same PICTURE-edit formatting a MOVE into it would apply
+    // (formatEditedPicture) - not the plain alphanumeric fit/pad below -
+    // COBOL performs numeric-edit formatting at *initialization* time too,
+    // not only at MOVE time (round-5 finding 3/s11: DISPLAY of an edited
+    // item declared with a VALUE clause showed the literal's own raw text,
+    // e.g. "7.5" for `PIC ZZ9.99 VALUE 7.5`, instead of the PICTURE-formatted
+    // "  7.50" cobc actually stores/displays).
+    if (pic?.dataType === 'edited' && pic?.editPattern) {
+      const rawForEdit = literalKind === 'numeric' || literalKind === 'string' ? literalText : '0';
+      return `"${escapeScalaString(formatEditedPicture(pic.editPattern, rawForEdit, !!item.blankWhenZero))}"`;
+    }
     if (literalKind === 'string' || literalKind === 'numeric') {
       const width = pic?.length || 0;
       const justifiedRight = String(item.justified || '').toUpperCase() === 'RIGHT';
@@ -985,6 +1019,10 @@ function buildFieldRegistry(ast) {
   const conditionRegistry = new Map();
   const lines = [];
   const declaredIndexNames = new Set();
+  // Unique per-program suffix for FILLER's hidden flat vars (see the leaf
+  // FILLER branch below) - just needs to never collide with another FILLER
+  // elsewhere in the same program, not to mean anything on its own.
+  let fillerSeq = 0;
 
   // `ancestorNames` is the full chain of uppercased ancestor group names from
   // the top-level 01 item down to (but not including) the current item -
@@ -1088,8 +1126,21 @@ function buildFieldRegistry(ast) {
         groupRegistry.set(
           groupKey,
           realChildren
-            .filter(c => !c.isFiller && c.name)
             .map(c => {
+              if (c.isFiller || !c.name) {
+                // A plain elementary FILLER got its own hidden flat var above
+                // (`_fillerCamel`/`_fillerInfo`, stashed directly on this AST
+                // node) - included here (isFiller: true, no nameUpper) so
+                // group DISPLAY/identical-layout group MOVE carry its bytes
+                // along (round-5 finding 3/s06). A group-level FILLER (has
+                // its own named children) has no single flat-var slot to
+                // give it - not exercised by any corpus program - so it's
+                // left out entirely here, same as before this fix (its own
+                // named children remain individually addressable by their
+                // own bare names regardless).
+                if (!c._fillerCamel) return null;
+                return { nameUpper: null, camel: c._fillerCamel, info: c._fillerInfo, groupKey: null, isFiller: true };
+              }
               const nameUpper = (c.name || '').toUpperCase();
               const info = qualifiedRegistry.get(`${nameUpper}::${parentUpper}`);
               const childHasRealChildren = (c.children || []).some(cc => cc.level !== 88);
@@ -1100,6 +1151,7 @@ function buildFieldRegistry(ast) {
                 groupKey: childHasRealChildren ? `${groupKey}/${nameUpper}` : null,
               };
             })
+            .filter(Boolean)
         );
 
         // FUNCTION LENGTH(group-item): a compile-time constant (the sum of
@@ -1115,7 +1167,51 @@ function buildFieldRegistry(ast) {
         continue;
       }
 
-      if (item.isFiller || !item.name) continue;
+      if (item.isFiller || !item.name) {
+        // FILLER bytes are unaddressable from the PROCEDURE DIVISION (no
+        // COBOL name to look them up by), but they still occupy real storage
+        // that a whole-group MOVE or DISPLAY must carry along unchanged
+        // (round-5 finding 3/s06 - verified against installed GnuCOBOL: a
+        // group-to-group MOVE copies a FILLER's bytes just like any other
+        // byte in the group, and a DISPLAY of the whole group shows them).
+        // A hidden `var` (never entered into `registry`/`qualifiedRegistry` -
+        // nothing outside this group's own display/MOVE concatenation ever
+        // references it - only into the group's own entry in `groupRegistry`
+        // below via the `_fillerCamel`/`_fillerInfo` stashed directly on this
+        // AST node) gives it the same flat-var representation as a named
+        // sibling, at the same position, so the concatenation this generator
+        // builds for group DISPLAY/identical-layout group MOVE (see
+        // expression-gen.js's groupDisplayValueExpr/generateGroupMove) is
+        // byte-width-correct end to end.
+        const ownCount = hasOccurs(item) && occursCount(item) > 1 ? occursCount(item) : null;
+        const fullChain = ownCount ? [...occursChain, ownCount] : occursChain;
+        fillerSeq += 1;
+        const fillerCamel = `_filler${fillerSeq}`;
+        const baseType = scalaBaseType(item);
+        let scalaType = baseType;
+        for (let i = 0; i < fullChain.length; i++) scalaType = `Vector[${scalaType}]`;
+        let defaultExpr = defaultElementaryValue(item, baseType);
+        for (let i = fullChain.length - 1; i >= 0; i--) {
+          defaultExpr = `Vector.fill(${fullChain[i]})(${defaultExpr})`;
+        }
+        lines.push(`  var ${fillerCamel}: ${scalaType} = ${defaultExpr}`);
+        const fillerPic = item.pic && typeof item.pic === 'object' ? item.pic : null;
+        item._fillerCamel = fillerCamel;
+        item._fillerInfo = {
+          camel: fillerCamel,
+          scalaType: baseType,
+          dataType: fillerPic?.dataType || (baseType === 'String' ? 'alphanumeric' : 'numeric'),
+          integerDigits: fillerPic?.integerDigits || 0,
+          decimalDigits: fillerPic?.decimalDigits || 0,
+          signed: !!(fillerPic && fillerPic.signed),
+          editPattern: null,
+          occursDepth: fullChain.length,
+          picLength: fillerPic?.length || 0,
+          justified: false,
+          blankWhenZero: false,
+        };
+        continue;
+      }
 
       const ownCount = hasOccurs(item) && occursCount(item) > 1 ? occursCount(item) : null;
       const fullChain = ownCount ? [...occursChain, ownCount] : occursChain;
@@ -1158,6 +1254,12 @@ function buildFieldRegistry(ast) {
         signed: !!(pic && pic.signed),
         editPattern: pic?.editPattern || null,
         occursDepth: fullChain.length,
+        // Same per-level occurs counts, outer dimension first, used to build
+        // `defaultExpr`'s own nested Vector.fill above - kept on the info
+        // object too so a later INITIALIZE (round-5 finding 4) can rebuild
+        // the identical Vector[...] nesting for a REPLACING/default value
+        // without needing the original DataItem/occursChain again.
+        occursCounts: fullChain.slice(),
         picLength: pic?.length || 0,
         // JUSTIFIED RIGHT (alphanumeric MOVE alignment) and BLANK WHEN ZERO
         // (numeric-edited MOVE) - see expression-gen.js's
@@ -1202,6 +1304,39 @@ function buildFieldRegistry(ast) {
   walk(fileItems, [], []);
 
   return { lines: lines.join('\n'), registry, tableRegistry, groupRegistry, groupKeyRegistry, groupByteLengthRegistry, qualifiedRegistry, conditionRegistry };
+}
+
+/**
+ * Build the record<->file name registries round-5 finding 1b needs: a WRITE/
+ * REWRITE statement identifies its record by the FD's own 01 record name
+ * (`WRITE OUT-REC`), but OPEN's writer/reader/iterator handles are keyed by
+ * the *file* name (`OPEN OUTPUT OUT-FILE`) - routinely a different word
+ * entirely (the overwhelmingly common COBOL style, in fact - see
+ * tests/corpus/proc/s01-fileio-roundtrip.cbl's own OUT-FILE/OUT-REC). SD
+ * ("sort") work files are excluded - buildSortFileRegistry already gives
+ * those their own independent in-memory buffer support, not real OPEN/READ/
+ * WRITE file handles at all.
+ *   - recordToFile: FD record name (upper) -> its FD's own file name (raw
+ *     COBOL text) - what a WRITE/REWRITE needs.
+ *   - fileToRecord: FD file name (upper) -> its first 01 record's own name
+ *     (raw COBOL text) - what a plain READ with no INTO clause needs (it
+ *     implicitly loads the FD's own record).
+ */
+function buildRecordFileRegistries(ast) {
+  const recordToFile = new Map();
+  const fileToRecord = new Map();
+  const files = ast.dataItems?.fileSection?.files || ast.data?.fileSection?.files || [];
+
+  for (const f of files) {
+    if (f.type === 'SD' || !f.name) continue;
+    for (const record of f.records || []) {
+      if (!record?.name) continue;
+      recordToFile.set(record.name.toUpperCase(), f.name);
+      if (!fileToRecord.has(f.name.toUpperCase())) fileToRecord.set(f.name.toUpperCase(), record.name);
+    }
+  }
+
+  return { recordToFile, fileToRecord };
 }
 
 /**
@@ -1506,6 +1641,13 @@ export function generateScala(ast, options = {}) {
   setSortFileRegistry(sortFileRegistry);
   const sortFileSupport = generateSortFileSupport(sortFileRegistry);
 
+  // FD record name <-> file name registries (round-5 finding 1b) - lets
+  // WRITE/REWRITE/plain-READ codegen resolve the *file*-keyed handle a
+  // record actually belongs to, regardless of which of the two names a given
+  // statement mentions.
+  const { recordToFile, fileToRecord } = buildRecordFileRegistries(ast);
+  setRecordFileRegistry(recordToFile, fileToRecord);
+
   // Package declaration
   sections.push(generatePackageDeclaration(opts.packageName));
   sections.push('');
@@ -1578,6 +1720,25 @@ export function generateScala(ast, options = {}) {
     sections.push('');
     sections.push('  // File paths');
     sections.push(fileConstants);
+  }
+
+  // File handle vars (File/reader/writer/iterator/random-access), one set
+  // per FD/SELECT file name, declared exactly once as top-level `var`s so
+  // OPEN can assign (not redeclare) them regardless of how many times, or in
+  // how many different modes, the same file is OPENed in this program's
+  // lifetime (round-5 finding 1c - see file-io-gen.js's
+  // generateFileHandleDeclarations/fileHandleVarNames doc comments).
+  const fileControlNames = getFileControls(ast).map(f => f.name || f.fileName).filter(Boolean);
+  const fdFileNames = (ast.dataItems?.fileSection?.files || ast.data?.fileSection?.files || [])
+    .filter(f => f.type !== 'SD' && f.name)
+    .map(f => f.name);
+  const allFileNames = [...new Set([...fileControlNames, ...fdFileNames].map(n => n.toUpperCase()))]
+    .map(upper => fileControlNames.find(n => n.toUpperCase() === upper) || fdFileNames.find(n => n.toUpperCase() === upper));
+  const fileHandleDecls = generateFileHandleDeclarations(allFileNames, 1);
+  if (fileHandleDecls) {
+    sections.push('');
+    sections.push('  // File handles');
+    sections.push(fileHandleDecls);
   }
 
   // Working storage fields (flattened elementary vars + REDEFINES accessors)

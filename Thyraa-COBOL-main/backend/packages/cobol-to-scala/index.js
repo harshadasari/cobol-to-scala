@@ -4,6 +4,7 @@ import { parseDataDivision } from './parser/data-division-parser.js';
 import { parseProcedureDivision } from './parser/procedure-parser.js';
 import { parseSqlBlock } from './parser/sql-parser.js';
 import { expandCopybooks } from './parser/copybook-resolver.js';
+import { parseEnvironmentDivision } from './parser/index.js';
 import { generateScala } from './generator/scala-generator.js';
 
 /**
@@ -29,12 +30,21 @@ export function parseCobol(source, options = {}) {
   const dataItems = parseDataDivision(tokens);
   const procedures = parseProcedureDivision(tokens);
   const sqlBlocks = []; // Extract SQL blocks
+  // ENVIRONMENT DIVISION (FILE-CONTROL/SELECT...ASSIGN) - previously never
+  // called from this entry point at all, so FILE-CONTROL info (the file
+  // name -> ASSIGN TO path mapping OPEN/file-path codegen needs) never
+  // reached the generator regardless of what the DATA/PROCEDURE DIVISIONs
+  // declared (round-5 finding 1a). parser/index.js's parseCobol already
+  // called this; convertToScala() below goes through *this* parseCobol, not
+  // that one, so it had to be wired in here too.
+  const environmentDivision = parseEnvironmentDivision(tokens);
 
   return {
     dataItems,
     procedures,
     sqlBlocks,
     tokens,
+    environmentDivision,
     copybooks: copybookReport
   };
 }

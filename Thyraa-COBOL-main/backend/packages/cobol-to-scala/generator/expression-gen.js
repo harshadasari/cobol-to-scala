@@ -12,6 +12,7 @@ import {
   generateRewrite,
   generateDelete as generateDeleteFile,
   generateStart,
+  fileHandleVarNames,
 } from './file-io-gen.js';
 
 /**
@@ -124,6 +125,18 @@ let GROUP_KEY_REGISTRY = new Map();
 let GROUP_BYTE_LENGTH_REGISTRY = new Map();
 /** SD file name AND its 01 record name (both upper) -> sort-buffer support info */
 let SORT_FILE_REGISTRY = new Map();
+/**
+ * FD record name (upper) -> its FD's own file name (raw COBOL text, not
+ * camelCase) - round-5 finding 1b. A WRITE/REWRITE statement identifies its
+ * record by the record's own name (`WRITE OUT-REC`), but the writer/file
+ * handle OPEN assigns is keyed by the *file* name (`OPEN OUTPUT OUT-FILE`) -
+ * the overwhelmingly common COBOL style even declares them differently
+ * (record name != file name), so a WRITE naively keyed off its own record
+ * name could reference a writer variable that was never declared at all.
+ */
+let RECORD_FILE_REGISTRY = new Map();
+/** FD file name (upper) -> its first 01 record's own name (raw COBOL text) - the mirror-image lookup for a plain READ with no INTO clause. */
+let FILE_RECORD_REGISTRY = new Map();
 /** "<name>::<immediate parent name>" (both upper) -> field info, for OF/IN qualified references */
 let QUALIFIED_REGISTRY = new Map();
 /** Level-88 condition name (upper) -> { info: <parent field's registry info>, values: [...] } */
@@ -167,6 +180,16 @@ export function setGroupByteLengthRegistry(registry) {
 
 export function setSortFileRegistry(registry) {
   SORT_FILE_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+export function setRecordFileRegistry(recordToFile, fileToRecord) {
+  RECORD_FILE_REGISTRY = recordToFile instanceof Map ? recordToFile : new Map();
+  FILE_RECORD_REGISTRY = fileToRecord instanceof Map ? fileToRecord : new Map();
+}
+
+/** The FD file name a WRITE/REWRITE of `recordName` actually belongs to - falls back to the record's own name when it isn't a registered FD record (defensive; every corpus program's record is registered). */
+function fileNameForRecord(recordName) {
+  return RECORD_FILE_REGISTRY.get(String(recordName || '').toUpperCase()) || recordName;
 }
 
 export function setQualifiedRegistry(registry) {
@@ -1846,7 +1869,20 @@ function renderVariableMoveSource(source, info) {
   if (info.dataType === 'numeric' || (info.dataType !== 'alphanumeric' && info.dataType !== 'edited')) {
     const intDigits = info.integerDigits > 0 ? info.integerDigits : 18;
     const decDigits = info.decimalDigits || 0;
-    const asBD = sourceInfo?.scalaType === 'BigDecimal' ? rawExpr : `BigDecimal(${rawExpr})`;
+    // A numeric-edited source (round-5 finding 6) is stored as its already-
+    // formatted PICTURE text (e.g. "  12.50" for PIC ZZ9.99, zero-suppressed
+    // leading positions rendered as spaces - see formatEditedPicture) - a
+    // bare `BigDecimal(rawExpr)` chokes on that internal whitespace
+    // (`NumberFormatException`), which CobolFmt.numval (already used for
+    // FUNCTION NUMVAL's own space-tolerant parsing) strips before parsing;
+    // any other source (a plain numeric field, or a non-numeric String this
+    // generator doesn't otherwise track) keeps the pre-existing
+    // BigDecimal(...) coercion unchanged.
+    const asBD = sourceInfo?.scalaType === 'BigDecimal'
+      ? rawExpr
+      : sourceInfo?.dataType === 'edited'
+        ? `CobolFmt.numval(${rawExpr})`
+        : `BigDecimal(${rawExpr})`;
     const truncated = `CobolFmt.truncNumeric(${asBD}, ${intDigits}, ${decDigits})`;
     if (info.scalaType === 'BigDecimal') return truncated;
     if (info.scalaType === 'Long') return `${truncated}.toLong`;
@@ -1868,15 +1904,16 @@ function groupRefNameUpper(ref) {
   return GROUP_REGISTRY.has(nameUpper) ? nameUpper : null;
 }
 
-/** Per-child metadata for one group's immediate real children, combining GROUP_REGISTRY (names/flat-var identifiers) with the qualified field registry (types) and a second GROUP_REGISTRY lookup (nested-group detection). */
+/** Per-child metadata for one group's immediate real children, combining GROUP_REGISTRY (names/flat-var identifiers) with the qualified field registry (types) and a second GROUP_REGISTRY lookup (nested-group detection). A FILLER child (round-5 finding 3/s06 - `nameUpper: null`, `isFiller: true`) has no case-class constructor field name of its own known to this function (case-class-gen.js names FILLERs by its own independent per-case-class sequence - see generateGroupMove's differing-layout branch, which bails out rather than guess) and no QUALIFIED_REGISTRY entry (nothing to qualify by name), so its already-computed `info` (stashed on the GROUP_REGISTRY entry itself) is used directly instead. */
 function groupChildInfos(nameUpper) {
   const children = GROUP_REGISTRY.get(nameUpper) || [];
   return children.map(c => ({
     nameUpper: c.nameUpper,
     camel: c.camel,
-    ccField: toCamelCase(c.nameUpper),
-    info: lookupQualified(c.nameUpper, nameUpper),
-    isGroup: GROUP_REGISTRY.has(c.nameUpper),
+    ccField: c.isFiller ? null : toCamelCase(c.nameUpper),
+    info: c.isFiller ? c.info : lookupQualified(c.nameUpper, nameUpper),
+    isGroup: c.nameUpper ? GROUP_REGISTRY.has(c.nameUpper) : false,
+    isFiller: !!c.isFiller,
   }));
 }
 
@@ -1949,17 +1986,20 @@ function generateGroupMove(sourceNameUpper, targetNameUpper, indent) {
   // Byte-level round trip needs every real child to have both a flat-var
   // identifier (to read the current value) *and* a matching case-class
   // constructor slot of the same name (case-class-gen.js's generateCaseClass
-  // gives every non-redefines, non-88 child - including FILLERs, under a
-  // synthetic name - its own constructor field, in the same order
-  // GROUP_REGISTRY lists real, named children). A REDEFINES child among
-  // them breaks that correspondence (it's a derived `lazy val` in the case
-  // class, not a constructor parameter, and isn't registered in
+  // gives every non-redefines, non-88 child - including FILLERs, under its
+  // own independent synthetic naming sequence - its own constructor field, in
+  // the same order GROUP_REGISTRY lists real, named children). A REDEFINES
+  // child among them breaks that correspondence (it's a derived `lazy val` in
+  // the case class, not a constructor parameter, and isn't registered in
   // qualifiedRegistry either - see buildFieldRegistry's redefines branch),
-  // and a FILLER means the case class has a constructor slot this registry
-  // doesn't track a value for at all. Neither shape occurs in the Phase 2
-  // adversarial corpus; emit a visible, still-compiling marker instead of a
+  // and a FILLER's own hidden flat-var name (`_fillerN`, round-5 finding
+  // 3/s06 - see scala-generator.js's buildFieldRegistry) has no known
+  // relationship to case-class-gen.js's independent `fillerN` case-class
+  // field naming sequence, so `ccField` is left `null` for it
+  // (groupChildInfos) rather than guessed. Neither shape occurs in the Phase
+  // 2 adversarial corpus; emit a visible, still-compiling marker instead of a
   // guessed/broken round trip rather than silently mis-converting one.
-  if (!srcChildren.every(c => c.info) || !tgtChildren.every(c => c.info)) {
+  if (!srcChildren.every(c => c.info && c.ccField) || !tgtChildren.every(c => c.info && c.ccField)) {
     return (
       `${indentStr}() // MOVE ${sourceNameUpper} TO ${targetNameUpper}: ??? TODO - differing-layout group MOVE ` +
       'with a FILLER/REDEFINES child is not supported (byte-level round trip needs every child to have a plain ' +
@@ -2044,6 +2084,12 @@ function correspondingPairs(sourceKey, targetKey) {
   const pairs = [];
 
   for (const tgt of tgtChildren) {
+    // A FILLER entry (round-5 finding 3/s06 - see scala-generator.js's
+    // buildFieldRegistry) has no `nameUpper` at all (`null`) - CORRESPONDING
+    // only ever matches *named* fields, so it must never participate here;
+    // without this guard two unrelated FILLERs on each side would spuriously
+    // "correspond" via `null === null`.
+    if (!tgt.nameUpper) continue;
     const src = srcChildren.find(s => s.nameUpper === tgt.nameUpper);
     if (!src) continue;
 
@@ -2081,8 +2127,16 @@ function correspondingPairs(sourceKey, targetKey) {
  * exceed the SD record's declared size).
  */
 function positionalPairs(sourceKey, targetKey) {
-  const srcChildren = GROUP_REGISTRY.get(sourceKey) || [];
-  const tgtChildren = GROUP_REGISTRY.get(targetKey) || [];
+  // FILLER entries (round-5 finding 3/s06) are excluded here - unlike
+  // generateGroupMove's identical-layout path, RELEASE/RETURN's FROM/INTO
+  // side is a distinct WORKING-STORAGE group the programmer explicitly wrote
+  // to line up with the SD record *by position*; a FILLER on one side but
+  // not the other would shift every subsequent pairing by one, corrupting a
+  // previously-correct positional match. Matches this function's
+  // pre-existing behavior (FILLER was never present in GROUP_REGISTRY at
+  // all before FILLER support was added for group DISPLAY/MOVE).
+  const srcChildren = (GROUP_REGISTRY.get(sourceKey) || []).filter(c => !c.isFiller);
+  const tgtChildren = (GROUP_REGISTRY.get(targetKey) || []).filter(c => !c.isFiller);
   const pairs = [];
   const n = Math.min(srcChildren.length, tgtChildren.length);
 
@@ -3589,16 +3643,73 @@ function generateDivide(statement, indent = 0) {
 }
 
 /**
+ * Concatenated raw-storage display text for a whole GROUP item (round-5
+ * finding 3) - cobc's own `DISPLAY group-item` shows every child's storage
+ * back-to-back with no separators, at its own fixed width, in declared
+ * order; there is no single flat Scala var holding a group's "value" the way
+ * there is for an elementary item (see scala-generator.js's
+ * buildFieldRegistry), so this builds the equivalent by walking
+ * GROUP_REGISTRY: a String child is fitted (space-padded/truncated) to its
+ * own declared width via CobolFmt.fitLeft, a numeric child renders its own
+ * unsigned zero-padded digit text via CobolFmt.digitsOf (matching the
+ * existing MOVE-numeric-to-alphanumeric convention - COBOL's raw DISPLAY
+ * storage for an unsigned/zoned numeric is exactly its digit text; signed
+ * zoned-overpunch storage is out of scope, see the bail-out below), a
+ * FILLER's own hidden flat var (round-5 finding 3/s06) is fitted the same
+ * way as any other String child, and a nested group recurses via its own
+ * `groupKey`. Returns `null` (not a guessed/wrong value) when the shape
+ * can't be represented this way: an OCCURS-bearing child (a `Vector`, not a
+ * scalar - whole-group DISPLAY concatenation of a table isn't modeled) or a
+ * child with no registry info at all.
+ */
+function groupDisplayValueExpr(groupKey) {
+  const children = GROUP_REGISTRY.get(groupKey);
+  if (!children || children.length === 0) return null;
+
+  const parts = [];
+  for (const c of children) {
+    if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) return null;
+    if (c.groupKey) {
+      const nested = groupDisplayValueExpr(c.groupKey);
+      if (nested == null) return null;
+      parts.push(nested);
+      continue;
+    }
+    const info = c.info;
+    if (!info) return null;
+    if (info.scalaType === 'String') {
+      const width = info.picLength || 0;
+      parts.push(width > 0 ? `CobolFmt.fitLeft(${c.camel}, ${width})` : c.camel);
+    } else {
+      const asBD = info.scalaType === 'BigDecimal' ? c.camel : `BigDecimal(${c.camel})`;
+      parts.push(`CobolFmt.digitsOf(${asBD}, ${info.integerDigits}, ${info.decimalDigits})`);
+    }
+  }
+  return parts.join(' + ');
+}
+
+/**
  * Render one DISPLAYed operand. Plain numeric (non-edited) PIC items print
  * through CobolFmt.num() so the output matches cobc's zero-padded,
  * leading-sign DISPLAY format (e.g. PIC S9(5) value 100 -> "+00100");
  * numeric-edited and alphanumeric fields already hold their final display
  * string (numeric-edited items are formatted at MOVE time - see
- * renderLiteralForTarget/formatEditedPicture) and print as-is.
+ * renderLiteralForTarget/formatEditedPicture) and print as-is. A bare group
+ * reference (round-5 finding 3 - `info` is null because a group never gets
+ * its own elementary FIELD_REGISTRY entry, only its children do) falls back
+ * to groupDisplayValueExpr's raw-storage concatenation.
  */
 function renderDisplayOperand(ref) {
   const expr = convertIdentifier(ref);
   const info = lookupFieldForRef(ref);
+  if (!info) {
+    const hasSubscripts = ref && typeof ref === 'object' && Array.isArray(ref.subscripts) && ref.subscripts.length > 0;
+    const nameUpper = ref && typeof ref === 'object' ? String(ref.name || '').toUpperCase() : String(ref || '').toUpperCase();
+    if (nameUpper && !hasSubscripts) {
+      const groupExpr = groupDisplayValueExpr(resolveGroupKey(nameUpper));
+      if (groupExpr) return `(${groupExpr})`;
+    }
+  }
   if (info && info.dataType === 'numeric') {
     const asBigDecimal = info.scalaType === 'BigDecimal' ? expr : `BigDecimal(${expr})`;
     return `CobolFmt.num(${asBigDecimal}, ${info.integerDigits}, ${info.decimalDigits}, ${info.signed})`;
@@ -3619,7 +3730,13 @@ function renderDisplayOperand(ref) {
 }
 
 /**
- * Generate DISPLAY statement
+ * Generate DISPLAY statement. `WITH NO ADVANCING` (parsed into
+ * `statement.noAdvancing` by parser/procedure-parser.js's
+ * parseDisplayStatement) suppresses the trailing newline a plain DISPLAY
+ * always emits - two DISPLAYs, the first WITH NO ADVANCING, print onto the
+ * *same* physical output line (round-5 finding 3's s11 repro chains two such
+ * DISPLAYs). Previously always emitted `println(...)`, ignoring the flag
+ * entirely - `print(...)` (no trailing newline) is used instead when set.
  */
 function generateDisplay(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -3648,31 +3765,78 @@ function generateDisplay(statement, indent = 0) {
     return convertArithmeticExpression(item);
   });
 
+  const printFn = statement.noAdvancing ? 'print' : 'println';
+
   if (items.length === 0) {
-    return `${indentStr}println()`;
+    return statement.noAdvancing ? `${indentStr}()` : `${indentStr}println()`;
   }
 
-  return `${indentStr}println(${items.join(' + ')})`;
+  return `${indentStr}${printFn}(${items.join(' + ')})`;
 }
 
 /**
- * Generate ACCEPT statement
+ * Coerce ACCEPT's raw (always textual/digit-string) source expression to the
+ * target field's own declared Scala type/width, exactly like any other MOVE
+ * source would be (round-5 finding 5): a numeric target gets an actual
+ * numeric value (`CobolFmt.truncNumeric(BigDecimal(...), ...)`, coerced to
+ * the target's own Scala numeric type), a numeric-edited target is PICTURE-
+ * formatted, and a plain alphanumeric target is fitted to its declared
+ * width - never a bare, untyped, unwidthed string. Falls back to the raw
+ * expression unchanged when the target has no registry entry at all (no
+ * worse than the pre-fix behavior for that case).
+ */
+function coerceAcceptValue(rawExpr, info) {
+  if (!info) return rawExpr;
+  if (info.dataType === 'edited' && info.editPattern) {
+    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawExpr}, ${info.blankWhenZero ? 'true' : 'false'})`;
+  }
+  if (info.scalaType === 'String') {
+    return fitAlphanumericExpr(rawExpr, info.picLength, info.justified);
+  }
+  const intDigits = info.integerDigits > 0 ? info.integerDigits : 18;
+  const decDigits = info.decimalDigits || 0;
+  const truncated = `CobolFmt.truncNumeric(BigDecimal(${rawExpr}), ${intDigits}, ${decDigits})`;
+  if (info.scalaType === 'BigDecimal') return truncated;
+  if (info.scalaType === 'Long') return `${truncated}.toLong`;
+  return `${truncated}.toInt`;
+}
+
+/**
+ * Generate ACCEPT statement. Previously always declared a brand-new `val
+ * <target> = ...` - a local shadowing binding, not an assignment to the
+ * target's actual registered flat var at all (round-5 finding 5): every
+ * later reference to the target elsewhere in the program still read the
+ * *original* (default-initialized, or previously MOVEd-into) value, and a
+ * numeric target was left holding raw, untyped date/time text instead of an
+ * actual number. Now resolves and assigns through the same
+ * renderAssignment/field-registry path any other statement uses, with
+ * coerceAcceptValue applying the same numeric/edited/alphanumeric coercion
+ * an ordinary MOVE source would get.
  */
 function generateAccept(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
-  const target = convertIdentifier(statement.target);
+  const targetRef = statement.target;
+  const info = lookupFieldForRef(targetRef);
 
+  let rawExpr;
   if (statement.from === 'DATE') {
-    return `${indentStr}val ${target} = java.time.LocalDate.now.format(java.time.format.DateTimeFormatter.ofPattern("yyMMdd"))`;
+    rawExpr = 'java.time.LocalDate.now.format(java.time.format.DateTimeFormatter.ofPattern("yyMMdd"))';
   } else if (statement.from === 'TIME') {
-    return `${indentStr}val ${target} = java.time.LocalTime.now.format(java.time.format.DateTimeFormatter.ofPattern("HHmmss"))`;
+    rawExpr = 'java.time.LocalTime.now.format(java.time.format.DateTimeFormatter.ofPattern("HHmmss"))';
   } else if (statement.from === 'DAY') {
-    return `${indentStr}val ${target} = java.time.LocalDate.now.getDayOfYear.toString`;
+    rawExpr = 'java.time.LocalDate.now.getDayOfYear.toString';
   } else if (statement.from === 'DAY-OF-WEEK') {
-    return `${indentStr}val ${target} = java.time.LocalDate.now.getDayOfWeek.getValue.toString`;
+    // ISO day-of-week (1=Monday..7=Sunday) - matches GnuCOBOL's own
+    // ACCEPT FROM DAY-OF-WEEK numbering (verified against installed
+    // GnuCOBOL - see tests/corpus/proc/s08-day-of-week-deterministic.cbl,
+    // which range-checks 1-7 rather than asserting a specific day, since the
+    // actual value is inherently a function of "today").
+    rawExpr = 'java.time.LocalDate.now.getDayOfWeek.getValue.toString';
+  } else {
+    rawExpr = 'scala.io.StdIn.readLine()';
   }
 
-  return `${indentStr}val ${target} = scala.io.StdIn.readLine()`;
+  return `${indentStr}${renderAssignment(targetRef, coerceAcceptValue(rawExpr, info))}`;
 }
 
 /**
@@ -4042,12 +4206,41 @@ function generateReturn(statement, indent = 0) {
 }
 
 /**
+ * The flat-var identifier and declared width READ ... INTO (or a plain READ
+ * with no INTO, which implicitly loads the FD's own 01 record) must assign -
+ * round-5 finding 1a/1b's file-registry work applied to READ: an INTO target
+ * always wins when present; otherwise the FD's own first record (looked up
+ * via FILE_RECORD_REGISTRY, keyed by the file name the READ names) is the
+ * implicit destination. Returns `{ camel, width }` (both possibly null if
+ * neither can be resolved, e.g. an INTO target with no registry entry).
+ */
+function readDestination(statement, fileName) {
+  if (statement.into) {
+    const info = lookupFieldForRef(statement.into);
+    return { camel: toCamelCase(statement.into.name || statement.into), width: info?.picLength || 0 };
+  }
+  const recordName = FILE_RECORD_REGISTRY.get(String(fileName || '').toUpperCase());
+  if (!recordName) return { camel: null, width: 0 };
+  const info = lookupField(recordName);
+  return { camel: toCamelCase(recordName), width: info?.picLength || 0 };
+}
+
+/**
  * Generate READ statement wrapper
  */
 function generateReadStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
-  const fileName = toCamelCase(statement.fileName || statement.file || 'file');
-  const iteratorVar = `${fileName}Iterator`;
+  const fileName = statement.fileName || statement.file || 'file';
+  const { iteratorVar } = fileHandleVarNames(fileName);
+  const { camel: destCamel, width } = readDestination(statement, fileName);
+  // A physical line shorter than the FD/target's own declared record length
+  // is exactly what LINE SEQUENTIAL WRITE produces (trailing spaces are
+  // stripped on write - see generateWriteStatement) - cobc pads it back out
+  // to the record's declared width on READ, which is why
+  // tests/corpus/proc/s01-fileio-roundtrip.cbl's re-DISPLAYed line comes back
+  // with its original trailing spaces (round-5 finding 1). A too-long line is
+  // truncated the same way any other alphanumeric MOVE would be.
+  const fittedExpr = width > 0 ? `CobolFmt.fitLeft(_record, ${width})` : '_record';
 
   const lines = [];
 
@@ -4055,8 +4248,8 @@ function generateReadStatement(statement, indent = 0) {
     lines.push(`${indentStr}if ${iteratorVar}.hasNext then`);
     lines.push(`${indentStr}  val _record = ${iteratorVar}.next()`);
 
-    if (statement.into) {
-      lines.push(`${indentStr}  ${toCamelCase(statement.into.name || statement.into)} = _record`);
+    if (destCamel) {
+      lines.push(`${indentStr}  ${destCamel} = ${fittedExpr}`);
     }
 
     if (statement.notAtEnd && Array.isArray(statement.notAtEnd)) {
@@ -4076,23 +4269,61 @@ function generateReadStatement(statement, indent = 0) {
     }
   } else {
     lines.push(`${indentStr}val _record = ${iteratorVar}.nextOption()`);
+    if (destCamel) {
+      lines.push(`${indentStr}_record.foreach(r => ${destCamel} = ${width > 0 ? `CobolFmt.fitLeft(r, ${width})` : 'r'})`);
+    }
   }
 
   return lines.join('\n');
 }
 
 /**
- * Generate WRITE statement wrapper
+ * Scala expression for the current display-text content of `recordName` - a
+ * flat elementary var if it's registered as one, or (a group FD record, e.g.
+ * a record containing FILLER between named fields, s06/finding 3's own FD
+ * shape) the same raw-storage concatenation groupDisplayValueExpr builds for
+ * DISPLAY of a whole group. `record` (not `record.stripTrailing()` etc.) is
+ * still the field's own fully space-padded storage - trimming to match
+ * cobc's LINE SEQUENTIAL WRITE behavior happens once, at the call site
+ * (generateWriteStatement), not here.
+ */
+function recordContentExpr(recordName) {
+  const info = lookupField(recordName);
+  if (info) {
+    const camel = info.camel;
+    if (info.dataType === 'numeric') {
+      const asBigDecimal = info.scalaType === 'BigDecimal' ? camel : `BigDecimal(${camel})`;
+      return `CobolFmt.num(${asBigDecimal}, ${info.integerDigits}, ${info.decimalDigits}, ${info.signed})`;
+    }
+    return camel;
+  }
+  const groupExpr = groupDisplayValueExpr(resolveGroupKey(String(recordName || '').toUpperCase()));
+  return groupExpr ? `(${groupExpr})` : toCamelCase(recordName);
+}
+
+/**
+ * Generate WRITE statement wrapper. `WRITE record-name [FROM identifier]`
+ * writes through the *file's* own writer (looked up via
+ * fileNameForRecord/RECORD_FILE_REGISTRY - round-5 finding 1b: the FD record
+ * name and the SELECT's file name are routinely different, most WRITE
+ * statements name the record, not the file, and OPEN's writer handle is
+ * keyed by the file name), never the record's own name directly.
+ *
+ * LINE SEQUENTIAL (this generator's only supported file organization) writes
+ * strip trailing spaces (verified against installed GnuCOBOL: a PIC X(20)
+ * record holding a 15-character value round-trips through cobc as a
+ * 15-character physical line, not a space-padded 20-character one) - round-5
+ * finding 1/s01.
  */
 function generateWriteStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
-  const recordName = toCamelCase(statement.recordName || statement.record || 'record');
+  const recordName = statement.recordName || statement.record || 'record';
+  const { writerVar } = fileHandleVarNames(fileNameForRecord(recordName));
+  const contentExpr = statement.from
+    ? recordContentExpr(statement.from.name || statement.from)
+    : recordContentExpr(recordName);
 
-  if (statement.from) {
-    return `${indentStr}${recordName}Writer.println(${toCamelCase(statement.from.name || statement.from)})`;
-  }
-
-  return `${indentStr}${recordName}Writer.println(${recordName})`;
+  return `${indentStr}${writerVar}.println((${contentExpr}).stripTrailing())`;
 }
 
 /**
@@ -4438,20 +4669,138 @@ function generateSet(statement, indent = 0) {
 }
 
 /**
- * Generate INITIALIZE statement
+ * Whether a REPLACING clause's category list applies to a leaf of the given
+ * CATEGORY (`info.dataType`) - COBOL's own INITIALIZE REPLACING rule matches
+ * by category name, not by a field's specific PICTURE. Numeric-edited
+ * (`'edited'`) counts as NUMERIC here: this parser's REPLACING clause only
+ * ever recognizes the bare ALPHABETIC/ALPHANUMERIC/NUMERIC category keywords
+ * (see parser/procedure-parser.js's parseInitializeStatement), never the
+ * ALPHANUMERIC-EDITED/NUMERIC-EDITED forms, so there is no more specific
+ * category for an edited field to match against.
+ */
+function initializeCategoryMatches(dataType, categories) {
+  const cats = (categories || []).map(c => String(c).toUpperCase());
+  if (dataType === 'alphanumeric') return cats.includes('ALPHANUMERIC');
+  if (dataType === 'alphabetic') return cats.includes('ALPHABETIC');
+  if (dataType === 'numeric' || dataType === 'edited') return cats.includes('NUMERIC');
+  return false;
+}
+
+/**
+ * Scalar (one-occurrence) INITIALIZE value for a single elementary leaf
+ * (round-5 finding 4), or `null` when this leaf must be left completely
+ * untouched. Two cases:
+ *   - No REPLACING clause at all: every leaf gets COBOL's ordinary
+ *     INITIALIZE default - ALPHABETIC/ALPHANUMERIC -> SPACES, NUMERIC/
+ *     NUMERIC-EDITED -> ZERO (PICTURE-formatted for an edited item) -
+ *     reusing the exact same repeatedCharLiteralFor/zeroLiteralFor helpers
+ *     MOVE SPACES/MOVE ZERO already use, so all three stay consistent.
+ *   - A REPLACING clause IS present: only a leaf whose CATEGORY matches one
+ *     of the REPLACING phrases is touched at all (the value is coerced to
+ *     the leaf's own type/width exactly like an ordinary MOVE source -
+ *     renderMoveSource already does this for a Literal or VariableReference
+ *     operand, the only two forms parseInitializeStatement's `parseOperand`
+ *     can produce) - a leaf whose category ISN'T mentioned by any REPLACING
+ *     phrase is left holding whatever value it already had (verified against
+ *     installed GnuCOBOL: `INITIALIZE WS-GROUP REPLACING ALPHANUMERIC DATA
+ *     BY "Q"` leaves a NUMERIC sibling at its own VALUE-clause value, not
+ *     reset to zero - see tests/corpus/proc/s07-initialize-group-
+ *     replacing.cbl's WS-AMOUNT). This is COBOL's actual REPLACING rule, not
+ *     "REPLACING overrides the default for its categories, default still
+ *     applies to the rest" as might be assumed from the phrase's name alone.
+ */
+function initializeLeafValueExpr(info, replacing) {
+  const match = (replacing || []).find(r => initializeCategoryMatches(info.dataType, r.category));
+  if (match) return renderMoveSource(match.value, info);
+  if (replacing && replacing.length > 0) return null;
+  if (info.dataType === 'numeric' || info.dataType === 'edited') return zeroLiteralFor(info);
+  return repeatedCharLiteralFor(' ', info);
+}
+
+/**
+ * Wrap a scalar INITIALIZE value in nested `Vector.fill(...)` per the leaf's
+ * own OCCURS ancestry - outermost dimension first, mirroring
+ * scala-generator.js's buildFieldRegistry's own `defaultExpr` nesting
+ * exactly (same `occursCounts` array, same fold direction), so every element
+ * of a table nested inside (or itself) an INITIALIZE target is set, not just
+ * a single scalar assigned to what is actually a `Vector[...]`-typed var.
+ */
+function wrapInitializeOccurs(scalarExpr, info) {
+  let expr = scalarExpr;
+  const counts = info.occursCounts || [];
+  for (let i = counts.length - 1; i >= 0; i--) {
+    expr = `Vector.fill(${counts[i]})(${expr})`;
+  }
+  return expr;
+}
+
+/**
+ * One `camel = <value>` assignment line per elementary leaf reachable from
+ * `groupKey` (recursing into any nested-group child via GROUP_REGISTRY,
+ * exactly like correspondingPairs' own recursion). A FILLER child (round-5
+ * finding 3's `isFiller` GROUP_REGISTRY entries) is skipped entirely - COBOL
+ * INITIALIZE never touches FILLER, it has no addressable identity to assign
+ * through in the first place.
+ */
+function initializeAssignmentLines(groupKey, replacing, indentStr) {
+  const children = GROUP_REGISTRY.get(groupKey) || [];
+  const lines = [];
+  for (const c of children) {
+    if (c.isFiller) continue;
+    if (c.groupKey) {
+      lines.push(...initializeAssignmentLines(c.groupKey, replacing, indentStr));
+      continue;
+    }
+    const info = c.info || lookupField(c.nameUpper);
+    if (!info) continue;
+    const scalarExpr = initializeLeafValueExpr(info, replacing);
+    if (scalarExpr == null) continue; // REPLACING present but this leaf's category wasn't mentioned - leave it untouched
+    lines.push(`${indentStr}${c.camel} = ${wrapInitializeOccurs(scalarExpr, info)}`);
+  }
+  return lines;
+}
+
+/**
+ * Generate INITIALIZE statement (round-5 finding 4). Previously emitted
+ * `<target> = <target>.copy() // INITIALIZE with defaults` unconditionally -
+ * always broken, since every WORKING-STORAGE item this generator declares is
+ * a flat `var` of a primitive/String/BigDecimal/Vector type, never a case
+ * class - `.copy()` isn't a member of any of them, a guaranteed compile
+ * error on every single INITIALIZE statement regardless of target shape.
+ * Implements the real per-category default rules (via
+ * initializeLeafValueExpr) for both a GROUP target (recursing over its
+ * children through GROUP_REGISTRY, honoring OCCURS/FILLER/REPLACING - see
+ * initializeAssignmentLines) and a plain elementary target.
  */
 function generateInitialize(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
+  const targets = statement.targets && statement.targets.length > 0 ? statement.targets : [statement.target].filter(Boolean);
   const lines = [];
 
-  const targets = statement.targets || [statement.target];
-
   for (const target of targets) {
-    const targetName = toCamelCase(target.name || target);
-    lines.push(`${indentStr}${targetName} = ${targetName}.copy() // INITIALIZE with defaults`);
+    const nameUpper = String(target?.name || target || '').toUpperCase();
+    const groupKey = resolveGroupKey(nameUpper);
+
+    if (GROUP_REGISTRY.has(groupKey)) {
+      const groupLines = initializeAssignmentLines(groupKey, statement.replacing, indentStr);
+      lines.push(...(groupLines.length > 0 ? groupLines : [`${indentStr}() // INITIALIZE ${nameUpper}: no addressable children found`]));
+      continue;
+    }
+
+    const info = lookupFieldForRef(target);
+    if (!info) {
+      lines.push(`${indentStr}() // INITIALIZE ${nameUpper}: not found in field registry`);
+      continue;
+    }
+    const scalarExpr = initializeLeafValueExpr(info, statement.replacing);
+    if (scalarExpr == null) {
+      lines.push(`${indentStr}() // INITIALIZE ${nameUpper}: REPLACING present, this item's category not mentioned - left untouched`);
+      continue;
+    }
+    lines.push(`${indentStr}${renderAssignment(target, wrapInitializeOccurs(scalarExpr, info))}`);
   }
 
-  return lines.join('\n');
+  return lines.length > 0 ? lines.join('\n') : `${indentStr}()`;
 }
 
 export default {

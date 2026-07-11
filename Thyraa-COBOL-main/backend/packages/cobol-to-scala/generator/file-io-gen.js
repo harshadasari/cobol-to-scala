@@ -34,6 +34,13 @@ function toIteratorVarName(cobolFileName) {
 }
 
 /**
+ * Generate random-access-handle variable name (I-O/EXTEND-via-RandomAccessFile mode)
+ */
+function toRandomVarName(cobolFileName) {
+  return toCamelCase(cobolFileName) + 'Random';
+}
+
+/**
  * Extract file name from various formats
  */
 function extractFileName(file) {
@@ -43,6 +50,30 @@ function extractFileName(file) {
   if (file.fileName) return file.fileName;
   if (file.value) return file.value;
   return 'file';
+}
+
+/**
+ * Every handle a file's OPEN might assign, declared exactly ONCE per file at
+ * object scope (see scala-generator.js's generateFileHandleDeclarations) as a
+ * plain `var` initialized to a harmless empty/null default - not as a `val`
+ * freshly declared inside generateOpen's own generated block. A program that
+ * OPENs the same file more than once in its lifetime (e.g. OPEN OUTPUT ...
+ * CLOSE ... OPEN INPUT ... - a completely ordinary sequential round-trip, see
+ * tests/corpus/proc/s01-fileio-roundtrip.cbl) previously re-declared
+ * `val <fileName>File = ...` (and, for two OPENs of the *same* mode, the
+ * mode-specific reader/writer/iterator too) on the second OPEN, which Scala
+ * rejects outright ("... is already defined as value ...") - round-5 finding
+ * 1c. Assigning to a pre-declared `var` instead compiles regardless of how
+ * many times, or in how many different modes, the same file is OPENed.
+ */
+export function fileHandleVarNames(fileName) {
+  return {
+    fileVar: toFileVarName(fileName),
+    readerVar: toReaderVarName(fileName),
+    writerVar: toWriterVarName(fileName),
+    iteratorVar: toIteratorVarName(fileName),
+    randomVar: toRandomVarName(fileName),
+  };
 }
 
 /**
@@ -56,32 +87,30 @@ export function generateOpen(statement, indent = 0) {
 
   for (const file of files) {
     const fileName = extractFileName(file);
-    const fileVar = toFileVarName(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar } = fileHandleVarNames(fileName);
     const mode = (statement.mode || file?.mode || 'INPUT').toUpperCase();
 
     switch (mode) {
       case 'INPUT':
-        const readerVar = toReaderVarName(fileName);
-        lines.push(`${indentStr}val ${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
-        lines.push(`${indentStr}val ${readerVar} = scala.io.Source.fromFile(${fileVar})`);
-        lines.push(`${indentStr}val ${toIteratorVarName(fileName)} = ${readerVar}.getLines()`);
+        lines.push(`${indentStr}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
+        lines.push(`${indentStr}${readerVar} = scala.io.Source.fromFile(${fileVar})`);
+        lines.push(`${indentStr}${iteratorVar} = ${readerVar}.getLines()`);
         break;
 
       case 'OUTPUT':
-        const writerVar = toWriterVarName(fileName);
-        lines.push(`${indentStr}val ${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
-        lines.push(`${indentStr}val ${writerVar} = new java.io.PrintWriter(${fileVar})`);
+        lines.push(`${indentStr}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
+        lines.push(`${indentStr}${writerVar} = new java.io.PrintWriter(${fileVar})`);
         break;
 
       case 'I-O':
       case 'IO':
-        lines.push(`${indentStr}val ${fileVar} = new java.io.RandomAccessFile(${toCamelCase(fileName)}Path, "rw")`);
+        lines.push(`${indentStr}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
+        lines.push(`${indentStr}${randomVar} = new java.io.RandomAccessFile(${fileVar}, "rw")`);
         break;
 
       case 'EXTEND':
-        const appendWriter = toWriterVarName(fileName);
-        lines.push(`${indentStr}val ${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
-        lines.push(`${indentStr}val ${appendWriter} = new java.io.PrintWriter(new java.io.FileWriter(${fileVar}, true))`);
+        lines.push(`${indentStr}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
+        lines.push(`${indentStr}${writerVar} = new java.io.PrintWriter(new java.io.FileWriter(${fileVar}, true))`);
         break;
 
       default:
@@ -102,13 +131,41 @@ export function generateClose(statement, indent = 0) {
   const files = Array.isArray(statement.files) ? statement.files : [statement.file];
 
   for (const file of files) {
-    const fileName = file.name || file;
-    const readerVar = toReaderVarName(fileName);
-    const writerVar = toWriterVarName(fileName);
+    const fileName = extractFileName(file);
+    const { readerVar, writerVar, randomVar } = fileHandleVarNames(fileName);
 
-    // Generate close for both reader and writer (one will exist)
-    lines.push(`${indentStr}try ${readerVar}.close() catch case _: Exception => ()`);
-    lines.push(`${indentStr}try ${writerVar}.close() catch case _: Exception => ()`);
+    // Only whichever handle OPEN actually assigned for this file is
+    // non-null; guard each close so CLOSE-ing a file that was never opened
+    // in this mode (or already closed) is a harmless no-op instead of a
+    // NullPointerException.
+    lines.push(`${indentStr}if ${readerVar} != null then { try ${readerVar}.close() catch case _: Exception => (); ${readerVar} = null }`);
+    lines.push(`${indentStr}if ${writerVar} != null then { try ${writerVar}.close() catch case _: Exception => (); ${writerVar} = null }`);
+    lines.push(`${indentStr}if ${randomVar} != null then { try ${randomVar}.close() catch case _: Exception => (); ${randomVar} = null }`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Generate the once-per-file top-level `var` declarations every OPEN/CLOSE
+ * this generator emits assumes are already in scope (see fileHandleVarNames'
+ * doc comment above) - one block per distinct FD/SELECT file name found in
+ * the ENVIRONMENT DIVISION's FILE-CONTROL. `null` defaults are safe because
+ * every generated OPEN unconditionally assigns before any generated READ/
+ * WRITE/CLOSE dereferences the same variable in a correct program (a READ/
+ * WRITE before OPEN is invalid COBOL to begin with).
+ */
+export function generateFileHandleDeclarations(fileNames, indent = 1) {
+  const indentStr = '  '.repeat(indent);
+  const lines = [];
+
+  for (const fileName of fileNames) {
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar } = fileHandleVarNames(fileName);
+    lines.push(`${indentStr}var ${fileVar}: java.io.File = null`);
+    lines.push(`${indentStr}var ${readerVar}: scala.io.BufferedSource = null`);
+    lines.push(`${indentStr}var ${writerVar}: java.io.PrintWriter = null`);
+    lines.push(`${indentStr}var ${iteratorVar}: Iterator[String] = Iterator.empty`);
+    lines.push(`${indentStr}var ${randomVar}: java.io.RandomAccessFile = null`);
   }
 
   return lines.join('\n');
@@ -357,5 +414,7 @@ export default {
   generateStart,
   generateFileIO,
   generateFileIOWithResource,
-  generateFileStatusCheck
+  generateFileStatusCheck,
+  generateFileHandleDeclarations,
+  fileHandleVarNames,
 };

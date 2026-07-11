@@ -33,7 +33,7 @@ Two loosely-coupled products live in this repo:
 | String handling | STRING, UNSTRING (incl. COUNT IN), INSPECT (tallying/replacing/converting) |
 | Table handling | SEARCH, SEARCH ALL (real binary search), incl. VARYING other-index |
 | Batch/sort | SORT (multi-key, mixed ASCENDING/DESCENDING), MERGE, RELEASE, RETURN |
-| File I/O | OPEN, CLOSE, READ, WRITE, REWRITE, DELETE, START |
+| File I/O | OPEN, CLOSE, READ, WRITE for LINE SEQUENTIAL files are now oracle-equivalent (round-5 fix: `convertToScala()`'s own entry point never parsed the ENVIRONMENT DIVISION at all before this — FILE-CONTROL/SELECT...ASSIGN never reached the generator, so every OPEN/WRITE/READ silently referenced undeclared variables; see `tests/corpus/proc/s01-fileio-roundtrip.cbl`). REWRITE, DELETE, START, and any non-LINE-SEQUENTIAL organization (INDEXED, RELATIVE) remain unimplemented comment-only stubs |
 | Intrinsics | Full FUNCTION set exercised by the corpus: NUMVAL/NUMVAL-C, LENGTH (incl. of a GROUP), MAX/MIN, date functions, REVERSE, ORD/CHR, and others — see `tests/oracle/README.md` for the exact list a given run has verified |
 | Interop | CALL (BY REFERENCE/CONTENT/VALUE), EXEC SQL (parsed + compile-verified Doobie generation, not yet wired into the main generator — see Phase 3), EXEC CICS (parsed + classified; skeleton generation only — see Phase 4) |
 | Terminal | ACCEPT, DISPLAY |

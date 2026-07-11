@@ -141,23 +141,24 @@ generator/parser fixes each one's mismatch pointed at.
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 79 corpus programs found (19
-under `data/`, 60 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+**cobc oracle capture / expected-vs-oracle check** - 93 corpus programs found (19
+under `data/`, 74 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
 excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
-precompiler, see `tests/sql.test.js` instead), all 79 compiled and ran cleanly under
-cobc (exit 0). 28 of the 79 (19 `data/` + 9 `proc/` baseline programs) already have a
+precompiler, see `tests/sql.test.js` instead), all 93 compiled and ran cleanly under
+cobc (exit 0). 28 of the 93 (19 `data/` + 9 `proc/` baseline programs) already have a
 hand-written `.expected.txt` that matches the captured `.oracle.txt` exactly - 0
-mismatches. The 20 `r01`-`r14*`, 15 `n01`-`n16*`, and 16 `q01`-`q12*` programs have no
-hand-written `.expected.txt` by design (they're verified directly against cobc via
-`oracleCompare()` below, not a separately hand-authored expectation) and show up
-here as a diagnostic-only capture ("no `<name>.expected.txt` alongside ... yet").
+mismatches. The 20 `r01`-`r14*`, 15 `n01`-`n16*`, 16 `q01`-`q12*`, and 14
+`s01`-`s12*` programs have no hand-written `.expected.txt` by design (they're
+verified directly against cobc via `oracleCompare()` below, not a separately
+hand-authored expectation) and show up here as a diagnostic-only capture ("no
+`<name>.expected.txt` alongside ... yet").
 
 **Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
 end-to-end (0 todo).
 
-**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 60/60 programs match
-end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, and all 16
-`q01`-`q12*` adversarial-refutation programs below.
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 74/74 programs match
+end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
+`q01`-`q12*`, and all 14 `s01`-`s12*` adversarial-refutation programs below.
 
 ### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
@@ -249,6 +250,30 @@ found and fixed - the "how to run" commands are the source of truth, this table 
 only a snapshot. See also `tests/round4-fixes.test.js` for focused,
 toolchain-independent unit tests of each fix above.
 
+### Round-5 adversarial-refutation findings and their fixes
+
+A round-5 refuter found 6 more root-cause dishonest divergences, concentrated in a
+layer no prior round had exercised at all: FILE I/O (`convertToScala()`'s own entry
+point never parsed the ENVIRONMENT DIVISION), INITIALIZE (100% non-functional -
+`.copy()` on a plain `var` is a guaranteed compile error), and four narrower gaps
+(PERFORM ... THRU spanning multiple SECTIONs, DISPLAY of a bare GROUP, ACCEPT FROM
+DATE/TIME/DAY/DAY-OF-WEEK, and MOVE from a numeric-edited source into a numeric
+target). All 6 are now fixed; every program hard-passes `oracleCompare()`.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | FILE I/O was end-to-end broken: (a) the package root `index.js`'s own `parseCobol()` (what `convertToScala()` actually calls) never invoked `parseEnvironmentDivision` at all, so FILE-CONTROL/SELECT...ASSIGN info never reached the generator regardless of what the DATA/PROCEDURE DIVISIONs declared; (b) `generateWriteStatement` named its writer after the WRITE statement's *record* name while `generateOpen` named it after the *file* name (the two routinely differ, e.g. `SELECT OUT-FILE` / `FD OUT-FILE. 01 OUT-REC`) - a WRITE referenced a writer variable that was never declared; (c) `OPEN OUTPUT` then a later `OPEN INPUT` of the same file re-declared its `java.io.File`/reader/writer as `val` a second time - "... is already defined as value ..." | (a) `index.js` now calls the (newly exported) `parser/index.js`'s `parseEnvironmentDivision` and carries `environmentDivision` on the AST; `scala-generator.js`'s `getFileControls`/`generateFileConstants`/`hasFileOperations` read it. (b) New `recordToFile`/`fileToRecord` registries (`scala-generator.js`'s `buildRecordFileRegistries`, installed via `expression-gen.js`'s `setRecordFileRegistry`) let `generateWriteStatement`/`generateReadStatement` resolve the FD's own file name from either the record or file name a statement mentions. (c) File handles (`File`/reader/writer/iterator/random-access) are now declared exactly once, as `var`s, at object scope (`file-io-gen.js`'s `generateFileHandleDeclarations`/`fileHandleVarNames`) - `generateOpen`/`generateClose` assign/null-check them instead of redeclaring. LINE SEQUENTIAL WRITE also now strips trailing spaces and READ pads the physical line back to the target's declared width, matching cobc's actual on-disk behavior | s01 |
+| 2 | `generatePerformThruMethod` named each nested-def paragraph in a THRU range via plain `toMethodName` - a THRU range spanning multiple SECTIONs (`PERFORM 1000-PARA-A THRU 2000-PARA-B`, with `1000-PARA-A`/`2000-PARA-A` both stripping to the same bare `paraA`) produced two identically-named nested `def`s in the same wrapper method - "paraA is already defined as method paraA" | `generatePerformThruMethod` (`generator/method-gen.js`) now takes the whole program's flattened `units` (name/statements/sectionName) and `ambiguousNames` set and resolves each nested def's name via the same collision-aware `resolveParagraphMethodName` `generateAllMethods`/`generateSectionMethod`/`generateProgramFlowLines` already use; `renderNestedFallthroughDefs`'s doc comment (previously wrong - it claimed a single THRU range was "inherently collision-free") is corrected | s02, s02b |
+| 3 | `DISPLAY` of a bare GROUP identifier referenced a flat var that was never declared (`println(wsGroup)` - a group never gets its own elementary `FIELD_REGISTRY` entry, only its children do) - a hard compile error on every such DISPLAY | New `groupDisplayValueExpr` (`generator/expression-gen.js`) concatenates every child's own fixed-width display form (`CobolFmt.fitLeft` for alphanumeric, `CobolFmt.digitsOf` for numeric, recursing into a nested group), matching cobc's raw concatenated-storage DISPLAY exactly; `renderDisplayOperand` falls back to it when a reference has no elementary registry entry. Also fixed along the way (uncovered by the same repro): a numeric-edited item's own VALUE clause is now PICTURE-formatted at declaration time (`scala-generator.js`'s `defaultElementaryValue`), and `DISPLAY ... WITH NO ADVANCING` now actually suppresses the trailing newline (`generateDisplay`) - both were silently ignored before | s06, s06b, s11 |
+| 4 | `INITIALIZE` unconditionally emitted `<target> = <target>.copy() // INITIALIZE with defaults` - always a hard compile error, since every WORKING-STORAGE item this generator declares is a flat `var` (Int/String/BigDecimal/Vector), never a case class | New `initializeLeafValueExpr`/`initializeAssignmentLines` (`generator/expression-gen.js`) implement COBOL's real per-category default rules (ALPHABETIC/ALPHANUMERIC -> SPACES, NUMERIC/NUMERIC-EDITED -> ZERO, reusing the same `repeatedCharLiteralFor`/`zeroLiteralFor` helpers MOVE SPACES/MOVE ZERO already use) recursively over a GROUP target's children (via `GROUP_REGISTRY`, honoring OCCURS via a new `occursCounts` field on each flat var's registry info) or a single elementary target; FILLER is left untouched entirely (no addressable identity). `REPLACING <category> BY <value>` - verified against installed GnuCOBOL - only touches a leaf whose CATEGORY matches one of the REPLACING phrases; a leaf whose category ISN'T mentioned is left holding whatever value it already had, not reset to the category default (contrary to what "REPLACING" might suggest on its own) | s07, s07b |
+| 5 | `ACCEPT ... FROM DATE/TIME/DAY/DAY-OF-WEEK` always declared a brand-new `val <target> = ...` - a local shadowing binding, never an assignment to the target's actual registered flat var; a numeric target was left holding raw untyped date/time text instead of an actual number | `generateAccept` (`generator/expression-gen.js`) now resolves and assigns through the same `renderAssignment`/field-registry path any other statement uses, with new `coerceAcceptValue` applying the same numeric (`CobolFmt.truncNumeric`)/edited (`CobolFmt.edited`)/alphanumeric (`CobolFmt.fitLeft`/`fitRight`) coercion an ordinary MOVE source would get | s08 |
+| 6 | `MOVE` from a numeric-edited source into a numeric target wrapped the source's already-PICTURE-formatted text (e.g. `"  12.50"` for `PIC ZZ9.99`, with zero-suppression spaces) directly in `BigDecimal(...)` - a guaranteed `NumberFormatException` at runtime the moment zero-suppression left any leading space in the stored text | `renderVariableMoveSource` (`generator/expression-gen.js`) routes a numeric-edited source through the existing `CobolFmt.numval` runtime helper (already used for `FUNCTION NUMVAL`'s own space-tolerant parsing) instead of a bare `BigDecimal(...)` call, before applying the usual `CobolFmt.truncNumeric` store-time truncation | s12 |
+
+Re-run `npm test` after generator changes; the table above will drift as new gaps are
+found and fixed - the "how to run" commands are the source of truth, this table is
+only a snapshot. See also `tests/round5-fixes.test.js` for focused,
+toolchain-independent unit tests of each fix above.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -307,7 +332,17 @@ toolchain-independent unit tests of each fix above.
   nested defs, so a GO TO within a THRU range correctly cascades exactly as before
   (see `r08-perform-thru-backward-goto.cbl`/`p14-godep.cbl`, both still passing).
   Revisit only if a future program actually needs this; no corpus target regresses
-  without it today.
+  without it today. **Round-5 update**: this exact gap now has a live repro - a GO
+  TO from outside a `PERFORM ... THRU` range that jumps directly into the *middle*
+  of that range (not its first paragraph) fails `oracleCompare()` (the mid-range
+  paragraph correctly runs, but doesn't fall through to the paragraph after it) -
+  confirmed against installed GnuCOBOL. Deliberately **not promoted** into
+  `tests/corpus/proc/` (same reasoning as round-3 finding 3's reference-
+  modification gap below: a program that actually exercises a known, intentional
+  gap would fail `oracleCompare()` by design, misrepresenting a known limitation as
+  a regression). The repro lives outside this corpus for now; revisit by giving
+  each nested-def paragraph its own fallthrough-aware entry point reachable from a
+  GO TO, not just from the `_stepN` wrapper chain, if a future pass has time.
 
 - **Figurative constant vs. a genuinely numeric field in a comparison, round-4
   finding 1's untested edge** - `renderRelationalCondition`'s "genuine numeric vs

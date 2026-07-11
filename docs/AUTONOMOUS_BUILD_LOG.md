@@ -14,6 +14,11 @@
 
 ## Activity
 
+### 2026-07-11 10:20 — Cycles 17-18: container restart survived; round-4 committed (852a711); round-5 verdict
+- Container restarted mid-round-4 verification; toolchain and working tree survived; orchestrator re-ran the full suite itself (472/0/0) and committed+pushed round-4 fixes (SECTION cluster, UNSTRING cluster, figurative comparisons, INSPECT BEFORE/AFTER, qualified reads, VARYING AFTER). 79 corpus programs.
+- Round-5 refutation: NOT CONVERGED but strongly converging - dishonest findings 11 -> 16 -> 15(13) -> 16(13) -> 6. New failure area is the never-exercised I/O/environment layer: main API never parses ENVIRONMENT DIVISION (all file OPEN/WRITE/READ broken - roadmap overclaimed), INITIALIZE 100% non-functional, DISPLAY of bare groups, ACCEPT FROM date sources type-broken, edited-source MOVE crash, THRU-across-sections collision. 6 hard survivals incl. unary/exponent precedence and negative division sign rules.
+- Round-5 fix agent dispatched. Convergence bar remains 0-2 dishonest; next round decides wrap-up.
+
 ### 2026-07-11 09:10 — Cycles 14-16: round-3 fixed+committed (99089c3); round-4 NOT CONVERGED
 - Round-3 fixes committed after orchestrator-caught regression (r11/r11b BigDecimal double-wrap - fix agent had mislabeled it 'pre-existing'; targeted agent fixed type-aware operand coercion). 63 corpus programs hard-pass; suite 424/0/0.
 - Docs/demo committed (cdac11d): runnable end-to-end demo verified EQUIVALENT; truth-passed roadmap; engine README.

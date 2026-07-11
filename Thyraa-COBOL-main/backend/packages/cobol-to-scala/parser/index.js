@@ -487,6 +487,9 @@ export function validateCobol(source) {
 
 // Re-export all components
 export {
+  // Environment division
+  parseEnvironmentDivision,
+
   // Tokens
   TokenType,
   Keywords,

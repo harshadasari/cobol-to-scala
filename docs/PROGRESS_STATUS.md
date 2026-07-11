@@ -1,9 +1,9 @@
 # COBOL-to-Scala Autonomous Build — Progress Status
 
-**Last updated:** 2026-07-11 ~20:15 UTC (run started ~01:30 UTC — **~19 hours elapsed** of the 2-day window)
+**Last updated:** 2026-07-11 ~21:20 UTC (run started ~01:30 UTC — **~20 hours elapsed** of the 2-day window)
 **Branch:** `claude/analyze-codebase-pdPSZ` — all work below is **committed and pushed**
 **Orchestrator token budget:** well under the 2M cap (orchestrator only dispatches/reviews; all coding happens in delegated Sonnet subagents whose tokens don't count against it)
-**Status:** 🟢 Running — round 13 found 5 more genuine bugs (fix in progress); 187 verified programs committed so far
+**Status:** 🟢 Running — round 13 complete and committed (198 verified programs, 828/828 tests); round 14 next
 
 ---
 
@@ -33,10 +33,10 @@ This is expensive on purpose: it's the only way to catch the class of bug that *
 | **4 — CICS** | CICS command classification, BMS screen-map parsing, service-skeleton generation | ✅ Scaffolding done (intentionally not a full behavioral CICS runtime — see roadmap doc) |
 
 ### The verification record (the actual proof of correctness)
-- **187 real COBOL test programs**, each compiled with genuine GnuCOBOL and diffed byte-for-byte against the generated Scala's output
-- **790 automated tests**, all passing
+- **198 real COBOL test programs**, each compiled with genuine GnuCOBOL and diffed byte-for-byte against the generated Scala's output
+- **828 automated tests**, all passing
 - **12 completed adversarial rounds** — dishonest-bug counts per round: `11, 16, 15, 16, 6, 6, 8, 4, 6, 6, 3, 4`
-- **Round 13 in progress**: found 5 more genuine bugs by testing *combinations* of previously-tested features rather than single features (expected, since single-feature bugs are increasingly scarce). Most notable: DECLARATIVES error-handler registries were only wired up *after* generating the handler bodies themselves — meaning a handler that retries its own failed operation, or one handler triggering another, silently couldn't fire. Fix in progress.
+- **Round 13 complete**: 5 more genuine bugs found and fixed (DECLARATIVES handler wiring order, SORT THRU wrappers, RENAMES support, CALL of table-bearing groups, redefining-table registries). Bonus: the orchestrator's own pre-commit verification caught a **state-leak bug** the fix itself introduced — converting two different COBOL programs in one process let the first program's error-handler wiring contaminate the second. That leak also explained earlier intermittent test failures that had looked like tooling flakiness. Fixed with per-conversion isolation + dedicated regression tests.
 - **28 commits**, each independently verified green before being pushed (never committed red)
 
 ### Notable bugs this process actually caught
@@ -56,7 +56,7 @@ Full details of every finding and fix are in `Thyraa-COBOL-main/backend/packages
 ## 3. What's still pending / open
 
 ### Actively in progress right now
-- **Round 13** adversarial hunting just dispatched — looking for whatever's left after 12 rounds
+- **Round 14** adversarial hunting — 13 rounds complete, all committed
 
 ### Documented, intentional gaps (not bugs — known and clearly marked)
 These are real COBOL features the engine doesn't fully handle yet. Each one degrades **visibly** (a clear `???` marker or documented skip) rather than silently producing wrong output:
@@ -72,7 +72,7 @@ These are real COBOL features the engine doesn't fully handle yet. Each one degr
 - **OCCURS DEPENDING ON dynamic parse/format** — sized at a fixed maximum rather than truly dynamic
 
 ### Where this goes next
-Round 13 is running now. The dishonest-finding trend (6→6→3→4) suggests we're close to diminishing returns but hasn't flattened to zero yet — each round still finds 3-4 genuine bugs. I'll keep running rounds, verifying, committing, and pushing after each one, and will update this file at the next natural checkpoint.
+Round 14 dispatching now. The finding trend (3→4→5-per-round) is holding steady in the "combinations of features" regime — each round still pays for itself with real bugs. I'll keep running rounds, verifying, committing, and pushing after each one, and will update this file at the next natural checkpoint.
 
 ---
 

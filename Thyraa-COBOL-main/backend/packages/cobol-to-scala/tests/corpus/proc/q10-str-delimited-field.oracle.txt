@@ -1,0 +1,2 @@
+TARGET=HELLO-DONE!              
+PTR-AFTER=12

@@ -46,31 +46,6 @@ function analyzeParameters(procedure) {
 }
 
 /**
- * Analyze a procedure to determine its return type
- */
-function analyzeReturnType(procedure) {
-  // Check for explicit RETURNING clause
-  if (procedure.returning) {
-    return mapCobolTypeToScala(procedure.returning);
-  }
-
-  // Check statements for STOP RUN or EXIT
-  if (procedure.statements) {
-    for (const stmt of procedure.statements) {
-      if (stmt.type === 'STOP RUN' || stmt.type === 'STOP-RUN') {
-        return 'Unit';
-      }
-      if (stmt.type === 'GOBACK') {
-        return 'Unit';
-      }
-    }
-  }
-
-  // Default to Unit
-  return 'Unit';
-}
-
-/**
  * Normalize statement type from AST class names to simple keywords
  * e.g., "PerformStatement" -> "PERFORM", "IfStatement" -> "IF"
  */
@@ -259,8 +234,21 @@ ${indentStr}}`;
     // once, around the outermost level only, not inside generateVaryingNest's
     // own per-level recursion.
     const levels = [stmt.varying, ...(stmt.varying.after || [])];
+    const testBefore = stmt.testBefore !== false;
+    const bi = '  '.repeat(indent + 1);
+    // WITH TEST BEFORE (the default - round-4 finding 5): every level's FROM
+    // value is set exactly once, up front, for *all* levels at once - not
+    // separately inside each level's own construct (see generateVaryingNest's
+    // doc comment for why: after this fix, a level only ever gets reset again
+    // when the level immediately enclosing it increments, never on its own
+    // initiative). WITH TEST AFTER keeps its own pre-existing per-level
+    // self-reset (unaffected by this fix - verified already correct against
+    // installed GnuCOBOL, see generateVaryingNest's WITH TEST AFTER branch).
+    const initLines = testBefore
+      ? levels.map(l => `${bi}${toCamelCase(l.variable || 'i')} = ${varyingOperandExpr(l.from, 1)}`).join('\n') + '\n'
+      : '';
     return `${indentStr}scala.util.boundary {
-${generateVaryingNest(levels, 0, stmt, indent + 1)}
+${initLines}${generateVaryingNest(levels, 0, stmt, indent + 1)}
 ${indentStr}}`;
   }
 
@@ -280,11 +268,30 @@ ${indentStr}}`;
  * Render one level of a PERFORM VARYING ... AFTER ... nest (recursively -
  * the innermost level's "body" is the PERFORM's own statements/target
  * paragraph; every other level's "body" is the *next* level's whole
- * while-loop). Resetting the inner variable to its FROM value happens
- * naturally here: it's the first line of the block that becomes the outer
- * loop's body, so it re-runs on every outer iteration, exactly like COBOL
- * re-initializing each AFTER variable at the start of each enclosing
- * iteration.
+ * while-loop).
+ *
+ * WITH TEST BEFORE (round-4 finding 5): every level's *own* FROM-reset is
+ * hoisted out of this function entirely (see generatePerformFromAST's
+ * `initLines`, emitted once for every level up front, before the outermost
+ * while even starts) - what happens *here* instead is resetting every level
+ * *deeper* than this one back to its own FROM value, unconditionally,
+ * immediately after this level's own increment (`resetDeeperLines`). This
+ * matches cobc's actual documented PERFORM VARYING algorithm exactly
+ * (verified against installed GnuCOBOL with perf01's differing-step,
+ * negative-step AFTER nest): incrementing a level re-initializes every level
+ * nested under it back to FROM *before* control returns to retest this
+ * level's own UNTIL - including on the very last outer iteration, whose
+ * retest is about to fail and exit the whole construct. The pre-fix version
+ * instead reset each level's FROM value at the *top* of its own construct -
+ * which only re-ran when the *enclosing* level's while-body executed again,
+ * never on that enclosing level's *final* (test-failing, body-skipped)
+ * retest - so every AFTER variable was left holding whatever value its own
+ * last inner iteration reached, not its FROM value, once the whole nest
+ * finished (e.g. `FINAL-J` held the AFTER variable's last-used value instead
+ * of its FROM-reset one).
+ *
+ * WITH TEST AFTER VARYING is unaffected by any of this (see below) - kept
+ * exactly as before, since it's already verified correct.
  */
 function generateVaryingNest(levels, i, stmt, indent) {
   const indentStr = '  '.repeat(indent);
@@ -305,10 +312,16 @@ function generateVaryingNest(levels, i, stmt, indent) {
   const bodyIndentStr = '  '.repeat(indent + 1);
 
   if (testBefore) {
-    return `${indentStr}${varName} = ${from}
-${indentStr}while !(${until}) do
-${body}
-${bodyIndentStr}${varName} = ${varName} + ${by}`;
+    const resetDeeperLines = levels
+      .slice(i + 1)
+      .map(l => `${bodyIndentStr}${toCamelCase(l.variable || 'i')} = ${varyingOperandExpr(l.from, 1)}`)
+      .join('\n');
+    return [
+      `${indentStr}while !(${until}) do`,
+      body,
+      `${bodyIndentStr}${varName} = ${varName} + ${by}`,
+      resetDeeperLines,
+    ].filter(Boolean).join('\n');
   }
 
   // WITH TEST AFTER VARYING: the TEST phrase applies uniformly to every
@@ -372,23 +385,101 @@ function convertConditionToScala(condition) {
  * which defeats the purpose.
  */
 export function generateMethod(procedure, indent = 0) {
-  const indentStr = '  '.repeat(indent);
-  const methodName = toMethodName(procedure.name);
   const params = analyzeParameters(procedure);
-  const returnType = analyzeReturnType(procedure);
-
-  // Build parameter list
   const paramList = params.map(p => `${p.name}: ${p.type}`).join(', ');
+  return generateMethodNamed(toMethodName(procedure.name), procedure.statements, indent, paramList);
+}
 
-  const signature = `${indentStr}def ${methodName}(${paramList}): ${returnType} =`;
+/**
+ * Same as generateMethod, but with a precomputed method name (used when a
+ * paragraph's bare name needs to be qualified by its enclosing section to
+ * avoid colliding with a same-named paragraph elsewhere - see
+ * resolveParagraphMethodName/collectAmbiguousParagraphNames below, round-4
+ * finding 8).
+ */
+function generateMethodNamed(methodName, statements, indent = 0, paramList = '') {
+  const indentStr = '  '.repeat(indent);
+  const signature = `${indentStr}def ${methodName}(${paramList}): Unit =`;
+  const body = generateMethodBody(statements, indent + 1);
+  return [signature, body].join('\n');
+}
 
-  const lines = [signature];
+/**
+ * Find every bare paragraph method name (post toMethodName/numeric-prefix-
+ * stripping) that would be generated more than once across the whole
+ * PROCEDURE DIVISION - counting genuinely top-level (section-less) paragraphs
+ * plus every paragraph nested inside every SECTION (and a paragraphless
+ * section's own name, standing in for itself). Two paragraphs in *different*
+ * sections legitimately have distinct COBOL names (e.g. "1000-PARA-A" and
+ * "2000-PARA-A") that still collide once toMethodName strips each one's own
+ * section-numbered prefix - round-4 finding 8 (mirrors case-class-gen.js's
+ * collectAmbiguousGroupClassNames for the exact same "only qualify names that
+ * actually collide" reasoning). Names appearing exactly once are left alone,
+ * so every previously-generated (section-less) program is untouched.
+ */
+export function collectAmbiguousParagraphNames(topLevelParagraphs, sections) {
+  const counts = new Map();
+  const bump = (name) => {
+    const bare = toMethodName(name);
+    counts.set(bare, (counts.get(bare) || 0) + 1);
+  };
 
-  // Generate method body
-  const body = generateMethodBody(procedure.statements, indent + 1);
-  lines.push(body);
+  for (const p of topLevelParagraphs || []) bump(p.name);
+  for (const s of sections || []) {
+    const paras = s.paragraphs && s.paragraphs.length > 0 ? s.paragraphs : [s];
+    for (const p of paras) bump(p.name);
+  }
 
-  return lines.join('\n');
+  const ambiguous = new Set();
+  for (const [name, count] of counts) {
+    if (count > 1) ambiguous.add(name);
+  }
+  return ambiguous;
+}
+
+/**
+ * Resolve the actual top-level method name for a paragraph, given the shared
+ * ambiguity set (collectAmbiguousParagraphNames) and the paragraph's own
+ * enclosing section name (null for a genuinely top-level paragraph). Unique
+ * bare names are returned unqualified (byte-for-byte the same as before this
+ * fix); a colliding one is qualified by its enclosing section's own method
+ * name, e.g. "1000-PARA-A" inside "3000-THIRD SECTION" becomes
+ * `thirdParaA` - mirroring case-class-gen.js's resolveClassName.
+ */
+export function resolveParagraphMethodName(paragraphName, sectionName, ambiguousNames) {
+  const bare = toMethodName(paragraphName);
+  if (ambiguousNames && ambiguousNames.has(bare) && sectionName) {
+    const sectionPart = toMethodName(sectionName);
+    return sectionPart + bare.charAt(0).toUpperCase() + bare.slice(1);
+  }
+  return bare;
+}
+
+/**
+ * Flatten the whole PROCEDURE DIVISION into one ordered list of paragraph-like
+ * units - `{ name, statements, sectionName }` - in true source order: any
+ * genuinely top-level (pre-first-SECTION) paragraphs first, then each
+ * section's own paragraphs in order (a paragraphless section - direct
+ * statements, no nested paragraph names - becomes a single pseudo-paragraph
+ * unit standing in for itself). This is the order COBOL falls through in
+ * during ordinary top-to-bottom execution, and the order
+ * generateProgramFlowLines/generateAllMethods below both need.
+ */
+export function flattenProcedureUnits(topLevelParagraphs, sections) {
+  const units = [];
+  for (const p of topLevelParagraphs || []) {
+    units.push({ name: p.name, statements: p.statements, sectionName: null });
+  }
+  for (const s of sections || []) {
+    if (s.paragraphs && s.paragraphs.length > 0) {
+      for (const p of s.paragraphs) {
+        units.push({ name: p.name, statements: p.statements, sectionName: s.name });
+      }
+    } else {
+      units.push({ name: s.name, statements: s.statements, sectionName: null });
+    }
+  }
+  return units;
 }
 
 /**
@@ -460,60 +551,239 @@ export function generatePerformThruMethod(fromParagraph, toParagraph, paragraphs
     return `${indentStr}def ${methodName}(): Unit =\n${indentStr}  ()`;
   }
 
-  const lines = [`${indentStr}def ${methodName}(): Unit =`];
   const defIndent = indent + 1;
-  const defIndentStr = '  '.repeat(defIndent);
-
-  rangeParagraphs.forEach((para, i) => {
-    const name = toMethodName(para.name);
-    lines.push(`${defIndentStr}def ${name}(): Unit =`);
-    lines.push(generateMethodBody(para.statements, defIndent + 1));
-
-    const isLast = i === rangeParagraphs.length - 1;
-    if (!isLast && !statementEndsInUnconditionalTransfer(para.statements)) {
-      const nextName = toMethodName(rangeParagraphs[i + 1].name);
-      lines.push(`${'  '.repeat(defIndent + 1)}${nextName}() // implicit fall-through`);
-    }
-  });
-
-  lines.push(`${defIndentStr}${toMethodName(rangeParagraphs[0].name)}()`);
+  const lines = [`${indentStr}def ${methodName}(): Unit =`];
+  lines.push(...renderNestedFallthroughDefs(rangeParagraphs, defIndent, p => toMethodName(p.name)));
+  lines.push(`${'  '.repeat(defIndent)}${toMethodName(rangeParagraphs[0].name)}()`);
 
   return lines.join('\n');
 }
 
 /**
- * Generate all methods from a list of procedures
+ * Render one paragraph per nested local `def`, in order, each followed by an
+ * automatic call to the *next* paragraph's def (round-3's "implicit
+ * fall-through") unless the paragraph's own last statement already
+ * unconditionally transfers control away (statementEndsInUnconditionalTransfer)
+ * or it's the last paragraph in the list. Shared by generatePerformThruMethod
+ * (bounded to one PERFORM ... THRU range), generateSectionMethod (bounded to
+ * one SECTION's own paragraphs, for PERFORM-of-a-section-name - round-4
+ * finding 7), and generateProgramFlowLines (the *whole* PROCEDURE DIVISION,
+ * for the program's true entry point - round-4 finding 9). `nameFor` computes
+ * each paragraph's local def name; callers needing collision-safe names across
+ * a scope that spans multiple sections pass resolveParagraphMethodName,
+ * everyone else (a single section, or a single THRU range - inherently
+ * collision-free, since paragraph names are unique within either) just passes
+ * plain toMethodName.
  */
-export function generateAllMethods(procedures, indent = 0) {
-  if (!procedures || procedures.length === 0) {
+function renderNestedFallthroughDefs(paragraphs, defIndent, nameFor) {
+  const defIndentStr = '  '.repeat(defIndent);
+  const lines = [];
+
+  paragraphs.forEach((para, i) => {
+    const name = nameFor(para);
+    lines.push(`${defIndentStr}def ${name}(): Unit =`);
+    lines.push(generateMethodBody(para.statements, defIndent + 1));
+
+    const isLast = i === paragraphs.length - 1;
+    if (!isLast && !statementEndsInUnconditionalTransfer(para.statements)) {
+      const nextName = nameFor(paragraphs[i + 1]);
+      lines.push(`${'  '.repeat(defIndent + 1)}${nextName}() // implicit fall-through`);
+    }
+  });
+
+  return lines;
+}
+
+/**
+ * Render a bounded multi-unit fall-through chain by CALLING each unit's own
+ * already-generated standalone flat top-level method (see generateAllMethods)
+ * - one positionally-named (`_step0`, `_step1`, ...) wrapper `def` per unit,
+ * each calling that unit's flat method and then, unless its last statement
+ * already unconditionally transfers control away
+ * (statementEndsInUnconditionalTransfer) or it's the last unit, calling the
+ * next step.
+ *
+ * Deliberately NOT the same body-duplicating approach generatePerformThruMethod
+ * uses (renderNestedFallthroughDefs): that approach names each nested def
+ * after the paragraph itself, which generateSectionMethod/
+ * generateProgramFlowLines (round-4 findings 7/9) cannot safely do - a
+ * SECTION wrapper or the whole-program flow spans every paragraph in a
+ * section/program, including ones an ordinary out-of-line
+ * `PERFORM <paragraph-name>` elsewhere in that very same section/program
+ * explicitly targets. If that target's own body were *also* duplicated here
+ * as a same-named sibling nested def, the explicit PERFORM's call site
+ * (rendered with the exact same bare/qualified name - see
+ * paragraphMethodName/toMethodName, used verbatim regardless of context)
+ * would resolve to *this* fallthrough-rigged sibling instead of the real
+ * (bounded, no-fallthrough) flat method by ordinary Scala lexical scoping -
+ * silently re-running whatever came after it a second, unintended time. This
+ * is exactly how a real regression was caught: tests/corpus/proc/p12-sort.cbl's
+ * `SORT ... INPUT PROCEDURE 1000-RELEASE-RECORDS OUTPUT PROCEDURE
+ * 2000-RETURN-RECORDS` re-triggered 2000-RETURN-RECORDS prematurely (reading
+ * the SD buffer *before* the sort itself ran) purely because both paragraphs
+ * also happened to be adjacent in the whole-program natural-fall-through
+ * chain. Naming each wrapper step positionally instead sidesteps this
+ * entirely: nothing outside this function ever calls a `_stepN` name, so it
+ * can never be shadowed by, or shadow, an ordinary out-of-line PERFORM.
+ *
+ * Trade-off, accepted deliberately: a GO TO/PERFORM that is *not* a unit's
+ * own last statement (statementEndsInUnconditionalTransfer only inspects the
+ * last one) already skips the rest of that unit's own flat method correctly
+ * via its own generated `return`/call (an ordinary Scala method return) - but
+ * this wrapper, calling that flat method as one opaque unit, cannot then
+ * additionally tell "the flat method returned after firing an internal
+ * mid-body unconditional transfer" apart from "the flat method simply
+ * finished" the way the body-duplicating approach's inline `return` could -
+ * so a non-last-statement GOTO in a unit that also participates in this
+ * chain may still see this wrapper attempt the next step. Narrow (COBOL
+ * style overwhelmingly puts a transfer last, or inside a terminating IF) and
+ * far safer than the alternative above.
+ */
+function renderNestedFallthroughSteps(units, defIndent, flatNameFor) {
+  const defIndentStr = '  '.repeat(defIndent);
+  const bodyIndentStr = '  '.repeat(defIndent + 1);
+  const stepName = (i) => `_step${i}`;
+  const lines = [];
+
+  units.forEach((unit, i) => {
+    lines.push(`${defIndentStr}def ${stepName(i)}(): Unit =`);
+    lines.push(`${bodyIndentStr}${flatNameFor(unit)}()`);
+    const isLast = i === units.length - 1;
+    if (!isLast && !statementEndsInUnconditionalTransfer(unit.statements)) {
+      lines.push(`${bodyIndentStr}${stepName(i + 1)}() // implicit fall-through`);
+    }
+  });
+
+  return { lines, entryStepName: stepName(0) };
+}
+
+/**
+ * Generate the wrapper method for a SECTION that contains its own paragraphs
+ * - PERFORM of a section name must run every paragraph inside that section,
+ * in order (respecting fall-through *within* the section), then return
+ * control right after the PERFORM statement - it must NOT continue into the
+ * next section, even if that next section immediately follows in source
+ * order (round-4 finding 7; verified against cobc with sect01/sect01b: a
+ * PERFORM'd section's own last paragraph falling off its end returns to the
+ * PERFORM's caller, never spilling into the next SECTION). Built from
+ * renderNestedFallthroughSteps (see its doc comment for why - NOT the
+ * body-duplicating renderNestedFallthroughDefs generatePerformThruMethod
+ * uses), calling each paragraph's own flat top-level method (qualified by
+ * `ambiguousNames` exactly like that flat method's own name was resolved in
+ * generateAllMethods, so this calls the *same* method, not a name that
+ * doesn't exist). Named after the section itself (not `fromNameToToName`) so
+ * a plain `PERFORM <section-name>` - which resolves via the exact same
+ * toMethodName/paragraphMethodName transform as any paragraph target - finds
+ * it.
+ *
+ * A paragraphless section (statements directly under the SECTION header, no
+ * nested paragraph names at all) needs no nesting - it's already a single
+ * unit, so it gets a plain flat method exactly like any standalone paragraph.
+ */
+export function generateSectionMethod(section, indent = 0, ambiguousNames = null) {
+  const indentStr = '  '.repeat(indent);
+  const methodName = toMethodName(section.name);
+
+  if (!section.paragraphs || section.paragraphs.length === 0) {
+    return generateMethodNamed(methodName, section.statements, indent);
+  }
+
+  const defIndent = indent + 1;
+  const flatNameFor = (p) => resolveParagraphMethodName(p.name, section.name, ambiguousNames);
+  const { lines: stepLines, entryStepName } = renderNestedFallthroughSteps(
+    section.paragraphs,
+    defIndent,
+    flatNameFor
+  );
+  const lines = [`${indentStr}def ${methodName}(): Unit =`, ...stepLines, `${'  '.repeat(defIndent)}${entryStepName}()`];
+
+  return lines.join('\n');
+}
+
+/**
+ * Generate the lines for the program's true entry point: the *whole*
+ * PROCEDURE DIVISION - every paragraph, across every section, in source
+ * order - chained via renderNestedFallthroughSteps (round-4 finding 9:
+ * "COBOL semantics are sequential fall-through from [the first unit] through
+ * the whole division"), calling each unit's own flat top-level method
+ * (qualified by `ambiguousNames` exactly like generateAllMethods resolved it,
+ * round-4 finding 8) rather than duplicating its body - see
+ * renderNestedFallthroughSteps's doc comment for why this specific form is
+ * required here (not the body-duplicating approach generateSectionMethod's
+ * doc comment initially considered and a real regression - an explicit
+ * out-of-line PERFORM elsewhere re-triggering a "later" paragraph a second
+ * time - ruled out).
+ */
+export function generateProgramFlowLines(units, indent, ambiguousNames) {
+  if (!units || units.length === 0) {
+    return [`${'  '.repeat(indent)}()`];
+  }
+  const flatNameFor = (u) => resolveParagraphMethodName(u.name, u.sectionName, ambiguousNames);
+  const { lines, entryStepName } = renderNestedFallthroughSteps(units, indent, flatNameFor);
+  lines.push(`${'  '.repeat(indent)}${entryStepName}()`);
+  return lines;
+}
+
+/**
+ * Generate all methods from the PROCEDURE DIVISION's top-level (section-less)
+ * paragraphs and its SECTIONs.
+ *
+ * Every paragraph - whether genuinely top-level or nested inside a section -
+ * still gets its own standalone flat top-level method (used for a direct,
+ * non-THRU `PERFORM <paragraph-name>` targeting just that one paragraph,
+ * regardless of which section it lives in), with its bare name qualified by
+ * its enclosing section only when that bare name would otherwise collide
+ * with another paragraph elsewhere in the program (round-4 finding 8). Each
+ * section that itself contains paragraphs additionally gets its own bounded
+ * wrapper method (generateSectionMethod, round-4 finding 7), and every
+ * PERFORM ... THRU range still gets its own wrapper exactly as before.
+ */
+export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
+  const units = flattenProcedureUnits(topLevelParagraphs, sections);
+  if (units.length === 0) {
     return '';
   }
 
+  const ambiguousNames = collectAmbiguousParagraphNames(topLevelParagraphs, sections);
   const methods = [];
   const performThrus = new Set();
 
   // First pass - collect PERFORM THRU targets (PerformStatement AST nodes
   // use .targetParagraph/.throughParagraph - see parser/ast.js - not
   // .target/.thru).
-  for (const procedure of procedures) {
-    if (procedure.statements) {
-      for (const stmt of procedure.statements) {
-        if (stmt.type === 'PerformStatement' && stmt.throughParagraph) {
-          performThrus.add(`${stmt.targetParagraph}:${stmt.throughParagraph}`);
-        }
+  for (const unit of units) {
+    for (const stmt of unit.statements || []) {
+      if (stmt.type === 'PerformStatement' && stmt.throughParagraph) {
+        performThrus.add(`${stmt.targetParagraph}:${stmt.throughParagraph}`);
       }
     }
   }
 
-  // Generate regular methods
-  for (const procedure of procedures) {
-    methods.push(generateMethod(procedure, indent));
+  // Flat standalone top-level methods - one per paragraph (collision-
+  // qualified name), plus one per paragraphless section (never ambiguous:
+  // paragraphless sections stand in for themselves, sectionName null).
+  for (const unit of units) {
+    const methodName = resolveParagraphMethodName(unit.name, unit.sectionName, ambiguousNames);
+    methods.push(generateMethodNamed(methodName, unit.statements, indent));
   }
 
-  // Generate PERFORM THRU wrapper methods
+  // Section wrapper methods (PERFORM-of-section-name support).
+  for (const section of sections || []) {
+    if (section.paragraphs && section.paragraphs.length > 0) {
+      methods.push(generateSectionMethod(section, indent, ambiguousNames));
+    }
+  }
+
+  // PERFORM THRU wrapper methods, over the flattened paragraph-only list
+  // (top-level paragraphs + every section's own paragraphs, in order) -
+  // unchanged from before this fix.
+  const paragraphsOnly = [...(topLevelParagraphs || [])];
+  for (const section of sections || []) {
+    paragraphsOnly.push(...(section.paragraphs || []));
+  }
   for (const thru of performThrus) {
     const [from, to] = thru.split(':');
-    methods.push(generatePerformThruMethod(from, to, procedures, indent));
+    methods.push(generatePerformThruMethod(from, to, paragraphsOnly, indent));
   }
 
   return methods.join('\n\n');
@@ -523,5 +793,10 @@ export default {
   toMethodName,
   generateMethod,
   generatePerformThruMethod,
-  generateAllMethods
+  generateSectionMethod,
+  generateProgramFlowLines,
+  generateAllMethods,
+  collectAmbiguousParagraphNames,
+  resolveParagraphMethodName,
+  flattenProcedureUnits,
 };

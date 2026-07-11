@@ -22,8 +22,16 @@ import {
   setAmbiguousGroupClassNames,
   generateCobolFmtHelper,
   generateCobolInspectHelper,
+  generateCobolUnstringHelper,
 } from './expression-gen.js';
-import { generateMethod, generateAllMethods, toMethodName } from './method-gen.js';
+import {
+  generateMethod,
+  generateAllMethods,
+  toMethodName,
+  flattenProcedureUnits,
+  collectAmbiguousParagraphNames,
+  generateProgramFlowLines,
+} from './method-gen.js';
 import { generateFileIO, generateFileStatusCheck } from './file-io-gen.js';
 import { generateSql, generateDoobieImports, generateTransactorSetup } from './sql-gen.js';
 
@@ -1369,83 +1377,79 @@ function generateEnums(ast, indent = 0) {
 }
 
 /**
+ * Split a raw parsed AST's PROCEDURE DIVISION into `{ topLevelParagraphs,
+ * sections }`, handling the handful of shapes different parser entry points
+ * have historically produced (see generateMethods/findMainProcedure's prior
+ * per-function copies of this same fallback chain, now unified here so both
+ * agree on the exact same paragraph/section structure - round-4 finding 9
+ * depended on these being consistent, since a section-led program was
+ * previously invisible to findMainProcedure even though generateMethods
+ * already (partially) saw its sections).
+ */
+function splitProcedureDivision(ast) {
+  // Format 1: ast.procedure.paragraphs (nested format) - no sections in this shape.
+  if (ast.procedure?.paragraphs && Array.isArray(ast.procedure.paragraphs)) {
+    return { topLevelParagraphs: ast.procedure.paragraphs, sections: [] };
+  }
+  // Format 2: ast.procedures is a ProcedureDivision object with paragraphs + sections.
+  if (ast.procedures?.paragraphs && Array.isArray(ast.procedures.paragraphs)) {
+    const sections = Array.isArray(ast.procedures.sections) ? ast.procedures.sections : [];
+    return { topLevelParagraphs: ast.procedures.paragraphs, sections };
+  }
+  // Format 3: ast.procedures is an array directly.
+  if (Array.isArray(ast.procedures)) {
+    return { topLevelParagraphs: ast.procedures, sections: [] };
+  }
+  return { topLevelParagraphs: [], sections: [] };
+}
+
+/**
  * Generate methods from COBOL procedures
  * Handles multiple parser output formats
  */
 function generateMethods(ast, indent = 1) {
-  let procedures = [];
-
-  // Format 1: ast.procedure.paragraphs (nested format)
-  if (ast.procedure?.paragraphs && Array.isArray(ast.procedure.paragraphs)) {
-    procedures = ast.procedure.paragraphs;
-  }
-  // Format 2: ast.procedures is a ProcedureDivision object with paragraphs
-  else if (ast.procedures?.paragraphs && Array.isArray(ast.procedures.paragraphs)) {
-    procedures = ast.procedures.paragraphs;
-    // Also include paragraphs from sections
-    if (ast.procedures.sections && Array.isArray(ast.procedures.sections)) {
-      for (const section of ast.procedures.sections) {
-        if (section.paragraphs) {
-          procedures = [...procedures, ...section.paragraphs];
-        }
-        // Include section-level statements as a method
-        if (section.statements && section.statements.length > 0) {
-          procedures = [...procedures, section];
-        }
-      }
-    }
-  }
-  // Format 3: ast.procedures is an array directly
-  else if (Array.isArray(ast.procedures)) {
-    procedures = ast.procedures;
-  }
-
-  return generateAllMethods(procedures, indent);
+  const { topLevelParagraphs, sections } = splitProcedureDivision(ast);
+  return generateAllMethods(topLevelParagraphs, sections, indent);
 }
 
 /**
- * Generate main method if requested
+ * Generate main method if requested.
+ *
+ * The `@main def run()` entry point is the *whole* PROCEDURE DIVISION's true
+ * entry: the first paragraph (whether genuinely top-level or the first
+ * paragraph of the first SECTION - round-4 finding 9) chained by natural
+ * fall-through all the way through the rest of the division, including
+ * across SECTION boundaries - not just a single call to the first paragraph's
+ * own (fall-through-free) standalone method, which left every paragraph after
+ * the first unreachable unless some other paragraph happened to PERFORM it.
  */
 function generateMainMethod(ast, options, indent = 1) {
   if (!options.generateMain) return '';
 
   const indentStr = '  '.repeat(indent);
-  const mainProcedure = findMainProcedure(ast);
+  const { topLevelParagraphs, sections } = splitProcedureDivision(ast);
+  const units = flattenProcedureUnits(topLevelParagraphs, sections);
+  const ambiguousNames = collectAmbiguousParagraphNames(topLevelParagraphs, sections);
 
-  const lines = [
-    `${indentStr}@main def run(): Unit =`,
-    `${indentStr}  ${toMethodName(mainProcedure || 'mainProcedure')}()`
-  ];
+  const lines = [`${indentStr}@main def run(): Unit =`];
+  lines.push(...generateProgramFlowLines(units, indent + 1, ambiguousNames));
 
   return lines.join('\n');
 }
 
 /**
- * Find the main procedure (typically the first one or one with specific naming)
+ * Find the main procedure: the true first unit of the PROCEDURE DIVISION in
+ * source order - a genuinely top-level paragraph if one precedes every
+ * SECTION, otherwise the first paragraph of the first SECTION (or that
+ * section's own name, if it has no nested paragraphs at all) - round-4
+ * finding 9. COBOL's entry point is always whatever comes first, regardless
+ * of its name, so this no longer favors a paragraph named "MAIN"/"START"/etc.
+ * over a differently-named paragraph that actually comes first.
  */
-function findMainProcedure(ast) {
-  let procedures = [];
-
-  // Handle multiple formats
-  if (ast.procedure?.paragraphs && Array.isArray(ast.procedure.paragraphs)) {
-    procedures = ast.procedure.paragraphs;
-  } else if (ast.procedures?.paragraphs && Array.isArray(ast.procedures.paragraphs)) {
-    procedures = ast.procedures.paragraphs;
-  } else if (Array.isArray(ast.procedures)) {
-    procedures = ast.procedures;
-  }
-
-  if (procedures.length === 0) return null;
-
-  // Look for common main procedure names
-  const mainNames = ['MAIN', 'MAIN-PROCEDURE', 'MAIN-PARA', '0000-MAIN', '0000-MAIN-PARAGRAPH', 'START'];
-  for (const name of mainNames) {
-    const found = procedures.find(p => p.name?.toUpperCase() === name);
-    if (found) return found.name;
-  }
-
-  // Return the first procedure
-  return procedures[0]?.name;
+export function findMainProcedure(ast) {
+  const { topLevelParagraphs, sections } = splitProcedureDivision(ast);
+  const units = flattenProcedureUnits(topLevelParagraphs, sections);
+  return units[0]?.name ?? null;
 }
 
 /**
@@ -1533,6 +1537,13 @@ export function generateScala(ast, options = {}) {
   // substring counting/replacement) used by generated INSPECT statements.
   sections.push('// CobolInspect: INSPECT TALLYING/REPLACING helpers');
   sections.push(generateCobolInspectHelper());
+  sections.push('');
+
+  // CobolUnstring: UNSTRING scanning helper (WITH POINTER start/writeback,
+  // DELIMITED BY ALL collapsing, DELIMITER IN) used by generated UNSTRING
+  // statements.
+  sections.push('// CobolUnstring: UNSTRING scanning helper');
+  sections.push(generateCobolUnstringHelper());
   sections.push('');
 
   // Generate case classes (outside the object for better organization)

@@ -1,0 +1,3 @@
+T1=BBB  
+T2=CCC  
+PTR-AFTER=13

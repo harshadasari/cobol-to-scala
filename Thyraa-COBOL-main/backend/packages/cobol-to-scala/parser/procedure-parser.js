@@ -575,6 +575,24 @@ function parseAndCondition(ctx) {
  *     actually written in practice (with literals/bare operators, not bare
  *     condition-name identifiers immediately after AND/OR).
  */
+/**
+ * True when the current token can only start a literal / figurative-constant
+ * / FUNCTION-call operand - never an IDENTIFIER, never a fresh class/sign/
+ * condition-name test (none of those apply to a non-identifier operand).
+ * Shared by isAbbreviatedRelationContinuation's tail check and
+ * parsePrimaryCondition's non-identifier-subject relational condition
+ * (round-4 finding 1's `IF HIGH-VALUES > LOW-VALUES` case: COBOL's relational
+ * operand is a full arithmetic-expression, which may legally be just a
+ * literal/figurative constant with no identifier at all).
+ */
+function isLiteralOrFigurativeOrFunctionStart(ctx) {
+  return (
+    ctx.check(TokenType.STRING_LITERAL) || ctx.check(TokenType.NUMERIC_LITERAL) ||
+    ['ZERO', 'ZEROS', 'ZEROES', 'SPACE', 'SPACES', 'HIGH-VALUE', 'HIGH-VALUES',
+     'LOW-VALUE', 'LOW-VALUES', 'QUOTE', 'QUOTES', 'FUNCTION'].some(v => ctx.checkValue(v))
+  );
+}
+
 function isAbbreviatedRelationContinuation(ctx) {
   if (
     ctx.check(TokenType.OP_EQUAL) || ctx.check(TokenType.OP_GREATER) || ctx.check(TokenType.OP_LESS) ||
@@ -584,11 +602,7 @@ function isAbbreviatedRelationContinuation(ctx) {
   }
   if (['EQUAL', 'EQUALS', 'GREATER', 'LESS'].some(v => ctx.checkValue(v))) return true;
   if (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.OP_LPAREN)) return false;
-  return (
-    ctx.check(TokenType.STRING_LITERAL) || ctx.check(TokenType.NUMERIC_LITERAL) ||
-    ['ZERO', 'ZEROS', 'ZEROES', 'SPACE', 'SPACES', 'HIGH-VALUE', 'HIGH-VALUES',
-     'LOW-VALUE', 'LOW-VALUES', 'QUOTE', 'QUOTES', 'FUNCTION'].some(v => ctx.checkValue(v))
-  );
+  return isLiteralOrFigurativeOrFunctionStart(ctx);
 }
 
 function parseNotCondition(ctx) {
@@ -821,6 +835,31 @@ function parsePrimaryCondition(ctx) {
       conditionType: 'simple',
       subject,
     });
+  }
+
+  // Relational condition whose subject is itself a literal/figurative
+  // constant/FUNCTION call, with no identifier at all - e.g.
+  // `IF HIGH-VALUES > LOW-VALUES`. Class/sign/condition-name tests never
+  // apply to a non-identifier subject, so this only ever attempts the
+  // relational form; if no relational operator follows, this isn't a
+  // supported condition shape (falls through to the `return null` below,
+  // same as before this fix, rather than guessing).
+  if (isLiteralOrFigurativeOrFunctionStart(ctx)) {
+    const subject = parseEvaluateValue(ctx);
+    ctx.matchValue('IS');
+    const notMod = ctx.matchValue('NOT');
+    const operator = matchRelationalOperator(ctx, notMod);
+    if (operator) {
+      const object = parseEvaluateValue(ctx);
+      ctx.lastRelation = { subject, operator };
+      return new RelationalCondition({
+        subject,
+        relationalOperator: operator,
+        object,
+      });
+    }
+    ctx.lastRelation = null;
+    return null;
   }
 
   ctx.lastRelation = null;
@@ -1540,15 +1579,21 @@ function parseUnstringStatement(ctx) {
   // Parse source
   stmt.source = parseVariableReference(ctx);
 
-  // Parse DELIMITED BY
+  // Parse DELIMITED BY. Each delimiter is recorded as { node, all } - `all`
+  // is true when this specific delimiter (DELIMITED BY [ALL] id-1 [OR [ALL]
+  // id-2 ...] - each OR'd alternative has its own optional ALL) was written
+  // with the ALL keyword, so codegen can collapse consecutive occurrences of
+  // *that* delimiter into a single logical one (round-4 finding 11) instead
+  // of silently discarding the flag the way a bare `ctx.matchValue('ALL')`
+  // (previously unassigned) did.
   if (ctx.matchValue('DELIMITED')) {
     ctx.matchValue('BY');
-    ctx.matchValue('ALL');
-    stmt.delimiters.push(parseOperand(ctx));
+    let all = !!ctx.matchValue('ALL');
+    stmt.delimiters.push({ node: parseOperand(ctx), all });
 
     while (ctx.matchValue('OR')) {
-      ctx.matchValue('ALL');
-      stmt.delimiters.push(parseOperand(ctx));
+      all = !!ctx.matchValue('ALL');
+      stmt.delimiters.push({ node: parseOperand(ctx), all });
     }
   }
 
@@ -1594,6 +1639,28 @@ function parseUnstringStatement(ctx) {
 }
 
 /**
+ * Parse an optional `BEFORE INITIAL <value>` / `AFTER INITIAL <value>` phrase
+ * (round-4 finding 3) trailing one INSPECT TALLYING/REPLACING sub-clause, or
+ * the whole CONVERTING clause - restricts that one operation to the portion
+ * of the INSPECT target before/after the first occurrence of `<value>`,
+ * leaving the rest of the target completely untouched by *that* clause (a
+ * later clause in the same INSPECT statement, or a later BEFORE/AFTER region
+ * with a different boundary, is unaffected and evaluated fresh). Returns
+ * `{ type: 'BEFORE'|'AFTER', value }` or null when absent - see
+ * generator/expression-gen.js's `generateInspect`/`applyInspectRegion`/
+ * `inspectTallyScanExpr` for how this is honored at codegen time.
+ */
+function parseInspectRegion(ctx) {
+  if (ctx.checkValue('BEFORE') || ctx.checkValue('AFTER')) {
+    const type = ctx.advance().value.toUpperCase();
+    ctx.matchValue('INITIAL');
+    const value = parseOperand(ctx);
+    return { type, value };
+  }
+  return null;
+}
+
+/**
  * Parse INSPECT statement
  */
 function parseInspectStatement(ctx) {
@@ -1611,6 +1678,7 @@ function parseInspectStatement(ctx) {
         counter: parseVariableReference(ctx),
         type: null,
         what: null,
+        region: null,
       };
       ctx.matchValue('FOR');
       if (ctx.matchValue('CHARACTERS')) {
@@ -1622,6 +1690,7 @@ function parseInspectStatement(ctx) {
         tally.type = 'LEADING';
         tally.what = parseOperand(ctx);
       }
+      tally.region = parseInspectRegion(ctx);
       stmt.tallying.push(tally);
 
       if (ctx.checkValue('REPLACING') || ctx.check(TokenType.PERIOD)) break;
@@ -1632,7 +1701,7 @@ function parseInspectStatement(ctx) {
     stmt.inspectType = stmt.inspectType === 'tallying' ? 'tallying-replacing' : 'replacing';
     // Parse replacing clauses (simplified)
     while (!ctx.isAtEnd() && !ctx.check(TokenType.PERIOD)) {
-      const replace = { type: null, from: null, to: null };
+      const replace = { type: null, from: null, to: null, region: null };
 
       if (ctx.matchValue('CHARACTERS')) {
         replace.type = 'CHARACTERS';
@@ -1652,6 +1721,7 @@ function parseInspectStatement(ctx) {
       if (ctx.matchValue('BY')) {
         replace.to = parseOperand(ctx);
       }
+      replace.region = parseInspectRegion(ctx);
 
       stmt.replacing.push(replace);
     }
@@ -1662,7 +1732,8 @@ function parseInspectStatement(ctx) {
     const from = parseOperand(ctx);
     ctx.matchValue('TO');
     const to = parseOperand(ctx);
-    stmt.converting = { from, to };
+    const region = parseInspectRegion(ctx);
+    stmt.converting = { from, to, region };
   }
 
   return stmt;

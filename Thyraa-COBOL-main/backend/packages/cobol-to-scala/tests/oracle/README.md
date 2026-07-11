@@ -125,33 +125,39 @@ for the finding -> program -> fix mapping. The `n01`-`n16` programs
 (including `*b` isolation follow-ups) were added the same way by a **round-3**
 adversarial refuter (12 findings, plus one more - "finding 13"/unrounded
 truncation - found while docs were independently being fact-checked in
-parallel) - see "Round-3 findings" below. All of these were promoted into
-this directory (not kept as a separate corpus) specifically so this same
-data-driven suite picks them up automatically: no test-registration code
-changes were needed to add them, only the generator/parser fixes each one's
-mismatch pointed at.
+parallel) - see "Round-3 findings" below. The `q01`-`q12` programs (including
+`*b`/`*c` isolation follow-ups) were added the same way by a **round-4**
+adversarial refuter that found 13 more root-cause dishonest divergences -
+SECTION handling (PERFORM of a section name, same-stripped-name paragraph
+collisions across sections, and the program's true entry point), UNSTRING
+(WITH POINTER, DELIMITED BY ALL, DELIMITER IN, multi-UNSTRING scoping), and
+six further expression/statement gaps - see "Round-4 findings" below. All of
+these were promoted into this directory (not kept as a separate corpus)
+specifically so this same data-driven suite picks them up automatically: no
+test-registration code changes were needed to add them, only the
+generator/parser fixes each one's mismatch pointed at.
 
 ## Current inventory (last recorded run: 2026-07-11)
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 63 corpus programs found (19
-under `data/`, 44 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+**cobc oracle capture / expected-vs-oracle check** - 79 corpus programs found (19
+under `data/`, 60 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
 excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
-precompiler, see `tests/sql.test.js` instead), all 63 compiled and ran cleanly under
-cobc (exit 0). 28 of the 63 (19 `data/` + 9 `proc/` baseline programs) already have a
+precompiler, see `tests/sql.test.js` instead), all 79 compiled and ran cleanly under
+cobc (exit 0). 28 of the 79 (19 `data/` + 9 `proc/` baseline programs) already have a
 hand-written `.expected.txt` that matches the captured `.oracle.txt` exactly - 0
-mismatches. The 20 `r01`-`r14*` and 15 `n01`-`n16*` programs have no hand-written
-`.expected.txt` by design (they're verified directly against cobc via
+mismatches. The 20 `r01`-`r14*`, 15 `n01`-`n16*`, and 16 `q01`-`q12*` programs have no
+hand-written `.expected.txt` by design (they're verified directly against cobc via
 `oracleCompare()` below, not a separately hand-authored expectation) and show up
 here as a diagnostic-only capture ("no `<name>.expected.txt` alongside ... yet").
 
 **Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
 end-to-end (0 todo).
 
-**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 44/44 programs match
-end-to-end (0 todo), including all 20 `r01`-`r14*` and all 15 `n01`-`n16*`
-adversarial-refutation programs below.
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 60/60 programs match
+end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, and all 16
+`q01`-`q12*` adversarial-refutation programs below.
 
 ### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
@@ -214,6 +220,35 @@ only a snapshot. See also `tests/phase2-refutation-fixes.test.js` and
 `tests/round3-fixes.test.js` for focused, toolchain-independent unit tests of each
 fix above.
 
+### Round-4 adversarial-refutation findings (q01-q12) and their fixes
+
+A round-4 refuter found 13 more root-cause dishonest divergences: three in
+SECTION handling (a real-world-common organization none of the prior rounds'
+corpus exercised at all), four in UNSTRING, and six further expression/
+statement gaps. All 13 are now fixed; every program hard-passes
+`oracleCompare()`.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 7 | `PERFORM` of a SECTION name (not a paragraph) generated a call to a method that was never generated at all - a section containing paragraphs was silently dropped from codegen entirely (only a *paragraphless* section, with statements directly under its header, ever became a callable method) | New `generateSectionMethod` (`generator/method-gen.js`) generates a wrapper method named after the section, nesting its own paragraphs as local `def`s with fall-through bounded to just that section (mirrors `generatePerformThruMethod`'s existing nested-def pattern, factored into a shared `renderNestedFallthroughDefs` helper) | q09, q09b |
+| 8 | Same-named paragraphs in different sections (e.g. `1000-PARA-A` and `2000-PARA-A` - distinct COBOL names, but `toMethodName`'s leading-numeric-prefix strip collapses both to `paraA`) collided as duplicate top-level `def`s - a hard compile error | New `collectAmbiguousParagraphNames`/`resolveParagraphMethodName` (`generator/method-gen.js`) qualify only genuinely-colliding bare names by their enclosing section (mirrors `case-class-gen.js`'s `collectAmbiguousGroupClassNames`/`resolveClassName` pattern exactly) - a unique bare name is untouched | q09 |
+| 9 | `findMainProcedure` only ever looked at top-level (section-less) paragraphs - a program whose first unit was a SECTION generated a `run()` that called a hallucinated, nonexistent `mainprocedure()`; separately, even once a real first paragraph was found, `run()` called *only* that one paragraph's fall-through-free standalone method - every paragraph after the first was unreachable unless some other paragraph happened to `PERFORM` it, section or no section | `findMainProcedure`/`generateMainMethod` (`generator/scala-generator.js`) now resolve the true first unit (paragraph or section) via a unified `splitProcedureDivision`/`flattenProcedureUnits`, and `run()`'s body chains *every* paragraph across the *whole* division via `generateProgramFlowLines`/`renderNestedFallthroughSteps` so natural fall-through actually spans section boundaries. **Mid-course correction, caught by the full regression sweep, not by the 16 repro programs**: the first implementation duplicated each paragraph's own statements as same-named nested `def`s (mirroring `generatePerformThruMethod`'s existing pattern) - this silently broke `tests/corpus/proc/p12-sort.cbl` (an already-passing, pre-round-4 program): its `SORT ... INPUT PROCEDURE`/`OUTPUT PROCEDURE` explicitly `PERFORM`s two paragraphs that also happen to be adjacent in the whole-program fall-through chain, and Scala's lexical scoping resolved that explicit PERFORM's call site to the fallthrough-rigged nested sibling instead of the real bounded flat method - silently re-running the OUTPUT PROCEDURE a paragraph early, before the SORT itself had run, corrupting the result with no compile error at all. Fixed by *not* duplicating bodies for finding 7/9's wrappers: `renderNestedFallthroughSteps` (`generator/method-gen.js`) instead calls each unit's own already-generated flat top-level method through positionally-named (`_step0`, `_step1`, ...) wrapper `def`s that can never collide with (or shadow) any COBOL-derived name - see its doc comment for the full trace, and the "Known gaps" note below for the (narrow, unexercised) trade-off this specific fix accepts. `generatePerformThruMethod` itself (PERFORM ... THRU, pre-existing, already relied upon by `r08`/`p14`) was deliberately left on the original body-duplicating `renderNestedFallthroughDefs`, unchanged | q09, q09b, q09c |
+| 10 | `UNSTRING ... WITH POINTER` ignored the pointer's starting value entirely (always scanned from position 1) and never wrote the final position back | Rewrote `generateUnstring` to delegate to a new `CobolUnstring.unstring` runtime helper that takes an explicit 0-based start position and returns the final scan position, which is written back (`+1` for COBOL's 1-based `POINTER` field) - a single regex `.split()` (the prior implementation) has no notion of a start offset at all | q11 |
+| 11 | `UNSTRING ... DELIMITED BY ALL` parsed and silently discarded the `ALL` keyword (`ctx.matchValue('ALL')` with no assignment) - consecutive delimiters were never collapsed, producing spurious empty fields | Parser: each delimiter is now `{ node, all }` (`parser/procedure-parser.js`'s `parseUnstringStatement`); codegen passes `(text, all)` pairs to `CobolUnstring.unstring`, which extends a match over every immediately-following repeat of that *same* delimiter text when `all` is set | q12, q12c |
+| 12 | `UNSTRING ... DELIMITER IN` was parsed into the AST (`target.delimiter`) but never read by codegen - the receiving field was silently left at its default value | `generateUnstring` now assigns each `DELIMITER IN` target from `CobolUnstring.unstring`'s returned per-field matched-delimiter text | q12, q12b |
+| 13 | Two `UNSTRING` statements in the same paragraph collided over `val _parts` ("_parts is already defined") - a hard compile error | `generateUnstring`'s whole statement is now wrapped in its own `{ ... }` block scope, mirroring `generateString`'s existing pattern exactly | q12 |
+| 1 | Figurative constants (`HIGH-VALUES`/`LOW-VALUES`/`SPACES`/`ZEROES`) used directly in a comparison rendered as their own literal keyword text (e.g. `wsHv == "HIGH-VALUE"`) instead of the actual fill character(s) - and `IF HIGH-VALUES > LOW-VALUES` (a figurative-led condition with no identifier at all) failed to parse as a condition at all, silently dropping it (`return null`) and corrupting the rest of the statement into an orphaned `??? TODO: unsupported statement` plus a hardcoded `if true` | Parser: `parsePrimaryCondition` now also accepts a literal/figurative/FUNCTION-led subject for the relational form (`isLiteralOrFigurativeOrFunctionStart`); codegen: new `relationalOperandExpr`/`figurativeCompareText` (`generator/expression-gen.js`) render a figurative comparison operand expanded to the *other* operand's own width (a field's `picLength`, or a literal's own text length), falling back to a single character with no such anchor (compiler-verified: `HIGH-VALUES > LOW-VALUES` compares exactly one 0xFF byte against one 0x00 byte) | q02 |
+| 2 | `MOVE ZEROES` into a numeric-EDITED field (`zeroLiteralFor`) rendered a bare run of `'0'` characters instead of the PICTURE-formatted result (e.g. `PIC ZZ,ZZ9.99` should store `"     0.00"`, not `"0000000000000"`) | `zeroLiteralFor` (`generator/expression-gen.js`) now checks `info.dataType === 'edited'` first and routes through `formatEditedPicture`, exactly like `renderLiteralForTarget`'s numeric-literal-zero branch already does | q02 |
+| 3 | `INSPECT ... BEFORE INITIAL`/`AFTER INITIAL` was not parsed at all - the whole phrase was left completely unconsumed, so the INSPECT ran **unrestricted** over the entire target (double-dishonest: wrong counts/replacements *and* the leftover tokens were then mis-parsed as a bogus separate statement) | Parser: `parseInspectRegion` (`parser/procedure-parser.js`) attaches an optional `{ type: 'BEFORE'\|'AFTER', value }` to each TALLYING/REPLACING sub-clause and to CONVERTING; codegen: new `CobolInspect.beforeInitial`/`afterInitial` runtime helpers split the target around the first occurrence of the boundary, and `generateInspect`'s new `inspectTallyScanExpr`/`applyInspectRegion` (`generator/expression-gen.js`) restrict the operation to the right piece, reattaching the untouched complement for REPLACING/CONVERTING | q04 |
+| 4 | `DIVIDE ... GIVING` into a numeric-EDITED receiver assigned the raw `Int`/`BigDecimal` division result directly to the String-typed target - a hard Scala 3 compile error ("Found: Int, Required: String") | `storeNumericByInfo` (`generator/expression-gen.js`) now checks for an edited target first: applies the same store-time ROUNDED-or-truncated digit coercion, then formats the result through the runtime `CobolFmt.edited` helper (`numericRawValueExpr` renders the intermediate `BigDecimal` as its expected signed-decimal-text form) - the same fix benefits ADD/SUBTRACT/MULTIPLY/COMPUTE GIVING into an edited receiver too, since they all share this function | q06 |
+| 5 | `PERFORM VARYING ... AFTER ...` left the AFTER variable holding whatever value its own last inner pass reached once the whole nest exited, instead of its FROM-reset value - cobc's actual documented algorithm resets every level nested under a level that just incremented back to FROM *unconditionally*, including on the enclosing level's final, test-failing retest | `generateVaryingNest`/`generatePerformFromAST` (`generator/method-gen.js`, WITH TEST BEFORE only - WITH TEST AFTER was already verified correct and left untouched): every level's FROM is now set once, up front, for *all* levels at once; after each level's own increment, every *deeper* level (not just its immediate child) is reset to FROM again, matching cobc's documented step-by-step algorithm exactly | q07 |
+| 6 | A qualified **and** subscripted read reference (`X OF A OF B (i)`) dropped the qualifier - `convertIdentifier`'s subscript check ran first and returned immediately with a bare, unqualified name, entirely skipping the qualifiers branch below it (the write path, `renderAssignment`/`targetCamelFor`, already resolved the qualifier correctly) | `convertIdentifier` (`generator/expression-gen.js`) now resolves the qualified base name *first* (reusing the same `lookupQualified` the write path already does), and only then appends the subscript index chain to *that* resolved name | q08 |
+
+Re-run `npm test` after generator changes; the table above will drift as new gaps are
+found and fixed - the "how to run" commands are the source of truth, this table is
+only a snapshot. See also `tests/round4-fixes.test.js` for focused,
+toolchain-independent unit tests of each fix above.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -228,3 +263,61 @@ fix above.
   gap as a regression. Revisit by implementing substring-read / splice-write against
   the field's own display text (its own declared width is already known via the field
   registry) if a future pass has time for it.
+
+- **An explicit out-of-line `PERFORM <paragraph-name>` (or `GO TO`) that targets
+  one specific paragraph whose bare name is ambiguous across sections (round-4
+  finding 8's qualification)** - the qualified flat top-level method name (e.g.
+  `thirdParaA` for `1000-PARA-A` inside `3000-THIRD SECTION`) is only ever
+  produced by, and known to, `generateAllMethods`/`generateSectionMethod`/
+  `generateProgramFlowLines` (all in `generator/method-gen.js`); a `PERFORM`/
+  `GO TO` *statement* naming that same paragraph is rendered via
+  `expression-gen.js`'s `paragraphMethodName` (or `method-gen.js`'s bare
+  `toMethodName` for a top-level `PerformStatement`), neither of which knows
+  about section-qualification at all - both always emit the plain bare name
+  (`paraA()`), which would not compile if that specific bare name turned out to
+  be ambiguous. Real COBOL itself requires such a reference to be qualified
+  (`PERFORM 1000-PARA-A OF 3000-THIRD`) or it is genuinely ambiguous and illegal
+  unqualified - a program that actually needs this is *already* invalid COBOL
+  without doing so, so this gap only matters for programs using a bare,
+  would-be-ambiguous reference, which none of the round-4 corpus programs (or any
+  prior corpus) do; `sect01`/`q09`'s own only cross-paragraph reference is a
+  `PERFORM` of the (never-ambiguous) *section* name, not one of its colliding
+  paragraphs. Revisit by threading qualification context through
+  `paragraphMethodName`/nested-PERFORM resolution (needs the calling paragraph's
+  own enclosing section, not currently plumbed through `generateExpression`) if a
+  future program needs it.
+
+- **GO TO (or a nested PERFORM) into a paragraph that must then *itself* keep
+  falling through, within a SECTION wrapper or the whole-program flow (round-4
+  findings 7/9's `renderNestedFallthroughSteps`)** - a GO TO from paragraph A to
+  paragraph B (both part of the same section/whole-program chain) correctly runs
+  B's own flat method (an ordinary Scala call), but if B's own last statement
+  *isn't itself* a transfer, real COBOL would keep falling through from B into
+  whatever comes after it in that same range - B's flat method has no fallthrough
+  of its own (only the `_stepN` wrapper chain does, and a GO TO resolves straight
+  to the flat method, not the wrapper), so that further fall-through does not
+  happen. This is the deliberate, narrower trade-off `renderNestedFallthroughSteps`
+  accepts in exchange for fixing the `p12-sort.cbl` regression above (see its doc
+  comment and finding 9's fix note) - unlike that regression (a very common
+  pattern: an ordinary out-of-line PERFORM elsewhere in the program), this needs a
+  GO TO specifically, to a paragraph that itself doesn't end in a transfer, where
+  the code additionally depends on cascading past it - a narrow combination no
+  corpus program (existing or newly promoted) exercises. `PERFORM ... THRU`
+  (`generatePerformThruMethod`) is unaffected - it still duplicates bodies as
+  nested defs, so a GO TO within a THRU range correctly cascades exactly as before
+  (see `r08-perform-thru-backward-goto.cbl`/`p14-godep.cbl`, both still passing).
+  Revisit only if a future program actually needs this; no corpus target regresses
+  without it today.
+
+- **Figurative constant vs. a genuinely numeric field in a comparison, round-4
+  finding 1's untested edge** - `renderRelationalCondition`'s "genuine numeric vs
+  alphanumeric" branch (e.g. `IF WS-NUMERIC-FIELD = SPACES`) computes the
+  alphanumeric side's padding width from `relationalOperandDescriptor`, which does
+  not (and, without knowing the *other* operand first, cannot on its own) assign a
+  figurative constant a `literalText`/width - this is a narrow, pre-existing
+  (not newly introduced) inconsistency this round's fix did not additionally chase,
+  since fig01/q02 only exercises a figurative constant against an *alphanumeric*
+  field/figurative constant (the common case, and the one this fix fully corrects).
+  Not promoted as its own corpus program - no test asserts a specific outcome for
+  it. Revisit by threading the anchor width through before computing
+  `relationalOperandDescriptor` for the figurative side, if a future pass has time.

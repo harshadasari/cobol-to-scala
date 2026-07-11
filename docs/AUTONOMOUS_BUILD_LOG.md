@@ -14,6 +14,12 @@
 
 ## Activity
 
+### 2026-07-11 09:10 — Cycles 14-16: round-3 fixed+committed (99089c3); round-4 NOT CONVERGED
+- Round-3 fixes committed after orchestrator-caught regression (r11/r11b BigDecimal double-wrap - fix agent had mislabeled it 'pre-existing'; targeted agent fixed type-aware operand coercion). 63 corpus programs hard-pass; suite 424/0/0.
+- Docs/demo committed (cdac11d): runnable end-to-end demo verified EQUIVALENT; truth-passed roadmap; engine README.
+- Round-4 refutation: NOT CONVERGED - 13 new dishonest findings. Clusters: SECTION-based programs fundamentally broken (no section methods, paragraph-name collisions, unreachable entry point - highest real-world severity); UNSTRING (POINTER/ALL/DELIMITER IN/scope collision); figurative constants in comparisons; INSPECT BEFORE-AFTER; qualified+subscripted reads; DIVIDE into edited receiver; VARYING AFTER final value. 4 attack programs survived (indexes, 3-subject ALSO EVALUATE, S9(18) boundary, STRING BY field).
+- Round-4 fix agent dispatched with all 16 repro programs. Loop-until-dry continues; convergence bar 0-2 dishonest.
+
 ### 2026-07-11 ~06:20 — Cycle 13: Phase 4 + Phase 2b fix wave landed (379/379); docs+demo wrap-up pass
 
 - Since cycle 12's dispatch, both in-flight agents landed and were verified green before commit (per this log's own convention — no committing red):

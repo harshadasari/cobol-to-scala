@@ -1,0 +1,8 @@
+A-T1=A    
+A-T2=B    
+A-T3=C    
+B-T1=AA   
+B-D1=,
+B-T2=BB   
+B-D2=;
+B-T3=CC   

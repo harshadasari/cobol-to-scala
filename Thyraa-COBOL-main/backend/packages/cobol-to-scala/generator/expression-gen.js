@@ -414,11 +414,19 @@ function convertIdentifier(cobolId) {
       return `??? /* TODO: reference modification (read) not implemented - ${toCamelCase(name)}(...) - see tests/oracle/README.md known gaps */`;
     }
 
-    const subscripts = Array.isArray(cobolId.subscripts) ? cobolId.subscripts : [];
-    if (subscripts.length > 0) {
-      const idxChain = subscripts.map(s => `(${subscriptIndexExpr(s)})`).join('');
-      return `${toCamelCase(name)}${idxChain}`;
-    }
+    // Resolve the base (unsubscripted) identifier FIRST - honoring OF/IN
+    // qualification when present - and only THEN append any subscript index
+    // chain to *that* resolved name (round-4 finding 6). Previously the
+    // subscript check ran first and returned immediately with a bare
+    // `toCamelCase(name)`, entirely skipping the qualifiers branch below it
+    // whenever the reference was *both* qualified and subscripted (e.g.
+    // `WS-EMP-NAME OF WS-DEPT-A (1)`) - silently dropping the qualifier and
+    // resolving to whichever same-named field happened to get the bare
+    // registry entry, or a nonexistent identifier if none did. This mirrors
+    // renderAssignment/targetCamelFor's write-side resolution order exactly
+    // (which already got this right: resolve the qualified camel name, then
+    // subscript it).
+    let baseName;
     if (cobolId.qualifiers && cobolId.qualifiers.length > 0) {
       // OF/IN qualification disambiguates *which* same-named data item is
       // meant (e.g. `NAME OF WS-TARGET-GROUP`) - it is not a path into a
@@ -427,11 +435,22 @@ function convertIdentifier(cobolId) {
       // resolve it through the qualified registry rather than emitting a
       // `<qualifier>.<name>` dot-path that has no corresponding Scala value.
       const info = lookupQualified(name.toUpperCase(), String(cobolId.qualifiers[0]).toUpperCase());
-      if (info) return info.camel;
-      const bare = lookupField(name);
-      return bare ? bare.camel : toCamelCase(name);
+      if (info) {
+        baseName = info.camel;
+      } else {
+        const bare = lookupField(name);
+        baseName = bare ? bare.camel : toCamelCase(name);
+      }
+    } else {
+      baseName = toCamelCase(name);
     }
-    return toCamelCase(name);
+
+    const subscripts = Array.isArray(cobolId.subscripts) ? cobolId.subscripts : [];
+    if (subscripts.length > 0) {
+      const idxChain = subscripts.map(s => `(${subscriptIndexExpr(s)})`).join('');
+      return `${baseName}${idxChain}`;
+    }
+    return baseName;
   }
 
   // Handle qualified names (OF/IN) - older format
@@ -800,6 +819,77 @@ export function generateCobolInspectHelper() {
     '    sb.toString',
     '  def replaceCharacters(s: String, to: String): String =',
     '    if to.isEmpty then s else to.head.toString * s.length',
+    '  // INSPECT ... BEFORE/AFTER INITIAL <boundary> (round-4 finding 3): split',
+    '  // `s` into (the piece an operation should actually scan/modify, the',
+    '  // untouched complement to reattach) around the *first* occurrence of',
+    '  // `boundary`. beforeInitial\'s region is everything up to (not including)',
+    '  // that occurrence; afterInitial\'s region is everything after it (the',
+    '  // boundary text itself belongs to the *unchanged* complement in both',
+    '  // cases). No occurrence at all: BEFORE treats the whole string as the',
+    '  // region (nothing to exclude), AFTER treats the region as empty (nothing',
+    '  // "after" an occurrence that never happened).',
+    '  def beforeInitial(s: String, boundary: String): (String, String) =',
+    '    if boundary.isEmpty then (s, "")',
+    '    else',
+    '      val i = s.indexOf(boundary)',
+    '      if i < 0 then (s, "") else (s.substring(0, i), s.substring(i))',
+    '  def afterInitial(s: String, boundary: String): (String, String) =',
+    '    if boundary.isEmpty then (s, "")',
+    '    else',
+    '      val i = s.indexOf(boundary)',
+    '      if i < 0 then (s, "") else (s.substring(0, i + boundary.length), s.substring(i + boundary.length))',
+  ].join('\n');
+}
+
+/**
+ * UNSTRING runtime helper (see generateUnstring) - a character-by-character
+ * scan (not a single regex `.split()`, which can't express all of this at
+ * once): starts at a given 0-based position (WITH POINTER - round-4 finding
+ * 10), stops after at most `maxFields` delimited fields (COBOL only fills as
+ * many INTO targets as it has), and for each field also reports back which
+ * literal delimiter text actually matched at its boundary (DELIMITER IN -
+ * finding 12; empty string for a final field consumed with no delimiter
+ * following, i.e. ran out of source). `delims` is tried in listed order at
+ * every position - the earliest match in the source wins; a tie at the same
+ * position keeps whichever delimiter is *listed* first (mirrors regex
+ * alternation's leftmost-alternative-wins precedence, matching COBOL's
+ * DELIMITED BY id-1 OR id-2 OR ... left-to-right priority). `all` (true for
+ * a delimiter written with the ALL keyword - finding 11) extends the match
+ * over every immediately-following repeat of that *same* delimiter text, so
+ * "a,,b" DELIMITED BY ALL "," yields ["a","b"], not ["a","","b"].
+ */
+export function generateCobolUnstringHelper() {
+  return [
+    'object CobolUnstring:',
+    '  def unstring(source: String, startPos: Int, delims: Seq[(String, Boolean)], maxFields: Int): (Vector[String], Vector[String], Int) =',
+    '    var pos = math.max(0, math.min(startPos, source.length))',
+    '    var fields = Vector.empty[String]',
+    '    var matched = Vector.empty[String]',
+    '    var continue_ = true',
+    '    while fields.length < maxFields && continue_ do',
+    '      var bestIdx = -1',
+    '      var bestText = ""',
+    '      var bestAll = false',
+    '      for (text, all) <- delims if text.nonEmpty do',
+    '        val i = source.indexOf(text, pos)',
+    '        if i >= 0 && (bestIdx == -1 || i < bestIdx) then',
+    '          bestIdx = i',
+    '          bestText = text',
+    '          bestAll = all',
+    '      if bestIdx == -1 then',
+    '        fields = fields :+ source.substring(pos)',
+    '        matched = matched :+ ""',
+    '        pos = source.length',
+    '        continue_ = false',
+    '      else',
+    '        fields = fields :+ source.substring(pos, bestIdx)',
+    '        var endPos = bestIdx + bestText.length',
+    '        if bestAll then',
+    '          while endPos <= source.length - bestText.length && source.regionMatches(endPos, bestText, 0, bestText.length) do',
+    '            endPos += bestText.length',
+    '        matched = matched :+ bestText',
+    '        pos = endPos',
+    '    (fields, matched, pos)',
   ].join('\n');
 }
 
@@ -1297,12 +1387,31 @@ function toBigDecimalOperand(node) {
  * least type-correct) behavior for that edge case.
  */
 function storeNumericByInfo(info, bdExpr, rawExpr, rounded) {
+  const intDigits = info?.integerDigits > 0 ? info.integerDigits : 18;
+  const decDigits = info?.decimalDigits || 0;
+  const fn = rounded ? 'roundNumeric' : 'truncNumeric';
+
+  if (info?.dataType === 'edited' && info.editPattern) {
+    // Numeric-edited receiver (round-4 finding 4, e.g. `DIVIDE ... GIVING
+    // <edited-field>`): the target is String-typed, so the bare BigDecimal/
+    // Int arithmetic result can never be assigned to it directly (a hard
+    // Scala 3 "Found: Int/BigDecimal, Required: String" compile error) - it
+    // must instead be formatted through the PICTURE, exactly like a
+    // numeric-edited MOVE already does (renderVariableMoveSource). Apply the
+    // same store-time ROUNDED-or-truncated digit-width coercion the plain
+    // numeric branch below applies (so an edited receiver truncates/rounds
+    // to its own declared decimal places exactly like a plain numeric one
+    // would), then render that exact stored value through the runtime
+    // CobolFmt.edited helper - numericRawValueExpr turns the intermediate
+    // BigDecimal into the signed-decimal-text form CobolFmt.edited expects.
+    const storedBD = `CobolFmt.${fn}(${bdExpr}, ${intDigits}, ${decDigits})`;
+    const rawValueExpr = numericRawValueExpr(storedBD, { scalaType: 'BigDecimal' });
+    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawValueExpr}, ${info.blankWhenZero ? 'true' : 'false'})`;
+  }
+
   if (!info || !['Int', 'Long', 'BigDecimal'].includes(info.scalaType)) {
     return rawExpr;
   }
-  const intDigits = info.integerDigits > 0 ? info.integerDigits : 18;
-  const decDigits = info.decimalDigits || 0;
-  const fn = rounded ? 'roundNumeric' : 'truncNumeric';
   const stored = `CobolFmt.${fn}(${bdExpr}, ${intDigits}, ${decDigits})`;
   if (info.scalaType === 'BigDecimal') return stored;
   if (info.scalaType === 'Long') return `(${stored}).toLong`;
@@ -1427,9 +1536,21 @@ export function generateCompute(statement, indent = 0) {
  * string of '0' characters for an alphanumeric target - COBOL's figurative
  * ZERO moved to an alphanumeric receiver fills it with '0' digit characters,
  * not empty text).
+ *
+ * A numeric-EDITED target (round-4 finding 2) needs the full PICTURE-edited
+ * rendering of zero (e.g. `MOVE ZEROES TO WS-EDITED` where WS-EDITED is
+ * `PIC ZZ,ZZ9.99` must store `"     0.00"`, not a bare run of '0' characters)
+ * - exactly the same `formatEditedPicture` call renderLiteralForTarget's own
+ * numeric-literal branch already makes for an explicit `MOVE 0 TO
+ * <edited-field>`; this is that same path, reached instead via the
+ * figurative-ZERO branch (MOVE ZERO/ZEROS/ZEROES), which previously fell
+ * through to the plain alphanumeric '0'-repeat branch below unconditionally.
  */
 function zeroLiteralFor(info) {
   if (!info) return '0';
+  if (info.dataType === 'edited' && info.editPattern) {
+    return `"${escapeScalaStringLiteral(formatEditedPicture(info.editPattern, '0', info.blankWhenZero))}"`;
+  }
   if (info.scalaType === 'BigDecimal') return 'BigDecimal(0)';
   if (info.scalaType === 'Long') return '0L';
   if (info.scalaType === 'String') return `"${'0'.repeat(Math.max(info.picLength || 0, 0))}"`;
@@ -2224,6 +2345,57 @@ function relationalOperandDescriptor(node) {
   return { scalaClass: 'numeric', semantic: 'numeric' };
 }
 
+/** Figurative-constant fill character - shared by MOVE's repeatedCharLiteralFor/zeroLiteralFor and the comparison rendering below. */
+function figurativeFillChar(figKind) {
+  switch (String(figKind).toUpperCase()) {
+    case 'SPACE': return ' ';
+    case 'HIGH-VALUE': return String.fromCharCode(255);
+    case 'LOW-VALUE': return String.fromCharCode(0);
+    case 'QUOTE': return '"';
+    case 'ZERO': return '0';
+    default: return ' ';
+  }
+}
+
+/**
+ * Scala string-literal expression for a figurative constant (HIGH-VALUES/
+ * LOW-VALUES/SPACES/ZEROES/QUOTES) used directly as one side of a relational
+ * comparison - round-4 finding 1. convertArithmeticExpression's generic
+ * Literal branch has no notion of "comparison width" at all (it just
+ * stringifies the figurative constant's own keyword text, e.g. literally
+ * `"HIGH-VALUE"` - never what COBOL actually compares), so a figurative
+ * comparison operand needs its own renderer here: COBOL expands a bare
+ * figurative constant to match whatever it's being compared *against* - the
+ * other operand's own declared width (a registered field's `picLength`, or a
+ * same-width literal's own text length) - falling back to a single character
+ * when there's no such anchor at all (both sides figurative, e.g.
+ * `HIGH-VALUES > LOW-VALUES` - compiler-verified against installed GnuCOBOL:
+ * this compares exactly one 0xFF byte against one 0x00 byte, not some other
+ * arbitrary width).
+ */
+function figurativeCompareText(literalNode, otherDescriptor) {
+  const ch = figurativeFillChar(literalNode.value);
+  const width =
+    otherDescriptor?.info?.picLength ||
+    (otherDescriptor?.literalText != null ? otherDescriptor.literalText.length : 0) ||
+    1;
+  return `"${escapeScalaStringLiteral(ch.repeat(Math.max(width, 1)))}"`;
+}
+
+/**
+ * Scala expression for one relational-condition operand, routing a bare
+ * figurative-constant operand through figurativeCompareText (sized against
+ * the *other* operand's descriptor) instead of convertArithmeticExpression's
+ * generic (and, for a figurative constant, simply wrong) literal rendering.
+ */
+function relationalOperandExpr(node, otherDescriptor) {
+  const simple = unwrapSimpleConditionOperand(node);
+  if (simple && simple.type === 'Literal' && simple.literalType === 'figurative') {
+    return figurativeCompareText(simple, otherDescriptor);
+  }
+  return convertArithmeticExpression(node);
+}
+
 /**
  * Render a RelationalCondition to Scala, coercing operand types per COBOL's
  * class-of-operand comparison rules instead of emitting a bare `left op
@@ -2260,8 +2432,17 @@ function renderRelationalCondition(condition) {
 
   const subj = relationalOperandDescriptor(condition.subject);
   const obj = relationalOperandDescriptor(condition.object);
-  const leftExpr = convertArithmeticExpression(condition.subject);
-  const rightExpr = convertArithmeticExpression(condition.object);
+  // relationalOperandExpr (not a bare convertArithmeticExpression) so a
+  // figurative-constant operand (HIGH-VALUES/LOW-VALUES/SPACES/...) renders
+  // as its actual comparison text, sized against the *other* operand's own
+  // descriptor (round-4 finding 1) - see figurativeCompareText's doc comment.
+  // This is exact for the common case both fig01's cases exercise (a
+  // figurative vs. a same-scalaClass alphanumeric field/figurative, handled
+  // just below); a figurative operand mismatched against a genuinely numeric
+  // field (the branch further down) is a pre-existing, untested edge case
+  // this fix does not additionally chase.
+  const leftExpr = relationalOperandExpr(condition.subject, obj);
+  const rightExpr = relationalOperandExpr(condition.object, subj);
 
   if (subj.scalaClass === obj.scalaClass) {
     if (subj.scalaClass !== 'string') {
@@ -2769,18 +2950,14 @@ export function generateString(statement, indent = 0) {
   return lines.join('\n');
 }
 
-/** Escape a literal string for embedding inside a Scala/Java regex. */
-function escapeRegexLiteral(text) {
-  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 /**
- * Best-effort literal text for one UNSTRING DELIMITED BY operand, used to
- * build the split() regex alternation. Only literal (including figurative)
- * delimiters resolve to compile-time text; a variable delimiter can't be
- * folded into a regex at generation time and is intentionally left
- * unsupported (falls through to the "no DELIMITED BY" TODO path) rather than
- * guessed.
+ * Best-effort literal text for one UNSTRING DELIMITED BY operand's `node`
+ * (see parser/procedure-parser.js's parseUnstringStatement - each entry in
+ * `statement.delimiters` is `{ node, all }`). Only literal (including
+ * figurative) delimiters resolve to compile-time text; a variable delimiter
+ * can't be folded into a literal at generation time and is intentionally
+ * left unsupported (falls through to the "no DELIMITED BY" TODO path) rather
+ * than guessed.
  */
 function unstringDelimiterLiteralText(node) {
   if (node && node.type === 'Literal') {
@@ -2796,28 +2973,63 @@ function unstringDelimiterLiteralText(node) {
 }
 
 /**
- * Generate UNSTRING statement. Splits the source on the DELIMITED BY
- * literal(s) (OR'd alternatives become a regex alternation) and distributes
- * the resulting parts positionally into the INTO targets - COBOL fills only
- * as many targets as there are parts (leftover targets are left untouched)
- * and TALLYING IN counts exactly the targets actually filled
- * (min(parts, targets), not the raw part count).
+ * Generate UNSTRING statement.
+ *
+ * Delegates the actual character-by-character scan to the embedded
+ * `CobolUnstring.unstring` runtime helper (see generateCobolUnstringHelper)
+ * rather than a single regex `.split()` the way this used to work, because a
+ * single `.split()` call cannot express everything real UNSTRING needs at
+ * once:
+ *   - WITH POINTER must *start* scanning at the pointer's current position
+ *     (not position 1) and write the final scan position back (round-4
+ *     finding 10) - `.split()` has no notion of a start offset.
+ *   - DELIMITED BY ALL must collapse a run of consecutive occurrences of
+ *     *that* delimiter into one logical delimiter (round-4 finding 11) -
+ *     expressible in a regex (`(?:txt)+`) but not while *also* reporting back
+ *     which literal delimiter matched at each boundary for DELIMITER IN
+ *     (finding 12), which needs the runtime to track per-boundary match text,
+ *     not just discard it the way `.split()` does.
+ *   - Only as many fields as there are INTO targets should ever be scanned
+ *     (COBOL fills only that many, leaving the rest of the source
+ *     un-inspected) - `.split()` unconditionally splits the whole remaining
+ *     string.
+ *
+ * COBOL fills only as many targets as there are delimited fields available
+ * (leftover targets are left untouched - modeled here as empty string, since
+ * every target is a flat, already-declared var); TALLYING IN counts exactly
+ * the targets actually filled, which `CobolUnstring.unstring`'s own
+ * `maxFields` cap already guarantees `_parts.length` equals directly (no
+ * separate `math.min` needed, unlike the old `.split()`-based version whose
+ * `_parts` was always the *entire* remaining string's split).
+ *
+ * Wrapped in its own `{ ... }` block scope (mirroring generateString) so two
+ * UNSTRING statements in the same paragraph don't collide over `_parts`/
+ * `_delims`/`_newPtr` (round-4 finding 13).
  */
 export function generateUnstring(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
+  const bi = '  '.repeat(indent + 1);
   const source = convertIdentifier(statement.source);
   const targets = statement.into || [];
 
-  const delimiterTexts = (statement.delimiters || []).map(unstringDelimiterLiteralText);
+  const delimEntries = statement.delimiters || [];
+  const delimiterTexts = delimEntries.map(e => unstringDelimiterLiteralText(e && e.node));
   if (delimiterTexts.length === 0 || delimiterTexts.some(t => t === null)) {
     return `${indentStr}// UNSTRING ${source}: DELIMITED BY clause missing or not a compile-time-resolvable literal - not supported (no corpus target exercises this shape)`;
   }
 
-  const regex = delimiterTexts.map(escapeRegexLiteral).join('|');
-  const lines = [`${indentStr}val _parts = ${source}.split("${regex}", -1)`];
+  const delimsScala = delimEntries
+    .map((e, i) => `("${escapeScalaStringLiteral(delimiterTexts[i])}", ${e.all ? 'true' : 'false'})`)
+    .join(', ');
+  const initialPtr = statement.pointer ? convertIdentifier(statement.pointer) : '1';
+
+  const lines = [`${indentStr}{`];
+  lines.push(
+    `${bi}val (_parts, _delims, _newPtr) = CobolUnstring.unstring(${source}, (${initialPtr}) - 1, Seq(${delimsScala}), ${targets.length})`
+  );
 
   targets.forEach((t, index) => {
-    lines.push(`${indentStr}${renderAssignment(t.target, `_parts.lift(${index}).getOrElse("")`)}`);
+    lines.push(`${bi}${renderAssignment(t.target, `_parts.lift(${index}).getOrElse("")`)}`);
     if (t.count) {
       // COUNT IN identifier: the number of characters actually delimited
       // into the corresponding target from the (full fixed-width, already
@@ -2825,21 +3037,82 @@ export function generateUnstring(statement, indent = 0) {
       // source field - i.e. the matched substring's own length, not the
       // receiving field's declared width (which the previous code silently
       // left unpopulated, at its default-initialized 0).
-      lines.push(`${indentStr}${renderAssignment(t.count, `_parts.lift(${index}).map(_.length).getOrElse(0)`)}`);
+      lines.push(`${bi}${renderAssignment(t.count, `_parts.lift(${index}).map(_.length).getOrElse(0)`)}`);
+    }
+    if (t.delimiter) {
+      // DELIMITER IN identifier: the literal delimiter text that actually
+      // matched at this field's boundary (empty when this field was the last
+      // one, consumed with no following delimiter at all) - round-4 finding 12.
+      lines.push(`${bi}${renderAssignment(t.delimiter, `_delims.lift(${index}).getOrElse("")`)}`);
     }
   });
 
   if (statement.tallying) {
-    lines.push(`${indentStr}${renderAssignment(statement.tallying, `math.min(_parts.length, ${targets.length})`)}`);
+    lines.push(`${bi}${renderAssignment(statement.tallying, '_parts.length')}`);
   }
 
+  if (statement.pointer) {
+    // CobolUnstring.unstring returns a 0-based "next unconsumed character"
+    // index; WITH POINTER's own field is COBOL's 1-based position.
+    lines.push(`${bi}${renderAssignment(statement.pointer, '_newPtr + 1')}`);
+  }
+
+  lines.push(`${indentStr}}`);
+
   return lines.join('\n');
+}
+
+/** Scala expression for an INSPECT BEFORE/AFTER INITIAL phrase's boundary operand. */
+function inspectRegionBoundaryExpr(region) {
+  return convertArithmeticExpression(region.value);
+}
+
+/**
+ * Scala expression for the substring an INSPECT TALLYING clause should scan,
+ * honoring an optional BEFORE/AFTER INITIAL region (round-4 finding 3): the
+ * portion of `target` before, or after, the first occurrence of the boundary
+ * text (the whole target when there's no region at all).
+ */
+function inspectTallyScanExpr(target, region) {
+  if (!region) return target;
+  const boundary = inspectRegionBoundaryExpr(region);
+  return region.type === 'BEFORE'
+    ? `CobolInspect.beforeInitial(${target}, ${boundary})._1`
+    : `CobolInspect.afterInitial(${target}, ${boundary})._2`;
+}
+
+/**
+ * Wrap a REPLACING/CONVERTING sub-clause's operation with its optional
+ * BEFORE/AFTER INITIAL restriction (round-4 finding 3): `buildOperation`
+ * receives the Scala expression text for whatever should actually be
+ * scanned/modified (either `scanExpr` itself, absent a region, or a `_reg`
+ * local bound to just the restricted piece) and returns the operation's own
+ * result expression; the untouched complement (`_rest`) - the piece before
+ * an AFTER boundary, or from a BEFORE boundary onward, including the
+ * boundary text itself either way - is reattached around it so the rest of
+ * the target is provably unmodified by this one clause.
+ */
+function applyInspectRegion(region, scanExpr, buildOperation) {
+  if (!region) return buildOperation(scanExpr);
+  const boundary = inspectRegionBoundaryExpr(region);
+  if (region.type === 'BEFORE') {
+    return `{ val (_reg, _rest) = CobolInspect.beforeInitial(${scanExpr}, ${boundary}); ${buildOperation('_reg')} + _rest }`;
+  }
+  return `{ val (_rest, _reg) = CobolInspect.afterInitial(${scanExpr}, ${boundary}); _rest + ${buildOperation('_reg')} }`;
 }
 
 /**
  * Generate INSPECT statement. `statement.tallying`/`.replacing` are always
  * arrays (empty when that clause is absent - see parser/ast.js's
- * InspectStatement), so each is checked by length, not truthiness.
+ * InspectStatement), so each is checked by length, not truthiness. Each
+ * TALLYING/REPLACING sub-clause and the CONVERTING clause may carry its own
+ * `region` (`{ type: 'BEFORE'|'AFTER', value }`, from
+ * parser/procedure-parser.js's parseInspectRegion) restricting that one
+ * operation to before/after the first occurrence of a boundary value -
+ * round-4 finding 3 (previously parsed not at all: the whole BEFORE/AFTER
+ * INITIAL phrase was left completely unconsumed, so the INSPECT ran
+ * unrestricted over the *entire* target and the leftover tokens were then
+ * mis-parsed as a separate, bogus statement).
  */
 export function generateInspect(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -2849,18 +3122,19 @@ export function generateInspect(statement, indent = 0) {
   if (Array.isArray(statement.tallying) && statement.tallying.length > 0) {
     for (const t of statement.tallying) {
       const counter = convertIdentifier(t.counter);
+      const scan = inspectTallyScanExpr(target, t.region);
       if (t.type === 'CHARACTERS') {
-        lines.push(`${indentStr}${counter} = ${counter} + (${target}).length`);
+        lines.push(`${indentStr}${counter} = ${counter} + (${scan}).length`);
       } else if (t.type === 'ALL') {
         const pattern = convertArithmeticExpression(t.what);
         // Non-overlapping substring count, scanning left to right - matches
         // COBOL's TALLYING FOR ALL semantics for both single- and
         // multi-character patterns (a plain .count(_ == char) would only be
         // correct for exactly-one-character patterns).
-        lines.push(`${indentStr}${counter} = ${counter} + CobolInspect.tallyAll(${target}, ${pattern})`);
+        lines.push(`${indentStr}${counter} = ${counter} + CobolInspect.tallyAll(${scan}, ${pattern})`);
       } else if (t.type === 'LEADING') {
         const pattern = convertArithmeticExpression(t.what);
-        lines.push(`${indentStr}${counter} = ${counter} + CobolInspect.tallyLeading(${target}, ${pattern})`);
+        lines.push(`${indentStr}${counter} = ${counter} + CobolInspect.tallyLeading(${scan}, ${pattern})`);
       }
     }
   }
@@ -2868,23 +3142,20 @@ export function generateInspect(statement, indent = 0) {
   if (Array.isArray(statement.replacing) && statement.replacing.length > 0) {
     let expr = target;
     for (const r of statement.replacing) {
-      if (r.type === 'CHARACTERS') {
-        const to = convertArithmeticExpression(r.to);
-        expr = `CobolInspect.replaceCharacters(${expr}, ${to})`;
-      } else {
+      const buildOperation = (scanExpr) => {
+        if (r.type === 'CHARACTERS') {
+          const to = convertArithmeticExpression(r.to);
+          return `CobolInspect.replaceCharacters(${scanExpr}, ${to})`;
+        }
         const from = convertArithmeticExpression(r.from);
         const to = convertArithmeticExpression(r.to);
-        if (r.type === 'FIRST') {
-          expr = `CobolInspect.replaceFirst(${expr}, ${from}, ${to})`;
-        } else if (r.type === 'LEADING') {
-          expr = `CobolInspect.replaceLeading(${expr}, ${from}, ${to})`;
-        } else if (r.type === 'TRAILING') {
-          expr = `CobolInspect.replaceTrailing(${expr}, ${from}, ${to})`;
-        } else {
-          // ALL (default)
-          expr = `CobolInspect.replaceAll(${expr}, ${from}, ${to})`;
-        }
-      }
+        if (r.type === 'FIRST') return `CobolInspect.replaceFirst(${scanExpr}, ${from}, ${to})`;
+        if (r.type === 'LEADING') return `CobolInspect.replaceLeading(${scanExpr}, ${from}, ${to})`;
+        if (r.type === 'TRAILING') return `CobolInspect.replaceTrailing(${scanExpr}, ${from}, ${to})`;
+        // ALL (default)
+        return `CobolInspect.replaceAll(${scanExpr}, ${from}, ${to})`;
+      };
+      expr = applyInspectRegion(r.region, expr, buildOperation);
     }
     lines.push(`${indentStr}${target} = ${expr}`);
   }
@@ -2892,9 +3163,10 @@ export function generateInspect(statement, indent = 0) {
   if (statement.converting) {
     const from = convertArithmeticExpression(statement.converting.from);
     const to = convertArithmeticExpression(statement.converting.to);
-    lines.push(
-      `${indentStr}${target} = ${target}.map(c => { val _i = (${from}).indexOf(c); if _i >= 0 then (${to})(_i) else c })`
-    );
+    const buildOperation = (scanExpr) =>
+      `(${scanExpr}).map(c => { val _i = (${from}).indexOf(c); if _i >= 0 then (${to})(_i) else c })`;
+    const expr = applyInspectRegion(statement.converting.region, target, buildOperation);
+    lines.push(`${indentStr}${target} = ${expr}`);
   }
 
   return lines.length > 0 ? lines.join('\n') : `${indentStr}()`;
@@ -4198,5 +4470,7 @@ export default {
   generateCall,
   setFieldRegistry,
   generateCobolFmtHelper,
+  generateCobolInspectHelper,
+  generateCobolUnstringHelper,
   formatEditedPicture,
 };

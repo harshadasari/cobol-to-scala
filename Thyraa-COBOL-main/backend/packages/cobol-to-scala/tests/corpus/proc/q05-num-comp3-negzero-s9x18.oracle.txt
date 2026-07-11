@@ -1,0 +1,8 @@
+NZ1-EDITED= 000
+NZ1-RAW=+000
+NZ2-EDITED= 000
+NZ2-RAW=+000
+NZ3-EDITED= 000
+NZ3-RAW=+000
+BIG-AFTER-ADD1=                  0
+BIG-SUM=                  0

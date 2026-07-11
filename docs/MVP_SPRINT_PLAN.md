@@ -1,6 +1,9 @@
 # Thyraa MVP Sprint Plan
 ## 10-20 Hours to Working Product
 
+**Originally authored:** 2026-02-08
+**Status updated:** 2026-07-11
+
 ---
 
 ## Core Constraints
@@ -9,6 +12,65 @@
 - **Scalability**: COBOL → Scala/Java/Python/Kotlin (pluggable targets)
 - **Future-proof**: MCP server + Agent-ready architecture
 - **Leverage**: Use existing Thyraa frontend/backend
+
+---
+
+## STATUS AS OF 2026-07-11
+
+> This plan was written on 2026-02-08 as a forward-looking 10-20 hour sprint
+> proposal, **before any of the work below happened**. Nothing in the
+> original text below has been deleted — every checklist item, table, and
+> code sample is preserved as the historical plan and annotated inline with
+> ✅ DONE / 🟡 PARTIAL / ⬜ NOT STARTED / OUT OF SCOPE. Read this section
+> first for the honest headline; read the annotations inline for the
+> item-by-item truth.
+
+**What actually happened instead:** rather than a 10-20 hour integration
+sprint, a 14-round autonomous adversarial-verification campaign (~22 hours,
+2026-07-10 → 2026-07-11) rebuilt and hardened the COBOL→Scala **conversion
+engine** at
+`Thyraa-COBOL-main/backend/packages/cobol-to-scala/` far beyond this plan's
+original scope — while almost everything this plan called "the product"
+(MCP server, Java/Python/Kotlin plugins, Docker/full-stack deployment,
+target-language dropdown, agent tooling) was **not** attempted, by design:
+the campaign was scoped to the engine only.
+
+**Headline numbers (verified, not projected):**
+- **209** oracle-verified COBOL programs (up from 48 at campaign start)
+- **879/879** automated tests passing (0 failing, 0 skipped, 0 todo)
+- **110** silent-divergence ("dishonest") bugs found and fixed across the campaign
+- **14** adversarial-refutation rounds, each writing new hostile COBOL, compiling with real GnuCOBOL (`cobc`), and diffing byte-for-byte against generated-then-compiled Scala output
+- Hunting **paused at round 14 by owner decision** (~22h into a 48h budget) — the finding-count plateaued at 3-5/round, not the 0-2 that would indicate convergence, so the engine is hardened, not "finished"
+
+**What got built (all 4 of the roadmap's later phases, not just this plan's Hour 0-20 scope):**
+1. **Data layer** — byte-level codecs for packed decimal/COMP-3, binary, zoned decimal, EBCDIC (cp037); PIC/COMP parsing; copybook expansion. ✅ Oracle-verified.
+2. **Procedure logic** — the full statement set: all PERFORM forms, IF/EVALUATE, SEARCH/SEARCH ALL, SORT/MERGE, STRING/UNSTRING/INSPECT, arithmetic with ROUNDED, MOVE (incl. CORRESPONDING), LINE SEQUENTIAL file I/O, DECLARATIVES, multi-program CALL, SECTIONs. ✅ Oracle-verified.
+3. **SQL/JCL** — EXEC SQL → typed Doobie code (compile-verified against real `doobie-core`), JCL step/DD/PROC parsing with dataset-lineage JSON. 🟡 Built as an MVP; **the SQL generator is not yet wired into the main conversion pipeline** — a real, disclosed gap.
+4. **CICS** — EXEC CICS command classification, BMS screen-map parsing, Scala service-skeleton generation. 🟡 Scaffolding only — explicitly **not** a behavioral CICS converter (every risky method body is an honest `???`).
+
+**What this plan asked for that remains genuinely undone:** the surrounding
+**product** — a generic multi-target (`Scala`/`Java`/`Python`/`Kotlin`)
+plugin registry, an MCP server exposing these as agent tools, a
+target-language dropdown UI, and a full Docker-composed stack — was
+**intentionally out of scope** for the engine-hardening campaign and remains
+unbuilt (see item-by-item annotations below for what partial UI/API
+integration does exist). **The engine now far exceeds this plan's original
+"10-20 hour MVP" bar for its one target language (Scala); the productized,
+multi-language, agent-ready platform this plan envisioned was not built.**
+
+**Known, disclosed engine gaps** (i.e., NOT silent bugs — each surfaces a
+visible `??? /* TODO */` marker in generated code): EXEC SQL not wired into
+the main generator; EXEC CICS behavioral conversion; reference-modification
+codegen; REWRITE/DELETE/START; SORT `USING`/`GIVING`; external/dynamic CALL;
+OCCURS DEPENDING ON dynamic sizing; general (non-THRU-scoped)
+inter-paragraph GO TO webs; JCL→sbt pipeline skeletons. The verification
+oracle throughout is GnuCOBOL, not IBM Enterprise COBOL, and the campaign
+did not converge (finding-rate plateaued at 3-5/round rather than 0-2).
+
+**For full detail, see:**
+- `docs/ADVERSARIAL_ROUNDS_REPORT.md` — the full 14-round campaign report (methodology, round-by-round narrative, bug-impact ranking, Known Gaps, resume plan)
+- `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` — statement-by-statement audit of what the engine handles today vs. the 4-phase "don't miss any aspect of COBOL" roadmap
+- `docs/PROGRESS_STATUS.md` — the current top-level status snapshot (what's done, what's pending, where to look for more)
 
 ---
 
@@ -101,65 +163,76 @@ const tools = [
 **Goal**: Connect existing pieces
 
 ```
-[ ] Set up conversion service in Thyraa backend
-[ ] Create /api/convert endpoint
-[ ] Define AST JSON schema (language-agnostic)
-[ ] Add target language parameter
+[x] Set up conversion service in Thyraa backend       -- 🟡 PARTIAL: real service exists (Thyraa-COBOL-main/backend/packages/cobol-to-scala/index.js: parseCobol, convertToScala), wired into the backend API — but it grew into a ~9,500-line engine, not the thin "connect existing pieces" service this line implied.
+[x] Create /api/convert endpoint                      -- 🟡 PARTIAL: real routes exist (Thyraa-COBOL-main/backend/api/routes/conversion.routes.js + conversion.controller.js: POST /parse, /scala, /batch, GET /runtime) — but hardcoded to Scala only, no generic target-selectable /api/convert as envisioned below.
+[ ] Define AST JSON schema (language-agnostic)         -- ⬜ NOT STARTED as a decoupled, published, multi-language schema: the internal AST is COBOL-specific and tightly coupled to the Scala generator, not designed for reuse across pluggable target languages.
+[ ] Add target language parameter                      -- ⬜ NOT STARTED: only Scala is a supported target; there is no target-language parameter/dispatch anywhere in the stack.
 ```
 
 ### Hour 2-6: Universal COBOL Parser (Node.js)
 **Goal**: Parse COBOL → JSON AST
 
 ```
-[ ] Port/simplify cobol2scala parser to TypeScript
-[ ] Output language-agnostic AST as JSON
-[ ] Handle: DATA DIVISION, PIC, COMP, OCCURS, level 88
-[ ] MCP tool: parse_cobol
+[x] Port/simplify cobol2scala parser to TypeScript     -- 🟡 PARTIAL: the parser was massively expanded, not simplified — lexer.js, data-division-parser.js, procedure-parser.js, sql-parser.js, jcl-parser.js, cics-parser.js, bms-parser.js, dclgen-parser.js, copybook-resolver.js — but it stayed in plain JS (Node.js), not TypeScript.
+[ ] Output language-agnostic AST as JSON               -- 🟡 PARTIAL: an internal AST exists and is used directly by the Scala generator; it was never published/decoupled as a reusable "language-agnostic" JSON contract for other-language plugins (there are no other-language plugins to consume it).
+[x] Handle: DATA DIVISION, PIC, COMP, OCCURS, level 88  -- ✅ DONE, far exceeded: full WORKING-STORAGE/FILE/LINKAGE/LOCAL-STORAGE parsing, PIC 9/X/A/S/V/P/Z/*/+/-/$/,/./B/0//CR/DB, USAGE DISPLAY..COMP-5/BINARY/PACKED-DECIMAL/INDEX/POINTER, OCCURS (incl. DEPENDING ON, INDEXED BY, KEY), REDEFINES, RENAMES (66), level 88, byte-level codecs. See docs/CAPABILITY_AUDIT_AND_ROADMAP.md §1.1.
+[ ] MCP tool: parse_cobol                              -- ⬜ NOT STARTED: no MCP server exists anywhere in the repo. The equivalent REST call is POST /api/convert/parse.
 ```
 
 ### Hour 6-10: Scala Plugin
 **Goal**: First target language working
 
 ```
-[ ] AST → Scala 3 case classes
-[ ] AST → Scala enums (level 88)
-[ ] Generate companion objects
-[ ] MCP tool: convert_to_scala
+[x] AST → Scala 3 case classes         -- ✅ DONE, far exceeded: byte-accurate recordLength/parse/format companions backed by real byte-level codecs (packed decimal, binary, zoned, EBCDIC cp037), not just plain field mapping. See generator/case-class-gen.js, generator/codecs.js.
+[x] AST → Scala enums (level 88)       -- ✅ DONE: level-88 → enum generation. See generator/enum-gen.js.
+[x] Generate companion objects         -- ✅ DONE: companions carry parse/format/recordLength, plus an embeddable runtime helper library (runtime/).
+[ ] MCP tool: convert_to_scala         -- ⬜ NOT STARTED: no MCP server. REST equivalent: POST /api/convert/scala (conversion.controller.js).
 ```
 
 ### Hour 10-14: Java Plugin (Copy + Modify)
 **Goal**: Prove multi-target works
 
 ```
-[ ] Copy Scala plugin structure
-[ ] AST → Java records/classes
-[ ] AST → Java enums
-[ ] MCP tool: convert_to_java
+[ ] Copy Scala plugin structure    -- ⬜ NOT STARTED
+[ ] AST → Java records/classes     -- ⬜ NOT STARTED
+[ ] AST → Java enums               -- ⬜ NOT STARTED
+[ ] MCP tool: convert_to_java      -- ⬜ NOT STARTED
 ```
+**This entire section remains undone.** No Java, Python, or Kotlin generator exists anywhere in the repo — the engine is, and has only ever been, single-target (COBOL → Scala). The "prove multi-target works" goal was never attempted; all 14 rounds of the later campaign hardened the one Scala target rather than proving the plugin architecture across languages.
 
 ### Hour 14-18: UI Integration
 **Goal**: Working end-to-end flow
 
 ```
-[ ] Add "Convert" tab to analysis results
-[ ] Target language selector dropdown
-[ ] Code preview with syntax highlighting
-[ ] Download generated code
+[x] Add "Convert" tab to analysis results   -- 🟡 PARTIAL: a real, working UI was built (Thyraa-COBOL-main/src/pages/ScalaConverter.tsx, 313 lines, wired to the real backend via src/lib/conversion-api.ts) reachable at the /convert route — but as a standalone page, not a tab embedded inside the analysis-results view.
+[ ] Target language selector dropdown       -- ⬜ NOT STARTED: no dropdown; the UI only ever produces Scala (matches the single-target reality above).
+[ ] Code preview with syntax highlighting   -- ⬜ NOT STARTED: output is shown in a plain <textarea>, not a syntax-highlighted code viewer (no Monaco/Prism/CodeMirror in this page).
+[x] Download generated code                 -- ✅ DONE: real Blob-based download button (handleDownload in ScalaConverter.tsx) plus a copy-to-clipboard action.
 ```
 
 ### Hour 18-20: MCP Server + Polish
 **Goal**: Agent-ready deployment
 
 ```
-[ ] Create MCP server wrapper
-[ ] Expose all tools via MCP protocol
-[ ] Docker compose for full stack
-[ ] Basic documentation
+[ ] Create MCP server wrapper           -- ⬜ NOT STARTED: no mcp/ directory or MCP dependency exists anywhere in the repo.
+[ ] Expose all tools via MCP protocol   -- ⬜ NOT STARTED: no agent/MCP tool exposure of any kind; a CLI-style demo (demo/convert-demo.sh, demo/convert.mjs) is the closest thing to an "agent-usable" entry point, and it is not MCP.
+[ ] Docker compose for full stack       -- ⬜ NOT STARTED: no docker-compose file exists in the repo.
+[x] Basic documentation                 -- ✅ DONE, vastly exceeded: docs/ADVERSARIAL_ROUNDS_REPORT.md, docs/CAPABILITY_AUDIT_AND_ROADMAP.md, docs/PROGRESS_STATUS.md, docs/AUTONOMOUS_BUILD_LOG.md, plus tests/oracle/README.md's per-round finding tables and demo/README.md.
 ```
 
 ---
 
 ## Simplified File Structure
+
+> **Status:** 🟡 PARTIAL — illustrative, not what was actually built. The
+> real conversion engine lives at
+> `Thyraa-COBOL-main/backend/packages/cobol-to-scala/` with
+> `parser/`, `generator/`, `runtime/`, and `tests/` directories (no
+> `cobol-parser`/`code-generators` split, no `java.js`, no `mcp/`). The real
+> API layer is `Thyraa-COBOL-main/backend/api/routes/conversion.routes.js` +
+> `conversion.controller.js`. The real frontend piece is
+> `Thyraa-COBOL-main/src/pages/ScalaConverter.tsx` at the `/convert` route.
+> No `docker-compose.yml` exists.
 
 ```
 thyraa/
@@ -195,6 +268,14 @@ thyraa/
 ---
 
 ## The Universal AST (JSON)
+
+> **Status:** 🟡 PARTIAL — this sketch is far simpler than what was actually
+> built. The real internal AST carries byte-level codec metadata (COMP-3/
+> binary/zoned/EBCDIC), REDEFINES/RENAMES/OCCURS DEPENDING ON shapes, and
+> full PROCEDURE DIVISION statement trees — but it was never published as a
+> standalone, decoupled "language-agnostic" schema like this one, since only
+> one target language (Scala) consumes it. See
+> `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` §1.1 for the real shape.
 
 ```json
 {
@@ -246,6 +327,15 @@ thyraa/
 ---
 
 ## Plugin Interface (Simple)
+
+> **Status:** 🟡 PARTIAL / ⬜ — the Scala side of this toy sketch was built
+> and then vastly outgrown it (real files: `generator/case-class-gen.js`,
+> `generator/codecs.js`, `generator/enum-gen.js`, `generator/expression-gen.js`,
+> `generator/file-io-gen.js`, `generator/method-gen.js`,
+> `generator/scala-generator.js`, `generator/sql-gen.js`,
+> `generator/cics-gen.js`, `generator/layout.js` — not one flat `scala.js`).
+> The `java.js` generator shown here was **never built** — ⬜ NOT STARTED,
+> confirmed no Java/Python/Kotlin generator exists in the repo.
 
 ```javascript
 // base.js - All generators extend this
@@ -335,6 +425,12 @@ class JavaGenerator extends BaseGenerator {
 
 ## MCP Server (Agent-Ready)
 
+> **Status:** ⬜ NOT STARTED — no MCP server, no `@modelcontextprotocol/sdk`
+> dependency, and no `mcp/` directory exist anywhere in the repo. This
+> entire code sample remains aspirational as of 2026-07-11. The closest
+> thing to an agent-usable entry point is the CLI demo
+> (`demo/convert-demo.sh`, `demo/convert.mjs`) — not MCP.
+
 ```javascript
 // mcp/server.js
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -423,6 +519,15 @@ await server.connect(transport);
 
 ## API Endpoints (REST + MCP Compatible)
 
+> **Status:** 🟡 PARTIAL — a real REST API was built
+> (`Thyraa-COBOL-main/backend/api/routes/conversion.routes.js` +
+> `conversion.controller.js`) with `POST /parse`, `POST /scala`,
+> `POST /batch` (a feature this plan didn't even ask for), and
+> `GET /runtime`. It is **not** the generic multi-target
+> `/api/convert` + `/api/transform` + `/api/targets` design sketched below —
+> there is no `target` parameter and no `generators` registry, because only
+> Scala was ever built as a target. There is no MCP compatibility layer.
+
 ```javascript
 // api/routes/convert.js
 import { parseCobol } from '../../packages/cobol-parser/index.js';
@@ -488,30 +593,37 @@ export default function(app) {
 
 ## What You Get in 20 Hours
 
-| Feature | Included |
-|---------|----------|
-| COBOL Parser (copybooks) | ✅ |
-| Universal JSON AST | ✅ |
-| Scala generator | ✅ |
-| Java generator | ✅ |
-| REST API | ✅ |
-| MCP Server | ✅ |
-| Plugin architecture | ✅ |
-| Basic UI integration | ✅ |
-| Multi-target support | ✅ |
-| Agent-ready tools | ✅ |
+*(Original plan's projection vs. actual status 5 months later, 2026-07-11. This table was the plan's forecast, not a completed checklist — every "✅" below is what the plan **expected**; the new "Actual status" column is the truth.)*
 
-| Feature | NOT Included (Future) |
-|---------|----------------------|
-| PROCEDURE DIVISION | ❌ |
-| Full program conversion | ❌ |
-| Python/Kotlin plugins | ❌ (easy to add) |
-| Validation engine | ❌ |
-| AI documentation | ❌ |
+| Feature | Planned as Included | Actual status (2026-07-11) |
+|---------|----------|-----------------------------|
+| COBOL Parser (copybooks) | ✅ | ✅ DONE — far exceeded: full lexer/parser incl. byte-level codecs, not just copybooks |
+| Universal JSON AST | ✅ | 🟡 PARTIAL — rich internal AST exists but was never decoupled/published as a multi-language schema |
+| Scala generator | ✅ | ✅ DONE — far exceeded: 209 oracle-verified programs, 879/879 tests passing |
+| Java generator | ✅ | ⬜ NOT STARTED — no Java generator exists |
+| REST API | ✅ | 🟡 PARTIAL — real endpoints exist (`/parse`, `/scala`, `/batch`, `/runtime`) but Scala-only, no generic target dispatch |
+| MCP Server | ✅ | ⬜ NOT STARTED — no MCP server anywhere in the repo |
+| Plugin architecture | ✅ | ⬜ NOT STARTED — single-target only; the pluggable-generator design was never built |
+| Basic UI integration | ✅ | 🟡 PARTIAL — a real `/convert` page exists (`ScalaConverter.tsx`), but standalone, not a tab in analysis results, and no language selector |
+| Multi-target support | ✅ | ⬜ NOT STARTED — Scala only |
+| Agent-ready tools | ✅ | ⬜ NOT STARTED — no MCP/agent tool surface; only a CLI demo script |
+
+| Feature | Planned as NOT Included (Future) | Actual status (2026-07-11) |
+|---------|----------------------|-----------------------------|
+| PROCEDURE DIVISION | ❌ | ✅ DONE — the single biggest surprise: full statement-level PROCEDURE DIVISION support, oracle-verified against real GnuCOBOL (see docs/CAPABILITY_AUDIT_AND_ROADMAP.md §1.1) |
+| Full program conversion | ❌ | 🟡 PARTIAL — batch/data-layer programs convert and are oracle-verified end to end; CICS/online programs get scaffolding only, not behavioral conversion |
+| Python/Kotlin plugins | ❌ (easy to add) | ⬜ NOT STARTED — still not built (nor is Java) |
+| Validation engine | ❌ | ✅ DONE — far exceeded: the 14-round adversarial oracle-verification harness against real `cobc`, described in docs/ADVERSARIAL_ROUNDS_REPORT.md, is a full validation engine this plan didn't even scope |
+| AI documentation | ❌ | ⬜ NOT STARTED as a product feature — extensive documentation was produced (see docs/PROGRESS_STATUS.md etc.) but as project docs authored by the build process, not an in-product "explain this COBOL" AI documentation feature |
 
 ---
 
 ## Adding New Target Languages (5 min each)
+
+> **Status:** ⬜ NOT STARTED — this remains purely aspirational. No second
+> target-language generator (Python, Java, or Kotlin) was ever added; the
+> `generators` registry pattern shown below does not exist in the real
+> codebase (there is nothing to register a second generator into).
 
 ```javascript
 // To add Python support:
@@ -562,3 +674,15 @@ Ready to start? I'll begin with:
 4. **Integrate with Thyraa's existing backend**
 
 Should I start coding now?
+
+---
+
+> **Historical note (2026-07-11):** this closing prompt is preserved as
+> written on 2026-02-08. What actually happened next was not this four-step
+> plan — steps 1 and 4 were pursued (an enhanced parser, integrated with the
+> backend), but step 2 stopped at Scala only (no Java plugin), and step 3
+> (MCP server) was never started. Instead, five months later, a separate
+> 14-round adversarial-verification campaign went deep on hardening the
+> single Scala target against real COBOL semantics rather than wide across
+> multiple target languages. See `docs/PROGRESS_STATUS.md` for what actually
+> happened and what remains open.

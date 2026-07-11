@@ -64,6 +64,25 @@ async function fileExists(p) {
     .catch(() => false);
 }
 
+/**
+ * round-7 findings 1/promotion: a corpus program that uses `COPY <name>[
+ * REPLACING ...]` (e.g. u09/u10's own repro shape) needs the same copybook
+ * text handed to both convertToScala() (options.copybooks) and cobc
+ * (harness.js's runCobol/oracleCompare - now also accepts `opts.copybooks`,
+ * writing each as `<name>.cpy` and passing `-I` so cobc's own COPY
+ * resolution finds them) - otherwise `COPY CUSTREC` has nothing to expand
+ * against on either side. A sibling `<base>.copybooks.json` file (`{"NAME":
+ * "copybook source text", ...}`) is optional - undefined (not `{}`) when
+ * absent, so a program with no COPY statement is completely unaffected.
+ */
+async function loadCopybooksFor(cblPath) {
+  const dir = path.dirname(cblPath);
+  const base = path.basename(cblPath, '.cbl');
+  const copybooksPath = path.join(dir, `${base}.copybooks.json`);
+  if (!(await fileExists(copybooksPath))) return undefined;
+  return JSON.parse(await fs.readFile(copybooksPath, 'utf-8'));
+}
+
 async function walkCblFiles(dir) {
   let entries;
   try {
@@ -167,7 +186,8 @@ describe('cobc oracle capture: every tests/corpus/**/*.cbl', () => {
         return;
       }
 
-      const result = await runCobol(cblPath);
+      const copybooks = await loadCopybooksFor(cblPath);
+      const result = await runCobol(cblPath, copybooks ? { copybooks } : undefined);
       const dir = path.dirname(cblPath);
       const base = path.basename(cblPath, '.cbl');
       const oraclePath = path.join(dir, `${base}.oracle.txt`);
@@ -234,7 +254,11 @@ describe('Phase 1 oracle compare: cobc vs generated Scala (tests/corpus/data onl
         return;
       }
 
-      const result = await oracleCompare(cblPath, { scalaOpts: { timeout: 120_000 } });
+      const copybooks = await loadCopybooksFor(cblPath);
+      const result = await oracleCompare(cblPath, {
+        scalaOpts: { timeout: 120_000 },
+        ...(copybooks ? { convertOptions: { copybooks } } : {}),
+      });
 
       if (!result.match) {
         // This is the Phase 1 work queue: currently-failing conversions are
@@ -265,7 +289,11 @@ describe('Phase 2 oracle compare: cobc vs generated Scala (tests/corpus/proc)', 
         return;
       }
 
-      const result = await oracleCompare(cblPath, { scalaOpts: { timeout: 120_000 } });
+      const copybooks = await loadCopybooksFor(cblPath);
+      const result = await oracleCompare(cblPath, {
+        scalaOpts: { timeout: 120_000 },
+        ...(copybooks ? { convertOptions: { copybooks } } : {}),
+      });
 
       if (!result.match) {
         // Same data-driven pattern as the Phase 1 (data/) suite above: a

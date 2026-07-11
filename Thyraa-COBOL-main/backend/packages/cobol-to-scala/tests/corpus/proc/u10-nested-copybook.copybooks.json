@@ -1,0 +1,4 @@
+{
+  "OUTERCPY": "       01 OUTER-REC.\n          05 OUTER-TAG PIC X(4) VALUE \"TAGV\".\n          COPY INNERCPY.\n",
+  "INNERCPY": "          05 INNER-VAL PIC 9(3).\n"
+}

@@ -1,0 +1,34 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. U08SAB2.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT FILE-A ASSIGN TO "u08a.dat"
+               ORGANIZATION IS LINE SEQUENTIAL.
+           SELECT FILE-B ASSIGN TO "u08b.dat"
+               ORGANIZATION IS LINE SEQUENTIAL.
+       I-O-CONTROL.
+           SAME AREA FOR FILE-A FILE-B.
+       DATA DIVISION.
+       FILE SECTION.
+       FD FILE-A
+           BLOCK CONTAINS 0 RECORDS.
+       01 REC-A PIC X(10).
+       FD FILE-B
+           BLOCK CONTAINS 10 RECORDS.
+       01 REC-B PIC X(10).
+       WORKING-STORAGE SECTION.
+       01 WS-EOF PIC X VALUE "N".
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           OPEN OUTPUT FILE-A.
+           MOVE "HELLO" TO REC-A.
+           WRITE REC-A.
+           CLOSE FILE-A.
+           OPEN INPUT FILE-A.
+           READ FILE-A
+               AT END MOVE "Y" TO WS-EOF
+               NOT AT END DISPLAY "GOT=" REC-A
+           END-READ.
+           CLOSE FILE-A.
+           STOP RUN.

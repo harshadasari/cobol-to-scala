@@ -252,6 +252,40 @@ export function setAmbiguousGroupClassNames(names) {
   AMBIGUOUS_GROUP_CLASS_NAMES = names instanceof Set ? names : new Set();
 }
 
+/**
+ * round-7 finding 1: PROGRAM-ID (upper, unquoted) -> `{ objectName, paramCount }`
+ * for every program parsed from the *same* COBOL source (a multi-PROGRAM-ID
+ * file - contained or sequential programs; see scala-generator.js's
+ * generateMultiProgramScala) - lets generateCall resolve `CALL "NAME" USING
+ * ...` to a real sibling `object <objectName>` and its generated `entry(...)`
+ * method (see scala-generator.js's generateEntryMethod) instead of guessing.
+ * Empty (the default) for every ordinary single-PROGRAM-ID source, which is
+ * every corpus program that existed before this - `generateCall` falls back
+ * to its pre-round-7 behavior 1:1 whenever a CALL's target isn't in this map,
+ * *except* that fallback is now an honest TODO marker instead of a bare
+ * undeclared call (round-7 finding 1c) - see generateCall's own doc comment.
+ */
+let CALL_PROGRAM_REGISTRY = new Map();
+
+export function setCallProgramRegistry(registry) {
+  CALL_PROGRAM_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+/**
+ * round-7 finding 5: SPECIAL-NAMES' `DECIMAL-POINT IS COMMA` (parsed by
+ * parser/index.js's parseEnvironmentDivision, installed by
+ * scala-generator.js's generateScala) - swaps the rendered decimal-point
+ * character from "." to "," for plain numeric DISPLAY (CobolFmt.num) and
+ * numeric-edited PICTURE formatting (formatEditedPicture/CobolFmt.edited).
+ * False (the default) for every program that doesn't declare this clause -
+ * every corpus program before round-7 - so this is a pure addition.
+ */
+let DECIMAL_POINT_IS_COMMA = false;
+
+export function setDecimalPointIsComma(value) {
+  DECIMAL_POINT_IS_COMMA = !!value;
+}
+
 function lookupTable(name) {
   if (!name) return null;
   return TABLE_REGISTRY.get(String(name).toUpperCase()) || null;
@@ -369,13 +403,26 @@ function paragraphMethodName(name) {
  * the parser.
  */
 function subscriptIndexExpr(sub) {
+  // round-7 finding 4: a subscript variable/expression is frequently a
+  // COMP-3 (BigDecimal-typed) field or index (see u04's own repro - a
+  // `PERFORM VARYING` control variable declared `COMP-3 PIC S9(4)`, used
+  // directly as a table subscript) - Vector's own `apply`/`updated` both
+  // require a plain `Int` index, so a bare `wsI - 1` (BigDecimal - Int, which
+  // is itself a BigDecimal) is a hard "Found: BigDecimal, Required: Int"
+  // compile error at every read/write/multi-dim subscript site that uses
+  // this function (renderCamelAssignment's `.updated(...)` write path
+  // included, since it also calls this). `.toInt` is applied at every
+  // non-literal branch (never the literal-fold branches, which already
+  // produce a plain Int constant string) - a no-op for the common case where
+  // the subscript already *is* a plain Scala Int (Int#toInt returns itself),
+  // so this is a pure addition with no behavior change for that case.
   if (sub && typeof sub === 'object') {
     if (sub.type === 'literal') {
       const n = parseInt(sub.value, 10);
       return String(Number.isFinite(n) ? n - 1 : 0);
     }
     if (sub.type === 'variable') {
-      return `${toCamelCase(sub.value)} - 1`;
+      return `(${toCamelCase(sub.value)} - 1).toInt`;
     }
     if (sub.type === 'ArithmeticExpression' && !sub.operator && !sub.unaryMinus && !sub.functionCall) {
       if (sub.value !== null && sub.value !== undefined) {
@@ -383,11 +430,11 @@ function subscriptIndexExpr(sub) {
         return String(Number.isFinite(n) ? n - 1 : 0);
       }
       if (sub.variable) {
-        return `${convertIdentifier(sub.variable)} - 1`;
+        return `(${convertIdentifier(sub.variable)} - 1).toInt`;
       }
     }
   }
-  return `(${convertArithmeticExpression(sub)}) - 1`;
+  return `((${convertArithmeticExpression(sub)}) - 1).toInt`;
 }
 
 /**
@@ -687,7 +734,15 @@ export function generateCobolFmtHelper() {
     '  // line break), never n-1.',
     '  def advanceSep(n: Int): String = if n <= 0 then "\\r" else "\\n" * n',
     '',
-    '  def num(v: BigDecimal, intDigits: Int, decDigits: Int, signed: Boolean): String =',
+    '  // round-7 finding 5: `decimalComma` (SPECIAL-NAMES\' DECIMAL-POINT IS',
+    '  // COMMA - see generator/expression-gen.js\'s setDecimalPointIsComma)',
+    '  // renders the decimal point as "," instead of "." - compiler-verified',
+    '  // against installed GnuCOBOL (tests/oracle - u03/u03b\'s oracle output,',
+    '  // round-7 refutation) that a plain (non-edited) numeric DISPLAY item',
+    '  // renders its assumed decimal point using the *current* DECIMAL-POINT',
+    '  // character, not always ".". Defaults to false so every call site that',
+    '  // predates this finding (100% of them) is byte-for-byte unchanged.',
+    '  def num(v: BigDecimal, intDigits: Int, decDigits: Int, signed: Boolean, decimalComma: Boolean = false): String =',
     '    val neg = v.signum < 0',
     '    val absVal = v.abs',
     '    val totalDigits = intDigits + decDigits',
@@ -696,8 +751,24 @@ export function generateCobolFmtHelper() {
     '    val intPart = if intDigits > 0 then digits.dropRight(decDigits) else ""',
     '    val decPart = if decDigits > 0 then digits.takeRight(decDigits) else ""',
     '    val signStr = if signed then (if neg then "-" else "+") else ""',
-    '    val body = if decDigits > 0 then intPart + "." + decPart else intPart',
+    '    val body = if decDigits > 0 then intPart + (if decimalComma then "," else ".") + decPart else intPart',
     '    signStr + body',
+    '',
+    '  // round-7 findings 2/3: DISPLAY of a COMP-1/COMP-2 (Float/Double) item -',
+    '  // these have no PIC clause (no fixed integer/decimal digit counts to',
+    '  // zero-pad to the way `num` above does for an ordinary DISPLAY numeric',
+    '  // item), so cobc renders them as plain decimal text instead - compiler-',
+    '  // verified against installed GnuCOBOL (tests/oracle - u02b\'s oracle',
+    '  // output, round-7 refutation): 3.5 -> "3.5", 2.25 -> "2.25", and a',
+    '  // *whole* value like 7.0 -> "7" (no trailing ".0"/decimal point at',
+    '  // all) - unlike Scala\'s own Float/Double.toString, which always keeps',
+    '  // a ".0" for a whole value. `.toString` on a Float/Double already gives',
+    '  // the shortest round-tripping decimal text (matching cobc\'s own',
+    '  // representation for every value both were checked against), so this',
+    '  // only has to additionally strip a trailing ".0".',
+    '  def floatDisplay(v: Double): String =',
+    '    val s = v.toString',
+    '    if s.endsWith(".0") then s.dropRight(2) else s',
     '',
     '  // Fixed-width alphanumeric MOVE alignment: default is truncate-right/',
     '  // pad-right with spaces; JUSTIFIED RIGHT truncates-left/pads-left.',
@@ -778,7 +849,15 @@ export function generateCobolFmtHelper() {
     '  // value is not known until runtime (a variable/expression, not a',
     '  // compile-time literal). rawValue is already-formatted signed decimal',
     '  // text (see numericRawValueExpr at the call site).',
-    '  def edited(editPattern: String, rawValue: String, blankWhenZero: Boolean): String =',
+    '  // `decimalComma` (round-7 finding 5, same convention as `num` above):',
+    '  // under SPECIAL-NAMES\' DECIMAL-POINT IS COMMA, "," (not ".") is the',
+    '  // edit pattern\'s decimal-point insertion character - e.g. `PIC ZZ9,99`',
+    '  // means what `PIC ZZ9.99` means by default (3 integer + 2 decimal',
+    '  // digit positions, decimal point rendered as ",") - compiler-verified',
+    '  // (u03b\'s oracle output). Defaults to false, matching every call site',
+    '  // that predates this finding.',
+    '  def edited(editPattern: String, rawValue: String, blankWhenZero: Boolean, decimalComma: Boolean = false): String =',
+    '    val decimalMarker = if decimalComma then \',\' else \'.\'',
     '    var corePattern = editPattern',
     '    var trailingSign: String = null',
     '    if corePattern.endsWith("CR") || corePattern.endsWith("DB") then',
@@ -806,7 +885,7 @@ export function generateCobolFmtHelper() {
     '',
     '    for idx <- chars.indices do',
     '      val ch = chars(idx)',
-    '      if ch == \'.\' then',
+    '      if ch == decimalMarker then',
     '        seenDecimalPoint = true',
     '      else if ch == \'9\' || ch == \'Z\' || ch == \'*\' then',
     '        digitPositions += DigitPos(idx, ch == \'9\', seenDecimalPoint, \'0\')',
@@ -1028,8 +1107,14 @@ export function generateCobolUnstringHelper() {
  *   field (all editPattern.length positions, including any CR/DB suffix)
  *   renders as spaces whenever the value is exactly zero, overriding every
  *   other edit character.
+ * @param {boolean} [decimalPointIsComma] - round-7 finding 5: SPECIAL-NAMES'
+ *   DECIMAL-POINT IS COMMA - "," (not ".") is the pattern's decimal-point
+ *   insertion character (defaults to the module-level flag set by
+ *   setDecimalPointIsComma, so existing call sites that don't pass this
+ *   explicitly still pick up the current program's setting).
  */
-export function formatEditedPicture(editPattern, rawValue, blankWhenZero = false) {
+export function formatEditedPicture(editPattern, rawValue, blankWhenZero = false, decimalPointIsComma = DECIMAL_POINT_IS_COMMA) {
+  const decimalMarker = decimalPointIsComma ? ',' : '.';
   let corePattern = editPattern;
   let trailingSign = null;
   if (/CR$/.test(corePattern) || /DB$/.test(corePattern)) {
@@ -1057,7 +1142,7 @@ export function formatEditedPicture(editPattern, rawValue, blankWhenZero = false
   let fixedSymbolChar = null;
 
   chars.forEach((ch, idx) => {
-    if (ch === '.') {
+    if (ch === decimalMarker) {
       seenDecimalPoint = true;
       return;
     }
@@ -1535,8 +1620,20 @@ function storeNumericByInfo(info, bdExpr, rawExpr, rounded) {
     // BigDecimal into the signed-decimal-text form CobolFmt.edited expects.
     const storedBD = `CobolFmt.${fn}(${bdExpr}, ${intDigits}, ${decDigits})`;
     const rawValueExpr = numericRawValueExpr(storedBD, { scalaType: 'BigDecimal' });
-    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawValueExpr}, ${info.blankWhenZero ? 'true' : 'false'})`;
+    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawValueExpr}, ${info.blankWhenZero ? 'true' : 'false'}, ${DECIMAL_POINT_IS_COMMA})`;
   }
+
+  // round-7 findings 2/3: a COMP-1/COMP-2 (Float/Double) target has no PIC
+  // clause at all, so the truncNumeric/roundNumeric digit-width coercion
+  // below (built entirely around a PIC's integer/decimal digit counts)
+  // doesn't apply - COMP-1/COMP-2 are genuine binary floating point, with no
+  // COBOL-defined digit-truncation semantics of their own. Previously this
+  // fell all the way through to the `!['Int','Long','BigDecimal'].includes`
+  // guard below and returned the bare BigDecimal-valued `rawExpr` unchanged -
+  // a hard "Found: BigDecimal, Required: Float/Double" compile error at
+  // every COMPUTE/ADD/SUBTRACT/MULTIPLY/DIVIDE target of this type.
+  if (info?.scalaType === 'Float') return `(${bdExpr}).toFloat`;
+  if (info?.scalaType === 'Double') return `(${bdExpr}).toDouble`;
 
   if (!info || !['Int', 'Long', 'BigDecimal'].includes(info.scalaType)) {
     return rawExpr;
@@ -1783,7 +1880,7 @@ function renderMoveSource(source, info) {
       BIGDECIMAL_RESULT_FUNCTIONS.has(String(source.name || '').toUpperCase())) {
     const rawExpr = generateFunctionCall(source);
     const rawValueExpr = numericRawValueExpr(rawExpr, { scalaType: 'BigDecimal' });
-    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawValueExpr}, ${info.blankWhenZero ? 'true' : 'false'})`;
+    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawValueExpr}, ${info.blankWhenZero ? 'true' : 'false'}, ${DECIMAL_POINT_IS_COMMA})`;
   }
 
   return convertArithmeticExpression(source);
@@ -1954,7 +2051,30 @@ function numericRawValueExpr(expr, sourceInfo) {
  */
 function renderVariableMoveSource(source, info) {
   const sourceInfo = lookupFieldForRef(source);
-  const rawExpr = convertIdentifier(source);
+  let rawExpr = convertIdentifier(source);
+
+  // round-7 finding 7: a group-item MOVE source (`MOVE WS-GROUP TO
+  // WS-A`) has no FIELD_REGISTRY entry of its own - a group never gets a
+  // flat Scala var, only its children do (see groupDisplayValueExpr's own
+  // doc comment) - so `sourceInfo` is null and the pre-fix `rawExpr` fell
+  // back to convertIdentifier's bare `toCamelCase(name)`: an undeclared
+  // identifier, a hard "not found" compile error (see u11/u11b's own
+  // repros). Route it through the exact same raw-storage concatenation
+  // groupDisplayValueExpr already builds for DISPLAY of a whole group
+  // (round-5 finding 3) instead - COBOL's group-MOVE-to-elementary
+  // semantics move the group's own concatenated storage text, which the
+  // branches below then truncate/pad to the receiving field's width exactly
+  // like any other alphanumeric MOVE source (sourceInfo staying null routes
+  // through their existing "no source info" fallbacks correctly, without
+  // needing further changes downstream).
+  if (!sourceInfo) {
+    const hasSubscripts = source && typeof source === 'object' && Array.isArray(source.subscripts) && source.subscripts.length > 0;
+    const nameUpper = source && typeof source === 'object' ? String(source.name || '').toUpperCase() : String(source || '').toUpperCase();
+    if (nameUpper && !hasSubscripts) {
+      const groupExpr = groupDisplayValueExpr(resolveGroupKey(nameUpper));
+      if (groupExpr) rawExpr = `(${groupExpr})`;
+    }
+  }
 
   if (!info) return rawExpr;
 
@@ -1962,7 +2082,7 @@ function renderVariableMoveSource(source, info) {
     const rawValueExpr = sourceInfo
       ? numericRawValueExpr(rawExpr, sourceInfo)
       : `(${rawExpr}).toString`;
-    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawValueExpr}, ${info.blankWhenZero ? 'true' : 'false'})`;
+    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawValueExpr}, ${info.blankWhenZero ? 'true' : 'false'}, ${DECIMAL_POINT_IS_COMMA})`;
   }
 
   if (info.scalaType === 'String') {
@@ -2812,10 +2932,21 @@ export function generateIf(statement, indent = 0) {
 
   const lines = [`${indentStr}if ${condition} then`];
 
-  if (statement.thenStatements) {
+  // round-7 finding 6: an empty THEN branch (e.g. `IF cond NEXT SENTENCE`, or
+  // any degenerate case with zero statements) must still emit a placeholder
+  // `()` - a Scala 3 significant-indentation `if ... then` with nothing
+  // indented under it does NOT compile to "empty block", it silently absorbs
+  // whatever statement follows at the *outer* indent level into looking like
+  // its own body was skipped, and worse, the subsequent `else` (if any) would
+  // no longer be recognized as belonging to this `if` at all. Always emitting
+  // at least one line keeps this branch's body real regardless of clause
+  // shape.
+  if (statement.thenStatements && statement.thenStatements.length > 0) {
     for (const stmt of statement.thenStatements) {
       lines.push(generateExpression(stmt, indent + 1));
     }
+  } else {
+    lines.push(`${indentStr}  ()`);
   }
 
   if (statement.elseStatements && statement.elseStatements.length > 0) {
@@ -3884,9 +4015,17 @@ function renderDisplayOperand(ref) {
       if (groupExpr) return `(${groupExpr})`;
     }
   }
+  // round-7 findings 2/3: COMP-1/COMP-2 (Float/Double) - no PIC clause, so
+  // integerDigits/decimalDigits are always 0/0 and the ordinary CobolFmt.num
+  // path below renders an all-zero-width (i.e. empty) numeric string. See
+  // CobolFmt.floatDisplay's own doc comment for the plain-decimal-text
+  // format cobc actually uses for these.
+  if (info && (info.scalaType === 'Float' || info.scalaType === 'Double')) {
+    return `CobolFmt.floatDisplay(${expr})`;
+  }
   if (info && info.dataType === 'numeric') {
     const asBigDecimal = info.scalaType === 'BigDecimal' ? expr : `BigDecimal(${expr})`;
-    return `CobolFmt.num(${asBigDecimal}, ${info.integerDigits}, ${info.decimalDigits}, ${info.signed})`;
+    return `CobolFmt.num(${asBigDecimal}, ${info.integerDigits}, ${info.decimalDigits}, ${info.signed}, ${DECIMAL_POINT_IS_COMMA})`;
   }
   // Plain (non-edited) alphanumeric PIC X/A items always occupy their full
   // declared storage width in COBOL - a MOVE of a shorter value space-pads
@@ -3962,7 +4101,7 @@ function generateDisplay(statement, indent = 0) {
 function coerceAcceptValue(rawExpr, info) {
   if (!info) return rawExpr;
   if (info.dataType === 'edited' && info.editPattern) {
-    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawExpr}, ${info.blankWhenZero ? 'true' : 'false'})`;
+    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawExpr}, ${info.blankWhenZero ? 'true' : 'false'}, ${DECIMAL_POINT_IS_COMMA})`;
   }
   if (info.scalaType === 'String') {
     return fitAlphanumericExpr(rawExpr, info.picLength, info.justified);
@@ -4380,23 +4519,95 @@ function generateReturn(statement, indent = 0) {
 }
 
 /**
- * The flat-var identifier and declared width READ ... INTO (or a plain READ
- * with no INTO, which implicitly loads the FD's own 01 record) must assign -
- * round-5 finding 1a/1b's file-registry work applied to READ: an INTO target
- * always wins when present; otherwise the FD's own first record (looked up
- * via FILE_RECORD_REGISTRY, keyed by the file name the READ names) is the
- * implicit destination. Returns `{ camel, width }` (both possibly null if
- * neither can be resolved, e.g. an INTO target with no registry entry).
+ * The read destination for READ ... INTO (or a plain READ with no INTO,
+ * which implicitly loads the FD's own 01 record) - round-5 finding 1a/1b's
+ * file-registry work applied to READ: an INTO target always wins when
+ * present; otherwise the FD's own first record (looked up via
+ * FILE_RECORD_REGISTRY, keyed by the file name the READ names) is the
+ * implicit destination.
+ *
+ * Returns one of:
+ *   - `{ mode: 'elementary', camel, width }` - the destination is a plain
+ *     flat field with its own FIELD_REGISTRY entry (the pre-round-7 case,
+ *     unchanged).
+ *   - `{ mode: 'group', className, width, children }` - round-7 finding 8's
+ *     companion fix (surfaced by promoting u12-batch-realistic.cbl, whose FD
+ *     record SALES-REC is a group with no INTO clause): a group has no flat
+ *     Scala var of its own to assign (see groupDisplayValueExpr's doc
+ *     comment - only its children are real vars), so the whole record must
+ *     decode into each named child instead. Reuses the same byte-level
+ *     round-trip idiom generateGroupMove already established for MOVE
+ *     CORRESPONDING between two groups: the group's own generated case class
+ *     (case-class-gen.js) already has a `.parse(bytes)` that decodes each
+ *     child via CobolCodecs.zonedDecode - for an unsigned field (the only
+ *     kind this path supports, see the guard below) that decodes plain ASCII
+ *     digit bytes with no overpunch, i.e. exactly the bytes
+ *     CobolFmt.digitsOf/groupDisplayValueExpr produce when *writing* the
+ *     same group (generateWriteStatement's WRITE path) - so parsing the
+ *     line straight back through the case class round-trips correctly.
+ *     `children` is `groupChildInfos(...)`'s list, pre-filtered to ones this
+ *     path actually knows how to assign back.
+ *   - `{ mode: 'unsupported', camel, width: 0 }` - resolved to *something*
+ *     (a name) but not a shape this generator can safely assign into (e.g. a
+ *     group containing a FILLER, a nested subgroup, or an OCCURS table -
+ *     none of which participate in a plain `_parsed.<child>` assignment the
+ *     way generateGroupMove's own guard already declines for the same
+ *     reasons). generateReadStatement emits a visible TODO instead of a
+ *     wrong or non-compiling assignment for this case.
+ *   - `{ mode: 'none', camel: null, width: 0 }` - nothing could be resolved
+ *     at all (matches the old `{ camel: null, width: 0 }` return exactly).
  */
 function readDestination(statement, fileName) {
-  if (statement.into) {
-    const info = lookupFieldForRef(statement.into);
-    return { camel: toCamelCase(statement.into.name || statement.into), width: info?.picLength || 0 };
+  const recordNameRaw = statement.into
+    ? (statement.into.name || statement.into)
+    : FILE_RECORD_REGISTRY.get(String(fileName || '').toUpperCase());
+  if (!recordNameRaw) return { mode: 'none', camel: null, width: 0 };
+
+  const info = statement.into ? lookupFieldForRef(statement.into) : lookupField(recordNameRaw);
+  if (info) {
+    return { mode: 'elementary', camel: toCamelCase(recordNameRaw), width: info.picLength || 0 };
   }
-  const recordName = FILE_RECORD_REGISTRY.get(String(fileName || '').toUpperCase());
-  if (!recordName) return { camel: null, width: 0 };
-  const info = lookupField(recordName);
-  return { camel: toCamelCase(recordName), width: info?.picLength || 0 };
+
+  const recordNameUpper = String(recordNameRaw).toUpperCase();
+  if (GROUP_REGISTRY.has(recordNameUpper) && !AMBIGUOUS_GROUP_CLASS_NAMES.has(toPascalCase(recordNameUpper))) {
+    const children = groupChildInfos(recordNameUpper);
+    const usable = children.length > 0 && children.every(c => c.info && !c.isGroup && !c.isFiller && c.ccField);
+    if (usable) {
+      const lenRaw = GROUP_BYTE_LENGTH_REGISTRY.get(recordNameUpper);
+      const width = lenRaw ? Number(lenRaw) : 0;
+      return { mode: 'group', className: toPascalCase(recordNameUpper), width, children };
+    }
+  }
+
+  return { mode: 'unsupported', camel: toCamelCase(recordNameRaw), width: 0 };
+}
+
+/**
+ * Lines to assign a just-read text line (`lineExpr`, e.g. `_record`) into its
+ * READ destination, at `indentStr` - shared by every branch of
+ * generateReadStatement (AT END/NOT AT END, FILE-STATUS-only, and fully
+ * unconditional) so the elementary/group/unsupported handling in
+ * readDestination only has to be threaded through once. Returns `[]` (no
+ * lines) for `mode: 'none'` - callers already treat "nothing to assign" as a
+ * no-op the same way the old `if (destCamel)` guard did.
+ */
+function readAssignLines(dest, lineExpr, indentStr) {
+  if (dest.mode === 'elementary') {
+    const rhs = dest.width > 0 ? `CobolFmt.fitLeft(${lineExpr}, ${dest.width})` : lineExpr;
+    return [`${indentStr}${dest.camel} = ${rhs}`];
+  }
+  if (dest.mode === 'group') {
+    const fitted = dest.width > 0 ? `CobolFmt.fitLeft(${lineExpr}, ${dest.width})` : lineExpr;
+    const lines = [`${indentStr}val _parsed = ${dest.className}.parse((${fitted}).getBytes)`];
+    for (const c of dest.children) {
+      lines.push(`${indentStr}${c.camel} = _parsed.${c.ccField}`);
+    }
+    return lines;
+  }
+  if (dest.mode === 'unsupported') {
+    return [`${indentStr}() // TODO: READ into group record "${dest.camel}" with a FILLER/nested-group/OCCURS child is not supported (see tests/oracle/README.md known gaps); record left unchanged`];
+  }
+  return [];
 }
 
 /**
@@ -4406,15 +4617,7 @@ function generateReadStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const fileName = statement.fileName || statement.file || 'file';
   const { iteratorVar } = fileHandleVarNames(fileName);
-  const { camel: destCamel, width } = readDestination(statement, fileName);
-  // A physical line shorter than the FD/target's own declared record length
-  // is exactly what LINE SEQUENTIAL WRITE produces (trailing spaces are
-  // stripped on write - see generateWriteStatement) - cobc pads it back out
-  // to the record's declared width on READ, which is why
-  // tests/corpus/proc/s01-fileio-roundtrip.cbl's re-DISPLAYed line comes back
-  // with its original trailing spaces (round-5 finding 1). A too-long line is
-  // truncated the same way any other alphanumeric MOVE would be.
-  const fittedExpr = width > 0 ? `CobolFmt.fitLeft(_record, ${width})` : '_record';
+  const dest = readDestination(statement, fileName);
   // round-6 finding 2/3 companion (t04): a registered FILE STATUS field must
   // become "00" on a successful READ and "10" once the iterator is
   // exhausted - including for a *bare* READ with no AT END clause at all
@@ -4428,22 +4631,38 @@ function generateReadStatement(statement, indent = 0) {
 
   const lines = [];
 
-  if (statement.atEnd || statement.notAtEnd) {
+  // round-7 finding 6 (MOST DANGEROUS): `options.atEnd`/`options.notAtEnd`
+  // default to `[]` in ast.js's ReadStatement constructor, and `[] || x` is
+  // truthy in JS - so the old `if (statement.atEnd || statement.notAtEnd)`
+  // was *always* true, even for a bare `READ file.` with no AT END clause at
+  // all. That routed every bare READ through the if/hasNext/else branch
+  // below with BOTH branches empty (no real AT END/NOT AT END statements to
+  // emit), which - because Scala 3 uses significant indentation - produces
+  // an `else` with nothing indented under it. The statements that lexically
+  // follow (the *next* COBOL statement after the READ) then render at the
+  // same indent as that empty `else` and get silently absorbed as if they
+  // were unconditional, when they were actually meant to be the NOT AT END
+  // path. Checking `.length > 0` instead of bare truthiness routes a true
+  // bare READ to the unconditional-read branch (`else` below) instead.
+  const hasAtEnd = Array.isArray(statement.atEnd) && statement.atEnd.length > 0;
+  const hasNotAtEnd = Array.isArray(statement.notAtEnd) && statement.notAtEnd.length > 0;
+
+  if (hasAtEnd || hasNotAtEnd) {
     lines.push(`${indentStr}if ${iteratorVar}.hasNext then`);
     lines.push(`${indentStr}  val _record = ${iteratorVar}.next()`);
 
-    if (destCamel) {
-      lines.push(`${indentStr}  ${destCamel} = ${fittedExpr}`);
-    }
+    lines.push(...readAssignLines(dest, '_record', `${indentStr}  `));
     if (statusVar) {
       lines.push(`${indentStr}  ${statusVar} = "00"`);
     }
 
-    if (statement.notAtEnd && Array.isArray(statement.notAtEnd)) {
+    if (hasNotAtEnd) {
       for (const stmt of statement.notAtEnd) {
         lines.push(generateExpression(stmt, indent + 1));
       }
     }
+    // (no `else ()` placeholder needed here: the `val _record = ...next()`
+    // line above always makes this branch non-empty regardless.)
 
     lines.push(`${indentStr}else`);
 
@@ -4451,11 +4670,15 @@ function generateReadStatement(statement, indent = 0) {
       lines.push(`${indentStr}  ${statusVar} = "10"`);
     }
 
-    if (statement.atEnd && Array.isArray(statement.atEnd)) {
+    if (hasAtEnd) {
       for (const stmt of statement.atEnd) {
         lines.push(generateExpression(stmt, indent + 1));
       }
     } else if (!statusVar) {
+      // Neither a real AT END clause nor a FILE STATUS assignment - this
+      // branch would otherwise be completely empty. Always emit the `()`
+      // placeholder (not conditionally per some other flag) so the `else`
+      // can never swallow a subsequent statement via indentation.
       lines.push(`${indentStr}  () // AT END`);
     }
   } else if (statusVar) {
@@ -4465,16 +4688,26 @@ function generateReadStatement(statement, indent = 0) {
     // no-op-ing past EOF) this must branch on `.hasNext` explicitly.
     lines.push(`${indentStr}if ${iteratorVar}.hasNext then`);
     lines.push(`${indentStr}  val _record = ${iteratorVar}.next()`);
-    if (destCamel) {
-      lines.push(`${indentStr}  ${destCamel} = ${fittedExpr}`);
-    }
+    lines.push(...readAssignLines(dest, '_record', `${indentStr}  `));
     lines.push(`${indentStr}  ${statusVar} = "00"`);
     lines.push(`${indentStr}else`);
     lines.push(`${indentStr}  ${statusVar} = "10"`);
   } else {
     lines.push(`${indentStr}val _record = ${iteratorVar}.nextOption()`);
-    if (destCamel) {
-      lines.push(`${indentStr}_record.foreach(r => ${destCamel} = ${width > 0 ? `CobolFmt.fitLeft(r, ${width})` : 'r'})`);
+    if (dest.mode !== 'none') {
+      const assignLines = readAssignLines(dest, 'r', `${indentStr}  `);
+      if (assignLines.length === 1) {
+        // Elementary/unsupported case: a single-line body still fits neatly
+        // as `.foreach(r => <line>)` (matches the exact pre-round-7 output
+        // for every existing corpus program - none of which hit the group
+        // path here).
+        const body = assignLines[0].trim();
+        lines.push(`${indentStr}_record.foreach(r => ${body})`);
+      } else {
+        lines.push(`${indentStr}_record.foreach { r =>`);
+        lines.push(...assignLines);
+        lines.push(`${indentStr}}`);
+      }
     }
   }
 
@@ -4497,7 +4730,7 @@ function recordContentExpr(recordName) {
     const camel = info.camel;
     if (info.dataType === 'numeric') {
       const asBigDecimal = info.scalaType === 'BigDecimal' ? camel : `BigDecimal(${camel})`;
-      return `CobolFmt.num(${asBigDecimal}, ${info.integerDigits}, ${info.decimalDigits}, ${info.signed})`;
+      return `CobolFmt.num(${asBigDecimal}, ${info.integerDigits}, ${info.decimalDigits}, ${info.signed}, ${DECIMAL_POINT_IS_COMMA})`;
     }
     return camel;
   }
@@ -4779,21 +5012,88 @@ function varyingOperandExprLocal(operand, fallback) {
 }
 
 /**
- * Generate CALL statement
+ * Generate CALL statement.
+ *
+ * round-7 finding 1: previously *every* CALL rendered as a bare
+ * `cleanName(args)` invocation regardless of whether any such method/function
+ * actually existed anywhere in the generated file - for a literal program
+ * name (the overwhelmingly common case: `CALL "ADDER" USING ...`) that was
+ * always a hard "not found" Scala compile error, since this generator never
+ * emitted anything named after an *external* subprogram, and even a
+ * same-file sibling PROGRAM-ID (multi-program source) had no corresponding
+ * callable method generated for it at all before this fix.
+ *
+ * Two cases, resolved via CALL_PROGRAM_REGISTRY (populated only in
+ * multi-PROGRAM-ID mode - see scala-generator.js's generateMultiProgramScala,
+ * which builds it from every PROGRAM-ID parsed out of the same source,
+ * *before* generating any program's method bodies, so a forward reference -
+ * calling a program declared later in the file, as in u01's own repro shape -
+ * still resolves):
+ *
+ *   - Known sibling program: emits `<ObjectName>.entry(<args>)` - see
+ *     generateEntryMethod's doc comment for what that method does on the
+ *     callee side. BY REFERENCE semantics (COBOL's default absent an
+ *     explicit BY CONTENT/VALUE on this CALL's own USING operand) need the
+ *     callee's post-call value to flow back into the *caller's* variable;
+ *     since a called COBOL subprogram can arbitrarily mutate its LINKAGE
+ *     SECTION parameters and the caller must see those mutations, and Scala
+ *     has no native by-reference parameter passing, the pragmatic mapping
+ *     this generator uses is: pass each argument's *current value* in, and
+ *     have `entry(...)` return every LINKAGE parameter's *final value* back
+ *     out as a tuple (or a bare scalar for a single-parameter callee) -
+ *     assigned back into each BY REFERENCE operand's own caller-side
+ *     variable. A BY CONTENT/VALUE operand is passed the same way but its
+ *     slot in the returned tuple is simply not written back (matches real
+ *     COBOL: the callee's own copy is local to that call).
+ *   - Unrecognized name (a genuinely external subprogram this source doesn't
+ *     define, or a dynamic `CALL <data-name>` naming a variable rather than
+ *     a literal - out of scope, no corpus program exercises it): emits a
+ *     visible, still-compiling `() // TODO` marker instead (round-7 finding
+ *     1c) - never a bare call to a name nothing in the file defines.
  */
 function generateCall(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
-  const programName = statement.programName?.value || statement.programName || 'subprogram';
-  const cleanName = toCamelCase(programName.replace(/['"]/g, ''));
+  const rawProgramName = statement.programName?.value || statement.programName || 'subprogram';
+  const nameUpper = String(rawProgramName).replace(/['"]/g, '').toUpperCase();
+  const target = CALL_PROGRAM_REGISTRY.get(nameUpper);
 
-  const args = (statement.using || []).map(param => {
-    if (param.value?.name) {
-      return toCamelCase(param.value.name);
-    }
+  const usingParams = statement.using || [];
+
+  if (!target) {
+    return `${indentStr}() // TODO: CALL "${rawProgramName}" - external subprogram not available for conversion (no PROGRAM-ID "${nameUpper}" found in this source); call skipped - see tests/oracle/README.md known gaps`;
+  }
+
+  const argExprs = usingParams.map(param => {
+    if (param.value?.name) return toCamelCase(param.value.name);
     return convertArithmeticExpression(param.value || param);
-  }).join(', ');
+  });
+  const callExpr = `${target.objectName}.entry(${argExprs.join(', ')})`;
 
-  return `${indentStr}${cleanName}(${args})`;
+  // Which caller-side variable (if any) each USING operand writes its
+  // post-call value back into: only a BY REFERENCE operand (COBOL's default
+  // when no BY CONTENT/VALUE is written) that is itself a plain variable
+  // reference (a literal/expression operand has nowhere to write back to,
+  // same as real COBOL - only a data-name can be passed BY REFERENCE).
+  const refTargets = usingParams.map(param => {
+    const mode = String(param.mode || 'REFERENCE').toUpperCase();
+    if (mode !== 'REFERENCE') return null;
+    return param.value?.name ? toCamelCase(param.value.name) : null;
+  });
+
+  if (target.paramCount === 0 || refTargets.every(t => t === null)) {
+    return `${indentStr}${callExpr}`;
+  }
+
+  if (target.paramCount === 1) {
+    const t = refTargets.find(Boolean);
+    return t ? `${indentStr}${t} = ${callExpr}` : `${indentStr}${callExpr}`;
+  }
+
+  const lines = [`${indentStr}val _callRet = ${callExpr}`];
+  refTargets.forEach((t, i) => {
+    if (t) lines.push(`${indentStr}${t} = _callRet._${i + 1}`);
+  });
+  return lines.join('\n');
 }
 
 /**

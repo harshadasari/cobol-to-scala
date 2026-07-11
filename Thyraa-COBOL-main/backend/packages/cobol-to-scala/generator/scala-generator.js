@@ -20,9 +20,11 @@ import {
   setQualifiedRegistry,
   setConditionRegistry,
   setAmbiguousGroupClassNames,
+  setDecimalPointIsComma,
   setRecordFileRegistry,
   setAdvancingFiles as setAdvancingFilesExpr,
   setFileStatusRegistry as setFileStatusRegistryExpr,
+  setCallProgramRegistry,
   generateCobolFmtHelper,
   generateCobolInspectHelper,
   generateCobolUnstringHelper,
@@ -437,6 +439,25 @@ function getFileSectionRecordItems(ast) {
     if (Array.isArray(f.records)) records.push(...f.records);
   }
   return records;
+}
+
+/**
+ * Collect every 01-level item in the LINKAGE SECTION, regardless of parser
+ * output shape (mirrors getWorkingStorageItems). round-7 finding 1: a called
+ * subprogram's PROCEDURE DIVISION references its LINKAGE SECTION items
+ * exactly like ordinary WORKING-STORAGE fields, but buildFieldRegistry never
+ * walked them at all before this fix - LINKAGE SECTION support didn't exist,
+ * since no corpus program before round-7 declared one. Folding these into
+ * the exact same flattened-var + FIELD_REGISTRY walk as WORKING-STORAGE
+ * items get is what lets generateEntryMethod's own registry lookups (and
+ * every ordinary statement inside the callee's own PROCEDURE DIVISION that
+ * references a LINKAGE item by name) resolve correctly.
+ */
+function getLinkageSectionItems(ast) {
+  if (ast.dataItems?.linkageSection?.items) return ast.dataItems.linkageSection.items;
+  if (ast.data?.linkageSection?.items) return ast.data.linkageSection.items;
+  if (ast.linkageSection && Array.isArray(ast.linkageSection)) return ast.linkageSection;
+  return [];
 }
 
 function isLevel(item, n) {
@@ -992,7 +1013,8 @@ function countLeafNameOccurrences(itemLists) {
 function buildFieldRegistry(ast) {
   const wsItems = getWorkingStorageItems(ast);
   const fileItems = getFileSectionRecordItems(ast);
-  const leafNameCounts = countLeafNameOccurrences([wsItems, fileItems]);
+  const linkageItems = getLinkageSectionItems(ast);
+  const leafNameCounts = countLeafNameOccurrences([wsItems, fileItems, linkageItems]);
   const registry = new Map();
   const tableRegistry = new Map();
   const groupRegistry = new Map();
@@ -1310,6 +1332,7 @@ function buildFieldRegistry(ast) {
 
   walk(wsItems, [], []);
   walk(fileItems, [], []);
+  walk(linkageItems, [], []);
 
   return { lines: lines.join('\n'), registry, tableRegistry, groupRegistry, groupKeyRegistry, groupByteLengthRegistry, qualifiedRegistry, conditionRegistry };
 }
@@ -1683,6 +1706,12 @@ export function generateScala(ast, options = {}) {
   setQualifiedRegistry(qualifiedRegistry);
   setConditionRegistry(conditionRegistry);
 
+  // SPECIAL-NAMES' DECIMAL-POINT IS COMMA (round-7 finding 5) - drives
+  // DISPLAY/numeric-edited PICTURE decimal-separator rendering in
+  // expression-gen.js (CobolFmt.num/CobolFmt.edited call sites, and
+  // formatEditedPicture's own compile-time-literal-folding path).
+  setDecimalPointIsComma(!!ast.environmentDivision?.decimalPointIsComma);
+
   // Case-class names that collide across two different top-level records
   // (see case-class-gen.js's collectAmbiguousGroupClassNames/resolveClassName
   // and generateAllCaseClasses below) - handed to expression-gen.js purely as
@@ -1732,45 +1761,56 @@ export function generateScala(ast, options = {}) {
   setFileStatusRegistryExpr(fileStatusRegistry);
   setFileStatusRegistryFileIO(fileStatusRegistry);
 
-  // Package declaration
-  sections.push(generatePackageDeclaration(opts.packageName));
-  sections.push('');
+  // Package declaration, imports, and the embedded runtime helper objects
+  // (CobolCodecs/CobolFmt/CobolInspect/CobolUnstring) - skipped when
+  // `opts.skipPreamble` is set (round-7 finding 1: generateMultiProgramScala
+  // sets this for every program after the first one in a multi-PROGRAM-ID
+  // source, since these are top-level `object`/`package` declarations that
+  // would otherwise be emitted - and fail to compile as duplicates - once
+  // per program in the same file). Always false by default, so every
+  // single-program call site (100% of existing corpus programs) emits this
+  // exactly as before.
+  if (!opts.skipPreamble) {
+    // Package declaration
+    sections.push(generatePackageDeclaration(opts.packageName));
+    sections.push('');
 
-  // Imports
-  const imports = generateImports(ast, opts);
-  if (imports) {
-    sections.push(imports);
+    // Imports
+    const imports = generateImports(ast, opts);
+    if (imports) {
+      sections.push(imports);
+      sections.push('');
+    }
+
+    // Embedded CobolCodecs runtime (see DEFAULT_OPTIONS.embedRuntime above).
+    if (opts.embedRuntime) {
+      sections.push('// --- Embedded runtime: CobolCodecs (see runtime/CobolCodecs.scala) ---');
+      sections.push('// Inlined because embedRuntime: true (the default), so this file is a');
+      sections.push('// self-contained `scala-cli run` script. Pass embedRuntime: false to instead');
+      sections.push('// `import com.thyraa.cobol.runtime.CobolCodecs` from a shared multi-file build.');
+      sections.push(COBOL_CODECS_SOURCE);
+      sections.push('');
+    }
+
+    // CobolFmt: numeric DISPLAY formatting helper (sign + zero-padding per
+    // PIC integer/decimal digit counts) used by generated DISPLAY statements.
+    sections.push('// CobolFmt: numeric DISPLAY formatting (sign + zero-padding per PIC)');
+    sections.push(generateCobolFmtHelper());
+    sections.push('');
+
+    // CobolInspect: INSPECT TALLYING/REPLACING helper (literal, non-overlapping
+    // substring counting/replacement) used by generated INSPECT statements.
+    sections.push('// CobolInspect: INSPECT TALLYING/REPLACING helpers');
+    sections.push(generateCobolInspectHelper());
+    sections.push('');
+
+    // CobolUnstring: UNSTRING scanning helper (WITH POINTER start/writeback,
+    // DELIMITED BY ALL collapsing, DELIMITER IN) used by generated UNSTRING
+    // statements.
+    sections.push('// CobolUnstring: UNSTRING scanning helper');
+    sections.push(generateCobolUnstringHelper());
     sections.push('');
   }
-
-  // Embedded CobolCodecs runtime (see DEFAULT_OPTIONS.embedRuntime above).
-  if (opts.embedRuntime) {
-    sections.push('// --- Embedded runtime: CobolCodecs (see runtime/CobolCodecs.scala) ---');
-    sections.push('// Inlined because embedRuntime: true (the default), so this file is a');
-    sections.push('// self-contained `scala-cli run` script. Pass embedRuntime: false to instead');
-    sections.push('// `import com.thyraa.cobol.runtime.CobolCodecs` from a shared multi-file build.');
-    sections.push(COBOL_CODECS_SOURCE);
-    sections.push('');
-  }
-
-  // CobolFmt: numeric DISPLAY formatting helper (sign + zero-padding per
-  // PIC integer/decimal digit counts) used by generated DISPLAY statements.
-  sections.push('// CobolFmt: numeric DISPLAY formatting (sign + zero-padding per PIC)');
-  sections.push(generateCobolFmtHelper());
-  sections.push('');
-
-  // CobolInspect: INSPECT TALLYING/REPLACING helper (literal, non-overlapping
-  // substring counting/replacement) used by generated INSPECT statements.
-  sections.push('// CobolInspect: INSPECT TALLYING/REPLACING helpers');
-  sections.push(generateCobolInspectHelper());
-  sections.push('');
-
-  // CobolUnstring: UNSTRING scanning helper (WITH POINTER start/writeback,
-  // DELIMITED BY ALL collapsing, DELIMITER IN) used by generated UNSTRING
-  // statements.
-  sections.push('// CobolUnstring: UNSTRING scanning helper');
-  sections.push(generateCobolUnstringHelper());
-  sections.push('');
 
   // Generate case classes (outside the object for better organization)
   const caseClasses = generateAllCaseClasses(ast, 0, { charset: opts.charset });
@@ -1861,6 +1901,18 @@ export function generateScala(ast, options = {}) {
     sections.push(mainMethod);
   }
 
+  // CALL entry point (round-7 finding 1) - only in multi-PROGRAM-ID mode
+  // (generateMultiProgramScala sets opts.emitEntryPoint for every program in
+  // the source); false by default, so no single-program-file output changes
+  // at all.
+  if (opts.emitEntryPoint) {
+    const entryMethod = generateEntryMethod(ast, fieldRegistry, 1);
+    if (entryMethod) {
+      sections.push('');
+      sections.push(entryMethod);
+    }
+  }
+
   sections.push(`end ${objectName}`);
 
   const code = sections.join('\n');
@@ -1874,7 +1926,154 @@ export function generateScala(ast, options = {}) {
 }
 
 /**
- * Generate Scala from multiple COBOL programs
+ * Generate the CALL entry point for one program in a multi-PROGRAM-ID source
+ * (round-7 finding 1) - assigns each incoming argument to this program's own
+ * PROCEDURE DIVISION USING (LINKAGE SECTION) variable, runs the *whole*
+ * PROCEDURE DIVISION exactly the way this program's own `@main` would
+ * (generateProgramFlowLines - same fall-through-from-the-first-unit
+ * semantics, round-4 finding 9), then returns every USING parameter's final
+ * value - a bare scalar for a single-parameter program, a tuple for more than
+ * one, `Unit` for zero (a CALL with no USING clause at all) - back to the
+ * caller.
+ *
+ * This is the callee side of the "value-in/tuple-out" pragmatic mapping this
+ * generator uses for COBOL's BY REFERENCE CALL semantics (real COBOL lets a
+ * called subprogram mutate its LINKAGE SECTION parameters and have the
+ * caller observe those mutations directly - Scala has no equivalent
+ * pass-by-reference mechanism) - see generateCall's own doc comment
+ * (generator/expression-gen.js) for the caller side: it assigns this
+ * method's return value(s) back into whichever of the CALL's own USING
+ * operands were BY REFERENCE (COBOL's default).
+ *
+ * A LINKAGE parameter's Scala type is looked up in `fieldRegistry` (the same
+ * one this program's own working-storage vars were flattened through -
+ * LINKAGE SECTION items go through the identical buildFieldRegistry path);
+ * falls back to `String` only if a parameter is somehow unregistered
+ * (defensive - every corpus program's LINKAGE item is registered).
+ */
+function generateEntryMethod(ast, fieldRegistry, indent = 1) {
+  const indentStr = '  '.repeat(indent);
+  const bi = '  '.repeat(indent + 1);
+
+  const usingNames = (ast.procedures?.using || []).map(n => (typeof n === 'string' ? n : (n?.name || n)));
+  const paramInfos = usingNames.map(name => {
+    const info = fieldRegistry.get(String(name).toUpperCase());
+    return { camel: toCamelCase(name), scalaType: info?.scalaType || 'String' };
+  });
+
+  const { topLevelParagraphs, sections } = splitProcedureDivision(ast);
+  const units = flattenProcedureUnits(topLevelParagraphs, sections);
+  const ambiguousNames = collectAmbiguousParagraphNames(topLevelParagraphs, sections);
+
+  const paramList = paramInfos.map((p, i) => `_arg${i}: ${p.scalaType}`).join(', ');
+  const returnType = paramInfos.length === 0
+    ? 'Unit'
+    : paramInfos.length === 1
+      ? paramInfos[0].scalaType
+      : `(${paramInfos.map(p => p.scalaType).join(', ')})`;
+
+  const lines = [
+    `${indentStr}// round-7 finding 1: CALL entry point for a sibling program in this same`,
+    `${indentStr}// multi-PROGRAM-ID source - see this function's own doc comment above and`,
+    `${indentStr}// generateCall's (generator/expression-gen.js) for the full BY REFERENCE`,
+    `${indentStr}// "value-in/tuple-out" convention this pairs with.`,
+    `${indentStr}def entry(${paramList}): ${returnType} =`,
+  ];
+  paramInfos.forEach((p, i) => lines.push(`${bi}${p.camel} = _arg${i}`));
+  lines.push(...generateProgramFlowLines(units, indent + 1, ambiguousNames));
+  if (paramInfos.length === 1) {
+    lines.push(`${bi}${paramInfos[0].camel}`);
+  } else if (paramInfos.length > 1) {
+    lines.push(`${bi}(${paramInfos.map(p => p.camel).join(', ')})`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Generate Scala for a multi-PROGRAM-ID COBOL source - contained or
+ * sequential programs sharing one file (round-7 finding 1; see u01's own
+ * repro shape: a calling program followed by its own callee, both full
+ * IDENTIFICATION/DATA/PROCEDURE DIVISIONs, in the same source). `programs` is
+ * `[{ programId, ast }, ...]` in source order - see index.js's
+ * splitProgramSources/parseCobol for how a raw source is split into this
+ * shape (only ever attempted when the source actually contains more than one
+ * PROGRAM-ID; a single-program source never reaches this function at all).
+ *
+ * Emits one `object <ProgramObjectName>:` per program (each with its own
+ * case classes/working-storage/methods, via ordinary generateScala), but the
+ * shared preamble (package declaration, imports, and the embedded
+ * CobolCodecs/CobolFmt/CobolInspect/CobolUnstring runtime objects - each a
+ * top-level definition that would be a duplicate-definition compile error if
+ * repeated) is emitted exactly once, ahead of the first program
+ * (`opts.skipPreamble` suppresses it for every program after the first - see
+ * generateScala's own doc comment on that option). Only the *first* program
+ * in the file gets `generateMain`'s `@main def run()` - matching cobc, where
+ * the primary/first program in a source is the one an `-x` executable
+ * actually runs; every program (including the first) also gets its own
+ * `entry(...)` method (generateEntryMethod) so a sibling CALL can invoke it
+ * regardless of declaration order.
+ *
+ * The cross-program CALL_PROGRAM_REGISTRY (generator/expression-gen.js's
+ * setCallProgramRegistry) is built from *every* program before any of their
+ * method bodies are generated, specifically so a CALL to a program declared
+ * later in the same source (a forward reference - again, u01's own shape:
+ * its first program calls "ADDER", declared second) still resolves.
+ */
+export function generateMultiProgramScala(programs, options = {}) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+
+  const callRegistry = new Map();
+  for (const { programId, ast } of programs) {
+    const name = programId || extractProgramName(ast);
+    const objectName = toPascalCase(name);
+    const usingNames = ast.procedures?.using || [];
+    callRegistry.set(String(name).toUpperCase(), {
+      objectName,
+      paramCount: usingNames.length,
+    });
+  }
+  setCallProgramRegistry(callRegistry);
+
+  const codeSections = [];
+  programs.forEach(({ programId, ast }, i) => {
+    const name = programId || extractProgramName(ast);
+    const programOpts = {
+      ...opts,
+      objectName: toPascalCase(name),
+      skipPreamble: i > 0,
+      emitEntryPoint: true,
+      generateMain: i === 0 && opts.generateMain,
+    };
+    const result = generateScala(ast, programOpts);
+    codeSections.push(result.code);
+  });
+
+  // Reset the shared registry immediately after use so a later, unrelated
+  // single-program conversion in the same process never sees stale entries
+  // from this multi-program run (setFieldRegistry/etc. are all reset the
+  // same way by every ordinary generateScala call already - this is the one
+  // registry generateScala itself never touches, since only this function
+  // populates it).
+  setCallProgramRegistry(new Map());
+
+  const firstName = programs[0]?.programId || extractProgramName(programs[0]?.ast || {});
+  const objectName = toPascalCase(firstName);
+
+  return {
+    code: codeSections.join('\n\n'),
+    filename: `${objectName}.scala`,
+    objectName,
+    packageName: opts.packageName,
+  };
+}
+
+/**
+ * Generate Scala from multiple COBOL programs (independently - one wholly
+ * separate file per program, no cross-program CALL wiring). Distinct from
+ * generateMultiProgramScala above, which links multiple PROGRAM-IDs *within
+ * one source* together (round-7 finding 1) - this one is for genuinely
+ * separate COBOL source files with no relationship to each other.
  */
 export function generateScalaMultiple(asts, options = {}) {
   const results = [];
@@ -1928,6 +2127,7 @@ export function formatScalaCode(code, options = {}) {
 export default {
   generateScala,
   generateScalaMultiple,
+  generateMultiProgramScala,
   formatScalaCode,
   extractProgramName,
   toPascalCase,

@@ -132,8 +132,25 @@ export async function runCobol(cobolPath, opts = {}) {
     const localSource = path.join(scratchDir, `${baseName}.cob`);
     await fs.copyFile(absSource, localSource);
 
+    // round-7: COPY-book resolution support (opts.copybooks: name -> text) -
+    // write each one as `<scratchDir>/<NAME>.cpy` so cobc's own copybook
+    // search path (`-I <dir>`) can resolve a `COPY <NAME>[ REPLACING ...]`
+    // statement the same way this engine's own expandCopybooks()
+    // (parser/copybook-resolver.js) already does on the Scala-generation
+    // side - lets the oracle harness verify COPY-bearing corpus programs
+    // against real cobc instead of only being able to skip them for lack of
+    // copybook support (see u09/u10, round-7 refutation).
+    const copybookNames = opts.copybooks ? Object.keys(opts.copybooks) : [];
+    for (const name of copybookNames) {
+      await fs.writeFile(path.join(scratchDir, `${name}.cpy`), opts.copybooks[name], 'utf-8');
+    }
+
     const exePath = path.join(scratchDir, baseName);
-    const compile = await runProcess('cobc', ['-x', '-o', exePath, localSource], {
+    const cobcArgs = ['-x', '-o', exePath, localSource];
+    if (copybookNames.length > 0) {
+      cobcArgs.push('-I', scratchDir);
+    }
+    const compile = await runProcess('cobc', cobcArgs, {
       cwd: scratchDir,
       timeout,
     });
@@ -305,7 +322,13 @@ export function lineDiff(expected, actual) {
 export async function oracleCompare(cobolPath, opts = {}) {
   const source = await fs.readFile(cobolPath, 'utf-8');
 
-  const cobolResult = await runCobol(cobolPath, opts.cobolOpts);
+  // A caller's `convertOptions.copybooks` (the map convertToScala() expands
+  // COPY statements against) doubles as cobc's own copybook search input
+  // by default - the same copybook text must resolve identically on both
+  // sides of the comparison. `opts.cobolOpts.copybooks`, if given
+  // explicitly, still wins (spread order below).
+  const cobolOpts = { copybooks: opts.convertOptions?.copybooks, ...opts.cobolOpts };
+  const cobolResult = await runCobol(cobolPath, cobolOpts);
 
   let scalaSource = null;
   let conversionError = null;

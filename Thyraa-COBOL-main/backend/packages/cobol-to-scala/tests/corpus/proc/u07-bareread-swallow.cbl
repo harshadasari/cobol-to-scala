@@ -1,0 +1,25 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. U07BR.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT IO-FILE ASSIGN TO "u07io.dat"
+               ORGANIZATION IS LINE SEQUENTIAL.
+       DATA DIVISION.
+       FILE SECTION.
+       FD IO-FILE.
+       01 IO-REC PIC X(10).
+       WORKING-STORAGE SECTION.
+       01 WS-DUMMY PIC X(3) VALUE "ABC".
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           OPEN OUTPUT IO-FILE.
+           MOVE "HELLO" TO IO-REC.
+           WRITE IO-REC.
+           CLOSE IO-FILE.
+           OPEN INPUT IO-FILE.
+           READ IO-FILE.
+           DISPLAY "GOT=" IO-REC.
+           DISPLAY "DUMMY=" WS-DUMMY.
+           CLOSE IO-FILE.
+           STOP RUN.

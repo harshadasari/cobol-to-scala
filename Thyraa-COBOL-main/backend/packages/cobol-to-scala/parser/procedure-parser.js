@@ -1776,7 +1776,31 @@ function parseCallStatement(ctx) {
 
     while (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.STRING_LITERAL) ||
            ctx.checkValue('BY') || ctx.checkValue('REFERENCE') ||
-           ctx.checkValue('CONTENT') || ctx.checkValue('VALUE')) {
+           ctx.checkValue('CONTENT') || ctx.checkValue('VALUE') ||
+           ctx.check(TokenType.COMMA)) {
+
+      // round-7 finding 1a: `CALL "X" USING BY REFERENCE A, B, C` (commas
+      // between operands - legal COBOL, and the overwhelmingly common style
+      // for a multi-argument CALL) previously wasn't consumed anywhere in
+      // this loop at all. The loop's own continuation condition didn't even
+      // list TokenType.COMMA, so it unconditionally exited after the first
+      // operand the moment it saw one - silently truncating `stmt.using` to
+      // just its first parameter and leaving every token from the first
+      // comma onward (", B, C.") completely unconsumed. Those leftover
+      // tokens then corrupted the *rest* of the PROCEDURE DIVISION parse:
+      // the very next statement/paragraph-name scan picked them up
+      // mid-stream, and - since a bare identifier immediately followed by a
+      // PERIOD satisfies isParagraphName's own pattern - a trailing operand
+      // like "WS-SUM." could even be misdetected as a brand new paragraph
+      // name, silently splitting one paragraph into two. Skipping a comma
+      // and continuing (rather than treating it as an operand or a
+      // terminator) fixes this without changing behavior for any
+      // comma-free USING list (single-argument CALLs, unaffected either
+      // way).
+      if (ctx.check(TokenType.COMMA)) {
+        ctx.advance();
+        continue;
+      }
 
       // Check for BY REFERENCE/CONTENT/VALUE
       if (ctx.matchValue('BY')) {
@@ -2724,9 +2748,31 @@ export function parseProcedureDivision(tokens) {
     ctx.advance();
   }
 
-  // Parse USING clause
+  // Parse USING clause. Same comma-consumption bug as CALL's own USING loop
+  // (round-7 finding 1a's other half - the CALL *site* isn't the only place
+  // COBOL allows/requires commas between USING operands; the *callee's own*
+  // `PROCEDURE DIVISION USING LK-A, LK-B, LK-SUM` declaration does too, and
+  // this loop's condition never listed TokenType.COMMA either, so it
+  // silently stopped after the first parameter name here as well. Also
+  // tolerates an optional `BY REFERENCE`/`BY VALUE` mode prefix per operand
+  // (legal COBOL here, though this generator's own CALL-site mapping treats
+  // every USING parameter as BY REFERENCE regardless - see
+  // generator/expression-gen.js's generateCall).
   if (ctx.matchValue('USING')) {
-    while (ctx.check(TokenType.IDENTIFIER)) {
+    while (!ctx.isAtEnd() && !ctx.check(TokenType.PERIOD)) {
+      if (ctx.check(TokenType.COMMA)) {
+        ctx.advance();
+        continue;
+      }
+      if (ctx.matchValue('BY')) {
+        ctx.matchValue('REFERENCE') || ctx.matchValue('VALUE') || ctx.matchValue('CONTENT');
+        continue;
+      }
+      if (ctx.checkValue('REFERENCE') || ctx.checkValue('VALUE') || ctx.checkValue('CONTENT')) {
+        ctx.advance();
+        continue;
+      }
+      if (!ctx.check(TokenType.IDENTIFIER)) break;
       division.using.push(ctx.advance().value);
     }
   }

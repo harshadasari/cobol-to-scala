@@ -14,6 +14,12 @@
 
 ## Activity
 
+### 2026-07-11 12:35 — Cycle 21: round-6 committed (68f762a); round-7 verdict + fix dispatched
+- Round-6 fixes committed after independent verification (545/0/0, 104 corpus programs).
+- Round-7 refutation: NOT CONVERGED - 8 dishonest findings, two of the silent-corruption class (bare READ with no AT END swallows the NEXT statement via empty-else indentation; SECTION anonymous leading blocks silently discarded - surfaced first in the realistic-batch-program test, confirming interaction-density hypothesis). Also: CALL entirely non-functional (comma parsing + no multi-program support), COMP-1/2 DISPLAY blank + Float arithmetic compile error, DECIMAL-POINT IS COMMA unimplemented, COMP-3 subscripts, MOVE group->elementary. 4 survivals incl. nested copybooks and COPY REPLACING via options.
+- Trend: 11, 16, 15, 16, 6, 6, 8 - plateaued rather than dried; each round still yields real product hardening. ~35h wall clock remains; loop continues.
+- Round-7 fix agent dispatched (multi-program CALL support is the big feature item; BY REFERENCE via return-tuple reassignment).
+
 ### 2026-07-11 11:35 — Cycles 19-20: round-5 committed (eded5a3); round-6 verdict + fix dispatched
 - Round-5 fixes committed and pushed after independent suite verification (511/0/0): file I/O end-to-end (ENVIRONMENT DIVISION finally wired into main API), INITIALIZE, group DISPLAY, ACCEPT date sources, edited-source MOVE de-editing, THRU-across-sections. 93 corpus programs.
 - Round-6 refutation: NOT CONVERGED - 6 dishonest across 3 of 12 programs (trend: 11 -> 16 -> 15 -> 16 -> 6 -> 6, and increasingly narrow corners): WRITE ADVANCING ignored (live path never reads it; a correct handler was dead code), quoted digit-content literals ("10") render as Int breaking every FILE STATUS comparison (systemic), STRING ON OVERFLOW dropped + unguarded copy crash, UNSTRING ON OVERFLOW not parsed (statement-stream corruption class). 7 hard survivals to be locked into the corpus (multi-file, WRITE FROM, empty-file read, FD REDEFINES, OCCURS VALUE, level-77, BLANK WHEN ZERO COMP-3).

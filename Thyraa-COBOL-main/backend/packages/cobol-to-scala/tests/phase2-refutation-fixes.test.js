@@ -428,7 +428,12 @@ test('Finding 10: DISPLAY of an index-name formats as signed 9-digit zero-padded
            STOP RUN.
 `;
   const code = convertToScala(source, {}).scala;
-  assert.match(code, /CobolFmt\.num\(BigDecimal\(wsIdx\), 9, 0, true\)/);
+  // round-7 finding 5 added a trailing `decimalComma` argument to every
+  // CobolFmt.num call site (false for a program with no SPECIAL-NAMES
+  // DECIMAL-POINT IS COMMA clause, like this one - byte-identical rendered
+  // output). The 9-digit signed index-name format this test proves is
+  // unchanged.
+  assert.match(code, /CobolFmt\.num\(BigDecimal\(wsIdx\), 9, 0, true, false\)/);
 });
 
 // ---------------------------------------------------------------------------

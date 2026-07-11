@@ -125,6 +125,13 @@ function parseEnvironmentDivision(tokens) {
     specialNames: [],
     fileControls: [],
     ioControls: [],
+    // round-7 finding 5: SPECIAL-NAMES paragraph's `DECIMAL-POINT IS COMMA`
+    // clause - see the SPECIAL-NAMES handling below and index.js's
+    // parseCobol/convertToScala (threads this into parseDataDivision's VALUE
+    // literal parsing) and scala-generator.js's generateScala (threads this
+    // into expression-gen.js's setDecimalPointIsComma for DISPLAY/edited-
+    // PICTURE rendering).
+    decimalPointIsComma: false,
   };
 
   let inEnvDivision = false;
@@ -157,6 +164,31 @@ function parseEnvironmentDivision(tokens) {
       }
       if (upperValue === 'INPUT-OUTPUT') {
         section = 'inputOutput';
+        continue;
+      }
+
+      // SPECIAL-NAMES paragraph (CONFIGURATION SECTION) - round-7 finding 5:
+      // `DECIMAL-POINT IS COMMA` swaps the roles of "." and "," program-wide
+      // (comma becomes the actual decimal point in both VALUE literals and
+      // DISPLAY/numeric-edited PICTURE output; period becomes the plain
+      // digit-grouping insertion character instead). Scanned as a flat
+      // token search within the paragraph rather than a structured
+      // sub-parse (SPECIAL-NAMES has many other clauses - UPSI, currency
+      // sign, alphabet names, mnemonic device names - none of which this
+      // generator supports or needs to; this only looks for the one clause
+      // it acts on, leaving everything else in the paragraph untouched).
+      if (upperValue === 'SPECIAL-NAMES') {
+        for (let j = i + 1; j < tokens.length; j++) {
+          const juv = tokens[j].value?.toUpperCase();
+          if (juv === 'DATA' || juv === 'PROCEDURE' || juv === 'INPUT-OUTPUT') break;
+          if (juv === 'DECIMAL-POINT') {
+            const next1 = tokens[j + 1]?.value?.toUpperCase();
+            const next2 = tokens[j + 2]?.value?.toUpperCase();
+            if (next1 === 'COMMA' || next2 === 'COMMA') {
+              result.decimalPointIsComma = true;
+            }
+          }
+        }
         continue;
       }
 

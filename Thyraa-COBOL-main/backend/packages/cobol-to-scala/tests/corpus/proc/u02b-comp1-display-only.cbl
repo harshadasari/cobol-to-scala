@@ -1,0 +1,11 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. U02B.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-F1  COMP-1 VALUE 3.5.
+       01 WS-F2  COMP-2 VALUE 2.25.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           DISPLAY WS-F1.
+           DISPLAY WS-F2.
+           STOP RUN.

@@ -1,0 +1,29 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. U01-CALL-BYREF.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-A       PIC 9(4) VALUE 10.
+       01 WS-B       PIC 9(4) VALUE 20.
+       01 WS-SUM     PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           DISPLAY "BEFORE A=" WS-A " B=" WS-B.
+           CALL "ADDER" USING BY REFERENCE WS-A, WS-B, WS-SUM.
+           DISPLAY "AFTER  A=" WS-A " B=" WS-B " SUM=" WS-SUM.
+           STOP RUN.
+
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. ADDER.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       LINKAGE SECTION.
+       01 LK-A     PIC 9(4).
+       01 LK-B     PIC 9(4).
+       01 LK-SUM   PIC 9(4).
+       PROCEDURE DIVISION USING LK-A, LK-B, LK-SUM.
+       ADD-PARA.
+           ADD LK-A LK-B GIVING LK-SUM.
+           ADD 1 TO LK-A.
+           GOBACK.
+       END PROGRAM ADDER.
+       END PROGRAM U01-CALL-BYREF.

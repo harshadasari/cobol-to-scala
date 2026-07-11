@@ -1,0 +1,17 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. U04PV3.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-I         COMP-3 PIC S9(4) VALUE 0.
+       01 WS-TOTAL     COMP-3 PIC S9(6) VALUE 0.
+       01 WS-TABLE.
+          05 WS-ITEM OCCURS 5 TIMES PIC 9(3) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > 5
+               MOVE WS-I TO WS-ITEM(WS-I)
+               COMPUTE WS-TOTAL = WS-TOTAL + WS-I
+           END-PERFORM.
+           DISPLAY "TOTAL=" WS-TOTAL.
+           DISPLAY "I3=" WS-ITEM(3).
+           STOP RUN.

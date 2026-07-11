@@ -427,6 +427,10 @@ export function collectAmbiguousParagraphNames(topLevelParagraphs, sections) {
   for (const p of topLevelParagraphs || []) bump(p.name);
   for (const s of sections || []) {
     const paras = s.paragraphs && s.paragraphs.length > 0 ? s.paragraphs : [s];
+    if (s.paragraphs && s.paragraphs.length > 0) {
+      const leading = sectionLeadingUnit(s);
+      if (leading) bump(leading.name);
+    }
     for (const p of paras) bump(p.name);
   }
 
@@ -435,6 +439,40 @@ export function collectAmbiguousParagraphNames(topLevelParagraphs, sections) {
     if (count > 1) ambiguous.add(name);
   }
   return ambiguous;
+}
+
+/**
+ * Synthetic paragraph-like unit standing in for any statements written
+ * directly under a SECTION header before its first named paragraph -
+ * round-7 finding 8: such a leading block was previously silently dropped
+ * entirely whenever the section also had at least one named paragraph
+ * (generateSectionMethod/flattenProcedureUnits only ever looked at
+ * `section.paragraphs`, never `section.statements`, once `section.paragraphs`
+ * was non-empty). Returns null when the section has no such leading block
+ * (the overwhelmingly common case - a SECTION whose very first line is a
+ * named paragraph).
+ *
+ * Verified against installed GnuCOBOL (tests/oracle - u13's oracle output,
+ * round-7 refutation): `PERFORM <section-name>` runs this leading block
+ * FIRST, then - per the section's own ordinary fall-through rule, exactly
+ * like falling from one named paragraph into the next - continues into the
+ * section's first named paragraph unless the leading block's own last
+ * statement is itself an unconditional transfer (GO TO/STOP RUN/GOBACK/EXIT
+ * PROGRAM). That is exactly what treating this as an ordinary leading unit
+ * in the same renderNestedFallthroughSteps chain as the section's real
+ * paragraphs already produces, so it is not special-cased beyond its
+ * synthesis here.
+ *
+ * The synthetic name (`<section-name>-SECTION-BODY`) cannot collide with any
+ * real COBOL paragraph/section name the source could declare for this exact
+ * section, and - because nothing in COBOL source syntax can ever name it -
+ * it is never an explicit PERFORM target; it only participates in the
+ * internal fall-through wiring built by flattenProcedureUnits/
+ * generateSectionMethod.
+ */
+function sectionLeadingUnit(section) {
+  if (!section.statements || section.statements.length === 0) return null;
+  return { name: `${section.name}-SECTION-BODY`, statements: section.statements, sectionName: section.name };
 }
 
 /**
@@ -472,6 +510,13 @@ export function flattenProcedureUnits(topLevelParagraphs, sections) {
   }
   for (const s of sections || []) {
     if (s.paragraphs && s.paragraphs.length > 0) {
+      // round-7 finding 8: a leading anonymous statement block (directly
+      // under the SECTION header, before the first named paragraph) is its
+      // own implicit first unit - see sectionLeadingUnit's doc comment.
+      const leading = sectionLeadingUnit(s);
+      if (leading) {
+        units.push({ name: leading.name, statements: leading.statements, sectionName: s.name });
+      }
       for (const p of s.paragraphs) {
         units.push({ name: p.name, statements: p.statements, sectionName: s.name });
       }
@@ -716,8 +761,12 @@ export function generateSectionMethod(section, indent = 0, ambiguousNames = null
 
   const defIndent = indent + 1;
   const flatNameFor = (p) => resolveParagraphMethodName(p.name, section.name, ambiguousNames);
+  // round-7 finding 8: prepend the section's own leading anonymous block (if
+  // any) as an implicit first unit, ahead of its named paragraphs.
+  const leading = sectionLeadingUnit(section);
+  const paragraphUnits = leading ? [leading, ...section.paragraphs] : section.paragraphs;
   const { lines: stepLines, entryStepName } = renderNestedFallthroughSteps(
-    section.paragraphs,
+    paragraphUnits,
     defIndent,
     flatNameFor
   );

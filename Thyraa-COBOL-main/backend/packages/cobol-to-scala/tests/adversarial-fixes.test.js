@@ -202,7 +202,15 @@ test('generator: WS-T(WS-I + 1) renders the full subscript expression, not just 
            STOP RUN.
 `;
   const code = convertToScala(source, {}).scala;
-  assert.match(code, /wsT\(\(\(wsI \+ 1\)\) - 1\)/);
+  // round-7 finding 4 changed the rendered shape: every non-literal subscript
+  // now carries a trailing `.toInt` (a no-op for an Int-valued expression,
+  // required for a BigDecimal/COMP-3 one - see subscriptIndexExpr's doc
+  // comment in generator/expression-gen.js). This assertion still proves the
+  // full `+ 1` expression is preserved (the original finding), just against
+  // the new shape - verified semantically equivalent via
+  // tests/corpus/data/a06-table-boundary.cbl's cobc oracleCompare, which
+  // still hard-passes.
+  assert.match(code, /wsT\(\(\(\(wsI \+ 1\)\) - 1\)\.toInt\)/);
 });
 
 // ---------------------------------------------------------------------------

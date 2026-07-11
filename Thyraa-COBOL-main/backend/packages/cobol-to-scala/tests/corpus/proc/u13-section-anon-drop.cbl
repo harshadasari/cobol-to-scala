@@ -1,0 +1,19 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. U13SEC.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-X PIC 9(3) VALUE 0.
+       PROCEDURE DIVISION.
+       0000-MAIN SECTION.
+           PERFORM 2000-WITH-ANON.
+           DISPLAY "X=" WS-X.
+           STOP RUN.
+
+       2000-WITH-ANON SECTION.
+           DISPLAY "ANON-BEFORE".
+           MOVE 7 TO WS-X.
+           PERFORM 2100-NAMED.
+
+       2100-NAMED.
+           DISPLAY "NAMED-PARA".
+           ADD 1 TO WS-X.

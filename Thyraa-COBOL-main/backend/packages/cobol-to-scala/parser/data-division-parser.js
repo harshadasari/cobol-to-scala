@@ -26,6 +26,14 @@ class ParserContext {
     this.tokens = tokens;
     this.position = 0;
     this.errors = [];
+    // round-7 finding 5: SPECIAL-NAMES' `DECIMAL-POINT IS COMMA` (parsed by
+    // parser/index.js's parseEnvironmentDivision) - set once, right after
+    // construction, by parseDataDivision's caller; every nested parse
+    // function below shares this same `ctx` instance, so this is visible
+    // everywhere a comma-decimal VALUE literal needs recognizing
+    // (parseValueClause) without threading an options parameter through
+    // every single parse function's signature.
+    this.decimalPointIsComma = false;
   }
 
   current() {
@@ -423,6 +431,30 @@ function parseValueClause(ctx) {
 
   const values = [];
 
+  // round-7 finding 5: under SPECIAL-NAMES' `DECIMAL-POINT IS COMMA`, a VALUE
+  // literal like `123,45` uses a comma - not a period - as its own decimal
+  // point (the lexer has no SPECIAL-NAMES context at tokenize time, so it
+  // always tokenizes this as NUMERIC_LITERAL "123", COMMA, NUMERIC_LITERAL
+  // "45", identically to how two ordinary comma-*separated* VALUEs would
+  // tokenize - see u03/u03b's own repro). Immediately adjacent
+  // NUMERIC_LITERAL-COMMA-NUMERIC_LITERAL is otherwise meaningless as a
+  // multi-value VALUE clause for a non-88-level elementary item (that shape
+  // only makes sense for a level-88's own VALUES list, parsed separately by
+  // parseLevel88, not here), so this narrow, mode-gated combination is safe.
+  const readNumericLiteral = () => {
+    const first = ctx.advance().value;
+    if (
+      ctx.decimalPointIsComma &&
+      ctx.check(TokenType.COMMA) &&
+      ctx.peek(1)?.type === TokenType.NUMERIC_LITERAL
+    ) {
+      ctx.advance(); // comma (the decimal point, in this mode)
+      const frac = ctx.advance().value;
+      return `${first}.${frac}`;
+    }
+    return first;
+  };
+
   do {
     let value = null;
 
@@ -447,11 +479,11 @@ function parseValueClause(ctx) {
     } else if (ctx.check(TokenType.STRING_LITERAL)) {
       value = { type: 'string', value: ctx.advance().value };
     } else if (ctx.check(TokenType.NUMERIC_LITERAL)) {
-      value = { type: 'numeric', value: ctx.advance().value };
+      value = { type: 'numeric', value: readNumericLiteral() };
     } else if (ctx.check(TokenType.OP_PLUS) || ctx.check(TokenType.OP_MINUS)) {
       const sign = ctx.advance().value;
       if (ctx.check(TokenType.NUMERIC_LITERAL)) {
-        value = { type: 'numeric', value: sign + ctx.advance().value };
+        value = { type: 'numeric', value: sign + readNumericLiteral() };
       }
     }
 
@@ -1037,8 +1069,9 @@ export function parseLocalStorageSection(ctx) {
 /**
  * Main function to parse DATA DIVISION
  */
-export function parseDataDivision(tokens) {
+export function parseDataDivision(tokens, options = {}) {
   const ctx = new ParserContext(tokens);
+  ctx.decimalPointIsComma = !!options.decimalPointIsComma;
   const result = {
     fileSection: null,
     workingStorageSection: null,

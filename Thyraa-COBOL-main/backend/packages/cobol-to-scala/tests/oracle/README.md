@@ -144,35 +144,57 @@ happened to look like digits, STRING `ON OVERFLOW`/`NOT ON OVERFLOW` (parsed
 but dropped at codegen) plus an unguarded STRING copy loop
 (`StringIndexOutOfBoundsException` on overflow), and UNSTRING `ON OVERFLOW`/
 `NOT ON OVERFLOW` (not parsed at all - the unconsumed clause corrupted the
-statement stream) - see "Round-6 findings" below. All of these were promoted
+statement stream) - see "Round-6 findings" below. The `u01`-`u13` programs
+(including `*b` isolation follow-ups) were added the same way by a
+**round-7** adversarial refuter that found 8 more root-cause dishonest
+divergences: a READ AT END truthiness bug that could silently swallow the
+statement *after* a bare READ, a SECTION's own leading (pre-first-named-
+paragraph) statement block silently discarded, CALL (comma-consuming parser
+bug plus no same-file multi-program/external-CALL support at all),
+COMP-1/COMP-2 (Float/Double) DISPLAY and arithmetic, a COMP-3 table subscript
+missing a `.toInt` conversion, SPECIAL-NAMES `DECIMAL-POINT IS COMMA`, and
+MOVE of a whole GROUP to an elementary receiver referencing an undeclared
+bare identifier - see "Round-7 findings" below. All of these were promoted
 into this directory (not kept as a separate corpus) specifically so this same
 data-driven suite picks them up automatically: no test-registration code
 changes were needed to add them, only the generator/parser fixes each one's
 mismatch pointed at.
 
+A COPY-bearing corpus program (`u09`/`u10`) additionally needs a sibling
+`<base>.copybooks.json` file (`{"NAME": "copybook source text", ...}`) -
+`oracle.test.js`'s `loadCopybooksFor` reads it and threads the same copybook
+text into both `convertToScala()` (`options.copybooks`) and cobc
+(`harness.js`'s `runCobol`/`oracleCompare`, which now also accept
+`opts.copybooks` and write each one as `<scratchDir>/<NAME>.cpy` with `-I
+<scratchDir>` passed to `cobc`, so its own COPY-book search resolves them
+too) - this is what makes a COPY-bearing program verifiable against real
+cobc at all; previously the harness had no copybook support whatsoever, so
+`u09`/`u10` could only be spot-checked with a throwaway script, never run
+through this data-driven suite.
+
 ## Current inventory (last recorded run: 2026-07-11)
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 104 corpus programs found
-(19 under `data/`, 85 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+**cobc oracle capture / expected-vs-oracle check** - 118 corpus programs found
+(19 under `data/`, 99 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
 excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
-precompiler, see `tests/sql.test.js` instead), all 104 compiled and ran cleanly under
-cobc (exit 0). 28 of the 104 (19 `data/` + 9 `proc/` baseline programs) already have a
+precompiler, see `tests/sql.test.js` instead), all 118 compiled and ran cleanly under
+cobc (exit 0). 28 of the 118 (19 `data/` + 9 `proc/` baseline programs) already have a
 hand-written `.expected.txt` that matches the captured `.oracle.txt` exactly - 0
 mismatches. The 20 `r01`-`r14*`, 15 `n01`-`n16*`, 16 `q01`-`q12*`, 14
-`s01`-`s12*`, and 11 `t01`-`t12*` (`t09` excluded) programs have no hand-written
-`.expected.txt` by design (they're verified directly against cobc via
+`s01`-`s12*`, 11 `t01`-`t12*` (`t09` excluded), and 14 `u01`-`u13*` programs have no
+hand-written `.expected.txt` by design (they're verified directly against cobc via
 `oracleCompare()` below, not a separately hand-authored expectation) and show up
 here as a diagnostic-only capture ("no `<name>.expected.txt` alongside ... yet").
 
 **Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
 end-to-end (0 todo).
 
-**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 85/85 programs match
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 99/99 programs match
 end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
-`q01`-`q12*`, all 14 `s01`-`s12*`, and all 11 `t01`-`t12*` (`t09` excluded)
-adversarial-refutation programs below.
+`q01`-`q12*`, all 14 `s01`-`s12*`, all 11 `t01`-`t12*` (`t09` excluded), and all 14
+`u01`-`u13*` adversarial-refutation programs below.
 
 ### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
@@ -321,6 +343,31 @@ found and fixed - the "how to run" commands are the source of truth, this table 
 only a snapshot. See also `tests/round6-fixes.test.js` for focused,
 toolchain-independent unit tests of each fix above.
 
+### Round-7 adversarial-refutation findings (u01-u13) and their fixes
+
+A round-7 refuter found 8 more root-cause dishonest divergences, one of them
+("MOST DANGEROUS") a truthiness bug capable of silently swallowing an
+arbitrary *later* statement, not just mishandling the READ itself. All 8 are
+now fixed; every promoted program hard-passes `oracleCompare()`.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 6 (MOST DANGEROUS) | `ReadStatement.atEnd`/`.notAtEnd` default to `[]` in `parser/ast.js`, and `[] \|\| x` is truthy in JS - `generateReadStatement`'s `if (statement.atEnd \|\| statement.notAtEnd)` (`generator/expression-gen.js`) was therefore *always* true, even for a bare `READ file.` with no AT END clause at all. That routed every bare READ through the if/hasNext/else branch with BOTH branches empty, and because Scala 3 uses significant indentation, the empty `else` had nothing indented under it - the statement lexically following the READ then rendered at the *same* indent as the empty `else` and was silently absorbed as if unconditional | Check `.length > 0` instead of bare truthiness, routing a genuinely bare READ to the pre-existing unconditional-read branch instead; the AT END branch, when it legitimately has no clause of its own (FILE STATUS absent too), now always emits a `()` placeholder rather than relying on a separate, gap-prone condition to decide whether to. Same empty-branch audit applied to `generateIf`: an IF with an empty `thenStatements` array now also always emits `()` | u07 |
+| 8 | A SECTION's own leading statements (directly under its header, before the first named paragraph) were silently discarded entirely whenever that section also had at least one named paragraph - `generateSectionMethod`/`flattenProcedureUnits` (`generator/method-gen.js`) only ever looked at `section.paragraphs`, never `section.statements`, once `section.paragraphs` was non-empty | New `sectionLeadingUnit` synthesizes a leading pseudo-paragraph (`<section-name>-SECTION-BODY`) from `section.statements` and prepends it to the section's own fall-through chain (`renderNestedFallthroughSteps`) and to `flattenProcedureUnits`'s whole-program unit list - compiler-verified against installed GnuCOBOL (u13) that `PERFORM <section-name>` runs this leading block first, then falls through into the first named paragraph exactly like any other paragraph boundary (including running that paragraph a *second* time via ordinary fall-through, even after an explicit nested `PERFORM` of it already ran it once - u13's own oracle output: `NAMED-PARA` prints twice) | u12, u13 |
+| 1a | `CALL "X" USING BY REFERENCE A, B, C` (comma-separated operands) silently truncated to just the first operand - the USING loop's own continuation condition (`parser/procedure-parser.js`'s `parseCallStatement`) never listed `TokenType.COMMA`, so it exited the instant it saw one, leaving every token from the first comma onward unconsumed and corrupting the rest of the PROCEDURE DIVISION parse (a trailing operand like `WS-SUM.` could even be misdetected as a brand-new paragraph name). The exact same bug existed in a callee's own `PROCEDURE DIVISION USING LK-A, LK-B, LK-C` clause (`parseProcedureDivision`) | Both USING loops now explicitly consume `TokenType.COMMA` (and, for `PROCEDURE DIVISION USING`, an optional `BY REFERENCE`/`BY VALUE`/`BY CONTENT` mode prefix per operand) instead of treating it as an unrecognized terminator | u01 |
+| 1b | No same-file multi-PROGRAM-ID support existed at all - `CALL "PROGNAME"` always rendered a bare, undeclared `progname(args)` call, a hard compile error, regardless of whether a sibling `PROGRAM-ID. PROGNAME.` existed in the very same source (u01's own repro shape: cobc compiles and runs this natively) | `index.js`'s new `splitProgramSources` detects >1 `PROGRAM-ID` and splits the source into one segment per program (falls back to the exact pre-round-7 single-program path otherwise - zero behavior change for every existing corpus program); `generator/scala-generator.js`'s new `generateMultiProgramScala` emits one `object` per program (shared preamble/runtime emitted once, via new `opts.skipPreamble`), builds a `CALL_PROGRAM_REGISTRY` (program name -> object/param count) *before* generating any program's methods (so a forward reference - u01's own MAIN-PARA calls ADDER, declared *after* it - still resolves), and gives every program its own `entry(...)` method (new `generateEntryMethod`) that assigns each incoming argument to that program's own LINKAGE SECTION var (LINKAGE SECTION items previously weren't flattened into the field registry/vars at all - `buildFieldRegistry` only ever walked WORKING-STORAGE/FILE SECTION items; new `getLinkageSectionItems` fixes that too), runs the whole PROCEDURE DIVISION, and returns every parameter's final value as a tuple. `generateCall` (`generator/expression-gen.js`) resolves the CALL target against this registry, passes current argument values in, and reassigns each BY REFERENCE (COBOL's default) operand from the returned tuple - the pragmatic "value-in/tuple-out" mapping this generator uses for COBOL's real BY-REFERENCE mutation semantics, since Scala has no pass-by-reference mechanism. Only the *first* program in the file gets `@main def run()`, matching cobc (the primary/first program in a source is the one an `-x` executable runs) | u01 |
+| 1c | An unresolvable CALL target (a genuinely external subprogram this source doesn't define, or a dynamic `CALL <data-name>`) still rendered a bare, undeclared call | `generateCall` now emits a visible, still-compiling `() // TODO: CALL "<name>" - external subprogram not available for conversion ...` marker instead whenever the target isn't in `CALL_PROGRAM_REGISTRY` - see "Known gaps" below | none - documented gap, not promoted |
+| 2 | `DISPLAY` of a COMP-1/COMP-2 (Float/Double) field rendered empty/wrong - these have no PIC clause at all, so `integerDigits`/`decimalDigits` were always 0/0, and `CobolFmt.num` (built entirely around PIC digit counts) produced an all-zero-width, effectively empty numeric string | New `CobolFmt.floatDisplay` runtime helper (`generator/expression-gen.js`) renders the field's own `.toString` (Float/Double's own shortest round-tripping decimal text - compiler-verified to already match cobc's own rendering for every value checked, e.g. `3.5`/`2.25`) with a trailing `.0` stripped (cobc renders a whole float value with no decimal point at all, e.g. `7.0` -> `"7"`, not Scala's default `"7.0"`); `renderDisplayOperand` routes a Float/Double-typed field through it instead of `CobolFmt.num` | u02, u02b |
+| 3 | A COMPUTE/ADD/SUBTRACT/MULTIPLY/DIVIDE storing into a COMP-1/COMP-2 target left the bare BigDecimal-valued result expression unconverted (`storeNumericByInfo`'s digit-truncation logic only recognized `Int`/`Long`/`BigDecimal` targets) - a hard "Found: BigDecimal, Required: Float/Double" compile error | `storeNumericByInfo` now casts with `.toFloat`/`.toDouble` for a Float/Double target, bypassing the PIC-digit-count truncation entirely (COMP-1/COMP-2 are genuine binary floating point with no COBOL-defined digit-truncation semantics of their own) | u02 |
+| 4 | A COMP-3 (BigDecimal-typed) variable used as a table subscript (e.g. a `PERFORM VARYING` control variable declared `COMP-3`) produced `vector.updated(wsI - 1, ...)` - a `BigDecimal`-valued index, which `Vector.apply`/`.updated` (both requiring a plain `Int`) reject outright at compile time | `subscriptIndexExpr` (`generator/expression-gen.js`) now appends `.toInt` at every non-literal subscript-rendering branch (read, `.updated` write, multi-dimensional) - a no-op for the common case where the subscript is already a plain Scala `Int` (`Int#toInt` returns itself), so this is a pure addition with no behavior change for any pre-existing corpus program | u04 |
+| 5 | SPECIAL-NAMES' `DECIMAL-POINT IS COMMA` clause was not parsed at all, so (a) a comma-decimal VALUE literal (`VALUE 123,45`) parsed as *two* separate comma-separated values instead of one `123.45`, and (b) DISPLAY/numeric-edited PICTURE formatting always rendered a period as the decimal point regardless of this clause | `parser/index.js`'s `parseEnvironmentDivision` now detects the clause (`environmentDivision.decimalPointIsComma`); `parseValueClause`'s (`parser/data-division-parser.js`) new `ctx.decimalPointIsComma`-gated `readNumericLiteral` combines an adjacent `NUMERIC_LITERAL COMMA NUMERIC_LITERAL` into one comma-decimal value; `generator/expression-gen.js`'s `CobolFmt.num`/`CobolFmt.edited` runtime helpers and the JS-side `formatEditedPicture` (compile-time literal folding) all gained a `decimalComma`/`decimalPointIsComma` parameter (threaded from `scala-generator.js`'s new `setDecimalPointIsComma`, called once per program from the parsed `environmentDivision`) that swaps the rendered decimal-point character from `.` to `,` - and, for an edited PICTURE, swaps *which* literal character (`,` vs `.`) marks the pattern's own decimal-point position, matching COBOL's documented role-swap exactly (`PIC ZZ9,99` under this clause means what `PIC ZZ9.99` means by default) | u03b |
+| 7 | `MOVE GROUP-ITEM TO elementary-field` referenced the group's own bare (nonexistent) identifier (`wsGroup = ...`) - a group never gets a flat Scala var of its own, only its children do - a hard "not found" compile error | `renderVariableMoveSource` (`generator/expression-gen.js`) now detects a source with no `FIELD_REGISTRY` entry that resolves to a known group (via the same `GROUP_REGISTRY`/`resolveGroupKey` DISPLAY-of-a-bare-group already uses - round-5 finding 3's `groupDisplayValueExpr`) and routes it through that same raw-storage concatenation instead, letting the existing alphanumeric-target fit/truncate/pad logic downstream apply unchanged | u11, u11b |
+
+Re-run `npm test` after generator changes; the table above will drift as new gaps are
+found and fixed - the "how to run" commands are the source of truth, this table is
+only a snapshot. See also `tests/round7-fixes.test.js` for focused,
+toolchain-independent unit tests of each fix above.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -435,3 +482,24 @@ toolchain-independent unit tests of each fix above.
   AFTER-positioned (a compile-time property, decidable per WRITE statement) and
   only emitting CLOSE's unconditional flush when the *last* WRITE to that file
   in program order was AFTER-positioned (or absent), if a future pass has time.
+
+- **`CALL` to an external subprogram this source doesn't define, round-7
+  finding 1c** - same-file (multi-PROGRAM-ID) CALLs are fully supported (see
+  the round-7 table above - `CALL_PROGRAM_REGISTRY`/`generateEntryMethod`), but
+  a genuinely external subprogram (compiled separately, never appearing in
+  this source as its own `PROGRAM-ID`) has no Scala counterpart this generator
+  could possibly produce on its own - there is no COBOL source to convert.
+  `generateCall` (`generator/expression-gen.js`) emits a visible, still-
+  compiling `() // TODO: CALL "<name>" - external subprogram not available for
+  conversion (no PROGRAM-ID "<NAME>" found in this source); call skipped` marker
+  instead of a bare undeclared call. A dynamic `CALL <data-name>` (naming a
+  variable holding a program name at runtime, rather than a literal) falls
+  into this same "unresolvable" path today, even if that name would happen to
+  match a sibling PROGRAM-ID at runtime - resolving it would require tracking
+  the variable's possible values, out of scope. Not promoted as its own corpus
+  program (a program that actually calls a name with no definition anywhere
+  would fail to *link*, not just run differently, under real cobc too - not a
+  meaningful oracle comparison either way). Revisit by accepting a
+  `linkedPrograms`/external-stub option (a caller-supplied Scala shim per
+  external name) if a future pass needs to convert a program that genuinely
+  calls out to a separately-compiled subprogram.

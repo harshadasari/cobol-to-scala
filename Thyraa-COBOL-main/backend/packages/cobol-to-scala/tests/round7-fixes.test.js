@@ -215,11 +215,18 @@ test('Finding 1b: a same-file (multi-PROGRAM-ID) CALL generates a sibling `objec
 `;
   const code = scalaOf(source);
   assert.match(code, /object Adder:/, 'the callee gets its own sibling object');
-  assert.match(code, /def entry\(_arg0: Int, _arg1: Int, _arg2: Int\): \(Int, Int, Int\)/);
-  assert.match(code, /val _callRet = Adder\.entry\(wsA, wsB, wsSum\)/);
-  assert.match(code, /wsA = _callRet\._1/);
-  assert.match(code, /wsB = _callRet\._2/);
-  assert.match(code, /wsSum = _callRet\._3/);
+  // round-12 finding 3: every entry() parameter now has a zero/spaces
+  // default (so a CALL with fewer USING operands than this LINKAGE SECTION
+  // declares still compiles) - the defaults don't change this fully-applied
+  // CALL's own behavior at all, only the declared signature text.
+  assert.match(code, /def entry\(_arg0: Int = 0, _arg1: Int = 0, _arg2: Int = 0\): \(Int, Int, Int\)/);
+  // round-12 incidental fix: _callRet is now uniquely numbered per CALL site
+  // (never a hardcoded literal name) - see generator/expression-gen.js's
+  // resetCallRetSeq/nextCallRetName doc comment.
+  assert.match(code, /val _callRet0 = Adder\.entry\(wsA, wsB, wsSum\)/);
+  assert.match(code, /wsA = _callRet0\._1/);
+  assert.match(code, /wsB = _callRet0\._2/);
+  assert.match(code, /wsSum = _callRet0\._3/);
   assert.match(code, /@main def run/, 'only the first (outer) program gets the @main entry point');
 });
 

@@ -704,26 +704,58 @@ function parseLevel88(ctx, parentItem) {
         value = { type: 'figurative', value: 'SPACE' };
       }
 
-      if (value) {
-        // Check for THRU/THROUGH
-        if (ctx.matchValue('THRU', 'THROUGH')) {
-          if (ctx.check(TokenType.STRING_LITERAL) || ctx.check(TokenType.NUMERIC_LITERAL)) {
-            value.through = ctx.advance().value;
-          }
+      // round-12 finding 1: the pre-fix loop condition below continued
+      // unconditionally on any non-PERIOD/non-EOF token, even when NONE of
+      // the branches above recognized the current token at all (e.g. the
+      // WHEN of a trailing `WHEN SET TO FALSE IS ...` clause, which this
+      // do-while's own body has no branch for) - since nothing in that case
+      // ever advances ctx, the loop spun forever without ever reading
+      // another token. A value-less iteration means there is nothing more
+      // for *this* VALUE clause to consume; stop and let the WHEN SET TO
+      // FALSE / bare FALSE IS handling below (or the caller) take over.
+      if (!value) break;
+
+      // Check for THRU/THROUGH
+      if (ctx.matchValue('THRU', 'THROUGH')) {
+        if (ctx.check(TokenType.STRING_LITERAL) || ctx.check(TokenType.NUMERIC_LITERAL)) {
+          value.through = ctx.advance().value;
         }
-        values.push(value);
       }
+      values.push(value);
     } while (ctx.match(TokenType.COMMA) || (!ctx.check(TokenType.PERIOD) && !ctx.isAtEnd()));
 
     condition.values = values;
   }
 
-  // Check for FALSE IS clause
-  if (ctx.matchValue('FALSE')) {
-    ctx.matchValue('IS');
-    if (ctx.check(TokenType.STRING_LITERAL) || ctx.check(TokenType.NUMERIC_LITERAL)) {
-      condition.falseValue = ctx.advance().value;
+  // Check for the COBOL-2002+ "WHEN SET TO FALSE IS literal-3" clause (the
+  // standard grammar for an 88-level's false value), tolerating a bare
+  // "FALSE IS literal-3" too (pre-existing behavior, kept for leniency).
+  const parseFalseValueLiteral = () => {
+    // Normalized to the exact same `{ type, value }` shape `condition.values`
+    // entries use (see the VALUE-clause loop above), so generator/
+    // expression-gen.js's level88ValueLiteral can format either one
+    // identically - see level88FalseValueAssignment.
+    if (ctx.check(TokenType.STRING_LITERAL)) {
+      condition.falseValue = { type: 'string', value: ctx.advance().value };
+    } else if (ctx.check(TokenType.NUMERIC_LITERAL)) {
+      condition.falseValue = { type: 'numeric', value: ctx.advance().value };
+    } else if (ctx.matchValue('ZERO', 'ZEROS', 'ZEROES')) {
+      condition.falseValue = { type: 'figurative', value: 'ZERO' };
+    } else if (ctx.matchValue('SPACE', 'SPACES')) {
+      condition.falseValue = { type: 'figurative', value: 'SPACE' };
     }
+  };
+
+  if (ctx.matchValue('WHEN')) {
+    ctx.matchValue('SET');
+    ctx.matchValue('TO');
+    if (ctx.matchValue('FALSE')) {
+      ctx.matchValue('IS');
+      parseFalseValueLiteral();
+    }
+  } else if (ctx.matchValue('FALSE')) {
+    ctx.matchValue('IS');
+    parseFalseValueLiteral();
   }
 
   ctx.skipPeriod();
@@ -802,8 +834,20 @@ export function parseWorkingStorageSection(ctx) {
 
     // Check for level 88
     if (ctx.check(TokenType.NUMERIC_LITERAL) && ctx.current().value === '88') {
+      // Parser-loop audit (round-12, prompted by finding 1's infinite-loop
+      // class): parseLevel88 must run unconditionally here, even when
+      // `currentItem` is null (a stray/leading 88-level with no preceding
+      // elementary item to attach to - malformed COBOL, but this parser must
+      // never hang on it) - parseLevel88 itself never dereferences
+      // `parentItem` (only the *caller* decides where to attach the
+      // resulting condition), so it's always safe to call purely to consume
+      // the level-88 entry's own tokens. Skipping the call entirely (the
+      // pre-fix behavior) left `continue` looping back to this exact same
+      // unconsumed '88' token forever - the identical no-progress shape
+      // finding 1 hung on, just gated behind a different (malformed-input)
+      // precondition instead of always-reachable valid syntax.
+      const condition = parseLevel88(ctx, currentItem);
       if (currentItem) {
-        const condition = parseLevel88(ctx, currentItem);
         currentItem.conditions.push(condition);
       }
       continue;
@@ -957,8 +1001,20 @@ function parseFileDescription(ctx) {
 
     // Check for level 88
     if (ctx.check(TokenType.NUMERIC_LITERAL) && ctx.current().value === '88') {
+      // Parser-loop audit (round-12, prompted by finding 1's infinite-loop
+      // class): parseLevel88 must run unconditionally here, even when
+      // `currentItem` is null (a stray/leading 88-level with no preceding
+      // elementary item to attach to - malformed COBOL, but this parser must
+      // never hang on it) - parseLevel88 itself never dereferences
+      // `parentItem` (only the *caller* decides where to attach the
+      // resulting condition), so it's always safe to call purely to consume
+      // the level-88 entry's own tokens. Skipping the call entirely (the
+      // pre-fix behavior) left `continue` looping back to this exact same
+      // unconsumed '88' token forever - the identical no-progress shape
+      // finding 1 hung on, just gated behind a different (malformed-input)
+      // precondition instead of always-reachable valid syntax.
+      const condition = parseLevel88(ctx, currentItem);
       if (currentItem) {
-        const condition = parseLevel88(ctx, currentItem);
         currentItem.conditions.push(condition);
       }
       continue;
@@ -1002,8 +1058,20 @@ export function parseLinkageSection(ctx) {
 
     // Check for level 88
     if (ctx.check(TokenType.NUMERIC_LITERAL) && ctx.current().value === '88') {
+      // Parser-loop audit (round-12, prompted by finding 1's infinite-loop
+      // class): parseLevel88 must run unconditionally here, even when
+      // `currentItem` is null (a stray/leading 88-level with no preceding
+      // elementary item to attach to - malformed COBOL, but this parser must
+      // never hang on it) - parseLevel88 itself never dereferences
+      // `parentItem` (only the *caller* decides where to attach the
+      // resulting condition), so it's always safe to call purely to consume
+      // the level-88 entry's own tokens. Skipping the call entirely (the
+      // pre-fix behavior) left `continue` looping back to this exact same
+      // unconsumed '88' token forever - the identical no-progress shape
+      // finding 1 hung on, just gated behind a different (malformed-input)
+      // precondition instead of always-reachable valid syntax.
+      const condition = parseLevel88(ctx, currentItem);
       if (currentItem) {
-        const condition = parseLevel88(ctx, currentItem);
         currentItem.conditions.push(condition);
       }
       continue;
@@ -1047,8 +1115,20 @@ export function parseLocalStorageSection(ctx) {
 
     // Check for level 88
     if (ctx.check(TokenType.NUMERIC_LITERAL) && ctx.current().value === '88') {
+      // Parser-loop audit (round-12, prompted by finding 1's infinite-loop
+      // class): parseLevel88 must run unconditionally here, even when
+      // `currentItem` is null (a stray/leading 88-level with no preceding
+      // elementary item to attach to - malformed COBOL, but this parser must
+      // never hang on it) - parseLevel88 itself never dereferences
+      // `parentItem` (only the *caller* decides where to attach the
+      // resulting condition), so it's always safe to call purely to consume
+      // the level-88 entry's own tokens. Skipping the call entirely (the
+      // pre-fix behavior) left `continue` looping back to this exact same
+      // unconsumed '88' token forever - the identical no-progress shape
+      // finding 1 hung on, just gated behind a different (malformed-input)
+      // precondition instead of always-reachable valid syntax.
+      const condition = parseLevel88(ctx, currentItem);
       if (currentItem) {
-        const condition = parseLevel88(ctx, currentItem);
         currentItem.conditions.push(condition);
       }
       continue;

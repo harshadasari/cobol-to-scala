@@ -1,0 +1,2 @@
+TARGET=[HELLO WORLD!        ] PTR=013
+F1=[AA   ] F2=[BB   ] F3=[CC   ] F4=[DD   ] UPTR=021

@@ -307,6 +307,58 @@ export function setCallProgramRegistry(registry) {
   CALL_PROGRAM_REGISTRY = registry instanceof Map ? registry : new Map();
 }
 
+// Incidentally-discovered-and-fixed bug (found while promoting round-12's
+// z09 survivor, which - unlike any single-CALL corpus program before it -
+// exercises two BY-REFERENCE-writeback CALLs in the SAME paragraph):
+// generateCall always named its intermediate result `val _callRet`, so a
+// second such CALL in the same method body redeclared the identical `val`
+// name - a hard "already defined" Scala compile error, not merely a wrong-
+// output bug. Every call site now asks for its own never-repeated name via
+// nextCallRetName(); resetCallRetSeq() is invoked once per generateScala()
+// call (scala-generator.js) purely so a fresh conversion's numbering starts
+// at 0 (cosmetic determinism - correctness never depended on any particular
+// starting value, only on never repeating one within the same generated
+// file).
+let CALL_RET_SEQ = 0;
+
+export function resetCallRetSeq() {
+  CALL_RET_SEQ = 0;
+}
+
+function nextCallRetName() {
+  return `_callRet${CALL_RET_SEQ++}`;
+}
+
+/**
+ * The COBOL default-initialization ("no VALUE clause") literal for a bare
+ * Scala type - numeric zero, or empty/blank text - with no item context
+ * (unlike scala-generator.js's defaultElementaryValue, which additionally
+ * honors an item's own VALUE clause; these two call sites never have an
+ * item to consult at all). Used for a CALL ... USING parameter this
+ * generator must supply a value for despite the source not actually passing
+ * one (round-12 findings 3/4):
+ *
+ *   - CALL ... USING OMITTED (finding 4): the operand is explicitly absent -
+ *     no caller-side value exists at all - so the callee's own parameter
+ *     simply gets its type's zero/spaces default passed in, and (per
+ *     generateCall's refWriters) nothing is ever written back to it.
+ *   - CALL ... USING <fewer args than the callee's LINKAGE SECTION declares>
+ *     (finding 3): a real cobc-compiled callee simply never touches its own
+ *     un-passed trailing LINKAGE items (they are not addressable at all per
+ *     the standard - reading one is undefined behavior); this generator
+ *     pragmatically models that as "starts out zero/spaces, is never written
+ *     back" - see generateEntryMethod's trailing default parameter values,
+ *     which this pairs with.
+ */
+export function defaultZeroValueForScalaType(scalaType) {
+  if (scalaType === 'BigDecimal') return 'BigDecimal(0)';
+  if (scalaType === 'Long') return '0L';
+  if (scalaType === 'Float') return '0.0f';
+  if (scalaType === 'Double') return '0.0';
+  if (scalaType === 'String') return '""';
+  return '0';
+}
+
 /**
  * round-7 finding 5: SPECIAL-NAMES' `DECIMAL-POINT IS COMMA` (parsed by
  * parser/index.js's parseEnvironmentDivision, installed by
@@ -413,17 +465,60 @@ function level88FirstValueAssignment(nameUpper) {
 }
 
 /**
+ * Mirror of level88FirstValueAssignment for `SET condition-name-1 TO FALSE`
+ * (round-12 finding 1): the parent field's camelCase identifier and the
+ * Scala literal for the condition's own `WHEN SET TO FALSE IS literal-3`
+ * clause (parser/data-division-parser.js's parseLevel88). Returns null when
+ * nameUpper isn't a registered condition name, or declares no false-value
+ * clause at all - real COBOL requires `SET ... TO FALSE` to only target a
+ * condition-name that actually declared one (cobc rejects it at compile
+ * time otherwise), so every condition-name this ever fires for in valid
+ * source has one; the null fallback just avoids generating a bogus
+ * assignment for a not-actually-valid program instead of crashing.
+ */
+function level88FalseValueAssignment(nameUpper) {
+  const entry = nameUpper ? CONDITION_REGISTRY.get(nameUpper) : null;
+  if (!entry || !entry.falseValue) return null;
+  const { info, falseValue } = entry;
+  return { camel: info.camel, literal: level88ValueLiteral(falseValue, info) };
+}
+
+/**
  * COBOL paragraph/section name -> Scala method name, mirroring
  * method-gen.js's toMethodName() exactly (strip a leading numeric prefix,
  * then camelCase). Duplicated locally rather than imported, since
  * method-gen.js imports *from* this module - importing back would create a
  * cycle.
  */
-function paragraphMethodName(name) {
+function paragraphMethodName(name, sectionName) {
   if (!name) return '';
   let n = String(name).replace(/^\d+[-_]?/, '');
   if (!n) n = '_' + name;
-  return toCamelCase(n);
+  const bare = toCamelCase(n);
+  // round-12 bonus finding (z12): an explicit OF/IN qualifier
+  // (`sectionName`, from PerformStatement.targetSection/throughSection -
+  // null for the ordinary unqualified form) routes a genuinely colliding
+  // bare name to its section-qualified method name, mirroring
+  // method-gen.js's resolveParagraphMethodName exactly (duplicated locally
+  // rather than imported - method-gen.js imports *from* this module, so
+  // importing back would create a cycle - see this function's own
+  // pre-existing doc note). AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM is
+  // installed by method-gen.js's generateAllMethods (the same ambiguity set
+  // resolveParagraphMethodName itself consults) via
+  // setAmbiguousParagraphNamesForPerform below.
+  if (sectionName && AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM.has(bare)) {
+    let sn = String(sectionName).replace(/^\d+[-_]?/, '');
+    if (!sn) sn = '_' + sectionName;
+    const sectionPart = toCamelCase(sn);
+    return sectionPart + bare.charAt(0).toUpperCase() + bare.slice(1);
+  }
+  return bare;
+}
+
+let AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM = new Set();
+
+export function setAmbiguousParagraphNamesForPerform(names) {
+  AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM = names instanceof Set ? names : new Set();
 }
 
 /**
@@ -4933,26 +5028,56 @@ function generateSearchAll(statement, indent, tinfo) {
       lines.push(`${wi}val _key${i} = ${pk.camel}(${idxVar} - 1)`);
     });
     const keyEqExpr = prefixKeys.map((pk, i) => `_key${i} == (${pk.targetExpr})`).join(' && ');
-    const body = singleWhen.statements && singleWhen.statements.length > 0
-      ? singleWhen.statements.map(s => generateExpression(s, indent + (residualLeaves.length > 0 ? 4 : 3))).join('\n')
-      : `${'  '.repeat(indent + (residualLeaves.length > 0 ? 4 : 3))}()`;
     lines.push(`${wi}if (${keyEqExpr}) then`);
     if (residualLeaves.length > 0) {
-      // round-11 finding 2: the composite key alone matched, but this WHEN
-      // has one or more further conjuncts (an un-prefixed trailing declared
-      // key, or an ordinary non-key test) that must ALSO hold - re-verify
-      // them here. Since the table is sorted uniquely by its full composite
-      // key, this is the only position that could ever match; a residual
-      // failure here is an outright "not found", not "keep narrowing" (the
-      // while loop is force-terminated by pinning _lo/_hi past each other,
-      // same as any other exhausted binary search).
+      // round-12 finding 2: extractKeyPrefix stops at the first declared key
+      // with no equality conjunct, so `prefixKeys` can be a *strict* prefix
+      // of the table's full declared composite key (a legitimate WHEN that
+      // tests a leading key plus a later one but skips a middle key, e.g.
+      // `WS-K1(x) = 10 AND WS-K3(x) = 9` against `ASCENDING KEY WS-K1 WS-K2
+      // WS-K3`, with WS-K2 left in `residualLeaves`). The table is only
+      // guaranteed sorted (and therefore unique) by its FULL declared key -
+      // multiple rows can tie on a mere prefix - so the round-11 assumption
+      // this replaces ("a residual failure at the landed row means outright
+      // not-found") was wrong: verified against installed GnuCOBOL
+      // (searchall-skipmiddle-check.cbl/z-corpus skipmiddle probe), which
+      // finds the correct tied row (K1=10,K2=2,K3=9) even though the binary
+      // search's own midpoint calculation lands on a *different* K1=10 row
+      // first. Fix: when the residual conjunct(s) fail at the landed index,
+      // do not immediately declare "not found" - first linearly scan every
+      // OTHER row tied with it on the extracted prefix key (contiguous,
+      // since the table is sorted by a key that starts with that same
+      // prefix) for one that satisfies every conjunct (prefix equality AND
+      // residual), in ascending table order. Only once that whole tied range
+      // is exhausted with no match is the search conclusively "not found".
       const residualExpr = residualLeaves.map(l => `(${convertCondition(l)})`).join(' && ');
-      lines.push(`${si}if (${residualExpr}) then`);
-      lines.push(body);
-      lines.push(`${'  '.repeat(indent + 4)}_searchDone = true`);
+      const ti = '  '.repeat(indent + 4);
+      const tbi = '  '.repeat(indent + 5);
+      const tieBody = singleWhen.statements && singleWhen.statements.length > 0
+        ? singleWhen.statements.map(s => generateExpression(s, indent + 5)).join('\n')
+        : `${'  '.repeat(indent + 5)}()`;
+      const tieLeftExpr = prefixKeys.map((pk, i) => `${pk.camel}(_tieLo - 2) == _key${i}`).join(' && ');
+      const tieRightExpr = prefixKeys.map((pk, i) => `${pk.camel}(_tieHi) == _key${i}`).join(' && ');
+      lines.push(`${si}var _tieLo = ${idxVar}`);
+      lines.push(`${si}while _tieLo > 1 && (${tieLeftExpr}) do _tieLo -= 1`);
+      lines.push(`${si}var _tieHi = ${idxVar}`);
+      lines.push(`${si}while _tieHi < ${times} && (${tieRightExpr}) do _tieHi += 1`);
+      lines.push(`${si}var _tieIdx = _tieLo`);
+      lines.push(`${si}var _tieFound = false`);
+      lines.push(`${si}while !_tieFound && _tieIdx <= _tieHi do`);
+      lines.push(`${ti}${idxVar} = _tieIdx`);
+      lines.push(`${ti}if (${residualExpr}) then`);
+      lines.push(tieBody);
+      lines.push(`${tbi}_tieFound = true`);
+      lines.push(`${ti}_tieIdx = _tieIdx + 1`);
+      lines.push(`${si}if _tieFound then`);
+      lines.push(`${ti}_searchDone = true`);
       lines.push(`${si}else`);
-      lines.push(`${'  '.repeat(indent + 4)}_lo = _hi + 1`);
+      lines.push(`${ti}_lo = _hi + 1`);
     } else {
+      const body = singleWhen.statements && singleWhen.statements.length > 0
+        ? singleWhen.statements.map(s => generateExpression(s, indent + 3)).join('\n')
+        : `${'  '.repeat(indent + 3)}()`;
       lines.push(body);
       lines.push(`${si}_searchDone = true`);
     }
@@ -5607,7 +5732,7 @@ function generatePerform(statement, indent = 0) {
   function body(bodyIndent) {
     const bodyLines = [];
     if (statement.targetParagraph) {
-      bodyLines.push(`${'  '.repeat(bodyIndent)}${paragraphMethodName(statement.targetParagraph)}()`);
+      bodyLines.push(`${'  '.repeat(bodyIndent)}${paragraphMethodName(statement.targetParagraph, statement.targetSection)}()`);
     }
     if (statement.statements) {
       for (const stmt of statement.statements) {
@@ -5632,7 +5757,7 @@ function generatePerform(statement, indent = 0) {
   // inside that *paragraph* is a separate, out-of-scope case (see
   // generateExit's doc comment) - so it needs no boundary.
   if (statement.performType === 'simple') {
-    lines.push(`${indentStr}${paragraphMethodName(statement.targetParagraph || 'procedure')}()`);
+    lines.push(`${indentStr}${paragraphMethodName(statement.targetParagraph || 'procedure', statement.targetSection)}()`);
   } else if (statement.performType === 'times') {
     const times = statement.times?.value || statement.times || '1';
     const bi = '  '.repeat(indent + 1);
@@ -5704,7 +5829,7 @@ function generatePerform(statement, indent = 0) {
     }
     lines.push(`${indentStr}}`);
   } else if (statement.targetParagraph) {
-    lines.push(`${indentStr}${paragraphMethodName(statement.targetParagraph)}()`);
+    lines.push(`${indentStr}${paragraphMethodName(statement.targetParagraph, statement.targetSection)}()`);
   }
 
   return lines.join('\n');
@@ -5764,6 +5889,23 @@ function varyingOperandExprLocal(operand, fallback) {
  *     a literal - out of scope, no corpus program exercises it): emits a
  *     visible, still-compiling `() // TODO` marker instead (round-7 finding
  *     1c) - never a bare call to a name nothing in the file defines.
+ *
+ * round-12 findings 3/4: a real CALL's USING list need not supply a value
+ * for every one of the callee's declared LINKAGE SECTION items - either
+ * because the caller simply passes fewer arguments than the callee declares
+ * (legal COBOL: an un-passed trailing LINKAGE item is not addressable at
+ * all per the standard, not a compile error), or because a specific
+ * positional argument is spelled `OMITTED`. Both pragmatically resolve to
+ * "that parameter starts at its type's zero/spaces default and is never
+ * written back": the fewer-args case is handled by simply not padding
+ * `argExprs` out to the callee's full arity at all - generateEntryMethod
+ * gives every trailing parameter its own Scala default value, so Scala's
+ * ordinary default-parameter mechanism covers any missing *trailing*
+ * arguments for free - while `OMITTED` (which can appear anywhere in the
+ * list, not only trailing) explicitly substitutes the default expression in
+ * that exact positional slot below, since Scala can't skip a middle
+ * positional argument the way a plain shorter argument list skips trailing
+ * ones.
  */
 function generateCall(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -5783,7 +5925,20 @@ function generateCall(statement, indent = 0) {
   // (groupDisplayValueExpr): a group has no flat Scala var of its own to
   // pass as an argument (see that function's own doc comment), only its
   // children do.
-  const argExprs = usingParams.map(param => {
+  const argExprs = usingParams.map((param, i) => {
+    // round-12 finding 4: CALL ... USING ... OMITTED ... - the parser
+    // (parser/procedure-parser.js's parseCallStatement) records this
+    // positional operand as `{ omitted: true, value: null }` rather than
+    // dropping it (dropping it would shift every argument after it into the
+    // wrong callee parameter slot). There is no caller-side value to pass at
+    // all, so this slot gets the callee's own declared parameter's
+    // zero/spaces default instead - see defaultZeroValueForScalaType's doc
+    // comment; refWriters below already skips write-back for it for free
+    // (param.value is null, so its `name` lookup is null too).
+    if (param.omitted) {
+      const paramType = target.paramTypes?.[i] || 'String';
+      return defaultZeroValueForScalaType(paramType);
+    }
     const name = param.value?.name;
     const hasSubscripts = Array.isArray(param.value?.subscripts) && param.value.subscripts.length > 0;
     if (name && !hasSubscripts && isRegisteredGroupName(String(name).toUpperCase())) {
@@ -5843,12 +5998,14 @@ function generateCall(statement, indent = 0) {
     const w = refWriters.find(Boolean);
     if (!w) return `${indentStr}${callExpr}`;
     if (w.kind === 'scalar') return `${indentStr}${w.camel} = ${callExpr}`;
-    return [`${indentStr}val _callRet = ${callExpr}`, ...renderWriteback(w, '_callRet')].join('\n');
+    const retName = nextCallRetName();
+    return [`${indentStr}val ${retName} = ${callExpr}`, ...renderWriteback(w, retName)].join('\n');
   }
 
-  const lines = [`${indentStr}val _callRet = ${callExpr}`];
+  const retName = nextCallRetName();
+  const lines = [`${indentStr}val ${retName} = ${callExpr}`];
   refWriters.forEach((w, i) => {
-    if (w) lines.push(...renderWriteback(w, `_callRet._${i + 1}`));
+    if (w) lines.push(...renderWriteback(w, `${retName}._${i + 1}`));
   });
   return lines.join('\n');
 }
@@ -5980,6 +6137,7 @@ function generateSet(statement, indent = 0) {
   for (const target of targets) {
     const targetNameUpper = bareVariableNameUpper(target) || String(target?.name || target || '').toUpperCase();
     const l88 = statement.value?.type === 'TRUE' ? level88FirstValueAssignment(targetNameUpper) : null;
+    const l88False = statement.value?.type === 'FALSE' ? level88FalseValueAssignment(targetNameUpper) : null;
 
     if (l88) {
       // SET condition-name-1 TO TRUE: the condition name itself has no
@@ -5989,6 +6147,15 @@ function generateSet(statement, indent = 0) {
       // nonexistent identifier (e.g. `wsStatusActive = true` when only
       // `wsStatus` - the *parent* PIC X(1) field - actually exists).
       lines.push(`${indentStr}${l88.camel} = ${l88.literal}`);
+    } else if (l88False) {
+      // SET condition-name-1 TO FALSE, mirroring the TRUE branch above
+      // (round-12 finding 1): assign the parent field its own declared
+      // `WHEN SET TO FALSE IS literal-3` value, not the Scala boolean
+      // `false` - the parent is a COBOL data item (e.g. PIC X(1)), not a
+      // boolean var, so `<parent> = false` was never valid Scala for it
+      // either (a compile error the pre-fix path never even reached, since
+      // the parser hung indefinitely on this exact 88-level shape).
+      lines.push(`${indentStr}${l88False.camel} = ${l88False.literal}`);
     } else if (statement.value?.type === 'TRUE') {
       lines.push(`${indentStr}${renderAssignment(target, 'true')}`);
     } else if (statement.value?.type === 'FALSE') {

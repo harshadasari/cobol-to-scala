@@ -79,15 +79,21 @@ test('Finding 1a: CALL ... USING BY REFERENCE of a GROUP passes the concatenated
 
 test('Finding 1b: the BY REFERENCE group writeback scatters the call\'s returned string back into the caller\'s own child vars by fixed offset/width', () => {
   const code = scalaOf(GROUP_BYREF_SOURCE);
-  assert.match(code, /val _callRet = V02sub\.entry/);
-  assert.match(code, /wsA = BigDecimal\(\(_callRet\)\.substring\(0, 4\)\)\.toInt/, 'WS-A (4 numeric digits at offset 0) must be parsed back out of the returned string');
-  assert.match(code, /wsB = \(_callRet\)\.substring\(4, 8\)/, 'WS-B (4 chars at offset 4) must be sliced back out of the returned string');
+  // round-12 incidental fix: _callRet is now uniquely numbered per CALL site
+  // (never a hardcoded literal name) - see generator/expression-gen.js's
+  // resetCallRetSeq/nextCallRetName doc comment.
+  assert.match(code, /val _callRet0 = V02sub\.entry/);
+  assert.match(code, /wsA = BigDecimal\(\(_callRet0\)\.substring\(0, 4\)\)\.toInt/, 'WS-A (4 numeric digits at offset 0) must be parsed back out of the returned string');
+  assert.match(code, /wsB = \(_callRet0\)\.substring\(4, 8\)/, 'WS-B (4 chars at offset 4) must be sliced back out of the returned string');
 });
 
 test('Finding 1c: the callee entry(...) scatters its incoming string into its own LINKAGE children and returns their concatenated text back out', () => {
   const code = scalaOf(GROUP_BYREF_SOURCE);
   assert.doesNotMatch(code, /\blkRec\b/, 'LK-REC has no flat Scala var of its own either - nothing should reference one named lkRec');
-  assert.match(code, /def entry\(_arg0: String\): String =/, 'a group LINKAGE parameter still has no fieldRegistry entry, so it keeps the pre-existing String fallback type');
+  // round-12 finding 3: entry() parameters now always have a zero/spaces
+  // default (here `""`, the String fallback's own default) - see
+  // generator/expression-gen.js's defaultZeroValueForScalaType.
+  assert.match(code, /def entry\(_arg0: String = ""\): String =/, 'a group LINKAGE parameter still has no fieldRegistry entry, so it keeps the pre-existing String fallback type');
   assert.match(code, /lkA = BigDecimal\(\(_arg0\)\.substring\(0, 4\)\)\.toInt/);
   assert.match(code, /lkB = \(_arg0\)\.substring\(4, 8\)/);
   // The method's final expression must be the group's own children

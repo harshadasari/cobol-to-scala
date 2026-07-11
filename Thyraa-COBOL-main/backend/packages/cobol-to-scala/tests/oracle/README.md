@@ -176,30 +176,32 @@ through this data-driven suite.
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 172 corpus programs found
-(19 under `data/`, 153 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+**cobc oracle capture / expected-vs-oracle check** - 187 corpus programs found
+(19 under `data/`, 168 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
 excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
 precompiler, see `tests/sql.test.js` instead; two round-9 repros, `w09`/`w12`, are
 deliberately excluded entirely - see the round-9 table below - since cobc itself
-rejects them), all 172 compiled and ran cleanly under cobc (exit 0). 28 of the 172
+rejects them), all 187 compiled and ran cleanly under cobc (exit 0). 28 of the 187
 (19 `data/` + 9 `proc/` baseline programs) already have a hand-written `.expected.txt`
 that matches the captured `.oracle.txt` exactly - 0 mismatches. The 20 `r01`-`r14*`,
 15 `n01`-`n16*`, 16 `q01`-`q12*`, 14 `s01`-`s12*`, 11 `t01`-`t12*` (`t09` excluded),
 14 `u01`-`u13*`, 12 `v01`-`v12*`, 12 `w01`-`w14*` (`w09`/`w12` excluded), 12
-`x01`-`x12`, and 16 `y01`-`y17*` (see the round-11 table below for the exact
-subset) programs have no hand-written `.expected.txt` by design (they're
-verified directly against cobc via `oracleCompare()` below, not a separately
-hand-authored expectation) and show up here as a diagnostic-only capture ("no
-`<name>.expected.txt` alongside ... yet").
+`x01`-`x12`, 16 `y01`-`y17*` (see the round-11 table below for the exact subset),
+and 15 `z01`-`z15*` (see the round-12 table below for the exact subset) programs
+have no hand-written `.expected.txt` by design (they're verified directly against
+cobc via `oracleCompare()` below, not a separately hand-authored expectation) and
+show up here as a diagnostic-only capture ("no `<name>.expected.txt` alongside ...
+yet").
 
 **Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
 end-to-end (0 todo).
 
-**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 153/153 programs
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 168/168 programs
 match end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
 `q01`-`q12*`, all 14 `s01`-`s12*`, all 11 `t01`-`t12*` (`t09` excluded), all 14
 `u01`-`u13*`, all 12 `v01`-`v12*`, all 12 `w01`-`w14*` (`w09`/`w12` excluded), all
-12 `x01`-`x12`, and all 16 `y01`-`y17*` adversarial-refutation programs below.
+12 `x01`-`x12`, all 16 `y01`-`y17*`, and all 15 `z01`-`z15*` adversarial-refutation
+programs below.
 
 ### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
@@ -536,6 +538,86 @@ group) MOVE CORRESPONDING).
 See `tests/round11-fixes.test.js` for focused, toolchain-independent unit
 tests of all 3 fixes above.
 
+### Round-12 adversarial-refutation findings (z01-z15) and their fixes
+
+A round-12 refuter found 4 more root-cause dishonest divergences - one of
+them (finding 1) a **severe, crash-class** bug (an infinite parser loop, not
+merely wrong output), the other three silent wrong-output/corruption bugs -
+plus one bonus fix promoted from the "honest" column (an explicit `PERFORM
+... OF/IN <section>` qualifier wasn't even consumed by the parser). All 4
+findings plus the bonus fix are now fixed; every promoted program
+hard-passes `oracleCompare()`.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | An 88-level's `WHEN SET TO FALSE IS <literal>` clause (the standard COBOL-2002+ grammar for a condition-name's false value) hung `parseLevel88`'s VALUE-clause loop in an INFINITE LOOP: none of the loop's branches recognize the `WHEN`/`SET`/`TO` tokens, and its own continuation condition kept looping on any non-PERIOD/non-EOF token regardless of whether anything was actually consumed that iteration - a hang, not a wrong-output bug, and the most severe class of finding this refutation process has found to date | `parser/data-division-parser.js`'s `parseLevel88` now (a) breaks out of the VALUE loop the instant an iteration recognizes no value token at all (a forced-progress guard - the loop's own continuation condition can no longer spin without an accompanying consumed token), (b) actually parses `WHEN SET TO FALSE IS <literal>` into `condition.falseValue` (normalized to the same `{ type, value }` shape `condition.values` entries use), and (c) `generateSet`'s new `level88FalseValueAssignment` (`generator/expression-gen.js`, mirroring the pre-existing `level88FirstValueAssignment` for `SET ... TO TRUE`) assigns the parent field that literal - not the Scala boolean `false`, which was never valid for a COBOL data item either. A parser-wide audit for the same "loop condition doesn't require progress" anti-pattern (grepping every `while`/`do...while` in `parser/`) found no other instance - every other loop either requires forward progress in its own continuation test, or has an unconditional fallback `ctx.advance()`/`break` in its body. Verified against installed GnuCOBOL (z11): `INITIAL=P`, `AFTER-TRUE=A`, `AFTER-FALSE=P` | z11 |
+| 2 | Multi-key `SEARCH ALL` whose WHEN clause skips a middle declared key (`WS-K1(x) = 10 AND WS-K3(x) = 9` against `ASCENDING KEY WS-K1 WS-K2 WS-K3` - a legal COBOL "search on key K1, re-verify K3" shape) force-terminated as "not found" the instant the binary search's own midpoint landed on a K1-tied row that failed the residual (K3) conjunct - round-11 finding 2's "a composite-key match can only occur at ONE table position" assumption is only true when the *extracted* prefix key is the table's FULL declared key; here it is a strict prefix (K2 has no equality conjunct), so multiple rows legitimately tie on it and a residual failure at the FIRST one landed on does not mean no OTHER tied row matches | `generateSearchAll` (`generator/expression-gen.js`) now, on a residual-conjunct failure at the landed index, scans outward to find the full contiguous tied range (every row sharing the same extracted-prefix key value), then linearly rescans that range for a row satisfying every conjunct (prefix equality AND residual) before force-terminating the outer binary search as "not found" - only once the WHOLE tied range is exhausted with no match. Verified against installed GnuCOBOL (z13): `SKIPMID=CCC` (row 3, `K1=10,K2=2,K3=9`) even though the binary search's own midpoint lands on row 2 (`K1=10,K2=2,K3=5`) first | z13 |
+| 3 | `CALL ... USING` with FEWER operands than the callee's own LINKAGE SECTION/`PROCEDURE DIVISION USING` declares (legal COBOL - an un-passed trailing LINKAGE item is simply not addressable, not a compile error) required exact Scala method arity (`generateEntryMethod`'s `entry(_arg0: T0, _arg1: T1, ...)` had no default values), so the CALL site's shorter argument list was a hard "missing argument" Scala compile error | `generateEntryMethod` (`generator/scala-generator.js`) now gives every LINKAGE parameter a default value - its type's own zero/spaces default (new `defaultZeroValueForScalaType`, `generator/expression-gen.js`) - and `generateCall` (same file) never pads its own argument list out to the callee's full declared arity; it passes exactly as many arguments as the CALL statement supplied, relying on Scala's own default-parameter mechanism for the (always-trailing) rest. Verified against installed GnuCOBOL (z14): `AFTER A=0011` (the callee's own un-passed `LK-B` is simply never touched, matching cobc) | z14 |
+| 4 | `CALL ... USING ... OMITTED ...` (a positional operand explicitly not supplied) wasn't even recognized by `parseCallStatement`'s USING loop condition (`OMITTED` is its own dedicated token type, not `IDENTIFIER`) - the loop silently exited the instant it saw `OMITTED`, leaving it and everything after it (further operands, `RETURNING`, the terminating period, ...) unconsumed to corrupt the rest of the statement parse | `parseCallStatement` (`parser/procedure-parser.js`) now parses `OMITTED` into an explicit placeholder `CallParameter` (`{ omitted: true, value: null }`) so every argument *after* it still lines up with the right callee parameter position; `generateCall` (`generator/expression-gen.js`) substitutes the callee's own zero/spaces default (via the new per-parameter `paramTypes` on `CALL_PROGRAM_REGISTRY`, populated from each program's own LINKAGE field registry in `generateMultiProgramScala`) in that exact positional slot, and never writes a value back to it (there is no caller-side operand to write back into - `refWriters` already skips it for free, since its `value` is `null`). Verified against installed GnuCOBOL (z15): `AFTER A=0011 C=0011` | z15 |
+
+**Bonus fix** (promoted from the "honest"/no-new-finding column, but with a
+newly-assessed severity - it silently corrupted the parse stream, which the
+original honest assessment understated): an explicit qualified out-of-line
+`PERFORM <paragraph-name> OF/IN <section-name>` (real COBOL's own required
+disambiguation whenever a bare paragraph name collides across sections) was
+not even *consumed* by `parsePerformStatement` - the `OF`/`IN` token and the
+section name after it fell straight through every remaining PERFORM clause
+check unconsumed, corrupting the rest of the PROCEDURE DIVISION parse
+(exactly the same *class* of bug as findings 1/4 above - an unconsumed
+qualifier/clause left to corrupt the token stream - caught by the same
+audit pass). Fixed in full (not just "consume and ignore"): `parsePerformStatement`
+now parses the qualifier into `PerformStatement.targetSection`/
+`throughSection`; `generatePerformFromAST` (`generator/method-gen.js`) and
+`generatePerform` (`generator/expression-gen.js`) route a qualified target
+through the same collision-aware `resolveParagraphMethodName` resolver
+`generateAllMethods`/`generateSectionMethod` already use to *declare* a
+qualified method (threaded via each module's own
+`setAmbiguousParagraphNamesForPerform`, mirroring the existing
+registry-setter pattern) - not just the previous, always-bare
+`toMethodName`/`paragraphMethodName`. An ordinary *unqualified* PERFORM to a
+would-be-ambiguous name is deliberately untouched (still the pre-existing,
+documented "Known gaps" limitation below) - only an explicit `OF`/`IN`
+qualifier is resolved. Verified against installed GnuCOBOL (z12): `START`,
+`IN-SECTION-B-PARA-ONE`, `END` (not `IN-SECTION-A-PARA-ONE`, which an
+unqualified/bare resolution would have wrongly called first) | z12 |
+
+**Incidentally-discovered-and-fixed bug** (found while promoting z09, not
+one of the 4 findings or the bonus fix itself, but blocking that survivor
+from hard-passing): `generateCall` always named its intermediate result
+`val _callRet`, so a SECOND BY-REFERENCE-writeback CALL in the *same*
+paragraph (z09's own shape - no single-CALL-per-paragraph corpus program
+before it exercised this) redeclared the identical `val` name - a hard
+Scala "already defined" compile error. Fixed by a per-call unique name
+(`nextCallRetName`/`resetCallRetSeq`, `generator/expression-gen.js`) instead
+of a hardcoded literal.
+
+15 round-12 probes were promoted: 5 fixed divergers (`z11` finding 1, `z13`
+finding 2, `z14` finding 3, `z15` finding 4, `z12` the bonus fix) plus 10
+survivors that already passed unmodified (once the incidental `_callRet`
+bug above was also fixed) before this round, locking in existing behavior
+as regression guards: `z01` further SEARCH ALL variants, `z02`
+two-dimensional subscripted INITIALIZE, `z03` INITIALIZE REPLACING of a
+subscripted table element, `z04` INITIALIZE of a whole record containing an
+OCCURS ... DEPENDING ON child, `z05` a 150-line "everything at once"
+integration program (DECLARATIVES triggered for real via a deliberate
+first-open-before-create, a self-seeded input file, SORT with INPUT/OUTPUT
+PROCEDURE, a multi-key SEARCH ALL, an edited-numeric report write, a CALL
+to a contained subprogram with a GROUP parameter, and a final read-back of
+the report file - a crown-jewel regression guard exercising a huge swath of
+the engine in one program), `z06` a pointer/index chain, `z07` INSPECT
+TALLYING against a subscripted table element, `z08` numeric MOVE
+truncation, `z09` combines findings 3/4 (OMITTED and fewer-args CALLs) with
+GOBACK-returns-to-caller vs STOP RUN-terminates-the-whole-run-unit
+semantics in one integration program, and `z09b` isolates the GOBACK-vs-
+STOP-RUN distinction on its own.
+
+See `tests/round12-fixes.test.js` for focused, toolchain-independent unit
+tests of all 4 findings, the bonus fix, and the incidental `_callRet` fix
+above - including a parser-termination guard (finding 1) that runs the
+conversion in a child process with a hard wall-clock timeout, since a
+synchronous infinite loop cannot be interrupted from within the same
+process/thread the way an ordinary assertion failure can.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -551,28 +633,32 @@ tests of all 3 fixes above.
   the field's own display text (its own declared width is already known via the field
   registry) if a future pass has time for it.
 
-- **An explicit out-of-line `PERFORM <paragraph-name>` (or `GO TO`) that targets
-  one specific paragraph whose bare name is ambiguous across sections (round-4
-  finding 8's qualification)** - the qualified flat top-level method name (e.g.
-  `thirdParaA` for `1000-PARA-A` inside `3000-THIRD SECTION`) is only ever
-  produced by, and known to, `generateAllMethods`/`generateSectionMethod`/
-  `generateProgramFlowLines` (all in `generator/method-gen.js`); a `PERFORM`/
-  `GO TO` *statement* naming that same paragraph is rendered via
-  `expression-gen.js`'s `paragraphMethodName` (or `method-gen.js`'s bare
-  `toMethodName` for a top-level `PerformStatement`), neither of which knows
-  about section-qualification at all - both always emit the plain bare name
-  (`paraA()`), which would not compile if that specific bare name turned out to
-  be ambiguous. Real COBOL itself requires such a reference to be qualified
-  (`PERFORM 1000-PARA-A OF 3000-THIRD`) or it is genuinely ambiguous and illegal
-  unqualified - a program that actually needs this is *already* invalid COBOL
-  without doing so, so this gap only matters for programs using a bare,
-  would-be-ambiguous reference, which none of the round-4 corpus programs (or any
-  prior corpus) do; `sect01`/`q09`'s own only cross-paragraph reference is a
+- **A bare, UNQUALIFIED out-of-line `PERFORM <paragraph-name>` (or `GO TO`) that
+  targets one specific paragraph whose bare name is ambiguous across sections
+  (round-4 finding 8's qualification)** - **round-12 narrowed this gap
+  considerably**: an *explicitly qualified* reference (`PERFORM 1000-PARA-A OF
+  3000-THIRD`/`... IN 3000-THIRD`) is now fully supported end-to-end -
+  `parsePerformStatement` (`parser/procedure-parser.js`) parses the `OF`/`IN`
+  qualifier into `PerformStatement.targetSection`/`throughSection`, and
+  `generatePerformFromAST` (`generator/method-gen.js`)/`generatePerform`
+  (`generator/expression-gen.js`) route it through the same collision-aware
+  `resolveParagraphMethodName` resolver `generateAllMethods`/
+  `generateSectionMethod` already use to *declare* a qualified method (see the
+  round-12 table above, `z12`) - what remains unaddressed is only a **bare,
+  UNQUALIFIED** reference to a paragraph name that happens to collide: real
+  COBOL requires qualification whenever it would otherwise be ambiguous - a
+  program using a bare, would-be-ambiguous reference is *already invalid
+  COBOL* without qualifying it - so this narrower residual gap only matters
+  for a program that is itself not valid COBOL, which no corpus program (old
+  or new) is; `sect01`/`q09`'s own only cross-paragraph reference is a
   `PERFORM` of the (never-ambiguous) *section* name, not one of its colliding
-  paragraphs. Revisit by threading qualification context through
-  `paragraphMethodName`/nested-PERFORM resolution (needs the calling paragraph's
-  own enclosing section, not currently plumbed through `generateExpression`) if a
-  future program needs it.
+  paragraphs, and `z12` itself uses the (legally required) qualified form.
+  `GO TO`'s own qualification is unaffected by the round-12 fix (only
+  `PERFORM` was addressed) and remains exactly as unqualified/bare as before.
+  Revisit by threading the calling paragraph's own enclosing section through
+  `generateExpression`/nested-PERFORM resolution (for the bare-unqualified
+  case) and by extending `GO TO`'s own parsing/codegen the same way `PERFORM`
+  was, if a future program needs either.
 
 - **GO TO (or a nested PERFORM) into a paragraph that must then *itself* keep
   falling through, within a SECTION wrapper or the whole-program flow (round-4

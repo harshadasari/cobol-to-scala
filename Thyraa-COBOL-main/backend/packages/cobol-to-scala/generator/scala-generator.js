@@ -27,6 +27,8 @@ import {
   setFileStatusRegistry as setFileStatusRegistryExpr,
   setDeclarativeHandlers as setDeclarativeHandlersExpr,
   setCallProgramRegistry,
+  resetCallRetSeq,
+  defaultZeroValueForScalaType,
   generateCobolFmtHelper,
   generateCobolInspectHelper,
   generateCobolUnstringHelper,
@@ -1577,7 +1579,11 @@ function buildFieldRegistry(ast) {
       // level88ConditionExpr in expression-gen.js).
       for (const cond of item.conditions || []) {
         if (!cond || !cond.name) continue;
-        conditionRegistry.set(String(cond.name).toUpperCase(), { info, values: cond.values || [] });
+        conditionRegistry.set(String(cond.name).toUpperCase(), {
+          info,
+          values: cond.values || [],
+          falseValue: cond.falseValue || null,
+        });
       }
     }
   }
@@ -2042,6 +2048,11 @@ export function generateScala(ast, options = {}) {
   // formatEditedPicture's own compile-time-literal-folding path).
   setDecimalPointIsComma(!!ast.environmentDivision?.decimalPointIsComma);
 
+  // Cosmetic determinism only (see expression-gen.js's resetCallRetSeq doc
+  // comment for the bug this counter itself fixes) - every generateScala()
+  // call starts its own program's `_callRet<N>` numbering fresh at 0.
+  resetCallRetSeq();
+
   // Case-class names that collide across two different top-level records
   // (see case-class-gen.js's collectAmbiguousGroupClassNames/resolveClassName
   // and generateAllCaseClasses below) - handed to expression-gen.js purely as
@@ -2338,7 +2349,18 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
   const units = flattenProcedureUnits(topLevelParagraphs, sections);
   const ambiguousNames = collectAmbiguousParagraphNames(topLevelParagraphs, sections);
 
-  const paramList = paramInfos.map((p, i) => `_arg${i}: ${p.scalaType}`).join(', ');
+  // round-12 finding 3: every parameter gets a default (its type's own
+  // zero/spaces value, matching real COBOL's un-passed-LINKAGE-item
+  // semantics - see expression-gen.js's defaultZeroValueForScalaType) so a
+  // CALL with fewer USING operands than this program's own LINKAGE SECTION
+  // declares still compiles: Scala allows omitting any number of *trailing*
+  // positional arguments as long as every omitted one has a default, and
+  // generateCall (expression-gen.js) never pads its own argument list out to
+  // this method's full arity - it simply passes exactly as many arguments as
+  // the CALL statement itself supplied.
+  const paramList = paramInfos
+    .map((p, i) => `_arg${i}: ${p.scalaType} = ${defaultZeroValueForScalaType(p.scalaType)}`)
+    .join(', ');
   const returnType = paramInfos.length === 0
     ? 'Unit'
     : paramInfos.length === 1
@@ -2422,10 +2444,18 @@ export function generateMultiProgramScala(programs, options = {}) {
   for (const { programId, ast } of programs) {
     const name = programId || extractProgramName(ast);
     const objectName = toPascalCase(name);
-    const usingNames = ast.procedures?.using || [];
+    const usingNames = (ast.procedures?.using || []).map(n => (typeof n === 'string' ? n : (n?.name || n)));
+    // round-12 finding 4: per-parameter Scala type (mirrors
+    // generateEntryMethod's own paramInfos lookup exactly) so a caller-side
+    // CALL ... USING ... OMITTED (generator/expression-gen.js's generateCall)
+    // can substitute a type-correct zero/spaces default in that positional
+    // slot instead of guessing "String" for every callee.
+    const { registry: linkageFieldRegistry } = buildFieldRegistry(ast);
+    const paramTypes = usingNames.map(n => linkageFieldRegistry.get(String(n).toUpperCase())?.scalaType || 'String');
     callRegistry.set(String(name).toUpperCase(), {
       objectName,
       paramCount: usingNames.length,
+      paramTypes,
     });
   }
   setCallProgramRegistry(callRegistry);

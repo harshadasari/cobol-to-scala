@@ -232,7 +232,13 @@ export class PerformStatement extends Statement {
     super('PerformStatement', options);
     this.performType = options.performType || 'simple'; // simple, times, until, varying, inline
     this.targetParagraph = options.targetParagraph || null;
+    // OF/IN qualifier explicitly disambiguating targetParagraph when its bare
+    // name collides across sections (round-12 bonus finding, z12) - e.g.
+    // `PERFORM PARA-ONE OF SECTION-B`. Null for the (overwhelmingly common)
+    // unqualified form.
+    this.targetSection = options.targetSection || null;
     this.throughParagraph = options.throughParagraph || null;
+    this.throughSection = options.throughSection || null;
     this.times = options.times || null;             // Expression for TIMES
     this.until = options.until || null;             // Condition for UNTIL
     this.testBefore = options.testBefore !== false; // WITH TEST BEFORE/AFTER
@@ -561,6 +567,12 @@ export class CallParameter extends ASTNode {
     this.mode = options.mode || 'REFERENCE';        // REFERENCE, CONTENT, VALUE
     this.value = options.value || null;
     this.length = options.length || null;           // LENGTH OF clause
+    // CALL ... USING ... OMITTED (round-12 finding 4): this positional
+    // argument was explicitly not supplied. `value` stays null; codegen
+    // passes the callee parameter's own zero/spaces default in this slot and
+    // never writes a post-call value back (there is no caller-side operand
+    // to write back into - see generator/expression-gen.js's generateCall).
+    this.omitted = options.omitted || false;
   }
 }
 

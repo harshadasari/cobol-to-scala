@@ -4,7 +4,30 @@
  */
 
 import { toCamelCase, toPascalCase, mapCobolTypeToScala } from './case-class-gen.js';
-import { generateExpression, convertCondition } from './expression-gen.js';
+import {
+  generateExpression,
+  convertCondition,
+  setAmbiguousParagraphNamesForPerform as setAmbiguousParagraphNamesForPerformExpr,
+} from './expression-gen.js';
+
+/**
+ * The whole-program ambiguous-bare-paragraph-name set (collectAmbiguousParagraphNames,
+ * below) most recently computed by scala-generator.js for the program
+ * currently being generated - module-level state, mirroring
+ * expression-gen.js's own registry-setter pattern (setFieldRegistry et al.),
+ * since generatePerformFromAST (an ordinary PERFORM statement inside a
+ * paragraph body) has no other way to reach it: it's several call frames
+ * below generateMethod/generateAllMethods, which is where this set is
+ * otherwise threaded through. Only consulted for a PERFORM statement that
+ * carries an explicit OF/IN qualifier (`stmt.targetSection` - round-12
+ * bonus finding) - an ordinary unqualified PERFORM is untouched (see
+ * resolvePerformTargetMethodName's doc comment).
+ */
+let CURRENT_AMBIGUOUS_PARAGRAPH_NAMES = new Set();
+
+export function setAmbiguousParagraphNamesForPerform(names) {
+  CURRENT_AMBIGUOUS_PARAGRAPH_NAMES = names instanceof Set ? names : new Set();
+}
 
 /**
  * Convert COBOL paragraph name to Scala method name
@@ -131,7 +154,7 @@ function generateMethodBody(statements, indent = 1) {
  */
 function performBodyLines(stmt, indent) {
   if (stmt.targetParagraph) {
-    return `${'  '.repeat(indent)}${toMethodName(stmt.targetParagraph)}()`;
+    return `${'  '.repeat(indent)}${resolvePerformTargetMethodName(stmt.targetParagraph, stmt.targetSection)}()`;
   }
   if (stmt.statements && stmt.statements.length > 0) {
     return generateMethodBody(stmt.statements, indent);
@@ -158,7 +181,17 @@ function varyingOperandExpr(operand, fallback) {
  */
 function generatePerformFromAST(stmt, indent = 0) {
   const indentStr = '  '.repeat(indent);
-  const target = toMethodName(stmt.targetParagraph || '');
+  // round-12 bonus finding (z12): an explicit OF/IN qualifier
+  // (stmt.targetSection) routes through the collision-aware resolver instead
+  // of a plain unqualified name - but only for the single-target (no THRU)
+  // form; a THRU range's own composite wrapper-method name
+  // (generatePerformThruMethod) is untouched/still built from the plain
+  // unqualified name below (no corpus program combines THRU with an
+  // explicit qualifier, so that combination is deliberately left as-is
+  // rather than guessed at).
+  const target = stmt.throughParagraph
+    ? toMethodName(stmt.targetParagraph || '')
+    : resolvePerformTargetMethodName(stmt.targetParagraph || '', stmt.targetSection);
 
   // Simple PERFORM
   if (stmt.performType === 'simple') {
@@ -491,6 +524,28 @@ export function resolveParagraphMethodName(paragraphName, sectionName, ambiguous
     return sectionPart + bare.charAt(0).toUpperCase() + bare.slice(1);
   }
   return bare;
+}
+
+/**
+ * The method name a PERFORM/GO TO *statement* should call for
+ * `paragraphName`, given whatever explicit OF/IN qualifier (`sectionName`,
+ * from `stmt.targetSection`/`stmt.throughSection` - null for the ordinary
+ * unqualified form) the statement itself carried (round-12 bonus finding,
+ * z12). Routes through resolveParagraphMethodName (the same collision-aware
+ * resolver generateAllMethods/generateSectionMethod already use to *declare*
+ * a qualified method in the first place) using the whole-program ambiguity
+ * set most recently installed by setAmbiguousParagraphNamesForPerform, so an
+ * explicitly qualified reference to a genuinely colliding bare name resolves
+ * to the correct section-qualified method - not the bare (and, for a
+ * colliding name, wrong/others'-shadowing) `toMethodName` this always used
+ * before. An unqualified PERFORM's own reference is untouched (sectionName
+ * is null unless the source itself wrote `OF`/`IN` - the pre-existing,
+ * documented "Known gaps" limitation for a bare would-be-ambiguous reference
+ * is intentionally not addressed here).
+ */
+function resolvePerformTargetMethodName(paragraphName, sectionName) {
+  if (!sectionName) return toMethodName(paragraphName);
+  return resolveParagraphMethodName(paragraphName, sectionName, CURRENT_AMBIGUOUS_PARAGRAPH_NAMES);
 }
 
 /**
@@ -864,6 +919,17 @@ export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
   }
 
   const ambiguousNames = collectAmbiguousParagraphNames(topLevelParagraphs, sections);
+  // round-12 bonus finding: make this same ambiguity set available to
+  // generatePerformFromAST (via resolvePerformTargetMethodName), several
+  // call frames below inside generateMethodNamed/generateMethodBody, for any
+  // PERFORM statement that carries an explicit OF/IN qualifier - see this
+  // module's own setAmbiguousParagraphNamesForPerform doc comment.
+  setAmbiguousParagraphNamesForPerform(ambiguousNames);
+  // Same set, threaded to expression-gen.js's own generatePerform (the
+  // sibling of generatePerformFromAST for a PERFORM nested inside an IF/
+  // EVALUATE/SEARCH branch body, etc.) via its own identically-purposed
+  // setter - see that module's paragraphMethodName/AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM.
+  setAmbiguousParagraphNamesForPerformExpr(ambiguousNames);
   const methods = [];
   const performThrus = new Set();
 

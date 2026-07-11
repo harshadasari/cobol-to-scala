@@ -897,9 +897,32 @@ function parsePerformStatement(ctx) {
   if (hasTarget) {
     stmt.targetParagraph = ctx.advance().value;
 
+    // OF/IN qualifier disambiguating a bare paragraph name that collides
+    // across sections (round-12 bonus finding, z12: `PERFORM PARA-ONE OF
+    // SECTION-B`) - real COBOL requires this qualification whenever the
+    // bare name would otherwise be ambiguous. Previously not consumed at
+    // all: the OF/IN token and the section name after it fell straight
+    // through every remaining clause check below (none of which recognize
+    // OF/IN either) completely unconsumed, corrupting the rest of the
+    // PROCEDURE DIVISION parse - see generator/method-gen.js's
+    // generatePerformFromAST/generator/expression-gen.js's generatePerform
+    // for how targetSection now routes to the collision-aware
+    // resolveParagraphMethodName instead of a plain unqualified method name.
+    if (ctx.matchValue('OF', 'IN')) {
+      if (ctx.check(TokenType.IDENTIFIER)) {
+        stmt.targetSection = ctx.advance().value;
+      }
+    }
+
     if (ctx.matchValue('THRU', 'THROUGH')) {
       if (ctx.check(TokenType.IDENTIFIER)) {
         stmt.throughParagraph = ctx.advance().value;
+
+        if (ctx.matchValue('OF', 'IN')) {
+          if (ctx.check(TokenType.IDENTIFIER)) {
+            stmt.throughSection = ctx.advance().value;
+          }
+        }
       }
     }
   }
@@ -1799,6 +1822,7 @@ function parseCallStatement(ctx) {
     while (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.STRING_LITERAL) ||
            ctx.checkValue('BY') || ctx.checkValue('REFERENCE') ||
            ctx.checkValue('CONTENT') || ctx.checkValue('VALUE') ||
+           ctx.check(TokenType.OMITTED) ||
            ctx.check(TokenType.COMMA)) {
 
       // round-7 finding 1a: `CALL "X" USING BY REFERENCE A, B, C` (commas
@@ -1848,6 +1872,25 @@ function parseCallStatement(ctx) {
       }
       if (ctx.matchValue('VALUE')) {
         currentMode = 'VALUE';
+        continue;
+      }
+
+      // round-12 finding 4: CALL ... USING ... OMITTED ... - a positional
+      // operand explicitly not supplied (legal COBOL; common for a
+      // subprogram that ignores one of its own middle LINKAGE parameters).
+      // The pre-fix loop condition above didn't even recognize the OMITTED
+      // token, so it silently exited the whole USING loop right here,
+      // leaving OMITTED and everything after it (further operands, RETURNING,
+      // the terminating period, ...) unconsumed to corrupt the rest of the
+      // statement parse. Push a placeholder parameter (no value - there is
+      // nothing to reference) rather than dropping the position entirely, so
+      // every argument *after* it still lines up with the right callee
+      // parameter slot - see generator/expression-gen.js's generateCall for
+      // the codegen side (a type-correct zero/spaces default, no write-back).
+      if (ctx.match(TokenType.OMITTED)) {
+        stmt.using.push(new CallParameter({ mode: currentMode, value: null, omitted: true }));
+        if (ctx.checkValue('RETURNING') || ctx.checkValue('ON') ||
+            ctx.checkValue('NOT') || ctx.check(TokenType.PERIOD)) break;
         continue;
       }
 

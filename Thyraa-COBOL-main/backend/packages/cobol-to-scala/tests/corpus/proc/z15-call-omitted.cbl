@@ -1,0 +1,28 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. OMCHECK.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-A PIC 9(4) VALUE 10.
+       01 WS-C PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           DISPLAY "BEFORE A=" WS-A " C=" WS-C.
+           CALL "SUBX" USING WS-A, OMITTED, WS-C.
+           DISPLAY "AFTER  A=" WS-A " C=" WS-C.
+           STOP RUN.
+
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SUBX.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       LINKAGE SECTION.
+       01 LK-A PIC 9(4).
+       01 LK-B PIC 9(4).
+       01 LK-C PIC 9(4).
+       PROCEDURE DIVISION USING LK-A, LK-B, LK-C.
+       SUBX-PARA.
+           ADD 1 TO LK-A.
+           MOVE LK-A TO LK-C.
+           GOBACK.
+       END PROGRAM SUBX.
+       END PROGRAM OMCHECK.

@@ -12,6 +12,12 @@ _(none currently open - all prior pins resolved; see cycle entries. Tracked-OPEN
 
 ## Activity
 
+### 2026-07-11 20:40 — Cycles 28-31: rounds 10-11 committed; round-12 verdict + fix in flight
+- Round-10 committed (a3724cf, 705/0/0, 156 programs): DECLARATIVES support, OPEN-failure FILE STATUS, byte-true LINE SEQUENTIAL WRITE (verified byte-exact vs cobc's packed bytes), ODO record WRITE, ADD/SUBTRACT CORRESPONDING ROUNDED, multi-target COMPUTE (never worked before - inverted parser break).
+- Round-11 committed (1c78ba3, 747/0/0, 172 programs) after a second container restart survived: ODO group DISPLAY wiring, composite-key SEARCH ALL, subscripted INITIALIZE. 13 survivors locked in.
+- Round-12 refutation: NOT CONVERGED at 4: (1) SEVERE parser infinite loop on 88-level WHEN SET TO FALSE (no-progress loop - new failure class); (2) round-11's own SEARCH ALL fix gaps on skipped-middle-key with tied rows; (3) CALL with fewer args than LINKAGE arity; (4) CALL OMITTED corrupts parse stream. Major positive: the 150-line everything-at-once integration program (SECTIONs+DECLARATIVES+file loop+composite SEARCH ALL+edited report+CALL group param+SORT) matched cobc byte-for-byte.
+- Round-12 fix agent in flight (incl. parser no-progress-loop hardening audit + qualified-PERFORM bonus). Trend: 11,16,15,16,6,6,8,4,6,6,3,4. Wall ~20.5h/48h.
+
 ### 2026-07-11 16:10 — Cycles 25-27: rounds 8-9 committed; round-10 verdict + fix in flight
 - Round-8 fixes committed (8c570c4, 633/0/0, 132 programs): group BY REFERENCE marshalling, NUMVAL comma mode, comparison padding, group VALUE slicing + 9 survivor promotions (nested CALL chains, cross-CALL file I/O).
 - Round-9 fixes committed (3b254c8, 667/0/0, 144 programs): EVALUATE padding site, sign-preserving group marshalling, packed-aware VALUE slicing, subscripted-row MOVE, backward THRU fall-through, REMAINDER via stored quotient.

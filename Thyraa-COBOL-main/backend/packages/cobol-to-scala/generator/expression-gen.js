@@ -841,24 +841,39 @@ function generateMultiply(statement, indent = 0) {
  */
 function generateDivide(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
-  const dividend = convertArithmeticExpression(statement.dividend);
-  const divisor = convertArithmeticExpression(statement.divisor);
-  const target = convertIdentifier(statement.target || statement.giving);
+  const lines = [];
 
-  let result = `${indentStr}`;
+  const giving = Array.isArray(statement.giving) ? statement.giving : [statement.giving].filter(Boolean);
+  const into = Array.isArray(statement.into) ? statement.into : [statement.into].filter(Boolean);
 
-  if (statement.giving) {
-    result += `val ${target} = ${dividend} / ${divisor}`;
+  if (giving.length > 0) {
+    // Parser fields: "DIVIDE A BY B"   -> dividend=A, divisor=B
+    //                "DIVIDE A INTO B" -> divisor=A, into=[B]
+    const dividend = into.length > 0
+      ? convertArithmeticExpression(into[0])
+      : convertArithmeticExpression(statement.dividend);
+    const divisor = convertArithmeticExpression(statement.divisor);
+
+    for (const target of giving) {
+      lines.push(`${indentStr}${convertIdentifier(target)} = ${dividend} / ${divisor}`);
+    }
+    if (statement.remainder) {
+      lines.push(`${indentStr}${convertIdentifier(statement.remainder)} = ${dividend} % ${divisor}`);
+    }
+  } else if (into.length > 0) {
+    // DIVIDE A INTO B  -> b = b / a
+    const divisor = convertArithmeticExpression(statement.divisor || statement.dividend);
+    for (const target of into) {
+      const name = convertIdentifier(target);
+      lines.push(`${indentStr}${name} = ${name} / ${divisor}`);
+    }
   } else {
-    result += `${target} = ${dividend} / ${divisor}`;
+    const dividend = convertArithmeticExpression(statement.dividend);
+    const divisor = convertArithmeticExpression(statement.divisor);
+    lines.push(`${indentStr}// DIVIDE with no target: ${dividend} / ${divisor}`);
   }
 
-  if (statement.remainder) {
-    const remainder = convertIdentifier(statement.remainder);
-    result += `\n${indentStr}val ${remainder} = ${dividend} % ${divisor}`;
-  }
-
-  return result;
+  return lines.join('\n');
 }
 
 /**

@@ -104,6 +104,28 @@ test('IF condition converts relational operators', () => {
   assert.match(result.scala, /if custBalance > 1000/);
 });
 
+test('arithmetic statement forms generate correct assignments', () => {
+  const source = `       IDENTIFICATION DIVISION.
+       PROGRAM-ID. ARITH.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           MULTIPLY A BY B GIVING C
+           DIVIDE B BY A GIVING C REMAINDER R
+           DIVIDE A INTO B
+           ADD 1 TO A
+           SUBTRACT A FROM B GIVING C
+           STOP RUN.
+`;
+  const code = convertToScala(source, {}).scala;
+  assert.match(code, /c = a \* b/, 'MULTIPLY GIVING');
+  assert.match(code, /c = b \/ a/, 'DIVIDE BY GIVING');
+  assert.match(code, /r = b % a/, 'DIVIDE REMAINDER');
+  assert.match(code, /b = b \/ a/, 'DIVIDE INTO');
+  assert.match(code, /a = a \+ 1/, 'ADD TO');
+  assert.ok(!code.includes('[object Object]'));
+  assert.ok(!code.includes('??? /*'), `unexpected TODO markers in:\n${code}`);
+});
+
 test('REDEFINES fields do not inflate the record length', () => {
   const source = `       01  DATE-RECORD.
            05  DATE-NUM       PIC 9(8).

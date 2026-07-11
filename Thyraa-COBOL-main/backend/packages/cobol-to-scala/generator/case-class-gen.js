@@ -3,6 +3,15 @@
  * Generate Scala 3 case classes from COBOL record definitions
  */
 
+import {
+  getPicPattern,
+  occursCount,
+  hasOccurs,
+  elementaryByteLength,
+  itemByteLength,
+  scalaBaseType,
+} from './layout.js';
+
 /**
  * Convert COBOL record name to PascalCase
  * CUSTOMER-RECORD -> CustomerRecord
@@ -30,90 +39,25 @@ export function toCamelCase(cobolName) {
  * Map COBOL PIC clause to Scala type
  */
 export function mapCobolTypeToScala(dataItem) {
-  const { picture, usage, occurs } = dataItem;
-
-  let baseType = 'String';
-
-  if (usage) {
-    const usageUpper = usage.toUpperCase();
-    if (usageUpper === 'COMP-1') {
-      baseType = 'Float';
-    } else if (usageUpper === 'COMP-2') {
-      baseType = 'Double';
-    } else if (usageUpper === 'COMP-3' || usageUpper === 'PACKED-DECIMAL') {
-      baseType = 'BigDecimal';
-    }
-  }
-
-  if (picture) {
-    const pic = picture.toUpperCase();
-
-    // Alphanumeric: PIC X(n) or PIC A(n)
-    if (/^[AX](\(\d+\))?$/.test(pic) || /^X+$/.test(pic) || /^A+$/.test(pic)) {
-      baseType = 'String';
-    }
-    // Signed decimal: PIC S9(n)V9(m) or similar
-    else if (/S?9.*V9/.test(pic) || /S?9.*V/.test(pic)) {
-      baseType = 'BigDecimal';
-    }
-    // Numeric with decimal: PIC 9(n)V9(m)
-    else if (/9.*V/.test(pic)) {
-      baseType = 'BigDecimal';
-    }
-    // Pure numeric: PIC 9(n) or PIC 9999
-    else if (/^S?9+$/.test(pic) || /^S?9\(\d+\)$/.test(pic)) {
-      const match = pic.match(/9\((\d+)\)/);
-      const digits = match ? parseInt(match[1], 10) : pic.replace(/S/g, '').length;
-
-      if (digits <= 9) {
-        baseType = 'Int';
-      } else {
-        baseType = 'Long';
-      }
-    }
-  }
-
-  // Handle OCCURS - wrap in Vector
-  if (occurs && occurs > 1) {
+  const baseType = scalaBaseType(dataItem);
+  if (hasOccurs(dataItem) && occursCount(dataItem) > 1) {
     return `Vector[${baseType}]`;
   }
-
   return baseType;
 }
 
 /**
- * Calculate field length from PIC clause
+ * Calculate total field length in bytes (including all OCCURS elements)
  */
 export function calculateFieldLength(dataItem) {
-  const { picture, usage } = dataItem;
-
-  if (!picture) return 0;
-
-  const pic = picture.toUpperCase();
-  let length = 0;
-
-  // Count characters considering (n) notation
-  const expanded = pic.replace(/([X9AVS])\((\d+)\)/g, (_, char, count) => {
-    return char.repeat(parseInt(count, 10));
-  });
-
-  // Remove sign indicators and decimal points for counting
-  const countable = expanded.replace(/[SV]/g, '');
-  length = countable.length;
-
-  // COMP-3 packed decimal uses fewer bytes
-  if (usage && usage.toUpperCase() === 'COMP-3') {
-    length = Math.ceil((length + 1) / 2);
-  }
-
-  return length;
+  return itemByteLength(dataItem);
 }
 
 /**
  * Generate a case class from a COBOL data item (record)
  */
 export function generateCaseClass(dataItem, indent = 0) {
-  const { name, children, level } = dataItem;
+  const { name, children } = dataItem;
 
   if (!name || !children || children.length === 0) {
     return '';
@@ -133,50 +77,90 @@ export function generateCaseClass(dataItem, indent = 0) {
 
   // Generate field definitions
   const fields = [];
+  const usedNames = new Set();
+  let fillerIndex = 0;
   let totalLength = 0;
 
   for (const child of children) {
     // Skip level 88 conditions (handled by enum generator)
     if (child.level === 88) continue;
 
-    const fieldName = toCamelCase(child.name);
-    let fieldType;
+    // REDEFINES entries overlay storage that is already accounted for by
+    // the redefined field; emitting them as extra constructor parameters
+    // would corrupt offsets, so they are skipped with a marker comment.
+    if (child.redefines) {
+      fields.push({
+        skipped: true,
+        comment: `// REDEFINES ${child.redefines}: ${child.name} shares the same storage (not generated)`
+      });
+      continue;
+    }
+
+    // FILLER fields must still occupy bytes but need unique Scala names
+    let fieldName = toCamelCase(child.name);
+    if (child.isFiller || !fieldName) {
+      fillerIndex += 1;
+      fieldName = `filler${fillerIndex}`;
+    }
+    while (usedNames.has(fieldName)) {
+      fillerIndex += 1;
+      fieldName = `${fieldName}${fillerIndex}`;
+    }
+    usedNames.add(fieldName);
+
+    const count = occursCount(child);
+    const isTable = hasOccurs(child) && count > 1;
 
     // Check if this is a group item (has children that aren't just 88 levels)
     const hasRealChildren = child.children &&
       child.children.some(c => c.level !== 88);
 
+    let fieldType;
     if (hasRealChildren) {
       fieldType = toPascalCase(child.name);
-      if (child.occurs && child.occurs > 1) {
+      if (isTable) {
         fieldType = `Vector[${fieldType}]`;
       }
     } else {
       fieldType = mapCobolTypeToScala(child);
     }
 
-    const fieldLength = calculateFieldLength(child);
-    totalLength += fieldLength * (child.occurs || 1);
+    // Length of one occurrence; totalLength accumulates all occurrences
+    const elementLength = hasRealChildren
+      ? itemByteLength({ ...child, occurs: null })
+      : elementaryByteLength(child);
+    totalLength += elementLength * count;
 
     fields.push({
       name: fieldName,
       type: fieldType,
       cobolName: child.name,
-      length: fieldLength,
-      occurs: child.occurs
+      length: elementLength,
+      occurs: count,
+      isTable,
+      isGroup: hasRealChildren,
+      decimalDigits: child.pic?.decimalDigits || 0
     });
   }
+
+  const realFields = fields.filter(f => !f.skipped);
 
   // Build case class definition
   lines.push(`${indentStr}case class ${className}(`);
 
-  const fieldDefs = fields.map((field, index) => {
-    const comma = index < fields.length - 1 ? ',' : '';
-    return `${indentStr}  ${field.name}: ${field.type}${comma}`;
+  realFields.forEach((field, index) => {
+    const comma = index < realFields.length - 1 ? ',' : '';
+    lines.push(`${indentStr}  ${field.name}: ${field.type}${comma}`);
   });
 
-  lines.push(...fieldDefs);
   lines.push(`${indentStr})`);
+
+  // Surface skipped REDEFINES entries so nothing disappears silently
+  for (const field of fields) {
+    if (field.skipped) {
+      lines.push(`${indentStr}${field.comment}`);
+    }
+  }
 
   // Generate companion object
   lines.push('');
@@ -188,34 +172,31 @@ export function generateCaseClass(dataItem, indent = 0) {
   lines.push(`${indentStr}  def parse(bytes: Array[Byte]): ${className} =`);
   lines.push(`${indentStr}    var offset = 0`);
 
-  for (const field of fields) {
-    if (field.type === 'String') {
-      lines.push(`${indentStr}    val ${field.name} = new String(bytes.slice(offset, offset + ${field.length})).trim`);
-      lines.push(`${indentStr}    offset += ${field.length}`);
-    } else if (field.type === 'Int') {
-      lines.push(`${indentStr}    val ${field.name} = new String(bytes.slice(offset, offset + ${field.length})).trim.toIntOption.getOrElse(0)`);
-      lines.push(`${indentStr}    offset += ${field.length}`);
-    } else if (field.type === 'Long') {
-      lines.push(`${indentStr}    val ${field.name} = new String(bytes.slice(offset, offset + ${field.length})).trim.toLongOption.getOrElse(0L)`);
-      lines.push(`${indentStr}    offset += ${field.length}`);
-    } else if (field.type === 'BigDecimal') {
-      lines.push(`${indentStr}    val ${field.name} = BigDecimal(new String(bytes.slice(offset, offset + ${field.length})).trim)`);
-      lines.push(`${indentStr}    offset += ${field.length}`);
-    } else if (field.type.startsWith('Vector[')) {
+  for (const field of realFields) {
+    if (field.isTable && field.isGroup) {
       const innerType = field.type.replace('Vector[', '').replace(']', '');
       lines.push(`${indentStr}    val ${field.name} = (0 until ${field.occurs}).map { _ =>`);
       lines.push(`${indentStr}      val elem = ${innerType}.parse(bytes.slice(offset, offset + ${innerType}.recordLength))`);
       lines.push(`${indentStr}      offset += ${innerType}.recordLength`);
       lines.push(`${indentStr}      elem`);
       lines.push(`${indentStr}    }.toVector`);
-    } else {
-      // Nested case class
+    } else if (field.isTable) {
+      const innerType = field.type.replace('Vector[', '').replace(']', '');
+      lines.push(`${indentStr}    val ${field.name} = (0 until ${field.occurs}).map { _ =>`);
+      lines.push(`${indentStr}      val elem = ${primitiveParseExpr(innerType, field)}`);
+      lines.push(`${indentStr}      offset += ${field.length}`);
+      lines.push(`${indentStr}      elem`);
+      lines.push(`${indentStr}    }.toVector`);
+    } else if (field.isGroup) {
       lines.push(`${indentStr}    val ${field.name} = ${field.type}.parse(bytes.slice(offset, offset + ${field.type}.recordLength))`);
       lines.push(`${indentStr}    offset += ${field.type}.recordLength`);
+    } else {
+      lines.push(`${indentStr}    val ${field.name} = ${primitiveParseExpr(field.type, field)}`);
+      lines.push(`${indentStr}    offset += ${field.length}`);
     }
   }
 
-  lines.push(`${indentStr}    ${className}(${fields.map(f => f.name).join(', ')})`);
+  lines.push(`${indentStr}    ${className}(${realFields.map(f => f.name).join(', ')})`);
   lines.push('');
 
   // Generate format method
@@ -223,30 +204,29 @@ export function generateCaseClass(dataItem, indent = 0) {
   lines.push(`${indentStr}    val buffer = new Array[Byte](recordLength)`);
   lines.push(`${indentStr}    var offset = 0`);
 
-  for (const field of fields) {
-    if (field.type === 'String') {
-      lines.push(`${indentStr}    val ${field.name}Bytes = record.${field.name}.padTo(${field.length}, ' ').take(${field.length}).getBytes`);
-      lines.push(`${indentStr}    System.arraycopy(${field.name}Bytes, 0, buffer, offset, ${field.length})`);
-      lines.push(`${indentStr}    offset += ${field.length}`);
-    } else if (field.type === 'Int' || field.type === 'Long') {
-      lines.push(`${indentStr}    val ${field.name}Str = record.${field.name}.toString.reverse.padTo(${field.length}, '0').reverse.take(${field.length})`);
-      lines.push(`${indentStr}    System.arraycopy(${field.name}Str.getBytes, 0, buffer, offset, ${field.length})`);
-      lines.push(`${indentStr}    offset += ${field.length}`);
-    } else if (field.type === 'BigDecimal') {
-      lines.push(`${indentStr}    val ${field.name}Str = record.${field.name}.toString.reverse.padTo(${field.length}, '0').reverse.take(${field.length})`);
-      lines.push(`${indentStr}    System.arraycopy(${field.name}Str.getBytes, 0, buffer, offset, ${field.length})`);
-      lines.push(`${indentStr}    offset += ${field.length}`);
-    } else if (field.type.startsWith('Vector[')) {
+  for (const field of realFields) {
+    if (field.isTable && field.isGroup) {
       const innerType = field.type.replace('Vector[', '').replace(']', '');
       lines.push(`${indentStr}    record.${field.name}.foreach { elem =>`);
       lines.push(`${indentStr}      val elemBytes = ${innerType}.format(elem)`);
       lines.push(`${indentStr}      System.arraycopy(elemBytes, 0, buffer, offset, ${innerType}.recordLength)`);
       lines.push(`${indentStr}      offset += ${innerType}.recordLength`);
       lines.push(`${indentStr}    }`);
-    } else {
+    } else if (field.isTable) {
+      const innerType = field.type.replace('Vector[', '').replace(']', '');
+      lines.push(`${indentStr}    record.${field.name}.foreach { elem =>`);
+      lines.push(`${indentStr}      val elemBytes = ${primitiveFormatExpr(innerType, field, 'elem')}`);
+      lines.push(`${indentStr}      System.arraycopy(elemBytes, 0, buffer, offset, ${field.length})`);
+      lines.push(`${indentStr}      offset += ${field.length}`);
+      lines.push(`${indentStr}    }`);
+    } else if (field.isGroup) {
       lines.push(`${indentStr}    val ${field.name}Bytes = ${field.type}.format(record.${field.name})`);
       lines.push(`${indentStr}    System.arraycopy(${field.name}Bytes, 0, buffer, offset, ${field.type}.recordLength)`);
       lines.push(`${indentStr}    offset += ${field.type}.recordLength`);
+    } else {
+      lines.push(`${indentStr}    val ${field.name}Bytes = ${primitiveFormatExpr(field.type, field, `record.${field.name}`)}`);
+      lines.push(`${indentStr}    System.arraycopy(${field.name}Bytes, 0, buffer, offset, ${field.length})`);
+      lines.push(`${indentStr}    offset += ${field.length}`);
     }
   }
 
@@ -259,6 +239,53 @@ export function generateCaseClass(dataItem, indent = 0) {
   }
 
   return lines.join('\n');
+}
+
+/**
+ * Scala expression that decodes one primitive value from `bytes` at `offset`.
+ * DISPLAY numerics with an implied decimal (PIC 9(5)V99) carry no decimal
+ * point in the stored bytes, so the value is rescaled after reading.
+ */
+function primitiveParseExpr(scalaType, field) {
+  const slice = `new String(bytes.slice(offset, offset + ${field.length})).trim`;
+  switch (scalaType) {
+    case 'Int':
+      return `${slice}.toIntOption.getOrElse(0)`;
+    case 'Long':
+      return `${slice}.toLongOption.getOrElse(0L)`;
+    case 'Float':
+      return `${slice}.toFloatOption.getOrElse(0.0f)`;
+    case 'Double':
+      return `${slice}.toDoubleOption.getOrElse(0.0)`;
+    case 'BigDecimal':
+      if (field.decimalDigits > 0) {
+        return `BigDecimal(${slice}.replaceAll("[^0-9+-]", "") match { case "" => "0"; case s => s }) / BigDecimal(10).pow(${field.decimalDigits})`;
+      }
+      return `BigDecimal(${slice} match { case "" => "0"; case s => s })`;
+    default:
+      return slice;
+  }
+}
+
+/**
+ * Scala expression producing the fixed-width byte encoding of one value.
+ */
+function primitiveFormatExpr(scalaType, field, valueExpr) {
+  switch (scalaType) {
+    case 'Int':
+    case 'Long':
+      return `${valueExpr}.toString.reverse.padTo(${field.length}, '0').reverse.take(${field.length}).getBytes`;
+    case 'Float':
+    case 'Double':
+      return `${valueExpr}.toString.reverse.padTo(${field.length}, '0').reverse.take(${field.length}).getBytes`;
+    case 'BigDecimal':
+      if (field.decimalDigits > 0) {
+        return `(${valueExpr} * BigDecimal(10).pow(${field.decimalDigits})).toBigInt.toString.reverse.padTo(${field.length}, '0').reverse.take(${field.length}).getBytes`;
+      }
+      return `${valueExpr}.toBigInt.toString.reverse.padTo(${field.length}, '0').reverse.take(${field.length}).getBytes`;
+    default:
+      return `${valueExpr}.padTo(${field.length}, ' ').take(${field.length}).getBytes`;
+  }
 }
 
 export default {

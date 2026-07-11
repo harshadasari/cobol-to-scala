@@ -4,6 +4,7 @@
  */
 
 import { toPascalCase, toCamelCase, generateCaseClass } from './case-class-gen.js';
+import { getPicPattern, scalaBaseType } from './layout.js';
 import { generateAllEnums, groupLevel88sByParent } from './enum-gen.js';
 import { generateExpression } from './expression-gen.js';
 import { generateMethod, generateAllMethods, toMethodName } from './method-gen.js';
@@ -146,7 +147,7 @@ function hasDateTimeOperations(ast) {
 function hasBigDecimalFields(ast) {
   const dataItems = collectDataItems(ast);
   return dataItems.some(item => {
-    const pic = item.picture?.toUpperCase() || '';
+    const pic = getPicPattern(item);
     return pic.includes('V') || pic.includes('S9');
   });
 }
@@ -365,24 +366,7 @@ function generateWorkingStorageFields(ast, indent = 1) {
  * Map simple COBOL type to Scala type
  */
 function mapSimpleType(item) {
-  const pic = item.picture?.toUpperCase() || '';
-  const usage = item.usage?.toUpperCase() || '';
-
-  if (usage === 'COMP-1') return 'Float';
-  if (usage === 'COMP-2') return 'Double';
-  if (usage === 'COMP-3') return 'BigDecimal';
-
-  if (pic.includes('V') || pic.includes('S9')) return 'BigDecimal';
-
-  if (/^[AX]/.test(pic)) return 'String';
-
-  if (/^9/.test(pic)) {
-    const match = pic.match(/9\((\d+)\)/);
-    const digits = match ? parseInt(match[1], 10) : pic.length;
-    return digits <= 9 ? 'Int' : 'Long';
-  }
-
-  return 'String';
+  return scalaBaseType(item);
 }
 
 /**

@@ -8,5 +8,8 @@
     ".": "./index.js",
     "./parser": "./parser/index.js",
     "./generator": "./generator/index.js"
+  },
+  "scripts": {
+    "test": "node --test 'tests/**/*.test.js'"
   }
 }

@@ -127,13 +127,23 @@ function parsePicPattern(pattern) {
     }
   }
 
+  // CR and DB are two-character trailing sign symbols occupying two
+  // storage positions; extract them before the per-character scan so the
+  // letters C/R/D/B are not misread.
+  let trailingSignPositions = 0;
+  if (expanded.endsWith('CR') || expanded.endsWith('DB')) {
+    trailingSignPositions = 2;
+    expanded = expanded.slice(0, -2);
+  }
+
   // Analyze expanded pattern
   let hasSign = false;
   let hasDecimal = false;
   let intDigits = 0;
   let decDigits = 0;
-  let alphaCount = 0;
-  let numericCount = 0;
+  let alphaCount = 0;  // A positions (alphabetic)
+  let xCount = 0;      // X positions (alphanumeric)
+  let digitCount = 0;
   let editChars = 0;
   let inDecimalPart = false;
 
@@ -147,7 +157,7 @@ function parsePicPattern(pattern) {
         inDecimalPart = true;
         break;
       case '9':
-        numericCount++;
+        digitCount++;
         if (inDecimalPart) {
           decDigits++;
         } else {
@@ -155,50 +165,68 @@ function parsePicPattern(pattern) {
         }
         break;
       case 'X':
-        alphaCount++;
+        xCount++;
         break;
       case 'A':
         alphaCount++;
         break;
       case 'Z':
       case '*':
+        // Zero-suppression positions hold a digit or a space
+        editChars++;
+        digitCount++;
+        if (inDecimalPart) {
+          decDigits++;
+        } else {
+          intDigits++;
+        }
+        break;
       case '+':
       case '-':
       case '$':
       case ',':
+      case 'B':
+      case '0':
+      case '/':
+        // Insertion characters occupy one storage position each
+        editChars++;
+        break;
       case '.':
         editChars++;
-        if (char === '.' && !inDecimalPart) {
+        if (!inDecimalPart) {
           inDecimalPart = true;
         }
-        numericCount++;
         break;
       case 'P':
-        // Scaling position - counts as decimal position
+        // Scaling position - affects the decimal point but occupies no storage
         if (inDecimalPart) {
           decDigits++;
         } else {
-          // P before V acts as negative scaling
           decDigits--;
         }
         break;
     }
   }
 
-  // Determine data type
-  if (alphaCount > 0 && numericCount === 0) {
+  editChars += trailingSignPositions;
+
+  // Determine data type and storage length in character positions.
+  // S, V and P never occupy storage (sign/decimal are implied unless
+  // SIGN SEPARATE is specified, which is handled at the usage level).
+  // A = alphabetic-only, X = alphanumeric.
+  if (alphaCount > 0 && xCount === 0 && digitCount === 0) {
     pic.dataType = 'alphabetic';
     pic.length = alphaCount;
-  } else if (alphaCount > 0 || expanded.includes('X')) {
+  } else if (xCount > 0 || alphaCount > 0) {
     pic.dataType = 'alphanumeric';
-    pic.length = expanded.length - (hasSign ? 1 : 0) - (hasDecimal ? 1 : 0);
+    pic.length = xCount + alphaCount + digitCount + editChars;
   } else if (editChars > 0) {
     pic.dataType = 'edited';
-    pic.length = expanded.length - (hasSign ? 1 : 0) - (hasDecimal ? 1 : 0);
-    pic.editPattern = expanded;
+    pic.length = digitCount + editChars;
+    pic.editPattern = expanded + (trailingSignPositions ? pattern.toUpperCase().slice(-2) : '');
   } else {
     pic.dataType = 'numeric';
-    pic.length = intDigits + decDigits;
+    pic.length = digitCount;
   }
 
   pic.integerDigits = intDigits;
@@ -219,7 +247,14 @@ function parsePicClause(ctx) {
     ctx.matchValue('IS');
   }
 
-  // Collect PIC pattern tokens
+  // Preferred path: the lexer captured the whole picture character-string
+  // as a single PICTURE_STRING token (see Lexer.scanPictureString).
+  if (ctx.check(TokenType.PICTURE_STRING)) {
+    return parsePicPattern(ctx.advance().value);
+  }
+
+  // Legacy fallback: reassemble the pattern from individual tokens
+  // (only reachable for token streams not produced by our lexer).
   let pattern = '';
   const picTokens = [
     TokenType.IDENTIFIER,
@@ -519,9 +554,10 @@ function parseDataItem(ctx) {
       continue;
     }
 
-    // USAGE clause
+    // USAGE clause (COMP/COMPUTATIONAL carry optional -1..-5 suffixes,
+    // e.g. COMP-3, which are lexed as single hyphenated tokens)
     if (ctx.checkValue('USAGE') ||
-        ctx.checkValue('COMP') || ctx.checkValue('COMPUTATIONAL') ||
+        /^(COMP|COMPUTATIONAL)(-[1-5])?$/i.test(current.value || '') ||
         ctx.checkValue('BINARY') || ctx.checkValue('PACKED-DECIMAL') ||
         ctx.checkValue('INDEX') || ctx.checkValue('DISPLAY') || ctx.checkValue('POINTER')) {
       item.usage = parseUsageClause(ctx);
@@ -1011,14 +1047,38 @@ export function parseDataDivision(tokens) {
   };
 
   // Find DATA DIVISION
+  let foundDivision = false;
   while (!ctx.isAtEnd()) {
     if (ctx.checkValue('DATA') && ctx.peek(1)?.value?.toUpperCase() === 'DIVISION') {
       ctx.advance(); // DATA
       ctx.advance(); // DIVISION
       ctx.skipPeriod();
+      foundDivision = true;
       break;
     }
     ctx.advance();
+  }
+
+  // Standalone copybook mode: copybooks are bare record fragments with no
+  // DATA DIVISION or section headers. When the source starts directly with
+  // level-numbered data items, parse them as a working-storage section.
+  if (!foundDivision) {
+    ctx.position = 0;
+    const startsWithDataItem = !ctx.isAtEnd() && (
+      ctx.check(TokenType.LEVEL_NUMBER) ||
+      (ctx.check(TokenType.NUMERIC_LITERAL) && /^\d{1,2}$/.test(ctx.current().value || ''))
+    );
+    const hasSectionHeaders = tokens.some(t =>
+      t.type === TokenType.WORKING_STORAGE ||
+      t.type === TokenType.FILE_SECTION ||
+      t.type === TokenType.LINKAGE ||
+      t.type === TokenType.LOCAL_STORAGE
+    );
+
+    if (startsWithDataItem && !hasSectionHeaders) {
+      result.workingStorageSection = parseWorkingStorageSection(ctx);
+      return result;
+    }
   }
 
   // Parse sections

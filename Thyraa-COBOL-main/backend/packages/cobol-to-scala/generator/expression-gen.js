@@ -100,7 +100,32 @@ function convertIdentifier(cobolId) {
     return toCamelCase(cobolId.name);
   }
 
-  return String(cobolId);
+  return safeNodeString(cobolId);
+}
+
+/**
+ * Render an unrecognized AST node as valid Scala instead of the useless
+ * "[object Object]" produced by String(object). Extracts the most likely
+ * payload (value/name/pattern) or, failing that, emits a TODO comment
+ * carrying the node type so the generated code still compiles and the
+ * unconverted construct is visible to a reviewer.
+ */
+function safeNodeString(node) {
+  if (node === null || node === undefined) return '';
+  if (typeof node !== 'object') return String(node);
+
+  if (node.value !== undefined && typeof node.value !== 'object') {
+    return convertLiteral(node.value);
+  }
+  if (typeof node.name === 'string' && node.name) {
+    return toCamelCase(node.name);
+  }
+  if (typeof node.pattern === 'string' && node.pattern) {
+    return `"${node.pattern}"`;
+  }
+
+  const nodeType = node.type || node.constructor?.name || 'unknown';
+  return `??? /* TODO: unsupported COBOL construct (${nodeType}) */`;
 }
 
 /**
@@ -125,6 +150,10 @@ function convertLiteral(value) {
     return value.toString();
   }
 
+  if (typeof value === 'object') {
+    return safeNodeString(value);
+  }
+
   return String(value);
 }
 
@@ -141,6 +170,37 @@ export function convertArithmeticExpression(expr) {
       return convertIdentifier(strExpr);
     }
     return strExpr;
+  }
+
+  // Nodes produced by the procedure parser (parser/ast.js shapes)
+  if (expr.type === 'ArithmeticExpression') {
+    if (expr.unaryMinus) {
+      return `-${convertArithmeticExpression(expr.right)}`;
+    }
+    if (expr.operator && expr.left != null && expr.right != null) {
+      const left = convertArithmeticExpression(expr.left);
+      const right = convertArithmeticExpression(expr.right);
+      if (expr.operator === '**') {
+        return `Math.pow(${left}, ${right})`;
+      }
+      const op = ARITHMETIC_OPERATORS[expr.operator] || expr.operator;
+      return `(${left} ${op} ${right})`;
+    }
+    if (expr.variable) {
+      return convertIdentifier(expr.variable);
+    }
+    if (expr.value !== null && expr.value !== undefined) {
+      return convertLiteral(expr.value);
+    }
+    return '0';
+  }
+
+  if (expr.type === 'VariableReference') {
+    return convertIdentifier(expr);
+  }
+
+  if (expr.type === 'Literal') {
+    return convertLiteral(expr.value);
   }
 
   if (expr.type === 'literal') {
@@ -174,7 +234,7 @@ export function convertArithmeticExpression(expr) {
     return `${funcName}(${args})`;
   }
 
-  return String(expr);
+  return safeNodeString(expr);
 }
 
 /**
@@ -212,16 +272,23 @@ function convertCobolFunction(funcName) {
  */
 export function generateCompute(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
-  const target = convertIdentifier(statement.target);
   const expression = convertArithmeticExpression(statement.expression);
 
-  // Determine if it's a val or var assignment
-  const keyword = statement.isNew ? 'val' : '';
+  // COMPUTE supports multiple targets: COMPUTE A B = expression
+  const targets = Array.isArray(statement.targets) && statement.targets.length > 0
+    ? statement.targets
+    : [statement.target].filter(Boolean);
 
-  if (keyword) {
-    return `${indentStr}${keyword} ${target} = ${expression}`;
+  if (targets.length === 0) {
+    return `${indentStr}// COMPUTE with no resolvable target: ${expression}`;
   }
-  return `${indentStr}${target} = ${expression}`;
+
+  const keyword = statement.isNew ? 'val ' : '';
+  const rounded = statement.rounded ? ' // ROUNDED' : '';
+
+  return targets
+    .map(target => `${indentStr}${keyword}${convertIdentifier(target)} = ${expression}${rounded}`)
+    .join('\n');
 }
 
 /**
@@ -291,6 +358,59 @@ export function convertCondition(condition) {
     return condition;
   }
 
+  // Nodes produced by the procedure parser (parser/ast.js shapes)
+  if (condition.type === 'RelationalCondition') {
+    const left = convertArithmeticExpression(condition.subject);
+    const right = convertArithmeticExpression(condition.object);
+    const rawOp = condition.relationalOperator || '=';
+    const op = rawOp === '<>' ? '!=' : (COMPARISON_OPERATORS[rawOp] || rawOp);
+    return `${left} ${op} ${right}`;
+  }
+
+  if (condition.type === 'Condition') {
+    const wrapNegated = expr => condition.negated ? `!(${expr})` : expr;
+
+    switch (condition.conditionType) {
+      case 'compound': {
+        const op = LOGICAL_OPERATORS[condition.operator?.toUpperCase()] || condition.operator;
+        if (condition.operator?.toUpperCase() === 'NOT') {
+          return `!(${convertCondition(condition.right || condition.left)})`;
+        }
+        return `(${convertCondition(condition.left)} ${op} ${convertCondition(condition.right)})`;
+      }
+      case 'class': {
+        const field = convertArithmeticExpression(condition.subject);
+        switch (condition.classType?.toUpperCase()) {
+          case 'NUMERIC':
+            return wrapNegated(`${field}.forall(_.isDigit)`);
+          case 'ALPHABETIC':
+            return wrapNegated(`${field}.forall(_.isLetter)`);
+          case 'ALPHABETIC-LOWER':
+            return wrapNegated(`${field}.forall(c => c.isLetter && c.isLower)`);
+          case 'ALPHABETIC-UPPER':
+            return wrapNegated(`${field}.forall(c => c.isLetter && c.isUpper)`);
+          default:
+            return wrapNegated(`true /* ${condition.classType} class test */`);
+        }
+      }
+      case 'sign': {
+        const field = convertArithmeticExpression(condition.subject);
+        switch (condition.signType?.toUpperCase()) {
+          case 'POSITIVE':
+            return wrapNegated(`${field} > 0`);
+          case 'NEGATIVE':
+            return wrapNegated(`${field} < 0`);
+          default:
+            return wrapNegated(`${field} == 0`);
+        }
+      }
+      case 'simple':
+      default:
+        // Level-88 condition name used as a boolean
+        return wrapNegated(convertArithmeticExpression(condition.subject));
+    }
+  }
+
   if (condition.type === 'comparison') {
     const left = convertArithmeticExpression(condition.left);
     const right = convertArithmeticExpression(condition.right);
@@ -348,7 +468,7 @@ export function convertCondition(condition) {
     }
   }
 
-  return String(condition);
+  return safeNodeString(condition);
 }
 
 /**

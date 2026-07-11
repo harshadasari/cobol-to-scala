@@ -38,6 +38,10 @@ export const TokenType = {
   // PIC/PICTURE Clause
   PIC: 'PIC',
   PICTURE: 'PICTURE',
+  // Entire picture character-string captured as one token by the lexer
+  // (e.g. "9(6)", "X(30)", "S9(7)V99", "ZZ,ZZ9.99"). Digits inside a picture
+  // must never be re-tokenized as level numbers or numeric literals.
+  PICTURE_STRING: 'PICTURE_STRING',
   PIC_X: 'X',
   PIC_A: 'A',
   PIC_9: '9',

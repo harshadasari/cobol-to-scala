@@ -1,0 +1,179 @@
+/**
+ * layout.js
+ * Shared record-layout helpers for the Scala generators.
+ *
+ * The parser produces DataItem AST nodes whose PIC clause is a PicClause
+ * object on `item.pic` and whose OCCURS clause is an OccursClause object on
+ * `item.occurs`. Earlier generator code expected plain `item.picture` strings
+ * and numeric `item.occurs`, which silently produced zero lengths. These
+ * helpers accept both shapes so every generator computes storage identically.
+ */
+
+/**
+ * Get the raw picture pattern string for a data item, regardless of AST shape.
+ */
+export function getPicPattern(item) {
+  if (!item) return '';
+  if (item.pic && typeof item.pic === 'object' && item.pic.pattern) {
+    return String(item.pic.pattern).toUpperCase();
+  }
+  if (typeof item.pic === 'string') {
+    return item.pic.toUpperCase();
+  }
+  if (typeof item.picture === 'string') {
+    return item.picture.toUpperCase();
+  }
+  return '';
+}
+
+/**
+ * Get the number of array elements an item occupies (1 when no OCCURS).
+ * Handles OccursClause objects, plain numbers and fixed/variable tables
+ * (DEPENDING ON uses the maximum so byte layouts stay fixed-length).
+ */
+export function occursCount(item) {
+  const occurs = item?.occurs;
+  if (!occurs) return 1;
+  if (typeof occurs === 'number') return occurs > 0 ? occurs : 1;
+  const count = occurs.times || occurs.maxTimes || occurs.minTimes || 1;
+  return count > 0 ? count : 1;
+}
+
+/**
+ * True when the item declares an OCCURS clause (even OCCURS 1).
+ */
+export function hasOccurs(item) {
+  return item?.occurs != null;
+}
+
+/**
+ * Number of storage character positions described by a picture pattern.
+ * Prefers the parsed PicClause; falls back to expanding the raw pattern.
+ */
+function picStorageLength(item) {
+  if (item.pic && typeof item.pic === 'object' && typeof item.pic.length === 'number') {
+    return item.pic.length;
+  }
+
+  const pattern = getPicPattern(item);
+  if (!pattern) return 0;
+
+  let expanded = pattern.replace(/([A-Z90*+\-$,./])\((\d+)\)/gi, (_, char, count) =>
+    char.repeat(parseInt(count, 10))
+  );
+  if (expanded.endsWith('CR') || expanded.endsWith('DB')) {
+    // CR/DB occupy two positions; strip so C/R/D/B aren't counted again
+    expanded = expanded.slice(0, -2) + '##';
+  }
+  // S, V and P are implied - they occupy no storage
+  return expanded.replace(/[SVP]/g, '').length;
+}
+
+/**
+ * Total digit count of a numeric picture (for COMP/COMP-3 sizing).
+ */
+function picDigits(item) {
+  if (item.pic && typeof item.pic === 'object') {
+    const { integerDigits = 0, decimalDigits = 0 } = item.pic;
+    const digits = integerDigits + Math.max(decimalDigits, 0);
+    if (digits > 0) return digits;
+  }
+  const pattern = getPicPattern(item);
+  const expanded = pattern.replace(/9\((\d+)\)/g, (_, count) => '9'.repeat(parseInt(count, 10)));
+  return (expanded.match(/9/g) || []).length;
+}
+
+/**
+ * Storage bytes of a single occurrence of an elementary item,
+ * honoring the USAGE clause:
+ *   DISPLAY      one byte per picture position
+ *   COMP/BINARY  2 bytes (1-4 digits), 4 bytes (5-9), 8 bytes (10-18)
+ *   COMP-1       4 bytes    COMP-2  8 bytes
+ *   COMP-3       ceil((digits + 1) / 2) packed bytes
+ *   SIGN SEPARATE adds one byte to DISPLAY numerics
+ */
+export function elementaryByteLength(item) {
+  const usage = (item.usage || 'DISPLAY').toUpperCase();
+
+  if (usage === 'COMP-1' || usage === 'COMPUTATIONAL-1') return 4;
+  if (usage === 'COMP-2' || usage === 'COMPUTATIONAL-2') return 8;
+
+  if (usage === 'COMP-3' || usage === 'COMPUTATIONAL-3' || usage === 'PACKED-DECIMAL') {
+    return Math.ceil((picDigits(item) + 1) / 2);
+  }
+
+  if (usage === 'COMP' || usage === 'COMP-4' || usage === 'COMP-5' ||
+      usage === 'COMPUTATIONAL' || usage === 'COMPUTATIONAL-4' ||
+      usage === 'COMPUTATIONAL-5' || usage === 'BINARY') {
+    const digits = picDigits(item);
+    if (digits <= 4) return 2;
+    if (digits <= 9) return 4;
+    return 8;
+  }
+
+  let length = picStorageLength(item);
+  if (item.sign && item.sign.separate) {
+    length += 1;
+  }
+  return length;
+}
+
+/**
+ * Total storage bytes of a data item including all occurrences.
+ * Group items sum their children recursively. Level-88 condition entries
+ * and REDEFINES entries occupy no additional storage.
+ */
+export function itemByteLength(item) {
+  if (!item) return 0;
+  if (item.level === 88) return 0;
+
+  const realChildren = (item.children || []).filter(
+    child => child.level !== 88 && !child.redefines
+  );
+
+  const single = realChildren.length > 0
+    ? realChildren.reduce((sum, child) => sum + itemByteLength(child), 0)
+    : elementaryByteLength(item);
+
+  return single * occursCount(item);
+}
+
+/**
+ * Map an elementary COBOL item to a Scala type (before OCCURS wrapping).
+ */
+export function scalaBaseType(item) {
+  const usage = (item.usage || '').toUpperCase();
+
+  if (usage === 'COMP-1' || usage === 'COMPUTATIONAL-1') return 'Float';
+  if (usage === 'COMP-2' || usage === 'COMPUTATIONAL-2') return 'Double';
+
+  const pic = item.pic && typeof item.pic === 'object' ? item.pic : null;
+  const pattern = getPicPattern(item);
+
+  const dataType = pic?.dataType ||
+    (/[XA]/.test(pattern) ? 'alphanumeric'
+      : /[Z*+$,]|CR$|DB$/.test(pattern) ? 'edited'
+      : pattern ? 'numeric' : 'alphanumeric');
+
+  if (dataType === 'alphabetic' || dataType === 'alphanumeric' || dataType === 'edited') {
+    return 'String';
+  }
+
+  const decimals = pic ? pic.decimalDigits : (/V/.test(pattern) ? 1 : 0);
+  if (decimals > 0 || usage === 'COMP-3' || usage === 'COMPUTATIONAL-3' || usage === 'PACKED-DECIMAL') {
+    return 'BigDecimal';
+  }
+
+  const digits = picDigits(item);
+  if (digits === 0) return 'String';
+  return digits <= 9 ? 'Int' : 'Long';
+}
+
+export default {
+  getPicPattern,
+  occursCount,
+  hasOccurs,
+  elementaryByteLength,
+  itemByteLength,
+  scalaBaseType,
+};

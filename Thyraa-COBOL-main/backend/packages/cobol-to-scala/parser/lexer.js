@@ -493,6 +493,67 @@ class Lexer {
     this.addTokenAt(TokenType.NUMERIC_LITERAL, value, startLine, startColumn, startPosition);
   }
 
+  /**
+   * Scan the picture character-string that follows a PIC/PICTURE keyword.
+   * Emits an optional IS keyword token followed by a single PICTURE_STRING
+   * token. The picture string is terminated by whitespace or by a period
+   * that ends the sentence (a period followed by whitespace/EOF); a period
+   * with a picture character after it is part of the picture (PIC 9(3).99).
+   */
+  scanPictureString() {
+    this.skipWhitespace();
+
+    // Optional IS between PIC and the picture string
+    if ((this.peek() === 'I' || this.peek() === 'i') &&
+        (this.peek(1) === 'S' || this.peek(1) === 's') &&
+        !this.isPictureChar(this.peek(2))) {
+      const isLine = this.currentLine;
+      const isColumn = this.currentColumn;
+      const isPosition = this.position;
+      this.advance();
+      this.advance();
+      this.addTokenAt(Keywords.get('IS') || TokenType.IDENTIFIER, 'IS', isLine, isColumn, isPosition);
+      this.skipWhitespace();
+    }
+
+    const startLine = this.currentLine;
+    const startColumn = this.currentColumn;
+    const startPosition = this.position;
+    let value = '';
+
+    while (!this.isAtEnd()) {
+      const char = this.peek();
+
+      if (char === ' ' || char === '\t' || char === '\r' || char === '\n') {
+        break;
+      }
+      if (char === '.') {
+        // Sentence-ending period: not followed by another picture character
+        const next = this.peek(1);
+        if (next === '\0' || next === ' ' || next === '\t' || next === '\r' || next === '\n' || next === '.') {
+          break;
+        }
+      }
+      if (!this.isPictureChar(char) && char !== '.') {
+        break;
+      }
+      value += this.advance();
+    }
+
+    if (value.length > 0) {
+      this.addTokenAt(TokenType.PICTURE_STRING, value.toUpperCase(), startLine, startColumn, startPosition);
+    }
+  }
+
+  /**
+   * Characters that may legally appear in a picture character-string.
+   * Symbols: A B E G N P S V X Z 9 0 / , + - * $ ( ) and CR/DB pairs.
+   */
+  isPictureChar(char) {
+    if (!char || char === '\0') return false;
+    return /[ABEGNPSVXZCRDabegnpsvxzcrd90-9()/,+\-*$]/.test(char);
+  }
+
   scanIdentifier() {
     const startLine = this.currentLine;
     const startColumn = this.currentColumn;
@@ -522,6 +583,13 @@ class Lexer {
     // Check if it's a keyword
     if (Keywords.has(upperValue)) {
       this.addTokenAt(Keywords.get(upperValue), value, startLine, startColumn, startPosition);
+      // PIC/PICTURE introduces a picture character-string which must be
+      // lexed as a single token: characters like 9, X, S, V and digits in
+      // parentheses would otherwise be misread as level numbers, numeric
+      // literals or identifiers (e.g. the 9 in "PIC 9(6)").
+      if (upperValue === 'PIC' || upperValue === 'PICTURE') {
+        this.scanPictureString();
+      }
       return;
     }
 

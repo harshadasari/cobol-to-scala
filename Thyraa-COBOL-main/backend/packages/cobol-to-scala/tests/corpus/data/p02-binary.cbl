@@ -1,0 +1,53 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. P02BINARY.
+      *
+      * Phase 1 corpus: COMP (binary) fields at 2/4/8-byte widths,
+      * including negative and picture-boundary values.
+      *
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-BIN2-POS         PIC S9(4) COMP.
+       01  WS-BIN2-NEG         PIC S9(4) COMP.
+       01  WS-BIN2-MAX         PIC S9(4) COMP.
+       01  WS-BIN2-MIN         PIC S9(4) COMP.
+       01  WS-BIN4-POS         PIC S9(9) COMP.
+       01  WS-BIN4-NEG         PIC S9(9) COMP.
+       01  WS-BIN4-MAX         PIC S9(9) COMP.
+       01  WS-BIN4-MIN         PIC S9(9) COMP.
+       01  WS-BIN8-POS         PIC S9(18) COMP.
+       01  WS-BIN8-NEG         PIC S9(18) COMP.
+       01  WS-BIN8-MAX         PIC S9(18) COMP.
+       01  WS-BIN8-MIN         PIC S9(18) COMP.
+       01  WS-BIN2-UNSIGNED    PIC 9(4) BINARY.
+       01  WS-BIN4-SCALED      PIC S9(7)V99 COMP.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           MOVE 100 TO WS-BIN2-POS
+           MOVE -100 TO WS-BIN2-NEG
+           MOVE 9999 TO WS-BIN2-MAX
+           MOVE -9999 TO WS-BIN2-MIN
+           MOVE 123456 TO WS-BIN4-POS
+           MOVE -123456 TO WS-BIN4-NEG
+           MOVE 999999999 TO WS-BIN4-MAX
+           MOVE -999999999 TO WS-BIN4-MIN
+           MOVE 123456789012 TO WS-BIN8-POS
+           MOVE -123456789012 TO WS-BIN8-NEG
+           MOVE 999999999999999999 TO WS-BIN8-MAX
+           MOVE -999999999999999999 TO WS-BIN8-MIN
+           MOVE 4321 TO WS-BIN2-UNSIGNED
+           MOVE -54321.99 TO WS-BIN4-SCALED
+           DISPLAY 'BIN2-POS=' WS-BIN2-POS
+           DISPLAY 'BIN2-NEG=' WS-BIN2-NEG
+           DISPLAY 'BIN2-MAX=' WS-BIN2-MAX
+           DISPLAY 'BIN2-MIN=' WS-BIN2-MIN
+           DISPLAY 'BIN4-POS=' WS-BIN4-POS
+           DISPLAY 'BIN4-NEG=' WS-BIN4-NEG
+           DISPLAY 'BIN4-MAX=' WS-BIN4-MAX
+           DISPLAY 'BIN4-MIN=' WS-BIN4-MIN
+           DISPLAY 'BIN8-POS=' WS-BIN8-POS
+           DISPLAY 'BIN8-NEG=' WS-BIN8-NEG
+           DISPLAY 'BIN8-MAX=' WS-BIN8-MAX
+           DISPLAY 'BIN8-MIN=' WS-BIN8-MIN
+           DISPLAY 'BIN2-UNSIGNED=' WS-BIN2-UNSIGNED
+           DISPLAY 'BIN4-SCALED=' WS-BIN4-SCALED
+           STOP RUN.

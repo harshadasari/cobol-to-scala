@@ -1,0 +1,45 @@
+*----------------------------------------------------------------*
+* CUSTSET - customer inquiry/update mapset (synthetic test fixture)
+*----------------------------------------------------------------*
+CUSTSET  DFHMSD TYPE=&SYSPARM,
+               MODE=INOUT,
+               LANG=COBOL,
+               TIOAPFX=YES
+*
+CUSTMAP  DFHMDI SIZE=(24,80),
+               LINE=1,
+               COLUMN=1
+*
+         DFHMDF POS=(1,30),
+               LENGTH=16,
+               ATTRB=(PROT,BRT),
+               INITIAL='CUSTOMER INQUIRY'
+CUSTNO   DFHMDF POS=(3,1),
+               LENGTH=6,
+               ATTRB=(UNPROT,NUM,FSET),
+               PICIN='9(6)'
+CUSTNAM  DFHMDF POS=(4,1),
+               LENGTH=30,
+               ATTRB=(PROT,FSET),
+               PICOUT='X(30)'
+ERRMSG   DFHMDF POS=(23,1),
+               LENGTH=40,
+               ATTRB=(PROT,BRT)
+*
+UPDMAP   DFHMDI SIZE=(24,80),
+               LINE=1,
+               COLUMN=1
+*
+         DFHMDF POS=(1,30),
+               LENGTH=14,
+               ATTRB=(PROT,BRT),
+               INITIAL='CUSTOMER UPDATE'
+CUSTNO   DFHMDF POS=(3,1),
+               LENGTH=6,
+               ATTRB=(UNPROT,NUM,FSET),
+               PICIN='9(6)'
+CUSTNAM  DFHMDF POS=(4,1),
+               LENGTH=30,
+               ATTRB=(UNPROT,FSET),
+               PICIN='X(30)',
+               PICOUT='X(30)'

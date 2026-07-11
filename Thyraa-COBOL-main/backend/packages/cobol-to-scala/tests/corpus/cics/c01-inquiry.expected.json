@@ -1,0 +1,111 @@
+[
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "HANDLE CONDITION",
+    "options": {
+      "ERROR": "ERROR-PARA",
+      "NOTFND": "NOTFND-PARA"
+    },
+    "respHandling": null,
+    "raw": "HANDLE CONDITION ERROR ( ERROR-PARA ) NOTFND ( NOTFND-PARA )"
+  },
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "RECEIVE MAP",
+    "options": {
+      "MAP": "CUSTMAP",
+      "MAPSET": "CUSTSET",
+      "INTO": "CUSTMAP-AREA"
+    },
+    "respHandling": null,
+    "raw": "RECEIVE MAP ( CUSTMAP ) MAPSET ( CUSTSET ) INTO ( CUSTMAP-AREA )"
+  },
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "READ",
+    "options": {
+      "FILE": "CUSTFILE",
+      "INTO": "CUST-RECORD",
+      "RIDFLD": "CUSTNOI",
+      "RESP": "WS-RESP"
+    },
+    "respHandling": {
+      "resp": "WS-RESP",
+      "resp2": null
+    },
+    "raw": "READ FILE ( CUSTFILE ) INTO ( CUST-RECORD ) RIDFLD ( CUSTNOI ) RESP ( WS-RESP )"
+  },
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "SEND MAP",
+    "options": {
+      "MAP": "CUSTMAP",
+      "MAPSET": "CUSTSET",
+      "FROM": "CUSTMAP-AREA",
+      "ERASE": true
+    },
+    "respHandling": null,
+    "raw": "SEND MAP ( CUSTMAP ) MAPSET ( CUSTSET ) FROM ( CUSTMAP-AREA ) ERASE"
+  },
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "SEND MAP",
+    "options": {
+      "MAP": "CUSTMAP",
+      "MAPSET": "CUSTSET",
+      "FROM": "CUSTMAP-AREA",
+      "ERASE": true
+    },
+    "respHandling": null,
+    "raw": "SEND MAP ( CUSTMAP ) MAPSET ( CUSTSET ) FROM ( CUSTMAP-AREA ) ERASE"
+  },
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "RETURN",
+    "options": {
+      "TRANSID": "CINQ",
+      "COMMAREA": "WS-COMMAREA",
+      "LENGTH": "6"
+    },
+    "respHandling": null,
+    "raw": "RETURN TRANSID ( CINQ ) COMMAREA ( WS-COMMAREA ) LENGTH ( 6 )"
+  },
+  {
+    "paragraph": "ERROR-PARA",
+    "command": "SEND MAP",
+    "options": {
+      "MAP": "CUSTMAP",
+      "MAPSET": "CUSTSET",
+      "FROM": "CUSTMAP-AREA",
+      "ERASE": true
+    },
+    "respHandling": null,
+    "raw": "SEND MAP ( CUSTMAP ) MAPSET ( CUSTSET ) FROM ( CUSTMAP-AREA ) ERASE"
+  },
+  {
+    "paragraph": "ERROR-PARA",
+    "command": "RETURN",
+    "options": {},
+    "respHandling": null,
+    "raw": "RETURN"
+  },
+  {
+    "paragraph": "NOTFND-PARA",
+    "command": "SEND MAP",
+    "options": {
+      "MAP": "CUSTMAP",
+      "MAPSET": "CUSTSET",
+      "FROM": "CUSTMAP-AREA",
+      "ERASE": true
+    },
+    "respHandling": null,
+    "raw": "SEND MAP ( CUSTMAP ) MAPSET ( CUSTSET ) FROM ( CUSTMAP-AREA ) ERASE"
+  },
+  {
+    "paragraph": "NOTFND-PARA",
+    "command": "RETURN",
+    "options": {},
+    "respHandling": null,
+    "raw": "RETURN"
+  }
+]

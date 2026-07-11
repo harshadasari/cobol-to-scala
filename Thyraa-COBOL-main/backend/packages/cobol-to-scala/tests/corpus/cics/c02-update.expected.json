@@ -1,0 +1,122 @@
+[
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "HANDLE CONDITION",
+    "options": {
+      "ERROR": "ERROR-PARA",
+      "NOTFND": "NOTFND-PARA"
+    },
+    "respHandling": null,
+    "raw": "HANDLE CONDITION ERROR ( ERROR-PARA ) NOTFND ( NOTFND-PARA )"
+  },
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "RECEIVE MAP",
+    "options": {
+      "MAP": "UPDMAP",
+      "MAPSET": "CUSTSET",
+      "INTO": "UPDMAP-AREA"
+    },
+    "respHandling": null,
+    "raw": "RECEIVE MAP ( UPDMAP ) MAPSET ( CUSTSET ) INTO ( UPDMAP-AREA )"
+  },
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "READ",
+    "options": {
+      "FILE": "CUSTFILE",
+      "INTO": "CUST-RECORD",
+      "RIDFLD": "CUSTNOI",
+      "UPDATE": true,
+      "RESP": "WS-RESP"
+    },
+    "respHandling": {
+      "resp": "WS-RESP",
+      "resp2": null
+    },
+    "raw": "READ FILE ( CUSTFILE ) INTO ( CUST-RECORD ) RIDFLD ( CUSTNOI ) UPDATE RESP ( WS-RESP )"
+  },
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "REWRITE",
+    "options": {
+      "FILE": "CUSTFILE",
+      "FROM": "CUST-RECORD",
+      "RESP": "WS-RESP"
+    },
+    "respHandling": {
+      "resp": "WS-RESP",
+      "resp2": null
+    },
+    "raw": "REWRITE FILE ( CUSTFILE ) FROM ( CUST-RECORD ) RESP ( WS-RESP )"
+  },
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "LINK",
+    "options": {
+      "PROGRAM": "AUDITLOG",
+      "COMMAREA": "AUDIT-COMMAREA",
+      "LENGTH": "16"
+    },
+    "respHandling": null,
+    "raw": "LINK PROGRAM ( AUDITLOG ) COMMAREA ( AUDIT-COMMAREA ) LENGTH ( 16 )"
+  },
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "SEND MAP",
+    "options": {
+      "MAP": "UPDMAP",
+      "MAPSET": "CUSTSET",
+      "FROM": "UPDMAP-AREA",
+      "ERASE": true
+    },
+    "respHandling": null,
+    "raw": "SEND MAP ( UPDMAP ) MAPSET ( CUSTSET ) FROM ( UPDMAP-AREA ) ERASE"
+  },
+  {
+    "paragraph": "MAIN-PARA",
+    "command": "RETURN",
+    "options": {},
+    "respHandling": null,
+    "raw": "RETURN"
+  },
+  {
+    "paragraph": "ERROR-PARA",
+    "command": "ABEND",
+    "options": {
+      "ABCODE": "CUER"
+    },
+    "respHandling": null,
+    "raw": "ABEND ABCODE ( CUER )"
+  },
+  {
+    "paragraph": "NOTFND-PARA",
+    "command": "SEND MAP",
+    "options": {
+      "MAP": "UPDMAP",
+      "MAPSET": "CUSTSET",
+      "FROM": "UPDMAP-AREA",
+      "ERASE": true
+    },
+    "respHandling": null,
+    "raw": "SEND MAP ( UPDMAP ) MAPSET ( CUSTSET ) FROM ( UPDMAP-AREA ) ERASE"
+  },
+  {
+    "paragraph": "NOTFND-PARA",
+    "command": "RETURN",
+    "options": {},
+    "respHandling": null,
+    "raw": "RETURN"
+  },
+  {
+    "paragraph": "XFER-PARA",
+    "command": "XCTL",
+    "options": {
+      "PROGRAM": "CUSTLIST",
+      "COMMAREA": "AUDIT-COMMAREA",
+      "LENGTH": "16"
+    },
+    "respHandling": null,
+    "raw": "XCTL PROGRAM ( CUSTLIST ) COMMAREA ( AUDIT-COMMAREA ) LENGTH ( 16 )"
+  }
+]

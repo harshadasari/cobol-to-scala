@@ -1,0 +1,143 @@
+{
+  "mapsets": [
+    {
+      "name": "CUSTSET",
+      "type": "&SYSPARM",
+      "mode": "INOUT",
+      "lang": "COBOL",
+      "tioapfx": "YES",
+      "maps": [
+        {
+          "name": "CUSTMAP",
+          "size": {
+            "rows": 24,
+            "cols": 80
+          },
+          "line": 1,
+          "column": 1,
+          "fields": [
+            {
+              "name": null,
+              "pos": {
+                "line": 1,
+                "col": 30
+              },
+              "length": 16,
+              "attrb": [
+                "PROT",
+                "BRT"
+              ],
+              "initial": "CUSTOMER INQUIRY",
+              "picin": null,
+              "picout": null
+            },
+            {
+              "name": "CUSTNO",
+              "pos": {
+                "line": 3,
+                "col": 1
+              },
+              "length": 6,
+              "attrb": [
+                "UNPROT",
+                "NUM",
+                "FSET"
+              ],
+              "initial": null,
+              "picin": "9(6)",
+              "picout": null
+            },
+            {
+              "name": "CUSTNAM",
+              "pos": {
+                "line": 4,
+                "col": 1
+              },
+              "length": 30,
+              "attrb": [
+                "PROT",
+                "FSET"
+              ],
+              "initial": null,
+              "picin": null,
+              "picout": "X(30)"
+            },
+            {
+              "name": "ERRMSG",
+              "pos": {
+                "line": 23,
+                "col": 1
+              },
+              "length": 40,
+              "attrb": [
+                "PROT",
+                "BRT"
+              ],
+              "initial": null,
+              "picin": null,
+              "picout": null
+            }
+          ]
+        },
+        {
+          "name": "UPDMAP",
+          "size": {
+            "rows": 24,
+            "cols": 80
+          },
+          "line": 1,
+          "column": 1,
+          "fields": [
+            {
+              "name": null,
+              "pos": {
+                "line": 1,
+                "col": 30
+              },
+              "length": 14,
+              "attrb": [
+                "PROT",
+                "BRT"
+              ],
+              "initial": "CUSTOMER UPDATE",
+              "picin": null,
+              "picout": null
+            },
+            {
+              "name": "CUSTNO",
+              "pos": {
+                "line": 3,
+                "col": 1
+              },
+              "length": 6,
+              "attrb": [
+                "UNPROT",
+                "NUM",
+                "FSET"
+              ],
+              "initial": null,
+              "picin": "9(6)",
+              "picout": null
+            },
+            {
+              "name": "CUSTNAM",
+              "pos": {
+                "line": 4,
+                "col": 1
+              },
+              "length": 30,
+              "attrb": [
+                "UNPROT",
+                "FSET"
+              ],
+              "initial": null,
+              "picin": "X(30)",
+              "picout": "X(30)"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "unrecognized": []
+}

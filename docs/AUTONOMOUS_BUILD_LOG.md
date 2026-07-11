@@ -3,7 +3,6 @@
 **Run start:** 2026-07-11 ~01:30 UTC · **Branch:** claude/analyze-codebase-pdPSZ · **Budget:** orchestrator ≤2M own tokens, 48h wall clock
 
 ## Open questions / blockers
-- **TRANSIENT RED at 5a9605e (orchestrator error):** broad `git add generator/` swept the Phase 3 SQL agent's half-finished sql-gen.js rewrite into the Phase 1b commit; scala-generator.js's `generateSql` import now fails to resolve, breaking 5 test-file loads. The in-flight SQL agent's own done-criteria require a green suite, which restores the exports; will verify+commit green on its completion. Process fix adopted: explicit file paths in git add while any agent is in flight.
 - **PHASE 2 REFUTED (queued fix):** 16/20 new adversarial proc programs diverge, 14 root causes, ALL silent (no TODO markers): NUMVAL crash on '+  12.5', 88-level conditions unimplemented (confirms Phase 1b mandate), EVALUATE expression-subject collapse, recursive PERFORM emits 1000Recurse(), WITH TEST AFTER invalid Scala, duplicate nested group names collide in codegen, LENGTH of group, MAX over BigDecimal, SEARCH VARYING ignored, index-name DISPLAY format, multi-key mixed-direction SORT, RELEASE FROM / RETURN INTO no-ops, UNSTRING COUNT IN dropped. Repros: scratchpad/phase2-refutation/. Baseline 9 corpus programs re-confirmed passing (pinned to 01c2fdb). Also: stale known-gaps table in tests/oracle/README.md must be refreshed. Fix wave dispatches when Phase 1b agent frees generator/.
 - **CRITIC BLOCKING #2:** safeNodeString checks node.name before its TODO fallback, so unhandled FunctionCall nodes render as bare identifiers (silent garbage; FUNCTION MOD(17,5) emits wsModPos = 0). Violates the coverage-honesty rule. Must reorder: unknown statement/expression types -> visible ??? TODO marker.
 - **PHASE 1 STATUS CORRECTED: NOT DONE.** Adversarial refuter (12 new edge-case programs vs compiler oracle) REFUTED the Phase 1 milestone: 11/12 diverge. The 7-program corpus was a narrow slice. Fix wave queued behind the in-flight Phase 2 generator agent (same files). Full repros preserved in scratchpad/phase1-refutation/.
@@ -14,6 +13,12 @@
 - **Orchestrator token spend:** minimal (cycle 1)
 
 ## Activity
+
+### 2026-07-11 05:45 — Cycle 12: Phase 3 SQL landed green (257/257); Phase 2b + Phase 4 dispatched
+- SQL agent completed after resume nudge: EXEC SQL -> typed Doobie (SELECT INTO/INSERT/UPDATE/DELETE/cursors-as-materialized-List with SQLCODE 100/WHENEVER/indicator vars as Option guards), compile-verified against REAL doobie-core 1.0.0-RC5 from Maven Central. Compat exports restored -> transient red from 5a9605e resolved. Committed 015c02f, pushed. Suite 257/257/0 verified in full before commit.
+- Dispatched: (a) Phase 2b fix agent - all 14 refuted proc gaps (NUMVAL crash, SET TO TRUE, EVALUATE expr-subject, recursive PERFORM, WITH TEST AFTER, duplicate nested group names, LENGTH(group), MAX/MIN BigDecimal, SEARCH VARYING, index DISPLAY format, multi-key SORT, RELEASE FROM/RETURN INTO, UNSTRING COUNT IN) + promotion of the 20 refuter programs into corpus/proc/ + stale README refresh. (b) Phase 4 groundwork - CICS command classifier, BMS map parser with symbolic-map layout derivation, honest ???-bodied service skeleton generator, CICS/BMS corpus + compile-checked tests (new files only).
+- Remaining Phase 3 gap tracked: sbt/pipeline skeletons from JCL (may fold into final wrap-up); SQL wire-in to main generator TODO'd in sql-gen.js header.
+- Wall clock ~4.3h of 48h.
 
 ### 2026-07-11 05:20 — Cycle 11: Phase 1b landed (all 12 adversarial programs pass); commit hygiene incident
 - Phase 1b agent: a01-a12 all hard-pass the oracle; zero regressions across all 28 corpus programs; 22 new unit tests; safeNodeString coverage-honesty fixed; two justified minimal parser fixes (subscript arithmetic was dropped at PARSE time; Condition.subject never attached). Suite was 225/225 at agent completion.

@@ -211,16 +211,26 @@ function parseVariableReference(ctx) {
     }
   }
 
-  // Parse subscripts
+  // Parse subscripts. Each subscript slot is a full arithmetic expression
+  // (not just a bare literal or identifier) - COBOL allows e.g.
+  // `WS-T(WS-I + 1)` - so this parses via parseArithmeticExpression rather
+  // than recognizing only IDENTIFIER/NUMERIC_LITERAL tokens directly; the
+  // older token-only recognition silently dropped every token after the
+  // first (`WS-T(WS-I + 1)` parsed as just `WS-T(WS-I)`, discarding `+ 1`
+  // without even a parse error) since operator tokens hit neither branch and
+  // fell through to `break`. subscriptIndexExpr (generator/expression-gen.js)
+  // still fast-paths the common bare-literal/bare-variable shapes for
+  // readability; anything else (this included) renders as a full expression.
   if (ctx.check(TokenType.OP_LPAREN)) {
     ctx.advance();
     while (!ctx.isAtEnd() && !ctx.check(TokenType.OP_RPAREN)) {
-      if (ctx.check(TokenType.IDENTIFIER)) {
-        ref.subscripts.push({ type: 'variable', value: ctx.advance().value });
-      } else if (ctx.check(TokenType.NUMERIC_LITERAL)) {
-        ref.subscripts.push({ type: 'literal', value: ctx.advance().value });
-      } else if (ctx.check(TokenType.COMMA)) {
+      if (ctx.check(TokenType.COMMA)) {
         ctx.advance();
+        continue;
+      }
+      const sub = parseArithmeticExpression(ctx);
+      if (sub) {
+        ref.subscripts.push(sub);
       } else {
         break;
       }
@@ -511,6 +521,30 @@ function parseNotCondition(ctx) {
   return condition;
 }
 
+/**
+ * Build a `Condition` node with its `subject` actually attached.
+ *
+ * parser/ast.js's base `Condition` class constructor does not read/store an
+ * `options.subject` at all (only its subclasses RelationalCondition/
+ * ClassCondition/SignCondition do, in their own constructors) - so every
+ * `new Condition({ conditionType: 'class'|'sign'|'simple', subject, ... })`
+ * call below (this parser builds plain `Condition` instances for those three
+ * shapes, not the dedicated subclasses) was silently dropping `subject`,
+ * leaving `condition.subject` `undefined` for class conditions (`IS
+ * NUMERIC`/`ALPHABETIC`/...), sign conditions (`IS POSITIVE`/`NEGATIVE`/
+ * `ZERO`), and - most visibly - level-88 condition-name tests (`IF
+ * WS-STATUS-ERROR`, `EVALUATE TRUE WHEN WS-STATUS-ERROR`), which rendered as
+ * an empty `if  then` (a compile error) since generator/expression-gen.js's
+ * convertCondition has nothing to convert. Assigning `.subject` directly
+ * after construction (rather than editing the shared ast.js base class) is
+ * the smallest fix that doesn't touch the AST node definitions.
+ */
+function makeCondition(options) {
+  const cond = new Condition(options);
+  cond.subject = options.subject ?? null;
+  return cond;
+}
+
 function parsePrimaryCondition(ctx) {
   // Parenthesized condition
   if (ctx.check(TokenType.OP_LPAREN)) {
@@ -530,45 +564,41 @@ function parsePrimaryCondition(ctx) {
 
     // Class test
     if (ctx.matchValue('NUMERIC')) {
-      const cond = new Condition({
+      return makeCondition({
         conditionType: 'class',
         subject,
         classType: 'NUMERIC',
         negated: notMod,
       });
-      return cond;
     }
     if (ctx.matchValue('ALPHABETIC')) {
-      const cond = new Condition({
+      return makeCondition({
         conditionType: 'class',
         subject,
         classType: 'ALPHABETIC',
         negated: notMod,
       });
-      return cond;
     }
     if (ctx.matchValue('ALPHABETIC-LOWER')) {
-      const cond = new Condition({
+      return makeCondition({
         conditionType: 'class',
         subject,
         classType: 'ALPHABETIC-LOWER',
         negated: notMod,
       });
-      return cond;
     }
     if (ctx.matchValue('ALPHABETIC-UPPER')) {
-      const cond = new Condition({
+      return makeCondition({
         conditionType: 'class',
         subject,
         classType: 'ALPHABETIC-UPPER',
         negated: notMod,
       });
-      return cond;
     }
 
     // Sign test
     if (ctx.matchValue('POSITIVE')) {
-      return new Condition({
+      return makeCondition({
         conditionType: 'sign',
         subject,
         signType: 'POSITIVE',
@@ -576,7 +606,7 @@ function parsePrimaryCondition(ctx) {
       });
     }
     if (ctx.matchValue('NEGATIVE')) {
-      return new Condition({
+      return makeCondition({
         conditionType: 'sign',
         subject,
         signType: 'NEGATIVE',
@@ -584,7 +614,7 @@ function parsePrimaryCondition(ctx) {
       });
     }
     if (ctx.matchValue('ZERO', 'ZEROS', 'ZEROES')) {
-      return new Condition({
+      return makeCondition({
         conditionType: 'sign',
         subject,
         signType: 'ZERO',
@@ -639,7 +669,7 @@ function parsePrimaryCondition(ctx) {
     }
 
     // Condition name (88 level)
-    return new Condition({
+    return makeCondition({
       conditionType: 'simple',
       subject,
     });
@@ -1070,6 +1100,20 @@ function parseSubtractStatement(ctx) {
     }
   }
 
+  // Parse ON SIZE ERROR
+  if (ctx.matchValue('ON')) {
+    ctx.matchValue('SIZE');
+    ctx.matchValue('ERROR');
+    stmt.onSizeError = parseStatementBlock(ctx, ['NOT', 'END-SUBTRACT']);
+  }
+
+  if (ctx.matchValue('NOT')) {
+    ctx.matchValue('ON');
+    ctx.matchValue('SIZE');
+    ctx.matchValue('ERROR');
+    stmt.notOnSizeError = parseStatementBlock(ctx, ['END-SUBTRACT']);
+  }
+
   ctx.matchValue('END-SUBTRACT');
 
   return stmt;
@@ -1111,6 +1155,20 @@ function parseMultiplyStatement(ctx) {
       }
       if (ctx.checkValue('ON') || ctx.checkValue('NOT') || ctx.check(TokenType.PERIOD)) break;
     }
+  }
+
+  // Parse ON SIZE ERROR
+  if (ctx.matchValue('ON')) {
+    ctx.matchValue('SIZE');
+    ctx.matchValue('ERROR');
+    stmt.onSizeError = parseStatementBlock(ctx, ['NOT', 'END-MULTIPLY']);
+  }
+
+  if (ctx.matchValue('NOT')) {
+    ctx.matchValue('ON');
+    ctx.matchValue('SIZE');
+    ctx.matchValue('ERROR');
+    stmt.notOnSizeError = parseStatementBlock(ctx, ['END-MULTIPLY']);
   }
 
   ctx.matchValue('END-MULTIPLY');
@@ -1167,6 +1225,20 @@ function parseDivideStatement(ctx) {
     if (ctx.check(TokenType.IDENTIFIER)) {
       stmt.remainder = parseVariableReference(ctx);
     }
+  }
+
+  // Parse ON SIZE ERROR
+  if (ctx.matchValue('ON')) {
+    ctx.matchValue('SIZE');
+    ctx.matchValue('ERROR');
+    stmt.onSizeError = parseStatementBlock(ctx, ['NOT', 'END-DIVIDE']);
+  }
+
+  if (ctx.matchValue('NOT')) {
+    ctx.matchValue('ON');
+    ctx.matchValue('SIZE');
+    ctx.matchValue('ERROR');
+    stmt.notOnSizeError = parseStatementBlock(ctx, ['END-DIVIDE']);
   }
 
   ctx.matchValue('END-DIVIDE');

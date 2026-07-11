@@ -1,0 +1,34 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. A09DISP.
+      *
+      * Adversarial: negative zoned DISPLAY values, all-zero edited
+      * field zero-suppression to spaces, BLANK WHEN ZERO.
+      *
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-ZONED-NEG        PIC S9(5) VALUE -123.
+       01  WS-ZONED-POS        PIC S9(5) VALUE 123.
+       01  WS-ZONED-NEG-DEC    PIC S9(3)V99 VALUE -1.5.
+       01  WS-ALL-ZERO-EDIT    PIC ZZZ9.
+       01  WS-ALL-ZERO-EDIT2   PIC ZZZZZ.
+       01  WS-BLANK-ZERO       PIC ZZZ9 BLANK WHEN ZERO.
+       01  WS-BLANK-ZERO-NONZ  PIC ZZZ9 BLANK WHEN ZERO.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           DISPLAY 'ZONED-NEG=' WS-ZONED-NEG
+           DISPLAY 'ZONED-POS=' WS-ZONED-POS
+           DISPLAY 'ZONED-NEG-DEC=' WS-ZONED-NEG-DEC
+
+           MOVE 0 TO WS-ALL-ZERO-EDIT
+           DISPLAY 'ALL-ZERO=[' WS-ALL-ZERO-EDIT ']'
+
+           MOVE 0 TO WS-ALL-ZERO-EDIT2
+           DISPLAY 'ALL-ZERO2=[' WS-ALL-ZERO-EDIT2 ']'
+
+           MOVE 0 TO WS-BLANK-ZERO
+           DISPLAY 'BLANK-ZERO=[' WS-BLANK-ZERO ']'
+
+           MOVE 42 TO WS-BLANK-ZERO-NONZ
+           DISPLAY 'BLANK-ZERO-NONZ=[' WS-BLANK-ZERO-NONZ ']'
+
+           STOP RUN.

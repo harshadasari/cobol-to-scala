@@ -122,6 +122,8 @@ let GROUP_REGISTRY = new Map();
 let SORT_FILE_REGISTRY = new Map();
 /** "<name>::<immediate parent name>" (both upper) -> field info, for OF/IN qualified references */
 let QUALIFIED_REGISTRY = new Map();
+/** Level-88 condition name (upper) -> { info: <parent field's registry info>, values: [...] } */
+let CONDITION_REGISTRY = new Map();
 
 export function setTableRegistry(registry) {
   TABLE_REGISTRY = registry instanceof Map ? registry : new Map();
@@ -139,6 +141,10 @@ export function setQualifiedRegistry(registry) {
   QUALIFIED_REGISTRY = registry instanceof Map ? registry : new Map();
 }
 
+export function setConditionRegistry(registry) {
+  CONDITION_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
 function lookupTable(name) {
   if (!name) return null;
   return TABLE_REGISTRY.get(String(name).toUpperCase()) || null;
@@ -152,6 +158,54 @@ function lookupSortFile(name) {
 /** Look up an OF/IN qualified reference's field info by (name, immediate parent). */
 function lookupQualified(nameUpper, parentUpper) {
   return QUALIFIED_REGISTRY.get(`${nameUpper}::${parentUpper}`) || null;
+}
+
+/**
+ * Scala boolean expression testing an 88-level condition name, e.g.
+ * `IF WS-STATUS-ERROR` or `EVALUATE TRUE WHEN WS-STATUS-ERROR` where
+ * WS-STATUS-ERROR is declared `88 WS-STATUS-ERROR VALUE 5 THRU 9.` under
+ * WS-STATUS-CODE. A condition name is *not* itself an addressable data item
+ * (there is no `wsStatusError` var) - it is sugar for testing its parent
+ * field against the VALUE/VALUES (incl. THRU ranges) the 88-level declared,
+ * so this renders `wsStatusCode >= 5 && wsStatusCode <= 9` (OR'd across
+ * every VALUE/range the condition name declares) directly against the
+ * parent's own flat var, using CONDITION_REGISTRY (built by
+ * scala-generator.js's buildFieldRegistry from each elementary item's
+ * `.conditions`). Returns null when `nameUpper` isn't a registered
+ * condition name, so callers can fall back to their prior (pre-88-support)
+ * behavior for anything else.
+ */
+function level88ConditionExpr(nameUpper) {
+  const entry = nameUpper ? CONDITION_REGISTRY.get(nameUpper) : null;
+  if (!entry) return null;
+  const { info, values } = entry;
+  const fieldExpr = info.camel;
+  const isString = info.scalaType === 'String';
+
+  function literalFor(v) {
+    if (!v || v.type === 'figurative') {
+      const fig = String(v?.value || '').toUpperCase();
+      if (fig === 'SPACE') return isString ? '" "' : '0';
+      return isString ? '""' : '0';
+    }
+    if (isString) return `"${escapeScalaStringLiteral(String(v.value))}"`;
+    if (info.scalaType === 'BigDecimal') return `BigDecimal("${v.value}")`;
+    if (info.scalaType === 'Long') return `${normalizeIntLiteralText(v.value)}L`;
+    return normalizeIntLiteralText(v.value);
+  }
+
+  const parts = (values || []).map(v => {
+    if (v.through !== undefined && v.through !== null) {
+      const lo = literalFor(v);
+      const hi = literalFor({ ...v, value: v.through });
+      return isString
+        ? `(${fieldExpr}.compareTo(${lo}) >= 0 && ${fieldExpr}.compareTo(${hi}) <= 0)`
+        : `(${fieldExpr} >= ${lo} && ${fieldExpr} <= ${hi})`;
+    }
+    return `(${fieldExpr} == ${literalFor(v)})`;
+  });
+
+  return parts.length > 0 ? `(${parts.join(' || ')})` : 'false';
 }
 
 /**
@@ -171,7 +225,14 @@ function paragraphMethodName(name) {
 /**
  * Scala expression for one subscript, 1-based COBOL -> 0-based Scala.
  * Literal subscripts are folded at generation time (`WS-QTY(1)` -> `0`);
- * variable subscripts render as `<camelName> - 1`.
+ * bare-variable subscripts render as `<camelName> - 1`; anything else (any
+ * real arithmetic, e.g. `WS-T(WS-I + 1)`) renders as a full parenthesized
+ * expression minus 1 - parser/procedure-parser.js's parseVariableReference
+ * parses every subscript slot as a full arithmetic expression (see its doc
+ * comment), so `sub` is normally an ArithmeticExpression node; the legacy
+ * `{type:'literal'|'variable', value}` tags are also still accepted, for any
+ * other call site that builds a subscript node directly rather than through
+ * the parser.
  */
 function subscriptIndexExpr(sub) {
   if (sub && typeof sub === 'object') {
@@ -182,8 +243,17 @@ function subscriptIndexExpr(sub) {
     if (sub.type === 'variable') {
       return `${toCamelCase(sub.value)} - 1`;
     }
+    if (sub.type === 'ArithmeticExpression' && !sub.operator && !sub.unaryMinus && !sub.functionCall) {
+      if (sub.value !== null && sub.value !== undefined) {
+        const n = parseInt(sub.value, 10);
+        return String(Number.isFinite(n) ? n - 1 : 0);
+      }
+      if (sub.variable) {
+        return `${convertIdentifier(sub.variable)} - 1`;
+      }
+    }
   }
-  return `${convertArithmeticExpression(sub)} - 1`;
+  return `(${convertArithmeticExpression(sub)}) - 1`;
 }
 
 /**
@@ -276,6 +346,26 @@ function convertIdentifier(cobolId) {
  * payload (value/name/pattern) or, failing that, emits a TODO comment
  * carrying the node type so the generated code still compiles and the
  * unconverted construct is visible to a reviewer.
+ *
+ * Ordering matters here (coverage-honesty fix): a node that carries a
+ * `.type` tag is a genuine AST construct (every ASTNode subclass sets one -
+ * see parser/ast.js) that reached this generic fallback because none of the
+ * specific dispatch tables (convertArithmeticExpression/convertCondition/
+ * convertIdentifier/...) recognized it - i.e. it is, by construction,
+ * unsupported, and MUST render the visible `???` TODO marker rather than
+ * silently guessing at a `.name` property. Guessing is actively dangerous:
+ * a `FunctionCall` node's `.name` is the *intrinsic function's* name (e.g.
+ * "UPPER-CASE"), so naively returning `toCamelCase(node.name)` for one that
+ * reached here would render `upperCase` - a plausible-looking but entirely
+ * fictitious identifier for a variable that doesn't exist, silently hiding
+ * the unsupported construct instead of flagging it (this is exactly what
+ * generateFunctionCall's own TODO marker exists to prevent for the FUNCTION
+ * dispatch path specifically; this fallback must never undermine it for any
+ * *other* node type that ends up here as FunctionCall once did before it
+ * got dedicated handling). Only a plain, untyped object (no `.type` at all -
+ * a shape from outside the ASTNode hierarchy, e.g. the legacy
+ * `{qualifier, name}` shape convertIdentifier also handles directly) falls
+ * through to the `.name`/`.pattern` best-effort sniffing below.
  */
 function safeNodeString(node) {
   if (node === null || node === undefined) return '';
@@ -284,6 +374,15 @@ function safeNodeString(node) {
   if (node.value !== undefined && typeof node.value !== 'object') {
     return convertLiteral(node.value);
   }
+
+  // Only `.type` counts as "this is a tagged AST construct" - NOT
+  // `node.constructor.name`, which is truthy ("Object") for every plain
+  // object literal and would otherwise defeat the untyped-object fallback
+  // below for every caller that builds an ad hoc `{name: ...}` shape.
+  if (node.type) {
+    return `??? /* TODO: unsupported COBOL construct (${node.type}) */`;
+  }
+
   if (typeof node.name === 'string' && node.name) {
     return toCamelCase(node.name);
   }
@@ -291,7 +390,7 @@ function safeNodeString(node) {
     return `"${node.pattern}"`;
   }
 
-  const nodeType = node.type || node.constructor?.name || 'unknown';
+  const nodeType = node.constructor?.name || 'unknown';
   return `??? /* TODO: unsupported COBOL construct (${nodeType}) */`;
 }
 
@@ -333,6 +432,17 @@ function convertLiteral(value) {
  * decimal point (if any) is inserted per the PIC's integer/decimal digit
  * counts, and an all-decimal PIC (0 integer digits, e.g. `SV9(5)`) omits the
  * leading zero entirely (`-.54321`, not `-0.54321`).
+ *
+ * Also carries the MOVE-time helpers used by generateMove/renderMoveSource
+ * (see the doc comments there): fixed-width alphanumeric fit (`fitLeft`/
+ * `fitRight`, default vs. JUSTIFIED RIGHT alignment), unsigned display-digit
+ * text for a numeric-to-alphanumeric MOVE (`digitsOf`), numeric MOVE
+ * truncation to a target's declared digit widths (`truncNumeric`), ON SIZE
+ * ERROR digit-capacity testing (`fitsDigits`), and a runtime port of
+ * formatEditedPicture (`edited`) for numeric-edited MOVE targets whose
+ * source isn't a compile-time literal (formatEditedPicture itself, in this
+ * file, still handles literal sources directly at generation time - cheaper,
+ * and covers the overwhelmingly common case).
  */
 export function generateCobolFmtHelper() {
   return [
@@ -348,6 +458,149 @@ export function generateCobolFmtHelper() {
     '    val signStr = if signed then (if neg then "-" else "+") else ""',
     '    val body = if decDigits > 0 then intPart + "." + decPart else intPart',
     '    signStr + body',
+    '',
+    '  // Fixed-width alphanumeric MOVE alignment: default is truncate-right/',
+    '  // pad-right with spaces; JUSTIFIED RIGHT truncates-left/pads-left.',
+    '  def fitLeft(s: String, width: Int): String =',
+    '    if width <= 0 then s',
+    '    else if s.length >= width then s.substring(0, width)',
+    '    else s + (" " * (width - s.length))',
+    '  def fitRight(s: String, width: Int): String =',
+    '    if width <= 0 then s',
+    '    else if s.length >= width then s.substring(s.length - width)',
+    '    else (" " * (width - s.length)) + s',
+    '',
+    '  // Unsigned display-digit text of a numeric value, zero-padded to',
+    '  // intDigits+decDigits with no decimal point character (COBOL\'s implied',
+    '  // V occupies no storage) and no sign - used when a numeric item is',
+    '  // MOVEd to an alphanumeric receiver, which takes the sending item\'s raw',
+    '  // digit characters only.',
+    '  def digitsOf(v: BigDecimal, intDigits: Int, decDigits: Int): String =',
+    '    val absVal = v.abs',
+    '    val totalDigits = intDigits + decDigits',
+    '    val unscaled = (absVal * BigDecimal(10).pow(decDigits)).setScale(0, BigDecimal.RoundingMode.HALF_UP).toBigInt.toString',
+    '    if unscaled.length < totalDigits then ("0" * (totalDigits - unscaled.length)) + unscaled else unscaled.takeRight(math.max(totalDigits, unscaled.length))',
+    '',
+    '  // Numeric MOVE truncation to a target\'s declared digit widths: extra',
+    '  // low-order decimal digits are dropped (never rounded - MOVE truncates,',
+    '  // it does not round), and extra high-order integer digits are dropped',
+    '  // (COBOL keeps only the low-order integerDigits digits, sign preserved -',
+    '  // matches BigDecimal\'s `%` remainder, which truncates toward zero).',
+    '  def truncNumeric(v: BigDecimal, intDigits: Int, decDigits: Int): BigDecimal =',
+    '    val scaled = v.setScale(decDigits, BigDecimal.RoundingMode.DOWN)',
+    '    val whole = scaled.setScale(0, BigDecimal.RoundingMode.DOWN)',
+    '    val frac = scaled - whole',
+    '    val mod = BigDecimal(10).pow(math.max(intDigits, 0))',
+    '    (whole % mod) + frac',
+    '',
+    '  // ON SIZE ERROR digit-capacity test: true when the *integer* part of v',
+    '  // fits within intDigits decimal digits (COBOL\'s SIZE ERROR condition is',
+    '  // about integer-digit overflow only - the fractional part is simply',
+    '  // truncated/rounded as normal and never triggers it).',
+    '  def fitsDigits(v: BigDecimal, intDigits: Int): Boolean =',
+    '    if intDigits <= 0 then v.abs.signum == 0',
+    '    else v.abs.toBigInt.toString.length <= intDigits',
+    '',
+    '  // Runtime port of the generator\'s formatEditedPicture (see',
+    '  // generator/expression-gen.js) for a numeric-edited MOVE whose source',
+    '  // value is not known until runtime (a variable/expression, not a',
+    '  // compile-time literal). rawValue is already-formatted signed decimal',
+    '  // text (see numericRawValueExpr at the call site).',
+    '  def edited(editPattern: String, rawValue: String, blankWhenZero: Boolean): String =',
+    '    var corePattern = editPattern',
+    '    var trailingSign: String = null',
+    '    if corePattern.endsWith("CR") || corePattern.endsWith("DB") then',
+    '      trailingSign = corePattern.substring(corePattern.length - 2)',
+    '      corePattern = corePattern.substring(0, corePattern.length - 2)',
+    '',
+    '    val raw = rawValue.trim',
+    '    val neg = raw.startsWith("-")',
+    '    val unsignedRaw = if raw.startsWith("-") || raw.startsWith("+") then raw.substring(1) else raw',
+    '    val dotIdx = unsignedRaw.indexOf(".")',
+    '    val intRaw = if dotIdx == -1 then unsignedRaw else unsignedRaw.substring(0, dotIdx)',
+    '    val decRaw = if dotIdx == -1 then "" else unsignedRaw.substring(dotIdx + 1)',
+    '',
+    '    val chars = corePattern.toCharArray.toVector',
+    '    case class DigitPos(idx: Int, fixed: Boolean, isDecimal: Boolean, var digit: Char)',
+    '',
+    '    var seenDecimalPoint = false',
+    '    val digitPositions = scala.collection.mutable.ArrayBuffer[DigitPos]()',
+    '    var floatingChar: Char = 0',
+    '    val floatingIndices = scala.collection.mutable.ArrayBuffer[Int]()',
+    '    var fixedSymbolIdx = -1',
+    '    var fixedSymbolChar: Char = 0',
+    '    val symCount = scala.collection.mutable.Map(\'$\' -> 0, \'+\' -> 0, \'-\' -> 0)',
+    '    for ch <- chars if symCount.contains(ch) do symCount(ch) += 1',
+    '',
+    '    for idx <- chars.indices do',
+    '      val ch = chars(idx)',
+    '      if ch == \'.\' then',
+    '        seenDecimalPoint = true',
+    '      else if ch == \'9\' || ch == \'Z\' || ch == \'*\' then',
+    '        digitPositions += DigitPos(idx, ch == \'9\', seenDecimalPoint, \'0\')',
+    '      else if ch == \'$\' || ch == \'+\' || ch == \'-\' then',
+    '        if symCount(ch) >= 2 then',
+    '          digitPositions += DigitPos(idx, false, seenDecimalPoint, \'0\')',
+    '          floatingChar = ch',
+    '          floatingIndices += idx',
+    '        else',
+    '          fixedSymbolIdx = idx',
+    '          fixedSymbolChar = ch',
+    '',
+    '    val intDigitCount = digitPositions.count(d => !d.isDecimal)',
+    '    val decDigitCount = digitPositions.count(d => d.isDecimal)',
+    '    val intDigits = if intDigitCount == 0 then "" else ("0" * math.max(intDigitCount - intRaw.length, 0) + intRaw).takeRight(intDigitCount)',
+    '    val decDigitsStr = if decDigitCount == 0 then "" else (decRaw + ("0" * decDigitCount)).take(decDigitCount)',
+    '    val digitsStr = intDigits + decDigitsStr',
+    '    for i <- digitPositions.indices do digitPositions(i).digit = digitsStr(i)',
+    '',
+    '    var firstShown = digitPositions.indexWhere(d => d.fixed || d.digit != \'0\')',
+    '    if firstShown == -1 then firstShown = digitPositions.length',
+    '',
+    '    var boundaryIdx = -1',
+    '    var symbolChar: Char = 0',
+    '    if floatingIndices.length >= 2 then',
+    '      symbolChar = floatingChar',
+    '      boundaryIdx = if firstShown > 0 then digitPositions(firstShown - 1).idx else floatingIndices(0)',
+    '',
+    '    val floatingSignChar = symbolChar match',
+    '      case \'+\' => if neg then "-" else "+"',
+    '      case \'-\' => if neg then "-" else " "',
+    '      case \'$\' => "$"',
+    '      case _ => ""',
+    '    val fixedSignChar = fixedSymbolChar match',
+    '      case \'+\' => if neg then "-" else "+"',
+    '      case \'-\' => if neg then "-" else " "',
+    '      case \'$\' => "$"',
+    '      case _ => ""',
+    '',
+    '    val shownFromIdx =',
+    '      if boundaryIdx != -1 then boundaryIdx',
+    '      else if firstShown < digitPositions.length then digitPositions(firstShown).idx',
+    '      else chars.length',
+    '',
+    '    val out = new StringBuilder',
+    '    for idx <- chars.indices do',
+    '      val ch = chars(idx)',
+    '      if ch == \'.\' then',
+    '        out += (if idx >= shownFromIdx then \'.\' else \' \')',
+    '      else if ch == \'9\' || ch == \'Z\' || ch == \'*\' then',
+    '        val arrIdx = digitPositions.indexWhere(_.idx == idx)',
+    '        out += (if arrIdx >= firstShown then digitPositions(arrIdx).digit else \' \')',
+    '      else if ch == \'$\' || ch == \'+\' || ch == \'-\' then',
+    '        if idx == fixedSymbolIdx then out ++= fixedSignChar',
+    '        else if idx == boundaryIdx then out ++= floatingSignChar',
+    '        else',
+    '          val arrIdx = digitPositions.indexWhere(_.idx == idx)',
+    '          out += (if arrIdx != -1 && arrIdx >= firstShown then digitPositions(arrIdx).digit else \' \')',
+    '      else',
+    '        out += (if idx >= shownFromIdx then ch else \' \')',
+    '',
+    '    var result = out.toString',
+    '    if trailingSign != null then result = result + (if neg then trailingSign else "  ")',
+    '',
+    '    val allZero = digitsStr.forall(_ == \'0\')',
+    '    if blankWhenZero && allZero then " " * editPattern.length else result',
   ].join('\n');
 }
 
@@ -419,8 +672,12 @@ export function generateCobolInspectHelper() {
  *   (repeat counts already expanded, CR/DB already appended as a literal
  *   2-char suffix - see parser/data-division-parser.js parsePicPattern).
  * @param {string} rawValue - the literal's raw text, e.g. "-987654321.99".
+ * @param {boolean} [blankWhenZero] - BLANK WHEN ZERO clause: the *entire*
+ *   field (all editPattern.length positions, including any CR/DB suffix)
+ *   renders as spaces whenever the value is exactly zero, overriding every
+ *   other edit character.
  */
-export function formatEditedPicture(editPattern, rawValue) {
+export function formatEditedPicture(editPattern, rawValue, blankWhenZero = false) {
   let corePattern = editPattern;
   let trailingSign = null;
   if (/CR$/.test(corePattern) || /DB$/.test(corePattern)) {
@@ -479,7 +736,13 @@ export function formatEditedPicture(editPattern, rawValue) {
   digitPositions.forEach((d, i) => { d.digit = digitsStr[i]; });
 
   let firstShownArrIdx = digitPositions.findIndex(d => d.kind === 'fixed' || (d.kind === 'suppress' && d.digit !== '0'));
-  if (firstShownArrIdx === -1) firstShownArrIdx = Math.max(digitPositions.length - 1, 0);
+  // No position qualifies (an all-suppress picture - no '9' anywhere - whose
+  // value is entirely zero): COBOL shows nothing at all (the whole field
+  // zero-suppresses to blank), NOT a forced trailing zero digit. A picture
+  // with at least one '9' always matches above via `kind === 'fixed'`
+  // regardless of that digit's value, so this branch is only reached for
+  // genuinely all-suppress zero pictures.
+  if (firstShownArrIdx === -1) firstShownArrIdx = digitPositions.length;
 
   let boundaryPatternIdx = null;
   let symbolChar = null;
@@ -500,9 +763,13 @@ export function formatEditedPicture(editPattern, rawValue) {
   else if (fixedSymbolChar === '-') fixedSignChar = neg ? '-' : ' ';
   else if (fixedSymbolChar === '$') fixedSignChar = '$';
 
+  // When nothing at all qualifies to be shown (all-suppress picture, zero
+  // value), fall past the end of the pattern rather than 0, so literal/
+  // insertion characters (commas, fixed text) blank out too, not just the
+  // digit positions - the whole field zero-suppresses to spaces.
   const shownFromPatternIdx = boundaryPatternIdx !== null
     ? boundaryPatternIdx
-    : (digitPositions[firstShownArrIdx] ? digitPositions[firstShownArrIdx].idx : 0);
+    : (firstShownArrIdx < digitPositions.length ? digitPositions[firstShownArrIdx].idx : corePattern.length);
 
   let out = '';
   chars.forEach((ch, idx) => {
@@ -534,6 +801,10 @@ export function formatEditedPicture(editPattern, rawValue) {
 
   if (trailingSign) {
     out += neg ? trailingSign : '  ';
+  }
+
+  if (blankWhenZero && /^0*$/.test(digitsStr)) {
+    return ' '.repeat(editPattern.length);
   }
 
   return out;
@@ -729,6 +1000,131 @@ function generateFunctionCall(fc) {
 }
 
 /**
+ * Coerce an arithmetic operand AST node (the shapes convertArithmeticExpression
+ * itself dispatches on: VariableReference, Literal, ArithmeticExpression, or
+ * a bare identifier/number) to a Scala expression *guaranteed* to be
+ * BigDecimal-valued - used by ON SIZE ERROR digit-capacity checks (which
+ * need the *exact*, unrounded mathematical result regardless of the
+ * receiving field's own Scala type) and by DIVIDE's GIVING-target coercion.
+ *
+ * Recurses into ArithmeticExpression structure and coerces only the *leaf*
+ * operands individually, rather than rendering the whole expression as a
+ * string first and then wrapping that string in `BigDecimal(...)` - wrapping
+ * an already-composed expression is exactly the bug this replaces: if every
+ * leaf of `wsA + wsB` is itself a BigDecimal-typed field, Scala infers `wsA +
+ * wsB` to *already* be of type `scala.math.BigDecimal`, and
+ * `BigDecimal(wsA + wsB)` then fails to compile (`BigDecimal.apply` has no
+ * overload accepting a `scala.math.BigDecimal`) - this was the DIVIDE
+ * "double-BigDecimal-wrap" compile error. Recursing and coercing only leaves
+ * means the top-level operator strings (`+`/`-`/`*`) are combined directly
+ * without ever re-wrapping an already-BigDecimal sub-expression.
+ */
+function toBigDecimalOperand(node) {
+  if (node === null || node === undefined) return 'BigDecimal(0)';
+
+  if (typeof node === 'string') {
+    return /^-?\d+(\.\d+)?$/.test(node) ? `BigDecimal("${node}")` : `BigDecimal(${convertIdentifier(node)})`;
+  }
+  if (typeof node === 'number') return `BigDecimal(${node})`;
+
+  if (node.type === 'Literal') {
+    if (node.literalType === 'figurative') return 'BigDecimal(0)';
+    return `BigDecimal("${node.value}")`;
+  }
+
+  if (node.type === 'VariableReference') {
+    const info = lookupFieldForRef(node);
+    const expr = convertIdentifier(node);
+    return info?.scalaType === 'BigDecimal' ? expr : `BigDecimal(${expr})`;
+  }
+
+  if (node.type === 'ArithmeticExpression') {
+    if (node.unaryMinus) return `(-${toBigDecimalOperand(node.right)})`;
+    if (node.functionCall) return `BigDecimal(${generateFunctionCall(node.functionCall)})`;
+    if (node.operator && node.left != null && node.right != null) {
+      const left = toBigDecimalOperand(node.left);
+      const right = toBigDecimalOperand(node.right);
+      if (node.operator === '**') return `${left}.pow((${right}).toInt)`;
+      const op = ARITHMETIC_OPERATORS[node.operator] || node.operator;
+      return `(${left} ${op} ${right})`;
+    }
+    if (node.variable) return toBigDecimalOperand(node.variable);
+    if (node.value !== null && node.value !== undefined) return `BigDecimal("${node.value}")`;
+    return 'BigDecimal(0)';
+  }
+
+  // Any other shape this function doesn't specifically recognize (e.g. the
+  // legacy 'literal'/'identifier'/'binary'/'unary' tags convertArithmeticExpression
+  // also accepts): render it normally and wrap only if the resulting text
+  // doesn't already start with `BigDecimal(` - a best-effort fallback, not a
+  // shape produced by this parser's own AST.
+  const rendered = convertArithmeticExpression(node);
+  return /^BigDecimal\(/.test(rendered) ? rendered : `BigDecimal(${rendered})`;
+}
+
+/**
+ * ON SIZE ERROR / NOT ON SIZE ERROR wrapper shared by COMPUTE/ADD/SUBTRACT/
+ * MULTIPLY/DIVIDE. `entries` is one `{ target, resultBD, finalExpr }` per
+ * receiving field: `resultBD` is a BigDecimal-valued Scala expression (via
+ * toBigDecimalOperand above) for the *exact* mathematical result, used only
+ * to test digit capacity - COBOL's SIZE ERROR condition is an integer-digit
+ * overflow test; the fractional part is simply truncated/rounded as normal
+ * and never itself triggers it (see CobolFmt.fitsDigits). `finalExpr` is
+ * exactly the expression this statement would generate with no ON SIZE
+ * ERROR clause at all (already coerced to the target's declared Scala
+ * type/rounding). On a size error, no target is updated at all (COBOL
+ * leaves every receiving field unchanged) and the ON SIZE ERROR statements
+ * run instead; otherwise every target is assigned as normal and NOT ON SIZE
+ * ERROR runs. `extraErrorCond`, when given, is OR'd into the size-error test
+ * ahead of every digit-capacity check (DIVIDE's BY ZERO test - BigDecimal
+ * division by zero raises an exception before a digit-capacity check could
+ * even run, so the zero test must short-circuit first via `||`).
+ */
+function generateArithmeticSizeErrorCheck(indent, statement, entries, extraErrorCond) {
+  const indentStr = '  '.repeat(indent);
+  const bi = '  '.repeat(indent + 1);
+
+  const digitConds = entries.map(e => {
+    const info = lookupFieldForRef(e.target);
+    const intDigits = info && info.integerDigits > 0 ? info.integerDigits : 18;
+    return `!CobolFmt.fitsDigits(${e.resultBD}, ${intDigits})`;
+  });
+  const cond = [extraErrorCond, ...digitConds].filter(Boolean).join(' || ');
+
+  const lines = [`${indentStr}if (${cond}) then`];
+  const onErrStmts = Array.isArray(statement.onSizeError) ? statement.onSizeError : [];
+  lines.push(
+    onErrStmts.length > 0 ? onErrStmts.map(s => generateExpression(s, indent + 1)).join('\n') : `${bi}()`
+  );
+  lines.push(`${indentStr}else`);
+  const notErrStmts = Array.isArray(statement.notOnSizeError) ? statement.notOnSizeError : [];
+  const body = [
+    ...entries.map(e => `${bi}${renderAssignment(e.target, e.finalExpr)}`),
+    ...notErrStmts.map(s => generateExpression(s, indent + 1)),
+  ];
+  lines.push(body.length > 0 ? body.join('\n') : `${bi}()`);
+  return lines.join('\n');
+}
+
+/**
+ * True when a statement carries an ON SIZE ERROR and/or NOT ON SIZE ERROR
+ * clause with at least one statement in its body. The parser always
+ * initializes both arrays to `[]` regardless of whether either clause was
+ * present in the source (see parser/ast.js's ComputeStatement/AddStatement/
+ * etc. constructors), so this can't distinguish "clause absent" from
+ * "clause present but empty" - an extreme corner case (an `ON SIZE ERROR`
+ * with literally no imperative statement following it) not exercised by any
+ * known corpus program, and not worth threading a dedicated presence flag
+ * through the parser for.
+ */
+function hasSizeErrorClause(statement) {
+  return (
+    (Array.isArray(statement.onSizeError) && statement.onSizeError.length > 0) ||
+    (Array.isArray(statement.notOnSizeError) && statement.notOnSizeError.length > 0)
+  );
+}
+
+/**
  * Generate COMPUTE statement
  */
 export function generateCompute(statement, indent = 0) {
@@ -744,24 +1140,62 @@ export function generateCompute(statement, indent = 0) {
     return `${indentStr}// COMPUTE with no resolvable target: ${expression}`;
   }
 
-  const keyword = statement.isNew ? 'val ' : '';
-  const rounded = statement.rounded ? ' // ROUNDED' : '';
+  if (!hasSizeErrorClause(statement)) {
+    const keyword = statement.isNew ? 'val ' : '';
+    const rounded = statement.rounded ? ' // ROUNDED' : '';
+    return targets
+      .map(target => `${indentStr}${keyword}${renderAssignment(target, expression)}${rounded}`)
+      .join('\n');
+  }
 
-  return targets
-    .map(target => `${indentStr}${keyword}${renderAssignment(target, expression)}${rounded}`)
-    .join('\n');
+  const resultBD = toBigDecimalOperand(statement.expression);
+  const entries = targets.map(target => ({ target, resultBD, finalExpr: expression }));
+  return generateArithmeticSizeErrorCheck(indent, statement, entries);
 }
 
 /**
  * Scala literal for a figurative/numeric ZERO MOVEd into a field, honoring
- * the target's declared Scala type (0 / 0L / BigDecimal(0) / "").
+ * the target's declared Scala type (0 / 0L / BigDecimal(0) / a target-width
+ * string of '0' characters for an alphanumeric target - COBOL's figurative
+ * ZERO moved to an alphanumeric receiver fills it with '0' digit characters,
+ * not empty text).
  */
 function zeroLiteralFor(info) {
   if (!info) return '0';
   if (info.scalaType === 'BigDecimal') return 'BigDecimal(0)';
   if (info.scalaType === 'Long') return '0L';
-  if (info.scalaType === 'String') return '""';
+  if (info.scalaType === 'String') return `"${'0'.repeat(Math.max(info.picLength || 0, 0))}"`;
   return '0';
+}
+
+/** Scala string literal for a target-width run of `ch`, or a single `ch` when the target's width isn't known. */
+function repeatedCharLiteralFor(ch, info) {
+  const width = info && info.scalaType === 'String' ? Math.max(info.picLength || 0, 1) : 1;
+  return `"${escapeScalaStringLiteral(ch.repeat(width))}"`;
+}
+
+/**
+ * Fixed-width alphanumeric MOVE alignment as a compile-time (JS) string
+ * transform - used whenever the source text is already known at generation
+ * time (a literal, or a figurative constant); the runtime equivalent for a
+ * variable source is CobolFmt.fitLeft/fitRight (see generateCobolFmtHelper).
+ * Default alignment truncates/pads on the right; JUSTIFIED RIGHT
+ * truncates/pads on the left.
+ */
+function fitAlphanumericText(text, width, justifiedRight) {
+  const s = String(text ?? '');
+  if (!width || width <= 0) return s;
+  if (s.length >= width) {
+    return justifiedRight ? s.slice(s.length - width) : s.slice(0, width);
+  }
+  const pad = ' '.repeat(width - s.length);
+  return justifiedRight ? pad + s : s + pad;
+}
+
+/** Runtime (Scala expression) equivalent of fitAlphanumericText, via the embedded CobolFmt helper. */
+function fitAlphanumericExpr(expr, width, justifiedRight) {
+  if (!width || width <= 0) return expr;
+  return justifiedRight ? `CobolFmt.fitRight(${expr}, ${width})` : `CobolFmt.fitLeft(${expr}, ${width})`;
 }
 
 /**
@@ -779,7 +1213,9 @@ function zeroLiteralFor(info) {
  *   - String target with an edited PIC (dataType 'edited'): the fully
  *     PICTURE-formatted string, computed by formatEditedPicture() - COBOL
  *     performs numeric-edit formatting at MOVE time, not at DISPLAY time.
- *   - String target (plain alphanumeric): quoted as-is.
+ *   - String target (plain alphanumeric): fitted to the target's declared
+ *     width (truncate/pad right, or left when JUSTIFIED RIGHT - see
+ *     fitAlphanumericText).
  * Falls back to the pre-existing untyped behavior when no registry info is
  * available (e.g. a program with no matching WORKING-STORAGE entry).
  */
@@ -790,15 +1226,15 @@ function renderMoveSource(source, info) {
 
   if (typeof source === 'string') {
     const upper = source.toUpperCase();
-    if (upper === 'SPACES' || upper === 'SPACE') return '""';
+    if (upper === 'SPACES' || upper === 'SPACE') return repeatedCharLiteralFor(' ', info);
     if (upper === 'ZEROS' || upper === 'ZEROES' || upper === 'ZERO') return zeroLiteralFor(info);
-    if (upper === 'HIGH-VALUES' || upper === 'HIGH-VALUE') return 'Char.MaxValue.toString';
-    if (upper === 'LOW-VALUES' || upper === 'LOW-VALUE') return 'Char.MinValue.toString';
+    if (upper === 'HIGH-VALUES' || upper === 'HIGH-VALUE') return repeatedCharLiteralFor(String.fromCharCode(255), info);
+    if (upper === 'LOW-VALUES' || upper === 'LOW-VALUE') return repeatedCharLiteralFor(String.fromCharCode(0), info);
     return convertIdentifier(source);
   }
 
   if (source && source.type === 'VariableReference') {
-    return convertIdentifier(source);
+    return renderVariableMoveSource(source, info);
   }
 
   return convertArithmeticExpression(source);
@@ -808,17 +1244,20 @@ function renderLiteralForTarget(lit, info) {
   if (lit.literalType === 'figurative') {
     switch (String(lit.value).toUpperCase()) {
       case 'ZERO': return zeroLiteralFor(info);
-      case 'SPACE': return '""';
-      case 'HIGH-VALUE': return 'Char.MaxValue.toString';
-      case 'LOW-VALUE': return 'Char.MinValue.toString';
-      default: return '""';
+      case 'SPACE': return repeatedCharLiteralFor(' ', info);
+      case 'HIGH-VALUE': return repeatedCharLiteralFor(String.fromCharCode(255), info);
+      case 'LOW-VALUE': return repeatedCharLiteralFor(String.fromCharCode(0), info);
+      default: return repeatedCharLiteralFor(' ', info);
     }
   }
 
   if (lit.literalType === 'string') {
     const text = lit.value ?? '';
     if (info?.dataType === 'edited' && info.editPattern) {
-      return `"${escapeScalaStringLiteral(formatEditedPicture(info.editPattern, text))}"`;
+      return `"${escapeScalaStringLiteral(formatEditedPicture(info.editPattern, text, info.blankWhenZero))}"`;
+    }
+    if (info?.scalaType === 'String' && info.dataType !== 'edited') {
+      return `"${escapeScalaStringLiteral(fitAlphanumericText(text, info.picLength, info.justified))}"`;
     }
     return `"${escapeScalaStringLiteral(text)}"`;
   }
@@ -826,18 +1265,54 @@ function renderLiteralForTarget(lit, info) {
   // Numeric literal (raw text, sign already included by the lexer, e.g. "-50").
   const raw = String(lit.value);
   if (info?.dataType === 'edited' && info.editPattern) {
-    return `"${escapeScalaStringLiteral(formatEditedPicture(info.editPattern, raw))}"`;
+    return `"${escapeScalaStringLiteral(formatEditedPicture(info.editPattern, raw, info.blankWhenZero))}"`;
+  }
+  if (info?.scalaType === 'String') {
+    // Numeric literal -> alphanumeric target: COBOL stores the literal's own
+    // digit text (unsigned - a numeric-to-alphanumeric MOVE never carries a
+    // sign character), fitted to the target's declared width exactly like an
+    // alphanumeric source.
+    const unsigned = raw.replace(/^[+-]/, '');
+    return `"${escapeScalaStringLiteral(fitAlphanumericText(unsigned, info.picLength, info.justified))}"`;
   }
   if (info?.scalaType === 'BigDecimal') {
-    return `BigDecimal("${raw}")`;
+    return `BigDecimal("${truncateNumericLiteralTextForMove(raw, info)}")`;
   }
   if (info?.scalaType === 'Long') {
-    return `${normalizeIntLiteralText(raw)}L`;
+    return `${normalizeIntLiteralText(truncateNumericLiteralTextForMove(raw, info))}L`;
   }
   if (info?.scalaType === 'Int') {
-    return normalizeIntLiteralText(raw);
+    return normalizeIntLiteralText(truncateNumericLiteralTextForMove(raw, info));
   }
   return convertLiteral(raw);
+}
+
+/**
+ * Truncate a numeric literal's text (JS string transform, generation-time -
+ * the runtime equivalent for a variable source is CobolFmt.truncNumeric) to
+ * the target's declared integer/decimal digit widths: COBOL MOVE drops
+ * excess low-order decimal digits (never rounds) and excess high-order
+ * integer digits (keeping the low-order ones, sign preserved).
+ */
+function truncateNumericLiteralTextForMove(raw, info) {
+  const s = String(raw ?? '0');
+  const neg = s.startsWith('-');
+  const unsigned = s.replace(/^[+-]/, '');
+  const dot = unsigned.indexOf('.');
+  let intPart = dot === -1 ? unsigned : unsigned.slice(0, dot);
+  let decPart = dot === -1 ? '' : unsigned.slice(dot + 1);
+
+  const decimalDigits = info?.decimalDigits;
+  const integerDigits = info?.integerDigits;
+  if (typeof decimalDigits === 'number' && decimalDigits >= 0) {
+    decPart = decPart.slice(0, decimalDigits);
+  }
+  if (typeof integerDigits === 'number' && integerDigits > 0 && intPart.length > integerDigits) {
+    intPart = intPart.slice(intPart.length - integerDigits);
+  }
+
+  const sign = neg ? '-' : '';
+  return decPart.length > 0 ? `${sign}${intPart || '0'}.${decPart}` : `${sign}${intPart || '0'}`;
 }
 
 function normalizeIntLiteralText(raw) {
@@ -850,16 +1325,232 @@ function escapeScalaStringLiteral(text) {
 }
 
 /**
+ * Unsigned display-digit runtime expression for a numeric field/expression
+ * used as a MOVE source into an alphanumeric target: COBOL takes the sending
+ * numeric item's own digit characters (zero-padded to its own declared
+ * width, no sign, no decimal point - V is an implied, non-storage position),
+ * via the embedded CobolFmt.digitsOf runtime helper.
+ */
+function numericDigitsExpr(expr, sourceInfo) {
+  const intDigits = sourceInfo?.integerDigits || 0;
+  const decDigits = sourceInfo?.decimalDigits || 0;
+  const asBD = sourceInfo?.scalaType === 'BigDecimal' ? expr : `BigDecimal(${expr})`;
+  return `CobolFmt.digitsOf(${asBD}, ${intDigits}, ${decDigits})`;
+}
+
+/**
+ * Runtime-value equivalent of `raw` in formatEditedPicture: signed decimal
+ * text for a numeric Scala expression whose value isn't known until runtime
+ * (a variable or computed expression, unlike a literal MOVE source, which
+ * formatEditedPicture already formats once at generation time - see
+ * renderLiteralForTarget). Used to drive CobolFmt.edited (the runtime port
+ * of formatEditedPicture) for a numeric-edited MOVE target.
+ */
+function numericRawValueExpr(expr, sourceInfo) {
+  if (sourceInfo?.scalaType === 'BigDecimal') {
+    return `{ val _v = (${expr}); (if _v.signum < 0 then "-" else "") + _v.abs.bigDecimal.toPlainString }`;
+  }
+  return `{ val _v = (${expr}); (if _v < 0 then "-" else "") + math.abs(_v).toString }`;
+}
+
+/**
+ * Render a MOVE source that is a (possibly subscripted) VariableReference,
+ * against the target field's registry info - the variable-source sibling of
+ * renderLiteralForTarget above. Handles every MOVE semantics rule that
+ * depends on knowing both the source's and target's *types*, none of which
+ * a bare `convertIdentifier(source)` (the pre-existing behavior, still used
+ * as the fallback when no target registry info is available) can express:
+ *   - numeric-edited target, any source: CobolFmt.edited (runtime port of
+ *     formatEditedPicture).
+ *   - numeric source -> alphanumeric target: unsigned display-digit text
+ *     (numericDigitsExpr), then fitted to the target's width/justification.
+ *   - alphanumeric source -> alphanumeric target: the source's own value,
+ *     first fitted to *its own* declared width (emulating COBOL's fully-
+ *     stored sending item - matters for JUSTIFIED RIGHT sources/targets,
+ *     see fitAlphanumericExpr's callers), then fitted again to the target's
+ *     width/justification.
+ *   - numeric source -> numeric target: truncated to the target's declared
+ *     digit widths (CobolFmt.truncNumeric) and coerced to its Scala type.
+ */
+function renderVariableMoveSource(source, info) {
+  const sourceInfo = lookupFieldForRef(source);
+  const rawExpr = convertIdentifier(source);
+
+  if (!info) return rawExpr;
+
+  if (info.dataType === 'edited' && info.editPattern) {
+    const rawValueExpr = sourceInfo
+      ? numericRawValueExpr(rawExpr, sourceInfo)
+      : `(${rawExpr}).toString`;
+    return `CobolFmt.edited("${escapeScalaStringLiteral(info.editPattern)}", ${rawValueExpr}, ${info.blankWhenZero ? 'true' : 'false'})`;
+  }
+
+  if (info.scalaType === 'String') {
+    if (sourceInfo && sourceInfo.dataType === 'numeric') {
+      const digitsExpr = numericDigitsExpr(rawExpr, sourceInfo);
+      return fitAlphanumericExpr(digitsExpr, info.picLength, info.justified);
+    }
+    const ownWidthExpr = sourceInfo && sourceInfo.scalaType === 'String' && sourceInfo.picLength > 0
+      ? fitAlphanumericExpr(rawExpr, sourceInfo.picLength, sourceInfo.justified)
+      : rawExpr;
+    return fitAlphanumericExpr(ownWidthExpr, info.picLength, info.justified);
+  }
+
+  if (info.dataType === 'numeric' || (info.dataType !== 'alphanumeric' && info.dataType !== 'edited')) {
+    const intDigits = info.integerDigits > 0 ? info.integerDigits : 18;
+    const decDigits = info.decimalDigits || 0;
+    const asBD = sourceInfo?.scalaType === 'BigDecimal' ? rawExpr : `BigDecimal(${rawExpr})`;
+    const truncated = `CobolFmt.truncNumeric(${asBD}, ${intDigits}, ${decDigits})`;
+    if (info.scalaType === 'BigDecimal') return truncated;
+    if (info.scalaType === 'Long') return `${truncated}.toLong`;
+    return `${truncated}.toInt`;
+  }
+
+  return rawExpr;
+}
+
+/**
+ * True when `ref` is a bare (no subscripts) reference to a name registered
+ * as a group in GROUP_REGISTRY - used to detect a group-to-group MOVE (see
+ * generateGroupMove) in generateMove below.
+ */
+function groupRefNameUpper(ref) {
+  if (!ref || typeof ref !== 'object') return null;
+  if (Array.isArray(ref.subscripts) && ref.subscripts.length > 0) return null;
+  const nameUpper = String(ref.name || '').toUpperCase();
+  return GROUP_REGISTRY.has(nameUpper) ? nameUpper : null;
+}
+
+/** Per-child metadata for one group's immediate real children, combining GROUP_REGISTRY (names/flat-var identifiers) with the qualified field registry (types) and a second GROUP_REGISTRY lookup (nested-group detection). */
+function groupChildInfos(nameUpper) {
+  const children = GROUP_REGISTRY.get(nameUpper) || [];
+  return children.map(c => ({
+    nameUpper: c.nameUpper,
+    camel: c.camel,
+    ccField: toCamelCase(c.nameUpper),
+    info: lookupQualified(c.nameUpper, nameUpper),
+    isGroup: GROUP_REGISTRY.has(c.nameUpper),
+  }));
+}
+
+/**
+ * Whether two groups' child lists are "identical layout": same count, and
+ * each positional pair shares the same Scala representation (type, width,
+ * decimal places). When true, a plain per-child assignment (in declared
+ * order) is byte-for-byte equivalent to a real COBOL group MOVE - no
+ * type-converting coercion happens, exactly as if the bytes were copied
+ * directly - without needing a byte-level round trip. Any child that is
+ * itself a nested group, or a metadata mismatch, means "no" (routes to the
+ * byte-level path in generateGroupMove instead).
+ */
+function groupLayoutsIdentical(srcChildren, tgtChildren) {
+  if (srcChildren.length === 0 || srcChildren.length !== tgtChildren.length) return false;
+  for (let i = 0; i < srcChildren.length; i++) {
+    const s = srcChildren[i];
+    const t = tgtChildren[i];
+    if (s.isGroup || t.isGroup) return false;
+    if (!s.info || !t.info) return false;
+    if (s.info.scalaType !== t.info.scalaType) return false;
+    if ((s.info.picLength || 0) !== (t.info.picLength || 0)) return false;
+    if ((s.info.decimalDigits || 0) !== (t.info.decimalDigits || 0)) return false;
+  }
+  return true;
+}
+
+/**
+ * Generate a group-to-group MOVE (`MOVE WS-SRC-GROUP TO WS-DST-GROUP`).
+ * COBOL group MOVE is byte-wise and never type-converts - unlike an
+ * elementary MOVE of the same underlying data, which does. Two strategies,
+ * chosen per the task's documented design:
+ *   - Identical layout (every child pair has the same Scala type/width -
+ *     see groupLayoutsIdentical): a plain per-child assignment via the field
+ *     registry. This is byte-for-byte equivalent to a real group MOVE
+ *     whenever both sides already share the same underlying representation
+ *     (the overwhelmingly common case - e.g. copying one WS-*-GROUP to
+ *     another of the same shape), without the overhead/complexity of a
+ *     round trip through case classes.
+ *   - Differing layout (e.g. a COMP-3 field on one side lining up with a
+ *     DISPLAY field of the same size on the other - genuine "read raw bytes
+ *     under a different PICTURE" territory): route through the byte-level
+ *     case classes generateAllCaseClasses/generateCaseClass already
+ *     generate for every WORKING-STORAGE group reachable from an 01-level
+ *     item - format() the sending group's current field values, space-pad/
+ *     truncate those bytes to the receiving group's length (COBOL group
+ *     MOVE follows the same padding rule as a plain alphanumeric MOVE), and
+ *     parse() them back out under the *receiving* group's own layout, which
+ *     is exactly "reinterpret the same bytes under a different PICTURE"
+ *     without guessing at a field-by-field numeric conversion.
+ * Falls back to a comment (not broken code) when a group has a FILLER or
+ * REDEFINES child - those don't occupy a case-class constructor slot the
+ * same way GROUP_REGISTRY assumes (see case-class-gen.js), so a byte-level
+ * round trip can't be safely constructed from the flat-var registry alone;
+ * this shape doesn't occur in the Phase 2 adversarial corpus.
+ */
+function generateGroupMove(sourceNameUpper, targetNameUpper, indent) {
+  const indentStr = '  '.repeat(indent);
+  const srcChildren = groupChildInfos(sourceNameUpper);
+  const tgtChildren = groupChildInfos(targetNameUpper);
+
+  if (srcChildren.length === 0 || tgtChildren.length === 0) {
+    return `${indentStr}() // MOVE ${sourceNameUpper} TO ${targetNameUpper}: group has no registered children`;
+  }
+
+  if (groupLayoutsIdentical(srcChildren, tgtChildren)) {
+    return tgtChildren.map((t, i) => `${indentStr}${t.camel} = ${srcChildren[i].camel}`).join('\n');
+  }
+
+  // Byte-level round trip needs every real child to have both a flat-var
+  // identifier (to read the current value) *and* a matching case-class
+  // constructor slot of the same name (case-class-gen.js's generateCaseClass
+  // gives every non-redefines, non-88 child - including FILLERs, under a
+  // synthetic name - its own constructor field, in the same order
+  // GROUP_REGISTRY lists real, named children). A REDEFINES child among
+  // them breaks that correspondence (it's a derived `lazy val` in the case
+  // class, not a constructor parameter, and isn't registered in
+  // qualifiedRegistry either - see buildFieldRegistry's redefines branch),
+  // and a FILLER means the case class has a constructor slot this registry
+  // doesn't track a value for at all. Neither shape occurs in the Phase 2
+  // adversarial corpus; emit a visible, still-compiling marker instead of a
+  // guessed/broken round trip rather than silently mis-converting one.
+  if (!srcChildren.every(c => c.info) || !tgtChildren.every(c => c.info)) {
+    return (
+      `${indentStr}() // MOVE ${sourceNameUpper} TO ${targetNameUpper}: ??? TODO - differing-layout group MOVE ` +
+      'with a FILLER/REDEFINES child is not supported (byte-level round trip needs every child to have a plain ' +
+      'flat-var + case-class constructor slot); group left unchanged'
+    );
+  }
+
+  const bi = '  '.repeat(indent + 1);
+  const srcClass = toPascalCase(sourceNameUpper);
+  const tgtClass = toPascalCase(targetNameUpper);
+  const lines = [`${indentStr}{`];
+  lines.push(`${bi}val _bytes = ${srcClass}.format(${srcClass}(${srcChildren.map(c => c.camel).join(', ')}))`);
+  lines.push(`${bi}val _padded = _bytes.padTo(${tgtClass}.recordLength, ' '.toByte).take(${tgtClass}.recordLength)`);
+  lines.push(`${bi}val _parsed = ${tgtClass}.parse(_padded)`);
+  for (const t of tgtChildren) {
+    lines.push(`${bi}${t.camel} = _parsed.${t.ccField}`);
+  }
+  lines.push(`${indentStr}}`);
+  return lines.join('\n');
+}
+
+/**
  * Generate MOVE statement
  */
 export function generateMove(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const source = statement.source;
   const targets = Array.isArray(statement.targets) ? statement.targets : [statement.target];
+  const sourceGroupUpper = groupRefNameUpper(source);
 
   const lines = [];
 
   for (const target of targets) {
+    const targetGroupUpper = groupRefNameUpper(target);
+    if (sourceGroupUpper && targetGroupUpper) {
+      lines.push(generateGroupMove(sourceGroupUpper, targetGroupUpper, indent));
+      continue;
+    }
     const info = lookupFieldForRef(target);
     const sourceExpr = renderMoveSource(source, info);
     lines.push(`${indentStr}${renderAssignment(target, sourceExpr)}`);
@@ -950,7 +1641,8 @@ export function convertCondition(condition) {
   if (typeof condition === 'string') {
     // Check if it's an 88-level condition name
     if (/^[A-Za-z]/.test(condition)) {
-      return convertIdentifier(condition);
+      const l88 = level88ConditionExpr(condition.toUpperCase());
+      return l88 !== null ? l88 : convertIdentifier(condition);
     }
     return condition;
   }
@@ -1002,9 +1694,20 @@ export function convertCondition(condition) {
         }
       }
       case 'simple':
-      default:
-        // Level-88 condition name used as a boolean
-        return wrapNegated(convertArithmeticExpression(condition.subject));
+      default: {
+        // Level-88 condition name used as a boolean, e.g. `IF WS-STATUS-OK`
+        // or `PERFORM UNTIL WS-FLAG-DONE` - not itself an addressable data
+        // item, so it must resolve through CONDITION_REGISTRY (see
+        // level88ConditionExpr) rather than being treated as a field
+        // reference; anything not a registered condition name falls back to
+        // the previous (pre-88-support) behavior.
+        const subj = condition.subject;
+        const nameUpper = subj && typeof subj === 'object'
+          ? String(subj.name || '').toUpperCase()
+          : String(subj || '').toUpperCase();
+        const l88 = level88ConditionExpr(nameUpper);
+        return wrapNegated(l88 !== null ? l88 : convertArithmeticExpression(condition.subject));
+      }
     }
   }
 
@@ -1109,6 +1812,20 @@ function evaluateSubjectExpr(subject) {
  * its corresponding subject (parser/ast.js's WhenClause.conditions[i] shapes:
  * ANY/TRUE/FALSE/NOT/RANGE/VALUE - see parseEvaluateStatement).
  */
+/**
+ * uppercased name of a bare VariableReference WHEN operand, or null for
+ * anything else (literal, arithmetic expression, ...) - used to detect a
+ * WHEN operand that is actually an 88-level condition name rather than an
+ * ordinary value to compare against (see evaluateConditionExpr's VALUE case).
+ */
+function bareVariableNameUpper(node) {
+  if (node && typeof node === 'object' && node.type === 'VariableReference' &&
+      (!Array.isArray(node.subscripts) || node.subscripts.length === 0)) {
+    return String(node.name || '').toUpperCase();
+  }
+  return null;
+}
+
 function evaluateConditionExpr(subject, cond) {
   if (!cond) return 'true';
   switch (cond.type) {
@@ -1127,8 +1844,23 @@ function evaluateConditionExpr(subject, cond) {
       return `((${s}) >= (${from}) && (${s}) <= (${to}))`;
     }
     case 'VALUE':
-    default:
+    default: {
+      // `EVALUATE TRUE WHEN <88-name>` (or `WHEN FALSE`'s pseudo-subject) is
+      // COBOL's idiom for `IF <88-name>` fanned out across multiple WHEN
+      // clauses - the WHEN operand there is a condition name, not a value to
+      // compare the TRUE/FALSE pseudo-subject against (which wouldn't even
+      // typecheck: the condition name isn't a boolean data item - see
+      // level88ConditionExpr). Detected only under a TRUE/FALSE subject,
+      // exactly the shape real COBOL requires for this idiom.
+      if (subject && (subject.type === 'TRUE' || subject.type === 'FALSE')) {
+        const nameUpper = bareVariableNameUpper(cond.value);
+        const l88 = nameUpper ? level88ConditionExpr(nameUpper) : null;
+        if (l88 !== null) {
+          return subject.type === 'FALSE' ? `!(${l88})` : l88;
+        }
+      }
       return `(${evaluateSubjectExpr(subject)}) == (${convertArithmeticExpression(cond.value)})`;
+    }
   }
 }
 
@@ -1464,7 +2196,14 @@ export function generateExpression(statement, indent = 0) {
     case 'NEXT-SENTENCE':
       return `${'  '.repeat(indent)}() // NEXT SENTENCE (implicit fall-through)`;
     default:
-      return `${'  '.repeat(indent)}() // ${type} statement (unsupported)`;
+      // Visible, grep-able TODO marker for a statement type this dispatch
+      // doesn't (yet) recognize - a `()` no-op keeps the surrounding method
+      // compiling (matching every other unsupported-construct marker in
+      // this file - see safeNodeString/generateFunctionCall's own `???`
+      // markers), rather than a runtime-throwing `???` literal, which would
+      // turn a merely-unimplemented statement into a hard crash the moment
+      // it's reached instead of a silent (but visible in the source) no-op.
+      return `${'  '.repeat(indent)}() /* ??? TODO: unsupported statement type (${type}) - not yet implemented */`;
   }
 }
 
@@ -1477,15 +2216,15 @@ function generateAdd(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
 
   // Get addends (values being added)
-  const addends = (statement.addends || statement.operands || []).map(a =>
-    convertArithmeticExpression(a)
-  );
+  const addendNodes = statement.addends || statement.operands || [];
+  const addends = addendNodes.map(a => convertArithmeticExpression(a));
 
   // TO/GIVING targets (raw refs - kept unstringified so renderAssignment can
   // see their subscripts; convertIdentifier is used separately for reading
   // a target's current value on the ADD ... TO path).
   const toTargets = statement.to || [];
   const givingTargets = statement.giving || [];
+  const withSizeError = hasSizeErrorClause(statement);
 
   const lines = [];
 
@@ -1493,17 +2232,34 @@ function generateAdd(statement, indent = 0) {
     // ADD ... GIVING - result goes to giving targets
     const toExprs = toTargets.map(t => convertIdentifier(t));
     const sum = [...addends, ...toExprs].join(' + ');
-    for (const target of givingTargets) {
-      lines.push(`${indentStr}${renderAssignment(target, sum)}`);
+    if (!withSizeError) {
+      for (const target of givingTargets) {
+        lines.push(`${indentStr}${renderAssignment(target, sum)}`);
+      }
+    } else {
+      const sumBD = `(${[...addendNodes, ...toTargets].map(toBigDecimalOperand).join(' + ')})`;
+      const entries = givingTargets.map(target => ({ target, resultBD: sumBD, finalExpr: sum }));
+      lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
-  } else if (toTargets.length > 0) {
+  } else if (toTargets.length > 0 && addends.length > 0) {
     // ADD ... TO - adds to each TO target
     const addendSum = addends.join(' + ');
-    for (const target of toTargets) {
-      if (addends.length > 0) {
+    if (!withSizeError) {
+      for (const target of toTargets) {
         const current = convertIdentifier(target);
         lines.push(`${indentStr}${renderAssignment(target, `${current} + ${addendSum}`)}`);
       }
+    } else {
+      const addendSumBD = `(${addendNodes.map(toBigDecimalOperand).join(' + ')})`;
+      const entries = toTargets.map(target => {
+        const current = convertIdentifier(target);
+        return {
+          target,
+          resultBD: `(${toBigDecimalOperand(target)} + ${addendSumBD})`,
+          finalExpr: `${current} + ${addendSum}`,
+        };
+      });
+      lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
   } else {
     // Fallback
@@ -1526,12 +2282,12 @@ function generateSubtract(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
 
   // Get subtrahends (values being subtracted)
-  const subtrahends = (statement.subtrahends || statement.operands || []).map(s =>
-    convertArithmeticExpression(s)
-  );
+  const subtrahendNodes = statement.subtrahends || statement.operands || [];
+  const subtrahends = subtrahendNodes.map(s => convertArithmeticExpression(s));
 
   const fromTargets = statement.from || [];
   const givingTargets = statement.giving || [];
+  const withSizeError = hasSizeErrorClause(statement);
 
   const lines = [];
 
@@ -1540,15 +2296,36 @@ function generateSubtract(statement, indent = 0) {
     const fromExprs = fromTargets.map(f => convertIdentifier(f));
     const fromExpr = fromExprs.join(' + ');
     const subExpr = subtrahends.join(' + ');
-    for (const target of givingTargets) {
-      lines.push(`${indentStr}${renderAssignment(target, `${fromExpr} - (${subExpr})`)}`);
+    const finalExpr = `${fromExpr} - (${subExpr})`;
+    if (!withSizeError) {
+      for (const target of givingTargets) {
+        lines.push(`${indentStr}${renderAssignment(target, finalExpr)}`);
+      }
+    } else {
+      const fromBD = `(${fromTargets.map(toBigDecimalOperand).join(' + ')})`;
+      const subBD = `(${subtrahendNodes.map(toBigDecimalOperand).join(' + ')})`;
+      const entries = givingTargets.map(target => ({ target, resultBD: `(${fromBD} - ${subBD})`, finalExpr }));
+      lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
   } else if (fromTargets.length > 0) {
     // SUBTRACT ... FROM - subtracts from each FROM target
     const subExpr = subtrahends.join(' + ');
-    for (const target of fromTargets) {
-      const current = convertIdentifier(target);
-      lines.push(`${indentStr}${renderAssignment(target, `${current} - (${subExpr})`)}`);
+    if (!withSizeError) {
+      for (const target of fromTargets) {
+        const current = convertIdentifier(target);
+        lines.push(`${indentStr}${renderAssignment(target, `${current} - (${subExpr})`)}`);
+      }
+    } else {
+      const subBD = `(${subtrahendNodes.map(toBigDecimalOperand).join(' + ')})`;
+      const entries = fromTargets.map(target => {
+        const current = convertIdentifier(target);
+        return {
+          target,
+          resultBD: `(${toBigDecimalOperand(target)} - ${subBD})`,
+          finalExpr: `${current} - (${subExpr})`,
+        };
+      });
+      lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
   }
 
@@ -1565,26 +2342,47 @@ function generateMultiply(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
 
   // Get multiplicand (the first operand)
-  const multiplicand = convertArithmeticExpression(statement.multiplicand || statement.left);
+  const multiplicandNode = statement.multiplicand || statement.left;
+  const multiplicand = convertArithmeticExpression(multiplicandNode);
 
   // Get by operands (what we multiply by)
   const byOperands = statement.by || [];
+  const withSizeError = hasSizeErrorClause(statement);
   const lines = [];
 
   if (statement.giving && statement.giving.length > 0) {
     // MULTIPLY A BY B GIVING C - result goes to C
-    const byExpr = byOperands.length > 0
-      ? convertArithmeticExpression(byOperands[0])
-      : convertArithmeticExpression(statement.right);
+    const byNode = byOperands.length > 0 ? byOperands[0] : statement.right;
+    const byExpr = convertArithmeticExpression(byNode);
+    const finalExpr = `${multiplicand} * ${byExpr}`;
 
-    for (const target of statement.giving) {
-      lines.push(`${indentStr}${renderAssignment(target, `${multiplicand} * ${byExpr}`)}`);
+    if (!withSizeError) {
+      for (const target of statement.giving) {
+        lines.push(`${indentStr}${renderAssignment(target, finalExpr)}`);
+      }
+    } else {
+      const resultBD = `(${toBigDecimalOperand(multiplicandNode)} * ${toBigDecimalOperand(byNode)})`;
+      const entries = statement.giving.map(target => ({ target, resultBD, finalExpr }));
+      lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
   } else if (byOperands.length > 0) {
     // MULTIPLY A BY B - result stored in B
-    for (const by of byOperands) {
-      const byExpr = convertIdentifier(by);
-      lines.push(`${indentStr}${renderAssignment(by, `${multiplicand} * ${byExpr}`)}`);
+    if (!withSizeError) {
+      for (const by of byOperands) {
+        const byExpr = convertIdentifier(by);
+        lines.push(`${indentStr}${renderAssignment(by, `${multiplicand} * ${byExpr}`)}`);
+      }
+    } else {
+      const multiplicandBD = toBigDecimalOperand(multiplicandNode);
+      const entries = byOperands.map(by => {
+        const byExpr = convertIdentifier(by);
+        return {
+          target: by,
+          resultBD: `(${multiplicandBD} * ${toBigDecimalOperand(by)})`,
+          finalExpr: `${multiplicand} * ${byExpr}`,
+        };
+      });
+      lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries));
     }
   } else {
     // Fallback for simple format
@@ -1602,7 +2400,12 @@ function generateMultiply(statement, indent = 0) {
 }
 
 /**
- * Generate DIVIDE statement
+ * Generate DIVIDE statement. GIVING targets that call for BigDecimal
+ * (decimal-place) division are coerced via toBigDecimalOperand (never a
+ * naive `BigDecimal(<already-rendered-expression-text>)` wrap - see its doc
+ * comment for why that double-wraps and fails to compile whenever the
+ * dividend/divisor are themselves already BigDecimal-typed fields, the
+ * DIVIDE "double-BigDecimal-wrap" bug).
  */
 function generateDivide(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -1610,35 +2413,78 @@ function generateDivide(statement, indent = 0) {
 
   const giving = Array.isArray(statement.giving) ? statement.giving : [statement.giving].filter(Boolean);
   const into = Array.isArray(statement.into) ? statement.into : [statement.into].filter(Boolean);
+  const withSizeError = hasSizeErrorClause(statement);
 
   if (giving.length > 0) {
     // Parser fields: "DIVIDE A BY B"   -> dividend=A, divisor=B
     //                "DIVIDE A INTO B" -> divisor=A, into=[B]
-    const dividend = into.length > 0
-      ? convertArithmeticExpression(into[0])
-      : convertArithmeticExpression(statement.dividend);
-    const divisor = convertArithmeticExpression(statement.divisor);
+    const dividendNode = into.length > 0 ? into[0] : statement.dividend;
+    const divisorNode = statement.divisor;
+    const dividend = convertArithmeticExpression(dividendNode);
+    const divisor = convertArithmeticExpression(divisorNode);
 
-    for (const target of giving) {
+    function givingValueExpr(target) {
       const info = lookupFieldForRef(target);
       // A BigDecimal GIVING target needs decimal-precision division - plain
       // Scala Int/Int division truncates (COBOL's DIVIDE ... GIVING into a
       // field with decimal places does not), so both operands are coerced
       // to BigDecimal before dividing whenever the target calls for it.
-      const valueExpr = info?.scalaType === 'BigDecimal'
-        ? `(${toBigDecimalExpr(dividend)} / ${toBigDecimalExpr(divisor)})`
+      return info?.scalaType === 'BigDecimal'
+        ? `(${toBigDecimalOperand(dividendNode)} / ${toBigDecimalOperand(divisorNode)})`
         : `${dividend} / ${divisor}`;
-      lines.push(`${indentStr}${renderAssignment(target, valueExpr)}`);
     }
-    if (statement.remainder) {
-      lines.push(`${indentStr}${renderAssignment(statement.remainder, `${dividend} % ${divisor}`)}`);
+
+    if (!withSizeError) {
+      for (const target of giving) {
+        lines.push(`${indentStr}${renderAssignment(target, givingValueExpr(target))}`);
+      }
+      if (statement.remainder) {
+        lines.push(`${indentStr}${renderAssignment(statement.remainder, `${dividend} % ${divisor}`)}`);
+      }
+    } else {
+      const dividendBD = toBigDecimalOperand(dividendNode);
+      const divisorBD = toBigDecimalOperand(divisorNode);
+      const entries = giving.map(target => ({
+        target,
+        resultBD: `(${dividendBD} / ${divisorBD})`,
+        finalExpr: givingValueExpr(target),
+      }));
+      if (statement.remainder) {
+        entries.push({
+          target: statement.remainder,
+          resultBD: `(${dividendBD} % ${divisorBD})`,
+          finalExpr: `${dividend} % ${divisor}`,
+        });
+      }
+      // DIVIDE BY ZERO: BigDecimal division would raise ArithmeticException
+      // before any digit-capacity check could even run, so it must be
+      // tested (and short-circuit into the ON SIZE ERROR branch) ahead of -
+      // not alongside - the digit checks.
+      const zeroCheck = `(${divisorBD}) == BigDecimal(0)`;
+      lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries, zeroCheck));
     }
   } else if (into.length > 0) {
     // DIVIDE A INTO B  -> b = b / a
-    const divisor = convertArithmeticExpression(statement.divisor || statement.dividend);
-    for (const target of into) {
-      const name = convertIdentifier(target);
-      lines.push(`${indentStr}${renderAssignment(target, `${name} / ${divisor}`)}`);
+    const divisorNode = statement.divisor || statement.dividend;
+    const divisor = convertArithmeticExpression(divisorNode);
+
+    if (!withSizeError) {
+      for (const target of into) {
+        const name = convertIdentifier(target);
+        lines.push(`${indentStr}${renderAssignment(target, `${name} / ${divisor}`)}`);
+      }
+    } else {
+      const divisorBD = toBigDecimalOperand(divisorNode);
+      const entries = into.map(target => {
+        const name = convertIdentifier(target);
+        return {
+          target,
+          resultBD: `(${toBigDecimalOperand(target)} / ${divisorBD})`,
+          finalExpr: `${name} / ${divisor}`,
+        };
+      });
+      const zeroCheck = `(${divisorBD}) == BigDecimal(0)`;
+      lines.push(generateArithmeticSizeErrorCheck(indent, statement, entries, zeroCheck));
     }
   } else {
     const dividend = convertArithmeticExpression(statement.dividend);
@@ -1647,14 +2493,6 @@ function generateDivide(statement, indent = 0) {
   }
 
   return lines.join('\n');
-}
-
-/**
- * Wrap an already-rendered Scala expression in a BigDecimal conversion,
- * unless it's already producing one.
- */
-function toBigDecimalExpr(expr) {
-  return /^BigDecimal\(/.test(expr) ? expr : `BigDecimal(${expr})`;
 }
 
 /**

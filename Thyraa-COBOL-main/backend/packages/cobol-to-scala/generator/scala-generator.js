@@ -17,6 +17,7 @@ import {
   setGroupRegistry,
   setSortFileRegistry,
   setQualifiedRegistry,
+  setConditionRegistry,
   generateCobolFmtHelper,
   generateCobolInspectHelper,
 } from './expression-gen.js';
@@ -407,10 +408,60 @@ function escapeScalaString(text) {
 }
 
 /**
+ * Fit a plain (compile-time-known) string to a fixed width the same way
+ * CobolFmt.fitLeft/fitRight do at runtime (see expression-gen.js's
+ * generateCobolFmtHelper) - used for a VALUE clause literal, which COBOL
+ * space-pads/truncates to the item's own declared PIC width (and
+ * left-pads/truncates-left instead when the item is JUSTIFIED RIGHT) at
+ * *initialization* time, not just at MOVE time.
+ */
+function fitAlphanumericText(text, width, justifiedRight) {
+  const s = String(text ?? '');
+  if (!width || width <= 0) return s;
+  if (s.length >= width) {
+    return justifiedRight ? s.slice(s.length - width) : s.slice(0, width);
+  }
+  const pad = ' '.repeat(width - s.length);
+  return justifiedRight ? pad + s : s + pad;
+}
+
+/**
+ * Truncate a numeric literal's text to an item's own declared integer/decimal
+ * digit counts, exactly as COBOL truncates (never rounds) a VALUE clause (or
+ * a MOVE - see expression-gen.js's CobolFmt.truncNumeric, the runtime
+ * equivalent for non-literal MOVE sources) that supplies more digits than the
+ * receiving item's PICTURE can hold: excess low-order decimal digits are
+ * dropped, excess high-order integer digits are dropped (sign preserved).
+ */
+function truncateNumericLiteralText(raw, integerDigits, decimalDigits) {
+  const s = String(raw ?? '0');
+  const neg = s.startsWith('-');
+  const unsigned = s.replace(/^[+-]/, '');
+  const dot = unsigned.indexOf('.');
+  let intPart = dot === -1 ? unsigned : unsigned.slice(0, dot);
+  let decPart = dot === -1 ? '' : unsigned.slice(dot + 1);
+
+  if (typeof decimalDigits === 'number' && decimalDigits >= 0) {
+    decPart = decPart.slice(0, decimalDigits);
+  }
+  if (typeof integerDigits === 'number' && integerDigits >= 0 && intPart.length > integerDigits) {
+    intPart = intPart.slice(intPart.length - integerDigits);
+  }
+
+  const sign = neg ? '-' : '';
+  return decPart.length > 0 ? `${sign}${intPart}.${decPart}` : `${sign}${intPart || '0'}`;
+}
+
+/**
  * Scala literal for an elementary item's initial value: honors the VALUE
  * clause (numeric/string/figurative-ZERO/figurative-SPACE) when present,
  * otherwise falls back to the COBOL default-initialization value for the
- * type (numeric 0, alphanumeric empty/spaces).
+ * type (numeric 0, alphanumeric empty/spaces). A VALUE clause is fitted to
+ * the item's own declared width/digit-counts exactly as COBOL does at
+ * initialization (see fitAlphanumericText/truncateNumericLiteralText above) -
+ * this matters because later MOVEs that read this item as a *source* trust
+ * its stored value to already be at its full declared width/precision (see
+ * expression-gen.js's renderVariableMoveSource).
  */
 function defaultElementaryValue(item, scalaType) {
   const raw = item.value;
@@ -435,17 +486,26 @@ function defaultElementaryValue(item, scalaType) {
     }
   }
 
+  const pic = item.pic && typeof item.pic === 'object' ? item.pic : null;
+
   if (scalaType === 'String') {
-    if (literalKind === 'string') return `"${escapeScalaString(literalText)}"`;
-    if (literalKind === 'numeric') return `"${escapeScalaString(literalText)}"`;
+    if (literalKind === 'string' || literalKind === 'numeric') {
+      const width = pic?.length || 0;
+      const justifiedRight = String(item.justified || '').toUpperCase() === 'RIGHT';
+      return `"${escapeScalaString(fitAlphanumericText(literalText, width, justifiedRight))}"`;
+    }
     return '""';
   }
   if (scalaType === 'BigDecimal') {
-    if (literalKind === 'numeric') return `BigDecimal("${literalText}")`;
+    if (literalKind === 'numeric') {
+      return `BigDecimal("${truncateNumericLiteralText(literalText, pic?.integerDigits, pic?.decimalDigits)}")`;
+    }
     return 'BigDecimal(0)';
   }
   if (scalaType === 'Long') {
-    if (literalKind === 'numeric') return `${normalizeIntLiteralText(literalText)}L`;
+    if (literalKind === 'numeric') {
+      return `${normalizeIntLiteralText(truncateNumericLiteralText(literalText, pic?.integerDigits, 0))}L`;
+    }
     return '0L';
   }
   if (scalaType === 'Float') {
@@ -457,7 +517,9 @@ function defaultElementaryValue(item, scalaType) {
     return '0.0';
   }
   // Int (default)
-  if (literalKind === 'numeric') return normalizeIntLiteralText(literalText);
+  if (literalKind === 'numeric') {
+    return normalizeIntLiteralText(truncateNumericLiteralText(literalText, pic?.integerDigits, 0));
+  }
   return '0';
 }
 
@@ -467,17 +529,94 @@ function normalizeIntLiteralText(raw) {
 }
 
 /**
+ * Character-sliced group REDEFINES: used whenever the redefined target is
+ * alphanumeric (String) - including REDEFINES over an OCCURS table (e.g.
+ * `01 WS-TABLE-VIEW REDEFINES WS-FLAT-VIEW. 05 WS-CHUNK OCCURS 3 TIMES PIC
+ * X(4).` over a PIC X(12) WS-FLAT-VIEW). Each child occupies a fixed run of
+ * *characters* (not decimal digits - see the numeric sibling path in
+ * redefinesAccessorLines, which is only meaningful when the target is
+ * itself numeric), left to right; a child with an OCCURS clause becomes a
+ * `Vector[String]` accessor whose elements are equal-width character slices
+ * of its own span. Both the getter and setter are plain `def`s (not a raw
+ * `var`), so `wsChunk(i)` (read) and `wsChunk = wsChunk.updated(i, v)`
+ * (write - see renderAssignment) both work exactly as if `wsChunk` were a
+ * real `Vector[String]` var, while the *actual* storage stays the shared
+ * target String.
+ */
+function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry) {
+  const lines = [];
+  let offset = 0;
+
+  for (const child of realChildren) {
+    const camel = toCamelCase(child.name);
+    const count = hasOccurs(child) && occursCount(child) > 1 ? occursCount(child) : 1;
+    const elementWidth = child.pic && typeof child.pic === 'object' ? (child.pic.length || 0) : 0;
+    const totalWidth = elementWidth * count;
+    const start = offset;
+    const end = offset + totalWidth;
+    offset = end;
+
+    if (count > 1) {
+      lines.push(`  def ${camel}: Vector[String] =`);
+      lines.push(
+        `    (0 until ${count}).map(i => ${targetCamel}.substring(${start} + i * ${elementWidth}, ${start} + (i + 1) * ${elementWidth})).toVector`
+      );
+      lines.push(`  def ${camel}_=(v: Vector[String]): Unit =`);
+      lines.push(
+        `    ${targetCamel} = ${targetCamel}.substring(0, ${start}) + (0 until ${count}).map(i => CobolFmt.fitLeft(v(i), ${elementWidth})).mkString + ${targetCamel}.substring(${end})`
+      );
+      registry.set((child.name || '').toUpperCase(), {
+        camel,
+        scalaType: 'String',
+        dataType: 'alphanumeric',
+        integerDigits: 0,
+        decimalDigits: 0,
+        signed: false,
+        editPattern: null,
+        occursDepth: 1,
+        picLength: elementWidth,
+        justified: false,
+        blankWhenZero: false,
+      });
+    } else {
+      lines.push(`  def ${camel}: String = ${targetCamel}.substring(${start}, ${end})`);
+      lines.push(
+        `  def ${camel}_=(v: String): Unit = ${targetCamel} = ${targetCamel}.substring(0, ${start}) + CobolFmt.fitLeft(v, ${elementWidth}) + ${targetCamel}.substring(${end})`
+      );
+      registry.set((child.name || '').toUpperCase(), {
+        camel,
+        scalaType: 'String',
+        dataType: (child.pic && child.pic.dataType) || 'alphanumeric',
+        integerDigits: 0,
+        decimalDigits: 0,
+        signed: false,
+        editPattern: null,
+        occursDepth: 0,
+        picLength: elementWidth,
+        justified: String(child.justified || '').toUpperCase() === 'RIGHT',
+        blankWhenZero: false,
+      });
+    }
+  }
+
+  return lines;
+}
+
+/**
  * Generate the accessor (`def`/`def_=`) pairs for a REDEFINES entry.
  *
  * - Elementary REDEFINES (no children): a plain pass-through alias onto the
  *   redefined target's flat var.
- * - Group REDEFINES (children): each child slices a fixed-width run of
- *   decimal digits out of the target's numeric value (e.g. WS-YEAR/MONTH/DAY
- *   REDEFINES a PIC 9(8) WS-DATE-NUMERIC) - reading/writing a child reads or
- *   rewrites just its digit-slice of the shared target var, so a write
- *   through either view is visible through the other, matching COBOL
- *   REDEFINES storage-sharing semantics without needing real byte-level
- *   aliasing in Scala.
+ * - Group REDEFINES over a NUMERIC target (children): each child slices a
+ *   fixed-width run of decimal digits out of the target's numeric value
+ *   (e.g. WS-YEAR/MONTH/DAY REDEFINES a PIC 9(8) WS-DATE-NUMERIC) - reading/
+ *   writing a child reads or rewrites just its digit-slice of the shared
+ *   target var, so a write through either view is visible through the
+ *   other, matching COBOL REDEFINES storage-sharing semantics without
+ *   needing real byte-level aliasing in Scala.
+ * - Group REDEFINES over an ALPHANUMERIC target (children): see
+ *   characterSlicedGroupRedefinesLines above - character-position slicing,
+ *   including REDEFINES over an OCCURS table.
  */
 function redefinesAccessorLines(item, registry) {
   const targetUpper = String(item.redefines || '').toUpperCase();
@@ -501,7 +640,28 @@ function redefinesAccessorLines(item, registry) {
     return lines;
   }
 
-  // Group REDEFINES: children slice the target's decimal digits left-to-right.
+  if (targetInfo.scalaType === 'String') {
+    return characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry);
+  }
+
+  if (!['Int', 'Long', 'BigDecimal'].includes(targetInfo.scalaType)) {
+    // Not a plain integer-or-BigDecimal numeric target and not String (e.g.
+    // Float/Double from COMP-1/COMP-2) - the digit-slicing arithmetic below
+    // assumes `/`, `%`, `*`, `-`, `+` over the target's own Scala numeric
+    // type, and character-slicing above assumes String; a group REDEFINES
+    // over anything else is genuinely infeasible to model with this
+    // generator's flat-var representation. Emit a visible marker that still
+    // compiles rather than silently-wrong numeric-view code.
+    lines.push(
+      `  // REDEFINES ${item.redefines}: ??? TODO - group REDEFINES over a ${targetInfo.scalaType} target is not supported; ${item.name}'s children are not accessible`
+    );
+    return lines;
+  }
+
+  // Group REDEFINES over a numeric (Int/Long/BigDecimal) target: children
+  // slice the target's decimal digits left-to-right. BigDecimal supports the
+  // same `/`/`%`/`*`/`-`/`+` operators used below, so no separate branch is
+  // needed for a COMP-3 (or other BigDecimal-typed) whole-number target.
   const widths = realChildren.map(c => (c.pic && c.pic.integerDigits) || 0);
   for (let i = 0; i < realChildren.length; i++) {
     const child = realChildren[i];
@@ -525,6 +685,9 @@ function redefinesAccessorLines(item, registry) {
       signed: !!(childPic && childPic.signed),
       editPattern: null,
       occursDepth: 0,
+      picLength: 0,
+      justified: false,
+      blankWhenZero: false,
     });
   }
 
@@ -590,6 +753,11 @@ function buildFieldRegistry(ast) {
   // a qualified reference always resolves correctly even when the bare name
   // happens to be unique too.
   const qualifiedRegistry = new Map();
+  // 88-level condition name (upper) -> { info: <parent field's registry
+  // info>, values: <Level88.values array> } - see the level88ConditionExpr
+  // doc comment in expression-gen.js for how this drives IF/EVALUATE
+  // condition-name generation.
+  const conditionRegistry = new Map();
   const lines = [];
   const declaredIndexNames = new Set();
 
@@ -707,6 +875,12 @@ function buildFieldRegistry(ast) {
         editPattern: pic?.editPattern || null,
         occursDepth: fullChain.length,
         picLength: pic?.length || 0,
+        // JUSTIFIED RIGHT (alphanumeric MOVE alignment) and BLANK WHEN ZERO
+        // (numeric-edited MOVE) - see expression-gen.js's
+        // renderVariableMoveSource/fitAlphanumericExpr and
+        // formatEditedPicture/CobolFmt.edited.
+        justified: String(item.justified || '').toUpperCase() === 'RIGHT',
+        blankWhenZero: !!item.blankWhenZero,
       };
       // Only an unambiguous name gets a bare-name registry entry - an
       // ambiguous one would just silently overwrite whichever same-named
@@ -716,13 +890,26 @@ function buildFieldRegistry(ast) {
       // depends on a bare-key entry existing here).
       if (!ambiguous) registry.set(nameUpper, info);
       qualifiedRegistry.set(`${nameUpper}::${(parentNameUpper || '').toUpperCase()}`, info);
+
+      // Level-88 condition-name registry: every VALUE/VALUES (incl. THRU
+      // ranges) declared under this elementary item, keyed by the 88-level's
+      // own name - used by convertCondition (IF/PERFORM UNTIL a-condition-
+      // name) and evaluateConditionExpr (EVALUATE TRUE/FALSE WHEN a-
+      // condition-name) to generate the equality/range test against this
+      // item's own value instead of treating the condition name as if it
+      // were itself a boolean data item (it isn't one - see
+      // level88ConditionExpr in expression-gen.js).
+      for (const cond of item.conditions || []) {
+        if (!cond || !cond.name) continue;
+        conditionRegistry.set(String(cond.name).toUpperCase(), { info, values: cond.values || [] });
+      }
     }
   }
 
   walk(wsItems, [], null);
   walk(fileItems, [], null);
 
-  return { lines: lines.join('\n'), registry, tableRegistry, groupRegistry, qualifiedRegistry };
+  return { lines: lines.join('\n'), registry, tableRegistry, groupRegistry, qualifiedRegistry, conditionRegistry };
 }
 
 /**
@@ -979,11 +1166,13 @@ export function generateScala(ast, options = {}) {
     tableRegistry,
     groupRegistry,
     qualifiedRegistry,
+    conditionRegistry,
   } = buildFieldRegistry(ast);
   setFieldRegistry(fieldRegistry);
   setTableRegistry(tableRegistry);
   setGroupRegistry(groupRegistry);
   setQualifiedRegistry(qualifiedRegistry);
+  setConditionRegistry(conditionRegistry);
 
   // SD ("sort") work-file support: a dedicated row case class + in-memory
   // buffer/cursor vars per SD, so SORT/RELEASE/RETURN can be generated as

@@ -1,0 +1,39 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. A02RND.
+      *
+      * Adversarial: COMPUTE ROUNDED vs truncation, V9(4) scale,
+      * division truncation vs "true" decimal math, negative rounding.
+      *
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-X                PIC S9(3)V9(4) COMP-3 VALUE 10.0000.
+       01  WS-Y                PIC S9(3)V9(4) COMP-3 VALUE 3.0000.
+       01  WS-RESULT-TRUNC     PIC S9(3)V9(4) COMP-3.
+       01  WS-RESULT-ROUND     PIC S9(3)V9(4) COMP-3.
+       01  WS-NEG-X            PIC S9(3)V9(4) COMP-3 VALUE -10.0000.
+       01  WS-RESULT-NEG-TRUNC PIC S9(3)V9(4) COMP-3.
+       01  WS-RESULT-NEG-ROUND PIC S9(3)V9(4) COMP-3.
+       01  WS-HALF-UP          PIC S9(3)V99 COMP-3.
+       01  WS-HALF-UP-SRC      PIC S9(3)V9(3) COMP-3 VALUE 2.345.
+       01  WS-HALF-DOWN-SRC    PIC S9(3)V9(3) COMP-3 VALUE 2.344.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           COMPUTE WS-RESULT-TRUNC = WS-X / WS-Y
+           DISPLAY 'DIV-TRUNC=' WS-RESULT-TRUNC
+
+           COMPUTE WS-RESULT-ROUND ROUNDED = WS-X / WS-Y
+           DISPLAY 'DIV-ROUND=' WS-RESULT-ROUND
+
+           COMPUTE WS-RESULT-NEG-TRUNC = WS-NEG-X / WS-Y
+           DISPLAY 'NEG-DIV-TRUNC=' WS-RESULT-NEG-TRUNC
+
+           COMPUTE WS-RESULT-NEG-ROUND ROUNDED = WS-NEG-X / WS-Y
+           DISPLAY 'NEG-DIV-ROUND=' WS-RESULT-NEG-ROUND
+
+           COMPUTE WS-HALF-UP ROUNDED = WS-HALF-UP-SRC
+           DISPLAY 'HALF-UP=' WS-HALF-UP
+
+           COMPUTE WS-HALF-UP ROUNDED = WS-HALF-DOWN-SRC
+           DISPLAY 'HALF-DOWN=' WS-HALF-UP
+
+           STOP RUN.

@@ -3,7 +3,7 @@
 **Run start:** 2026-07-11 ~01:30 UTC · **Branch:** claude/analyze-codebase-pdPSZ · **Budget:** orchestrator ≤2M own tokens, 48h wall clock
 
 ## Open questions / blockers
-- **CRITIC BLOCKING #1:** oracle suite compares COBOL-vs-Scala for corpus/data/ ONLY; the 9 proc/ programs are never run through convertToScala in any test (7/9 crash or emit non-compiling Scala). The 170/0/0 green count is NOT evidence of Phase 2 codegen. Fix: extend oracle compare + t.todo discipline to proc/ (in-flight Phase 2 agent's mandate; verify on landing).
+- **PHASE 2 REFUTED (queued fix):** 16/20 new adversarial proc programs diverge, 14 root causes, ALL silent (no TODO markers): NUMVAL crash on '+  12.5', 88-level conditions unimplemented (confirms Phase 1b mandate), EVALUATE expression-subject collapse, recursive PERFORM emits 1000Recurse(), WITH TEST AFTER invalid Scala, duplicate nested group names collide in codegen, LENGTH of group, MAX over BigDecimal, SEARCH VARYING ignored, index-name DISPLAY format, multi-key mixed-direction SORT, RELEASE FROM / RETURN INTO no-ops, UNSTRING COUNT IN dropped. Repros: scratchpad/phase2-refutation/. Baseline 9 corpus programs re-confirmed passing (pinned to 01c2fdb). Also: stale known-gaps table in tests/oracle/README.md must be refreshed. Fix wave dispatches when Phase 1b agent frees generator/.
 - **CRITIC BLOCKING #2:** safeNodeString checks node.name before its TODO fallback, so unhandled FunctionCall nodes render as bare identifiers (silent garbage; FUNCTION MOD(17,5) emits wsModPos = 0). Violates the coverage-honesty rule. Must reorder: unknown statement/expression types -> visible ??? TODO marker.
 - **PHASE 1 STATUS CORRECTED: NOT DONE.** Adversarial refuter (12 new edge-case programs vs compiler oracle) REFUTED the Phase 1 milestone: 11/12 diverge. The 7-program corpus was a narrow slice. Fix wave queued behind the in-flight Phase 2 generator agent (same files). Full repros preserved in scratchpad/phase1-refutation/.
 
@@ -13,6 +13,18 @@
 - **Orchestrator token spend:** minimal (cycle 1)
 
 ## Activity
+
+### 2026-07-11 05:00 — Cycle 10: Phase 2 refuted (14 silent gaps); Phase 3 SQL dispatched
+- Phase 2 refuter: REFUTED - findings pinned above. 4 hard attacks survived (SEARCH ALL descending/dup-keys, SORT dup stability, backward GO TO in THRU range). It also independently re-verified all 16 corpus programs pass at pinned commit.
+- Dispatched Phase 3 SQL agent (disjoint files: sql-parser.js, sql-gen.js, tests/corpus/sql/): EXEC SQL -> typed Doobie (SELECT INTO/INSERT/UPDATE/cursor->stream, indicator vars, WHENEVER/SQLCODE -> Either), string-level expected fragments + scala-cli compile check with real doobie dep.
+- In flight: Phase 1b hardening (11 data edge cases + safeNodeString ordering), Phase 3 SQL.
+- Queue: Phase 2b fix wave (14 findings) behind Phase 1b; then re-refutation of both; JCL flow-diagram/skeleton gap and stale README with it.
+
+### 2026-07-11 04:30 — Cycle 9: Phase 2 proc corpus fully oracle-equivalent; Phase 1b + Phase 2 refuter dispatched
+- Phase 2 generator agent complete: ALL 9 proc programs pass oracleCompare as hard assertions (SEARCH/SEARCH ALL with real binary search, SORT/RELEASE/RETURN with SD work-file modeling, MOVE CORRESPONDING, GO TO DEPENDING ON via nested defs in THRU ranges, full intrinsics, VARYING..AFTER, STRING/UNSTRING/INSPECT, EVALUATE rewrite). Fixed 4 pre-existing dead-code bugs. Known-unsupported forms carry explicit TODOs itemized in tests/oracle/README.md. CRITIC BLOCKING #1 RESOLVED - proc/ now oracle-gated.
+- Suite 179/0/0 verified independently; committed 01c2fdb, pushed.
+- Dispatched: (a) Phase 1b hardening agent - all 11 refuted edge cases (MOVE semantics/JUSTIFIED/group MOVE, arithmetic subscripts, ON SIZE ERROR, 88-level conditions, Z-suppression/BLANK WHEN ZERO, REDEFINES-over-table) + critic blocking #2 (safeNodeString TODO ordering) + promotion of the 12 adversarial programs into the corpus; (b) Phase 2 adversarial refuter - 10-14 new proc edge programs (scratchpad only).
+- Wall clock ~3h of 48h. Orchestrator spend est. ~80k of 2M.
 
 ### 2026-07-11 04:00 — Cycle 8: completeness critic report - claims verified, 2 blocking gaps
 - Critic verified: 170/0/0 reproduced independently; REDEFINES lazy views, ASCII 0x70 zoned scheme, 16/16 expected-vs-oracle all genuine; no out-of-scope work; no weakened assertions (one legitimate compiler-driven value correction); ODO deviation honestly disclosed; commit messages accurately worded.

@@ -319,6 +319,32 @@ function parsePicClause(ctx) {
 }
 
 /**
+ * round-16 finding 6: GnuCOBOL's native fixed-width binary USAGEs
+ * (BINARY-CHAR/BINARY-SHORT/BINARY-LONG/BINARY-DOUBLE) are the one USAGE
+ * family that is legally declared with NO PIC clause at all - the usage
+ * name itself fully determines the item's storage width and implied
+ * numeric picture (unlike COMP/COMP-4/COMP-5/BINARY, which only ever modify
+ * an explicit PIC). `parseUsageClause`'s pre-fix `usageMap` didn't recognize
+ * any of these hyphenated names at all (lexed as a single identifier token,
+ * same as COMP-3 - see lexer.js's scanIdentifier), so `USAGE BINARY-LONG`
+ * fell through `usageMap[upperValue]` undefined, returned the fallback
+ * `'DISPLAY'` WITHOUT consuming the `BINARY-LONG` token, and the main
+ * data-item clause loop's own "skip unknown tokens" fallback silently
+ * discarded it - the item ended up USAGE DISPLAY with no PIC at all,
+ * treated as a string (ADD behaved like concatenation: "30"+"1"="301").
+ * Exported so `parseDataItemClauses` below can synthesize the implicit PIC
+ * these usages imply once the whole clause loop has finished (a PIC clause
+ * appearing before OR after USAGE in the source is equally legal COBOL, so
+ * the synthesis has to happen after the full loop, not inline here).
+ */
+export const IMPLICIT_BINARY_PIC_DIGITS = {
+  'BINARY-CHAR': 3,
+  'BINARY-SHORT': 5,
+  'BINARY-LONG': 10,
+  'BINARY-DOUBLE': 20,
+};
+
+/**
  * Parse USAGE clause
  */
 function parseUsageClause(ctx) {
@@ -343,6 +369,10 @@ function parseUsageClause(ctx) {
     'COMPUTATIONAL-4': 'COMP-4',
     'COMPUTATIONAL-5': 'COMP-5',
     'BINARY': 'BINARY',
+    'BINARY-CHAR': 'BINARY-CHAR',
+    'BINARY-SHORT': 'BINARY-SHORT',
+    'BINARY-LONG': 'BINARY-LONG',
+    'BINARY-DOUBLE': 'BINARY-DOUBLE',
     'PACKED-DECIMAL': 'COMP-3',
     'INDEX': 'INDEX',
     'DISPLAY': 'DISPLAY',
@@ -587,12 +617,33 @@ function parseDataItem(ctx) {
     }
 
     // USAGE clause (COMP/COMPUTATIONAL carry optional -1..-5 suffixes,
-    // e.g. COMP-3, which are lexed as single hyphenated tokens)
+    // e.g. COMP-3, which are lexed as single hyphenated tokens). round-16
+    // finding 6: BINARY-CHAR/BINARY-SHORT/BINARY-LONG/BINARY-DOUBLE are
+    // likewise lexed as one hyphenated identifier token and are legal
+    // WITHOUT a preceding "USAGE"/"USAGE IS" keyword, same as bare BINARY -
+    // recognized directly here (not just via parseUsageClause's own
+    // usageMap, which only fires once this dispatch condition is already
+    // true).
     if (ctx.checkValue('USAGE') ||
         /^(COMP|COMPUTATIONAL)(-[1-5])?$/i.test(current.value || '') ||
+        /^BINARY-(CHAR|SHORT|LONG|DOUBLE)$/i.test(current.value || '') ||
         ctx.checkValue('BINARY') || ctx.checkValue('PACKED-DECIMAL') ||
         ctx.checkValue('INDEX') || ctx.checkValue('DISPLAY') || ctx.checkValue('POINTER')) {
       item.usage = parseUsageClause(ctx);
+      continue;
+    }
+
+    // SIGNED/UNSIGNED - only meaningful following one of the fixed-width
+    // native binary USAGEs above (`BINARY-LONG UNSIGNED`), but harmless to
+    // recognize unconditionally (no other clause uses these keywords).
+    // Defaults to signed when omitted (GnuCOBOL's own default for these
+    // USAGEs) - see the implicit-PIC synthesis below.
+    if (ctx.matchValue('SIGNED')) {
+      item.usageSigned = true;
+      continue;
+    }
+    if (ctx.matchValue('UNSIGNED')) {
+      item.usageSigned = false;
       continue;
     }
 
@@ -660,6 +711,34 @@ function parseDataItem(ctx) {
 
     // Skip unknown tokens
     ctx.advance();
+  }
+
+  // round-16 finding 6: a bare fixed-width native binary USAGE
+  // (BINARY-CHAR/BINARY-SHORT/BINARY-LONG/BINARY-DOUBLE) with no explicit
+  // PIC clause implies its own numeric picture - it's the one USAGE family
+  // legally declared without one at all. Applied only when no PIC clause
+  // was actually parsed above (an explicit `PIC S9(n) BINARY-LONG` - legal,
+  // if unusual - keeps its own declared picture untouched). Digit widths are
+  // the number of decimal digits needed to display the USAGE's full
+  // storage-width magnitude (oracle-verified for BINARY-LONG via e14: a
+  // 4-byte field DISPLAYs as `+0000000030`, 10 digits, not the 9 a plain
+  // "5-9 digits -> 4 bytes" COMP tiering would suggest - these fixed-width
+  // USAGEs pick their own byte width directly from the USAGE name, not from
+  // any digit count, so elementaryByteLength (layout.js) special-cases them
+  // the same way, independent of this synthesized digit count). Signed
+  // unless an explicit UNSIGNED clause was seen (item.usageSigned === false)
+  // - GnuCOBOL's own default for every one of these USAGEs.
+  if (!item.pic && IMPLICIT_BINARY_PIC_DIGITS[item.usage]) {
+    const digits = IMPLICIT_BINARY_PIC_DIGITS[item.usage];
+    const signed = item.usageSigned !== false;
+    item.pic = new PicClause({
+      pattern: `${signed ? 'S' : ''}9(${digits})`,
+      dataType: 'numeric',
+      length: digits,
+      integerDigits: digits,
+      decimalDigits: 0,
+      signed,
+    });
   }
 
   // Skip period if present

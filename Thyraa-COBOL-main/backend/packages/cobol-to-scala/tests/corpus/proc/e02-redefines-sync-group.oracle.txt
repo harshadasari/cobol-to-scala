@@ -1,0 +1,4 @@
+LEN=5
+LEAD=P
+TAIL=T
+NUM=+1075

@@ -88,6 +88,21 @@ export function picDigits(item) {
 }
 
 /**
+ * round-16 finding 6: byte width GnuCOBOL's native fixed-width binary
+ * USAGEs (BINARY-CHAR/BINARY-SHORT/BINARY-LONG/BINARY-DOUBLE - the C-like
+ * int8/int16/int32/int64 USAGEs, legally declared with no PIC clause at
+ * all) always use, regardless of digit count - see elementaryByteLength's
+ * own doc comment for why this can't reuse the ordinary COMP digit-count
+ * tiering below.
+ */
+const FIXED_BINARY_USAGE_BYTES = {
+  'BINARY-CHAR': 1,
+  'BINARY-SHORT': 2,
+  'BINARY-LONG': 4,
+  'BINARY-DOUBLE': 8,
+};
+
+/**
  * Storage bytes of a single occurrence of an elementary item,
  * honoring the USAGE clause:
  *   DISPLAY      one byte per picture position
@@ -98,6 +113,16 @@ export function picDigits(item) {
  */
 export function elementaryByteLength(item) {
   const usage = (item.usage || 'DISPLAY').toUpperCase();
+
+  // round-16 finding 6: GnuCOBOL's native fixed-width binary USAGEs pick
+  // their byte width directly from the USAGE name itself (BINARY-LONG is
+  // ALWAYS 4 bytes), not from the item's digit count the way an ordinary
+  // COMP/COMP-4/COMP-5/BINARY declaration's width is tiered below - so this
+  // is checked first and short-circuits that tiering entirely (which would
+  // otherwise misclassify e.g. BINARY-LONG's own 10-digit implicit PIC -
+  // see parser/data-division-parser.js's IMPLICIT_BINARY_PIC_DIGITS - into
+  // the "10-18 digits -> 8 bytes" tier instead of its true 4 bytes).
+  if (FIXED_BINARY_USAGE_BYTES[usage]) return FIXED_BINARY_USAGE_BYTES[usage];
 
   if (usage === 'COMP-1' || usage === 'COMPUTATIONAL-1') return 4;
   if (usage === 'COMP-2' || usage === 'COMPUTATIONAL-2') return 8;
@@ -160,7 +185,8 @@ export function syncPadBytes(item, offset) {
   const usage = (item.usage || '').toUpperCase();
   const isBinary = usage === 'COMP' || usage === 'COMP-4' || usage === 'COMP-5' ||
     usage === 'COMPUTATIONAL' || usage === 'COMPUTATIONAL-4' ||
-    usage === 'COMPUTATIONAL-5' || usage === 'BINARY';
+    usage === 'COMPUTATIONAL-5' || usage === 'BINARY' ||
+    !!FIXED_BINARY_USAGE_BYTES[usage];
   if (!isBinary) return 0;
 
   const size = elementaryByteLength(item);
@@ -185,7 +211,8 @@ function syncAlignmentSize(item) {
     const usage = (item.usage || '').toUpperCase();
     const isBinary = usage === 'COMP' || usage === 'COMP-4' || usage === 'COMP-5' ||
       usage === 'COMPUTATIONAL' || usage === 'COMPUTATIONAL-4' ||
-      usage === 'COMPUTATIONAL-5' || usage === 'BINARY';
+      usage === 'COMPUTATIONAL-5' || usage === 'BINARY' ||
+      !!FIXED_BINARY_USAGE_BYTES[usage];
     if (isBinary) max = elementaryByteLength(item);
   }
   const children = (item.children || []).filter(c => c.level !== 88 && !c.redefines);

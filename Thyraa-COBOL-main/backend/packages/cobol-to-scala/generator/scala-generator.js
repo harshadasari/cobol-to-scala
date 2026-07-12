@@ -7,8 +7,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { toPascalCase, toCamelCase, generateCaseClass, collectAmbiguousGroupClassNames } from './case-class-gen.js';
-import { getPicPattern, scalaBaseType, occursCount, hasOccurs, itemByteLength, syncPadBytes } from './layout.js';
+import {
+  toPascalCase,
+  toCamelCase,
+  generateCaseClass,
+  collectAmbiguousGroupClassNames,
+  classifyCodec,
+  decodeFieldExpr,
+  encodeFieldExpr,
+} from './case-class-gen.js';
+import { getPicPattern, scalaBaseType, occursCount, hasOccurs, itemByteLength, syncPadBytes, elementaryByteLength } from './layout.js';
 import { packedDecode, binaryDecode } from './codecs.js';
 import { generateAllEnums, groupLevel88sByParent } from './enum-gen.js';
 import {
@@ -920,7 +928,7 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
  *   characterSlicedGroupRedefinesLines above - character-position slicing,
  *   including REDEFINES over an OCCURS table.
  */
-function redefinesAccessorLines(item, registry, siblingList, tableRegistry) {
+function redefinesAccessorLines(item, registry, siblingList, tableRegistry, targetAbsOffset = 0) {
   const targetUpper = String(item.redefines || '').toUpperCase();
   const targetInfo = registry.get(targetUpper);
   const lines = [];
@@ -941,7 +949,23 @@ function redefinesAccessorLines(item, registry, siblingList, tableRegistry) {
     const targetItem = (siblingList || []).find(i => !isLevel(i, 88) && (i.name || '').toUpperCase() === targetUpper);
     const targetRealChildren = targetItem ? (targetItem.children || []).filter(c => !isLevel(c, 88)) : [];
     if (targetItem && targetRealChildren.length > 0) {
-      return groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry);
+      const redefiningRealChildren = (item.children || []).filter(c => !isLevel(c, 88));
+      // round-16 finding 1: the group-over-group path below
+      // (groupOverGroupRedefinesLines) only ever declared accessors for
+      // ITEM's OWN children, sliced out of a synthetic flat view over the
+      // target - it silently assumed `item` itself is always a group. An
+      // ELEMENTARY item (no children of its own) redefining a GROUP target
+      // (e02: `05 WS-B REDEFINES WS-A PIC X(5)` over a SYNC-padded group)
+      // fell through that assumption entirely: `item.children` is empty, so
+      // nothing was ever declared for `item` itself - a hard "Not found"
+      // compile error. elementaryOverGroupRedefinesLines below handles this
+      // mirror-image shape: same synthetic-flat-view construction, exposed
+      // directly as `item`'s own accessor instead of a further-sliced
+      // `...BaseFlat` helper.
+      if (redefiningRealChildren.length === 0) {
+        return elementaryOverGroupRedefinesLines(item, targetItem, registry, targetAbsOffset);
+      }
+      return groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry, targetAbsOffset);
     }
     lines.push(`  // REDEFINES ${item.redefines}: target not found - ${item.name} not accessible`);
     return lines;
@@ -1062,6 +1086,317 @@ function flattenRedefinesLeaves(groupItem) {
   }
   const ok = walk((groupItem.children || []).filter(c => !isLevel(c, 88)));
   return ok ? leaves : null;
+}
+
+/**
+ * round-16 finding 1: byte-accurate REDEFINES target flattening - a
+ * fallback for exactly the shapes flattenRedefinesLeaves's own doc comment
+ * says it deliberately bails on: a SIGNED numeric child and/or a non-DISPLAY
+ * USAGE (COMP/COMP-3/COMP-4/COMP-5/BINARY, including a SYNC-padded one).
+ * flattenRedefinesLeaves' "zero-padded decimal digit text" model is only
+ * actually correct for a DISPLAY (zoned) unsigned numeric or plain
+ * alphanumeric child - real storage for a signed/binary/packed child is not
+ * ASCII digit text at all, so guessing at a digit-text rendering for it
+ * would silently produce the wrong bytes rather than the honest "can't
+ * represent this" `null` flattenRedefinesLeaves already returns. This
+ * reuses case-class-gen.js's own `classifyCodec`/`decodeFieldExpr`/
+ * `encodeFieldExpr` - the EXACT SAME codec dispatch a record's own
+ * byte-level `parse`/`format` already uses - so a REDEFINES's synthetic
+ * flat view decodes/encodes each child identically to how that same field
+ * would round-trip through real file I/O.
+ *
+ * Tried only as a FALLBACK, after flattenRedefinesLeaves itself has already
+ * returned `null` (see groupOverGroupRedefinesLines/
+ * elementaryOverGroupRedefinesLines below) - every previously-supported
+ * shape (unsigned DISPLAY/plain alphanumeric, no OCCURS, no SYNC) still
+ * goes through flattenRedefinesLeaves and produces byte-for-byte the same
+ * generated text as before this round; this path only ever activates for a
+ * shape that model could not represent at all.
+ *
+ * `baseOffset` is the target group's own ABSOLUTE record offset (its true
+ * position in the whole record, threaded down from buildFieldRegistry's
+ * own `itemAbsoluteOffsets` map - see the `walk()` call site above) - needed
+ * so a SYNC binary descendant aligns against its real position, exactly
+ * like layout.js's itemByteLength/this same walk() already do for the
+ * group's own ordinary flat-var declaration (round-15 findings 1/2).
+ *
+ * Still bails (returns `null`) on a FILLER/unnamed child (no tracked value
+ * to encode - same restriction as flattenRedefinesLeaves), an OCCURS-
+ * bearing child (no Vector-of-rows support in this flat-character model),
+ * and a COMP-1/COMP-2 float child (`classifyCodec`'s own `'legacy'`
+ * codecKind - no byte-level float codec exists in CobolCodecs yet).
+ */
+function flattenRedefinesLeavesBytes(groupItem, baseOffset = 0) {
+  const leaves = [];
+  function walk(children, base) {
+    let offset = 0;
+    for (const child of children) {
+      if (isLevel(child, 88) || child.redefines) continue;
+      if (child.isFiller || !child.name) return false;
+      if (hasOccurs(child)) return false;
+
+      const padBefore = syncPadBytes(child, base + offset);
+      if (padBefore > 0) {
+        // round-16 finding 1: the SYNC pad bytes real cobc inserts before
+        // this child (0x00-valued - see layout.js's syncPadBytes doc
+        // comment) are real bytes of the target's own storage that a flat
+        // character view MUST still account for positionally, even though
+        // no COBOL name addresses them - omitting them here would shift
+        // every subsequent leaf's character offset left by the pad width,
+        // silently misaligning the whole rest of the view (e02: WS-A is
+        // A-LEAD(1) + 1 pad byte + A-NUM(2) + A-TAIL(1) = 5 bytes; without
+        // this, the flat view would total only 4 characters and every byte
+        // from A-NUM onward would be read/written one position too early).
+        leaves.push({ pad: true, width: padBefore });
+      }
+      offset += padBefore;
+      const childStart = base + offset;
+
+      const real = (child.children || []).filter(c => !isLevel(c, 88) && !c.redefines);
+      if (real.length > 0) {
+        if (!walk(real, childStart)) return false;
+        offset += itemByteLength(child, childStart);
+        continue;
+      }
+
+      const codec = classifyCodec(child, {});
+      if (codec.codecKind === 'legacy') return false;
+      const length = elementaryByteLength(child);
+      if (!length) return false;
+      leaves.push({
+        camel: toCamelCase(child.name),
+        width: length,
+        codecField: { ...codec, type: scalaBaseType(child), length },
+      });
+      offset += length;
+    }
+    return true;
+  }
+  const ok = walk((groupItem.children || []).filter(c => !isLevel(c, 88) && !c.redefines), baseOffset);
+  return ok ? leaves : null;
+}
+
+/**
+ * Normalize a flattenRedefinesLeaves() text-model leaf into the shared
+ * `{ camel, width, encode(expr), decode(sliceExpr) }` shape
+ * buildFlatViewLines below consumes - `encode` renders this leaf's own
+ * current value as its character-text contribution to the flat view (used
+ * for the getter and, when item's own declared width is a strict PREFIX of
+ * the full target width, to preserve the untouched tail on write);
+ * `decode` renders the Scala expression to assign back to this leaf's own
+ * var given its already-sliced substring of the flat view. Produces
+ * byte-for-byte the same expressions the pre-round-16 inline
+ * getter/setter-building code in groupOverGroupRedefinesLines used, so
+ * every previously-supported shape's generated Scala is unchanged.
+ */
+function textLeafOp(l) {
+  return {
+    camel: l.camel,
+    width: l.totalWidth,
+    encode: (expr) => (l.baseType === 'String'
+      ? (l.count > 1
+        ? `${expr}.map(s => CobolFmt.fitLeft(s, ${l.elementWidth})).mkString`
+        : `CobolFmt.fitLeft(${expr}, ${l.elementWidth})`)
+      : `CobolFmt.digitsOf(BigDecimal(${expr}), ${l.intDigits}, 0)`),
+    decode: (sliceExpr) => (l.baseType === 'String'
+      ? (l.count > 1
+        ? `(0 until ${l.count}).map(i => ${sliceExpr}.substring(i * ${l.elementWidth}, (i + 1) * ${l.elementWidth})).toVector`
+        : `CobolFmt.fitLeft(${sliceExpr}, ${l.elementWidth})`)
+      : `${sliceExpr}.toInt`),
+  };
+}
+
+/**
+ * round-16 finding 1 (re-using round-15 finding 4's own established rule):
+ * a decoded COMP/COMP-3/COMP-4/BINARY (packed or big-endian binary) value
+ * read back through a byte-accurate REDEFINES flat view can be WIDER than
+ * its declared PICTURE digit count (e.g. a 2-byte binary field's raw
+ * storage can hold values past 4 declared digits) - real cobc's
+ * "binary-truncate" runtime convention clips the OBSERVED value to the
+ * field's own low-order declared digits (verified end-to-end here via e02:
+ * a `PIC S9(4) COMP` field whose raw bytes decode to 21075 DISPLAYs as
+ * `+1075`, not `+21075`). COMP-5 (and this same round's BINARY-CHAR/SHORT/
+ * LONG/DOUBLE, all native/host-endian like COMP-5 - see case-class-gen.js's
+ * COMP5_USAGES) is specifically EXEMPT from this truncation (round-15
+ * finding 4) - detected here via `endianness === 'LITTLE'`, the same signal
+ * classifyCodec itself uses to pick COMP-5's native byte order. A no-op for
+ * 'zoned'/'string' codecKinds (DISPLAY storage has no independent "wider
+ * raw capacity" to truncate - its bytes already ARE the declared digit
+ * text) and for 'legacy' (excluded upstream by flattenRedefinesLeavesBytes
+ * already).
+ */
+function truncateNonComp5NumericValue(field, valueExpr) {
+  const isNative = field.endianness === 'LITTLE';
+  const needsTruncation = !isNative && (field.codecKind === 'packed' || field.codecKind === 'binary');
+  if (!needsTruncation) return valueExpr;
+  const decDigits = field.decimalDigits || 0;
+  const intDigits = Math.max((field.digits || 0) - decDigits, 0);
+  const truncated = `CobolFmt.truncNumeric(BigDecimal(${valueExpr}), ${intDigits}, ${decDigits})`;
+  if (field.type === 'BigDecimal') return truncated;
+  if (field.type === 'Int') return `(${truncated}).toIntExact`;
+  return `(${truncated}).toLongExact`;
+}
+
+/**
+ * Normalize a flattenRedefinesLeavesBytes() byte-model leaf into the same
+ * shared op shape textLeafOp produces above, routing through case-class-
+ * gen.js's decodeFieldExpr/encodeFieldExpr (wrapped to/from a Scala String
+ * via ISO-8859-1, the same lossless 1:1 byte<->char mapping this generator's
+ * flat-var Strings already use elsewhere - see case-class-gen.js's own
+ * charset doc comment) instead of digit-text concatenation. `decode` runs
+ * the decoded value through truncateNonComp5NumericValue above (a no-op for
+ * everything but a non-native binary/packed numeric).
+ */
+function byteLeafOp(l) {
+  if (l.pad) {
+    // round-16 finding 1: a SYNC alignment pad span (see
+    // flattenRedefinesLeavesBytes) - real 0x00 bytes with no COBOL name to
+    // read/write back through. `camel: null` tells buildFlatViewLines/
+    // elementaryOverGroupRedefinesLines' setter loops to still consume this
+    // op's own width when computing subsequent leaves' character offsets,
+    // but emit no assignment line for it at all.
+    const padLiteral = '"' + '\\u0000'.repeat(l.width) + '"';
+    return { camel: null, width: l.width, encode: () => padLiteral, decode: null };
+  }
+  return {
+    camel: l.camel,
+    width: l.width,
+    encode: (expr) => `new String(${encodeFieldExpr(l.codecField, expr)}, java.nio.charset.StandardCharsets.ISO_8859_1)`,
+    decode: (sliceExpr) => truncateNonComp5NumericValue(
+      l.codecField,
+      decodeFieldExpr(l.codecField, `${sliceExpr}.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1)`)
+    ),
+  };
+}
+
+/**
+ * Shared getter/setter construction for a synthetic flat-character view
+ * named `flatName` over an ordered list of leaf `ops` (see textLeafOp/
+ * byteLeafOp) - used both by groupOverGroupRedefinesLines (where `flatName`
+ * is a `...BaseFlat` helper further sliced by the redefining GROUP's own
+ * children) and elementaryOverGroupRedefinesLines (where `flatName` IS the
+ * redefining elementary item's own accessor directly). Byte-for-byte
+ * identical output to the pre-round-16 inline code for the text-leaf case.
+ */
+function buildFlatViewLines(flatName, ops) {
+  const getterExpr = ops.map(op => op.encode(op.camel)).join(' + ');
+  const lines = [`  def ${flatName}: String = ${getterExpr}`, `  def ${flatName}_=(v: String): Unit =`];
+  let offset = 0;
+  let anyAssignment = false;
+  for (const op of ops) {
+    const start = offset;
+    const end = offset + op.width;
+    offset = end;
+    // A pad-span op (round-16 finding 1's byteLeafOp) has no COBOL name to
+    // write back through - its width still advances `offset` for later
+    // ops, but it contributes no assignment line of its own.
+    if (op.camel === null) continue;
+    anyAssignment = true;
+    lines.push(`    ${op.camel} = ${op.decode(`v.substring(${start}, ${end})`)}`);
+  }
+  if (!anyAssignment) lines.push('    ()');
+  return lines;
+}
+
+/**
+ * round-16 finding 1: an ELEMENTARY item (no children of its own) REDEFINES-
+ * ing a GROUP target - e.g. e02's `05 WS-B REDEFINES WS-A PIC X(5)` where
+ * WS-A is a group with a SYNC-padded binary child. Before this fix,
+ * redefinesAccessorLines routed EVERY group-target REDEFINES through
+ * groupOverGroupRedefinesLines, which only ever declares accessors for the
+ * REDEFINING item's OWN children (sliced out of a synthetic flat view) - it
+ * assumed `item` is itself a group. An elementary redefining item has no
+ * children at all, so nothing was declared for `item` itself: a hard
+ * "Not found: wsB"-style compile error the moment anything referenced it.
+ *
+ * Builds the identical synthetic flat-character view groupOverGroupRedefinesLines
+ * builds (flattenRedefinesLeaves' text model first, flattenRedefinesLeavesBytes'
+ * byte-accurate codec model second), but exposes it DIRECTLY as `item`'s own
+ * accessor - there are no child items of `item`'s own to slice it further
+ * for. When `item`'s own declared width is a strict PREFIX of the target's
+ * full flat width (legal COBOL - REDEFINES only requires the redefiner not
+ * exceed the target's size), the setter reads the current full view back
+ * out first so only `item`'s own leading slice is overwritten, preserving
+ * the target's own untouched tail bytes - the same "read full, splice
+ * prefix, redistribute" convention characterSlicedGroupRedefinesLines's own
+ * elementary-child setter already uses against a real flat String target.
+ *
+ * Only reachable/supported for an alphanumeric-shaped `item` (scalaBaseType
+ * 'String') - a numeric REDEFINES of a group is a rarer shape this
+ * generator does not attempt to model; falls back to the pre-existing
+ * honest `???`/no-op stub pair (todoStubRedefinesLines's own convention)
+ * for that or any shape neither leaf-flattening model can represent,
+ * rather than ever leaving `item` completely undeclared or guessing at a
+ * wrong numeric decode.
+ */
+function elementaryOverGroupRedefinesLines(item, targetItem, registry, targetAbsOffset = 0) {
+  const camel = toCamelCase(item.name);
+  const itemBaseType = scalaBaseType(item);
+
+  const textLeaves = flattenRedefinesLeaves(targetItem);
+  const ops = textLeaves
+    ? textLeaves.map(textLeafOp)
+    : (flattenRedefinesLeavesBytes(targetItem, targetAbsOffset) || []).map(byteLeafOp);
+
+  if (itemBaseType !== 'String' || ops.length === 0) {
+    return [
+      `  // REDEFINES ${item.redefines}: ??? TODO - this elementary-over-group REDEFINES shape ` +
+        '(FILLER gap / nested OCCURS / unsupported type, or a non-alphanumeric redefining item) is not ' +
+        `supported; ${item.name} is declared but not aliased to real storage`,
+      `  def ${camel}: ${itemBaseType} = ??? // TODO REDEFINES ${item.redefines}: unsupported group shape`,
+      `  def ${camel}_=(v: ${itemBaseType}): Unit = () // TODO REDEFINES ${item.redefines}: write discarded (unsupported group shape)`,
+    ];
+  }
+
+  const itemWidth = elementaryByteLength(item);
+  const totalWidth = ops.reduce((sum, op) => sum + op.width, 0);
+  const getterExpr = ops.map(op => op.encode(op.camel)).join(' + ');
+  const fullWidthMatch = itemWidth >= totalWidth;
+
+  const lines = [
+    fullWidthMatch
+      ? `  def ${camel}: String = ${getterExpr}`
+      : `  def ${camel}: String = (${getterExpr}).substring(0, ${itemWidth})`,
+    `  def ${camel}_=(v: String): Unit =`,
+  ];
+
+  if (!fullWidthMatch) {
+    // item's own declared width is a strict prefix of the target's full
+    // width - only that leading slice is being overwritten; the target's
+    // own trailing bytes must survive untouched, so the current full view
+    // is read back out first and only its own head replaced before
+    // redistributing to each leaf.
+    lines.push(`    val _full = (${getterExpr})`);
+    lines.push(`    val _new = v + _full.substring(${itemWidth})`);
+  }
+  const sourceVar = fullWidthMatch ? 'v' : '_new';
+  let offset = 0;
+  let anyAssignment = false;
+  for (const op of ops) {
+    const start = offset;
+    const end = offset + op.width;
+    offset = end;
+    if (op.camel === null) continue; // pad span - no COBOL name to write back through
+    anyAssignment = true;
+    lines.push(`    ${op.camel} = ${op.decode(`${sourceVar}.substring(${start}, ${end})`)}`);
+  }
+  if (!anyAssignment) lines.push('    ()');
+
+  registry.set((item.name || '').toUpperCase(), {
+    camel,
+    scalaType: 'String',
+    dataType: (item.pic && item.pic.dataType) || 'alphanumeric',
+    integerDigits: (item.pic && item.pic.integerDigits) || 0,
+    decimalDigits: (item.pic && item.pic.decimalDigits) || 0,
+    signed: !!(item.pic && item.pic.signed),
+    editPattern: (item.pic && item.pic.editPattern) || null,
+    occursDepth: 0,
+    picLength: itemWidth,
+    justified: String(item.justified || '').toUpperCase() === 'RIGHT',
+    blankWhenZero: !!item.blankWhenZero,
+  });
+
+  return lines;
 }
 
 /**
@@ -1282,47 +1617,33 @@ function todoStubRedefinesLines(redefiningItem, registry, tableRegistry) {
  * variable reference to that helper's generated code without any changes to
  * it at all.
  */
-function groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry) {
+function groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry, targetAbsOffset = 0) {
   const redefiningRealChildren = (item.children || []).filter(c => !isLevel(c, 88));
-  const leaves = flattenRedefinesLeaves(targetItem);
+  const textLeaves = flattenRedefinesLeaves(targetItem);
 
-  if (!leaves) {
+  // round-16 finding 1: flattenRedefinesLeaves' text-digit model is tried
+  // FIRST (unchanged - byte-for-byte identical generated Scala to every
+  // pre-round-16 program using this path), falling back to
+  // flattenRedefinesLeavesBytes' byte-accurate codec model only for a shape
+  // the text model can't represent at all (a signed and/or non-DISPLAY
+  // target child - e.g. a SYNC-padded binary field) - and only THEN to the
+  // honest todoStubRedefinesLines decline if neither model can represent
+  // the target's shape.
+  const ops = textLeaves
+    ? textLeaves.map(textLeafOp)
+    : (flattenRedefinesLeavesBytes(targetItem, targetAbsOffset) || []).map(byteLeafOp);
+
+  if (ops.length === 0) {
     return todoStubRedefinesLines(item, registry, tableRegistry);
   }
 
   const flatName = `${toCamelCase(item.name)}BaseFlat`;
-
-  const getterParts = leaves.map(l => (l.baseType === 'String'
-    ? (l.count > 1
-      ? `${l.camel}.map(s => CobolFmt.fitLeft(s, ${l.elementWidth})).mkString`
-      : `CobolFmt.fitLeft(${l.camel}, ${l.elementWidth})`)
-    : `CobolFmt.digitsOf(BigDecimal(${l.camel}), ${l.intDigits}, 0)`));
-
-  const setterLines = [];
-  let offset = 0;
-  for (const l of leaves) {
-    const start = offset;
-    const end = offset + l.totalWidth;
-    offset = end;
-    if (l.baseType === 'String' && l.count > 1) {
-      setterLines.push(
-        `    ${l.camel} = (0 until ${l.count}).map(i => v.substring(${start} + i * ${l.elementWidth}, ${start} + (i + 1) * ${l.elementWidth})).toVector`
-      );
-    } else if (l.baseType === 'String') {
-      setterLines.push(`    ${l.camel} = CobolFmt.fitLeft(v.substring(${start}, ${end}), ${l.elementWidth})`);
-    } else {
-      setterLines.push(`    ${l.camel} = v.substring(${start}, ${end}).toInt`);
-    }
-  }
-
   const lines = [
     `  // REDEFINES ${item.redefines}: ${item.redefines} is a GROUP, not an elementary item - ${flatName}`,
     `  // is a synthetic flat-character view over its own children's storage (concatenated in`,
     `  // declaration order), so ${item.name}'s children below can character-slice it exactly`,
     `  // like a REDEFINES over a real PIC X target.`,
-    `  def ${flatName}: String = ${getterParts.join(' + ')}`,
-    `  def ${flatName}_=(v: String): Unit =`,
-    ...setterLines,
+    ...buildFlatViewLines(flatName, ops),
   ];
 
   lines.push(...characterSlicedGroupRedefinesLines(redefiningRealChildren, flatName, registry));
@@ -1479,6 +1800,19 @@ function buildFieldRegistry(ast) {
   // a top-level 01-record's own children genuinely do start at absolute 0.
   function walk(list, occursChain, ancestorNames, parentValueText, baseOffset = 0) {
     let offset = 0;
+    // round-16 finding 1: every real (named, non-88) sibling's own ABSOLUTE
+    // record offset (after its own SYNC padding, if any), keyed by its
+    // uppercased COBOL name - populated below as this loop reaches each
+    // item, consulted when a LATER sibling's own `.redefines` names one of
+    // them (COBOL requires a REDEFINES target to be the immediately-
+    // preceding same-level item in this same list, so it is always found
+    // here by the time a redefines branch below needs it). Threaded into
+    // redefinesAccessorLines so a REDEFINES of a GROUP target that itself
+    // contains a SYNC-padded child computes that child's alignment against
+    // the target's TRUE absolute position - exactly like this same walk()
+    // already does for the target's own ordinary flat-var declaration (see
+    // groupStartOffset below) - rather than silently assuming absolute 0.
+    const itemAbsoluteOffsets = new Map();
     for (const item of list) {
       if (isLevel(item, 88)) continue;
 
@@ -1537,7 +1871,8 @@ function buildFieldRegistry(ast) {
       }
 
       if (item.redefines) {
-        const accessorLines = redefinesAccessorLines(item, registry, list, tableRegistry);
+        const targetAbsOffset = itemAbsoluteOffsets.get(String(item.redefines).toUpperCase()) ?? 0;
+        const accessorLines = redefinesAccessorLines(item, registry, list, tableRegistry, targetAbsOffset);
         if (accessorLines.length) lines.push(...accessorLines);
         continue; // shares storage with what it redefines - no offset advance
       }
@@ -1596,6 +1931,7 @@ function buildFieldRegistry(ast) {
       const padBefore = syncPadBytes(item, baseOffset + offset);
       offset += padBefore;
       const groupStartOffset = baseOffset + offset;
+      if (item.name) itemAbsoluteOffsets.set(item.name.toUpperCase(), groupStartOffset);
 
       // round-8 finding 4: this item's own span within `parentValueText`
       // (null when there is no VALUE-bearing ancestor in scope at all - see

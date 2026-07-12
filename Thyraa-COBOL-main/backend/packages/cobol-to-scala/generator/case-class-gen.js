@@ -181,9 +181,18 @@ export function resolveClassName(name, context = {}) {
 
 const BINARY_USAGES = new Set([
   'COMP', 'COMP-4', 'COMP-5', 'COMPUTATIONAL', 'COMPUTATIONAL-4', 'COMPUTATIONAL-5', 'BINARY',
+  // round-16 finding 6: GnuCOBOL's native fixed-width binary USAGEs (legally
+  // declared with no PIC clause at all - see parser/data-division-parser.js's
+  // IMPLICIT_BINARY_PIC_DIGITS/layout.js's FIXED_BINARY_USAGE_BYTES).
+  'BINARY-CHAR', 'BINARY-SHORT', 'BINARY-LONG', 'BINARY-DOUBLE',
 ]);
 
-const COMP5_USAGES = new Set(['COMP-5', 'COMPUTATIONAL-5']);
+// BINARY-CHAR/SHORT/LONG/DOUBLE are native-byte-order like COMP-5 (they are
+// GnuCOBOL's C-like int8/int16/int32/int64 USAGEs), not big-endian like
+// plain COMP/COMP-4/BINARY.
+const COMP5_USAGES = new Set([
+  'COMP-5', 'COMPUTATIONAL-5', 'BINARY-CHAR', 'BINARY-SHORT', 'BINARY-LONG', 'BINARY-DOUBLE',
+]);
 
 function isPackedUsage(usage) {
   return usage === 'COMP-3' || usage === 'COMPUTATIONAL-3' || usage === 'PACKED-DECIMAL';
@@ -231,8 +240,16 @@ function picDataTypeOf(item) {
  * `options.charset` ('ascii' | 'ebcdic', default 'ascii') selects the
  * codePage used for both PIC X/A string fields and DISPLAY numeric zoned
  * fields (a COBOL file's records are conventionally all one charset).
+ *
+ * Exported (round-16 finding 1) so scala-generator.js's REDEFINES codegen
+ * can build a genuine byte-accurate flat character view over a GROUP target
+ * (one that may contain a SYNC-padded/binary/packed child) by reusing the
+ * exact same codec classification + decode/encode expression builders this
+ * module already uses for a record's own byte-level parse/format - rather
+ * than re-deriving (and risking disagreeing with) codec selection rules
+ * twice.
  */
-function classifyCodec(item, options = {}) {
+export function classifyCodec(item, options = {}) {
   const usage = (item.usage || 'DISPLAY').toUpperCase();
   const digits = picDigits(item);
   const decimalDigits = item.pic?.decimalDigits || 0;
@@ -601,7 +618,7 @@ function redefineLazyValLines(rf, className, indentStr) {
  * Scala expression that decodes one elementary value given an already-sliced
  * `bytesExpr` (an Array[Byte] expression of exactly this field's width).
  */
-function decodeFieldExpr(field, bytesExpr) {
+export function decodeFieldExpr(field, bytesExpr) {
   switch (field.codecKind) {
     case 'packed':
       return `CobolCodecs.packedDecode(${bytesExpr}, scale = ${field.decimalDigits})`;
@@ -635,7 +652,7 @@ function decodeFieldExpr(field, bytesExpr) {
 /**
  * Scala expression producing the fixed-width byte encoding of one elementary value.
  */
-function encodeFieldExpr(field, valueExpr) {
+export function encodeFieldExpr(field, valueExpr) {
   switch (field.codecKind) {
     case 'packed':
       return `CobolCodecs.packedEncode(${valueExpr}, ${field.digits}, scale = ${field.decimalDigits}, signed = ${field.signed})`;

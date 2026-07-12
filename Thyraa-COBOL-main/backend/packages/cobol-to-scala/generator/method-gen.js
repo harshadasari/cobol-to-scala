@@ -936,6 +936,61 @@ export function generateProgramFlowLines(units, indent, ambiguousNames) {
 }
 
 /**
+ * Statement-node fields that carry a NESTED, ordinary (non-WhenClause-
+ * wrapped) statement array - shared by every AST statement class that can
+ * itself hold an imperative-statement block (see parser/ast.js): inline
+ * PERFORM's own body, IF's two branches, and every ON EXCEPTION/SIZE ERROR/
+ * OVERFLOW/AT END(-OF-PAGE)/INVALID KEY imperative list any I/O or
+ * arithmetic statement carries.
+ */
+const NESTED_STATEMENT_LIST_FIELDS = [
+  'statements', 'thenStatements', 'elseStatements',
+  'atEnd', 'notAtEnd', 'atEndOfPage', 'notAtEndOfPage',
+  'invalidKey', 'notInvalidKey',
+  'onSizeError', 'notOnSizeError',
+  'onOverflow', 'notOnOverflow',
+  'onException', 'notOnException',
+];
+
+/**
+ * round-16 finding 4: recurse into EVERY statement-list-bearing field this
+ * AST defines (not just a unit's own top-level `.statements`), invoking
+ * `visit(stmt)` for each statement node encountered at any nesting depth -
+ * an inline PERFORM VARYING/TIMES/UNTIL's own body, an IF's then/else
+ * branches, an EVALUATE's WHEN/WHEN-OTHER bodies, a SEARCH's AT END/WHEN
+ * bodies, and every ON EXCEPTION/SIZE ERROR/OVERFLOW/INVALID KEY/AT END
+ * imperative list any other statement type carries - so a PERFORM ... THRU
+ * (or a SORT ... THRU procedure clause) nested arbitrarily deep inside other
+ * control-flow constructs is still discovered by generateAllMethods's own
+ * PERFORM-THRU-wrapper-method collection pass below. Before this fix that
+ * collection only ever walked a paragraph's own flat top-level statement
+ * list, so a PERFORM THRU nested inside so much as one PERFORM VARYING loop
+ * (let alone two, e10's own shape) never got its `<from>To<to>()` wrapper
+ * method generated at all - a hard "not found" compile error the moment
+ * such a nested PERFORM THRU actually executed.
+ */
+function collectStatementsDeep(statements, visit) {
+  for (const stmt of statements || []) {
+    if (!stmt || typeof stmt !== 'object') continue;
+    visit(stmt);
+
+    for (const field of NESTED_STATEMENT_LIST_FIELDS) {
+      if (Array.isArray(stmt[field])) collectStatementsDeep(stmt[field], visit);
+    }
+
+    // EVALUATE's WHEN clauses (and SEARCH's WHEN clauses) wrap their own
+    // statement list inside a WhenClause/SearchWhenClause object rather than
+    // exposing it as a direct field of the EVALUATE/SEARCH statement itself.
+    if (stmt.type === 'EvaluateStatement') {
+      for (const when of stmt.whenClauses || []) collectStatementsDeep(when.statements, visit);
+    }
+    if (stmt.type === 'SearchStatement') {
+      for (const when of stmt.whenClauses || []) collectStatementsDeep(when.statements, visit);
+    }
+  }
+}
+
+/**
  * Generate all methods from the PROCEDURE DIVISION's top-level (section-less)
  * paragraphs and its SECTIONs.
  *
@@ -1020,8 +1075,24 @@ export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
   // is a pure addition: it only ever adds wrapper methods that a SORT ...
   // THRU clause elsewhere in this same collection loop's file will actually
   // call, never changes anything for a program with no such clause.
+  //
+  // round-16 finding 4: this collection previously only walked each unit's
+  // own TOP-LEVEL `.statements` list - a PERFORM ... THRU nested inside any
+  // other control-flow construct's own body (an inline PERFORM VARYING/TIMES/
+  // UNTIL, an IF's then/else branch, an EVALUATE WHEN, a SEARCH WHEN) was
+  // invisible to it, so generatePerformThruMethod's own wrapper method never
+  // got generated at all - a hard "not found: <from>To<to>" compile error the
+  // moment such a nested PERFORM THRU actually executed (e10: two PERFORM
+  // VARYING loops nesting a `PERFORM SECA-P1 THRU SECB-P2`). `collectStatementsDeep`
+  // recurses into every statement-list-bearing field this AST defines
+  // (inline PERFORM's own body, IF's two branches, EVALUATE's WHEN/WHEN-OTHER
+  // bodies, SEARCH's AT END/WHEN bodies, and every ON EXCEPTION/SIZE ERROR/
+  // OVERFLOW/INVALID KEY/AT END(-OF-PAGE) imperative-statement list any
+  // other statement type carries) so a PERFORM THRU (or a SORT ... THRU
+  // procedure clause) at ANY nesting depth is found, not just at a
+  // paragraph's own top level.
   for (const unit of units) {
-    for (const stmt of unit.statements || []) {
+    collectStatementsDeep(unit.statements, stmt => {
       if (stmt.type === 'PerformStatement' && stmt.throughParagraph) {
         addPerformThru(stmt.targetParagraph, stmt.targetSection, stmt.throughParagraph, stmt.throughSection);
       }
@@ -1036,7 +1107,7 @@ export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
           addPerformThru(stmt.outputProcedure.procedure, null, stmt.outputProcedure.through, null);
         }
       }
-    }
+    });
   }
 
   // Flat standalone top-level methods - one per paragraph (collision-

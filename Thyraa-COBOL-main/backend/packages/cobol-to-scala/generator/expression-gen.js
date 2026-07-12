@@ -3181,6 +3181,23 @@ function relationalOperandExpr(node, otherDescriptor) {
   if (simple && simple.type === 'Literal' && simple.literalType === 'figurative') {
     return figurativeCompareText(simple, otherDescriptor);
   }
+  if (simple && simple.type === 'VariableReference' && simple.refMod) {
+    // round-16 finding 2: reference modification (`identifier(start:length)`,
+    // Known Gap #1) used as a relational-comparison operand (IF/EVALUATE).
+    // convertArithmeticExpression routes a VariableReference through
+    // convertIdentifier, whose shared ref-mod placeholder is `Nothing`-typed
+    // (`???`) - harmless for `==`/`!=` (defined on Any), but renderComparisonExpr's
+    // own `cmp` helper (above) renders every OTHER relational operator as
+    // `<left>.compareTo(<right>)`, and `Nothing` has no `compareTo` member -
+    // a hard compile error ("Found: Nothing, Required: ?{compareTo}") instead
+    // of an honest, compiling gap. Same fix shape as round-15 finding 8's
+    // stringSegmentValueExpr: substitute a concrete, String-typed empty
+    // placeholder - `"".compareTo(...)`/`"" == ...` both compile and run
+    // (comparing against an empty string - visibly wrong result, never a
+    // crash) - rather than implementing real ref-mod slicing here, which
+    // stays exactly as out of scope as everywhere else this gap surfaces.
+    return '("" /* TODO: reference modification not implemented as a comparison operand - see tests/oracle/README.md known gaps */)';
+  }
   return convertArithmeticExpression(node);
 }
 
@@ -4649,6 +4666,9 @@ const NON_DISPLAY_USAGES = new Set([
   'COMP-3', 'COMPUTATIONAL-3', 'PACKED-DECIMAL',
   'COMP', 'COMP-4', 'COMP-5', 'BINARY', 'COMPUTATIONAL', 'COMPUTATIONAL-4', 'COMPUTATIONAL-5',
   'COMP-1', 'COMPUTATIONAL-1', 'COMP-2', 'COMPUTATIONAL-2',
+  // round-16 finding 6: GnuCOBOL's native fixed-width binary USAGEs (no PIC
+  // clause at all) are non-DISPLAY storage too.
+  'BINARY-CHAR', 'BINARY-SHORT', 'BINARY-LONG', 'BINARY-DOUBLE',
 ]);
 
 function isNonDisplayUsage(usage) {
@@ -5100,14 +5120,26 @@ function generateSearch(statement, indent = 0) {
   const idxVar = statement.varying
     ? toCamelCase(statement.varying.name || statement.varying)
     : tinfo.indexed[0];
-  const times = tinfo.times;
+  // round-16 finding 5: a table declared OCCURS ... DEPENDING ON must be
+  // searched only up to the depending-on counter's CURRENT runtime value,
+  // not the table's fixed declared maximum (`tinfo.times`) - real cobc's
+  // SEARCH stops at the live count exactly like FUNCTION LENGTH/an ordinary
+  // whole-table DISPLAY already do elsewhere in this generator (see
+  // buildFieldRegistry's own `dependingOn` registration, threaded into
+  // `tinfo.dependingOn` as the counter's own camelCase flat-var name, null
+  // for a fixed-size OCCURS table - a no-op for every non-ODO SEARCH).
+  // Verified against installed GnuCOBOL (e13): `WS-ROW OCCURS 1 TO 5 TIMES
+  // DEPENDING ON WS-COUNT` with WS-COUNT = 3 does not find a row placed at
+  // index 4 (`R-CODE(4) = "DD"`) even though the fixed-max storage already
+  // holds that row's data - SEARCH must not see past the live count.
+  const bound = tinfo.dependingOn || String(tinfo.times);
   const bi = '  '.repeat(indent + 1);
   const wi = '  '.repeat(indent + 2);
   const si = '  '.repeat(indent + 3);
 
   const lines = [`${indentStr}{`];
   lines.push(`${bi}var _searchDone = false`);
-  lines.push(`${bi}while !_searchDone && ${idxVar} <= ${times} do`);
+  lines.push(`${bi}while !_searchDone && ${idxVar} <= ${bound} do`);
 
   const whenClauses = statement.whenClauses || [];
   whenClauses.forEach((when, i) => {
@@ -5276,7 +5308,11 @@ function generateSearchAll(statement, indent, tinfo) {
   const wi = '  '.repeat(indent + 2);
   const si = '  '.repeat(indent + 3);
   const idxVar = tinfo.indexed[0];
-  const times = tinfo.times;
+  // round-16 finding 5: same ODO-awareness as generateSearch above - a
+  // SEARCH ALL over an OCCURS ... DEPENDING ON table must bound both its
+  // binary-search range and its linear-scan fallback by the depending-on
+  // counter's live value, not the fixed declared maximum.
+  const times = tinfo.dependingOn || String(tinfo.times);
   const isDescending = tinfo.ascending.length === 0 && tinfo.descending.length > 0;
   const declaredKeysUpper = (tinfo.ascending.length > 0 ? tinfo.ascending : tinfo.descending).map(k => String(k).toUpperCase());
 
@@ -6213,6 +6249,25 @@ function generateCall(statement, indent = 0) {
     }
     const name = param.value?.name;
     const hasSubscripts = Array.isArray(param.value?.subscripts) && param.value.subscripts.length > 0;
+    if (name && param.value?.refMod) {
+      // round-16 finding 3: reference modification (`identifier(start:
+      // length)`, Known Gap #1) used as a CALL ... USING argument. Before
+      // this fix, this branch fell straight through to the plain
+      // `if (name) return toCamelCase(name)` case below, which passes the
+      // callee the FULL base variable - silently ignoring the (start:length)
+      // clause entirely rather than the slice the COBOL source actually
+      // names. Unlike the "not found" compile crashes ref-mod hits
+      // elsewhere, this compiled and ran - just with the WRONG value handed
+      // to the callee, no marker at all (e06: E06SUB received all of
+      // WS-SRC's 10 characters instead of the 5-character slice
+      // WS-SRC(3:5) names). Ref-mod's own slicing semantics stay exactly as
+      // out of scope as everywhere else this gap surfaces (see Known Gap
+      // #1) - the fix is only to stop passing a silently-wrong value: a
+      // concrete, String-typed, visibly-marked placeholder instead, the same
+      // honest-decline shape round-15 finding 8/round-16 finding 2 already
+      // use for a ref-mod'd STRING-segment/comparison operand.
+      return `("" /* TODO: CALL "${rawProgramName}" USING ${name}(...): reference modification not implemented as a CALL argument - see tests/oracle/README.md known gaps */)`;
+    }
     if (name && !hasSubscripts && isRegisteredGroupName(String(name).toUpperCase())) {
       const groupExpr = groupDisplayValueExpr(resolveGroupKey(String(name).toUpperCase()));
       if (groupExpr) return `(${groupExpr})`;
@@ -6256,6 +6311,17 @@ function generateCall(statement, indent = 0) {
     if (mode !== 'REFERENCE') return null;
     const name = param.value?.name;
     if (!name) return null;
+    // round-16 finding 3: a ref-mod'd BY REFERENCE argument has no real
+    // caller-side slice to write back into either (see the argExprs branch
+    // above) - writing the callee's returned value into the FULL base
+    // variable (the pre-fix behavior, since this only ever matched the plain
+    // `{ kind: 'scalar', camel: toCamelCase(name) }` case below) would
+    // silently corrupt the base variable's untouched bytes outside the
+    // named slice. Route through a dedicated writer kind that renders a
+    // visible, compiling no-op marker instead (see renderWriteback below).
+    if (param.value?.refMod) {
+      return { kind: 'refmod-unsupported', name };
+    }
     const hasSubscripts = Array.isArray(param.value?.subscripts) && param.value.subscripts.length > 0;
     const nameUpperParam = String(name).toUpperCase();
     if (!hasSubscripts && isRegisteredGroupName(nameUpperParam)) {
@@ -6273,6 +6339,12 @@ function generateCall(statement, indent = 0) {
   // path below, both of which evaluate the call exactly once first).
   const renderWriteback = (writer, sourceExpr) => {
     if (writer.kind === 'scalar') return [`${indentStr}${writer.camel} = ${sourceExpr}`];
+    if (writer.kind === 'refmod-unsupported') {
+      return [
+        `${indentStr}() // TODO: CALL ... USING BY REFERENCE ${writer.name}(...): reference modification not ` +
+          'implemented for CALL argument writeback - see tests/oracle/README.md known gaps',
+      ];
+    }
     const scattered = scatterGroupFromString(writer.groupKey, sourceExpr, indent);
     if (scattered == null) {
       return [

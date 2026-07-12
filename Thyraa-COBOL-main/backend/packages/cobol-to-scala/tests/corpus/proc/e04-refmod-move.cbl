@@ -1,0 +1,16 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. E04.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-SRC PIC X(10) VALUE "ABCDEFGHIJ".
+       01 WS-DEST PIC X(10) VALUE SPACES.
+       01 WS-MID PIC X(4) VALUE SPACES.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           MOVE WS-SRC(3:4) TO WS-MID.
+           DISPLAY "MID=" WS-MID.
+           MOVE WS-SRC(1:5) TO WS-DEST(6:5).
+           DISPLAY "DEST=" WS-DEST.
+           MOVE "ZZ" TO WS-SRC(9:2).
+           DISPLAY "SRC=" WS-SRC.
+           STOP RUN.

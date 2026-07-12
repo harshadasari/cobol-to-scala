@@ -1,9 +1,11 @@
 # COBOL-to-Scala Autonomous Build — Progress Status
 
-**Last updated:** 2026-07-11 ~23:05 UTC (run started ~01:30 UTC — **~22 hours elapsed**)
+**Last updated:** 2026-07-12 ~18:15 UTC (rounds resumed at your request — target: round 40)
 **Branch:** `claude/analyze-codebase-pdPSZ` — all work below is **committed and pushed**
-**Orchestrator token budget:** well under the 2M cap (orchestrator only dispatches/reviews; all coding happens in delegated Sonnet subagents whose tokens don't count against it)
-**Status:** 🟡 Adversarial hunting **paused at round 14 by your decision** — wrap-up phase in progress (detailed reports, docs truth-pass, final summary). Rounds resume whenever you say so.
+**Status:** 🟢 Running — round 15 complete and committed (223 verified programs, 923/924 tests, 1 honest todo by design). Round 16 in progress. Target: continue to round 40, then resume the wrap-up track (final completeness critic, docs truth-pass, final report).
+
+### Round 15 headline
+The first "feature-combination" round per the campaign's own resume plan — targeting deliberate intersections of already-working features rather than new top-level constructs. Found **8 dishonest findings** (up from the 3-5/round plateau, confirming combination-probes are higher-yield): 3 related SYNC-alignment bugs (group-VALUE inheritance, nested sub-group absolute offset, OCCURS-stride rounding), a COMP-5 truncation bug, two subscripted-row-MOVE bugs (cross-table and multi-dimensional — both fixed for real, not just degraded), an OPEN-failure FILE STATUS code bug, and a STRING+reference-modification crash (fixed to an honest compiling decline). 14 new corpus programs (`d01`-`d14`) promoted; corpus now 223.
 
 ---
 

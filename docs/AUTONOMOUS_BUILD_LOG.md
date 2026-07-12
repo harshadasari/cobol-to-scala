@@ -11,6 +11,13 @@ _(none currently open - all prior pins resolved; see cycle entries. Tracked-OPEN
 - **Refutation rounds:** 8 so far (11,16,15,16,6,6,8,4 findings - all fixed through r7; r8 fix in flight)
 
 ## Activity
+### Cycle: Rounds resumed at owner's request — target round 40 (2026-07-12 ~18:15 UTC)
+Owner instruction: continue adversarial rounds with Sonnet through round 40, then resume the wrap-up track. Model switched to Sonnet for this session (orchestrator + subagents both Sonnet now).
+
+**Round 15 committed (`a485607`)**: first "feature-combination" round per the campaign's own resume plan. 8 dishonest findings (up from the 3-5/round plateau) — 3 SYNC-alignment bugs (group-VALUE inheritance offset drift, nested sub-group absolute-offset alignment, OCCURS-stride rounding), a COMP-5 truncation bug, two subscripted-row-MOVE generalizations (cross-table + multi-dimensional, both fixed for real), an OPEN-failure FILE STATUS mode-based fix, and a STRING+reference-modification crash fixed to an honest compiling decline (ref-mod itself stays out of scope per Known Gap #1). Independently verified 923/924 (1 honest todo by design, documented precisely in the ledger). Corpus 209 -> 223.
+
+Process note: caught my own mistake mid-round — nested a shell `&` background inside a `run_in_background: true` Bash call, causing a premature "completed" notification when the wrapper script returned, not when the actual test process finished. Corrected by properly waiting on the real PID before trusting the result. Lesson: never combine shell-level `&` with the tool's own backgrounding.
+
 ### Cycle: RUN WRAP-UP — final state (2026-07-11 ~23:30 UTC)
 **The run is wrapped.** Owner instruction: stop adversarial hunting at round 14, produce detailed reports, resume rounds in a later session.
 

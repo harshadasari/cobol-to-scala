@@ -11,6 +11,11 @@ _(none currently open - all prior pins resolved; see cycle entries. Tracked-OPEN
 - **Refutation rounds:** 8 so far (11,16,15,16,6,6,8,4 findings - all fixed through r7; r8 fix in flight)
 
 ## Activity
+### Cycle: Round 16 committed (2026-07-12 ~22:55 UTC)
+Second feature-combination round. 6 dishonest findings: elementary-over-group REDEFINES crash with a SYNC-padded target child (fixed via a new byte-accurate codec-based flat-view fallback, reusing case-class-gen.js's own codec dispatch); ref-mod as an IF/EVALUATE comparison operand and as a CALL argument (both crashed or silently passed wrong data before, now honest-decline placeholders matching round 15's established pattern); PERFORM THRU nested inside other control flow never got its wrapper method generated (fixed - statement-list collection now recurses to any depth); SEARCH/SEARCH ALL ignoring an OCCURS DEPENDING ON's live counter (silent wrong output, fixed); bare USAGE BINARY-LONG/CHAR/SHORT/DOUBLE with no PIC silently typed as string (fixed with correct implicit PIC/width/signedness). Independently verified 966/971 (5 honest todos, all precisely accounted for in the ledger - including one, e14, confirmed to be the pre-existing round-13 table-writeback gap, not a new bug). Corpus 223 -> 237.
+
+Process note: the fix agent hit a session API limit mid-task (resets 9:40pm UTC) after completing all 6 fixes but before its own final suite run; I picked up independent verification myself once the reset had passed. Also hit a pgrep self-matching bug in my own wait-loop (`pgrep -f "node --test"` matched the wrapper script's own command line, causing a premature false-complete signal) - corrected by waiting on the exact PID directly.
+
 ### Cycle: Rounds resumed at owner's request — target round 40 (2026-07-12 ~18:15 UTC)
 Owner instruction: continue adversarial rounds with Sonnet through round 40, then resume the wrap-up track. Model switched to Sonnet for this session (orchestrator + subagents both Sonnet now).
 

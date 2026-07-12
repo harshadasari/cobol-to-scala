@@ -2546,57 +2546,112 @@ function subscriptedGroupRowRef(ref) {
 }
 
 /**
- * round-9 finding 4 (continued): the actual per-child copy for a whole-row
- * MOVE (`MOVE WS-ROW(i) TO WS-ROW(j)`, both references into the *same* table
- * of groups) - reuses the row group's own GROUP_REGISTRY entry (the same
+ * Build a read expression for a flat var nested `idxs.length` Vector layers
+ * deep (one layer per OCCURS-bearing ancestor, outermost subscript first) -
+ * `camel(idxs[0])(idxs[1])...`. `idxs.length === 0` (a bare, non-OCCURS
+ * child) just returns the camel itself unchanged.
+ */
+function nestedReadExpr(camel, idxs) {
+  return camel + idxs.map(i => `(${i})`).join('');
+}
+
+/**
+ * Build a `.updated(...)` write expression for the same nested-Vector shape
+ * nestedReadExpr reads, rebuilding one Vector layer at a time (Vector has no
+ * in-place index setter) so `valueExpr` ends up written at the exact
+ * `idxs`-addressed element. Mirrors renderAssignment's own local `rec`
+ * helper (same nested-nested-`.updated` shape for an ordinary elementary
+ * multi-dimensional subscript write), duplicated here rather than shared
+ * since renderAssignment's version is a private closure over a single
+ * `valueExpr` string it renders directly, not reusable standalone.
+ */
+function nestedUpdateExpr(camel, idxs, valueExpr) {
+  function rec(depth, baseExpr) {
+    if (depth === idxs.length - 1) {
+      return `${baseExpr}.updated(${idxs[depth]}, ${valueExpr})`;
+    }
+    return `${baseExpr}.updated(${idxs[depth]}, ${rec(depth + 1, `${baseExpr}(${idxs[depth]})`)})`;
+  }
+  return rec(0, camel);
+}
+
+/**
+ * round-9 finding 4 (continued, generalized by round-15 findings 5/6): the
+ * actual per-child copy for a whole-row MOVE (`MOVE WS-ROW-A(i) TO
+ * WS-ROW-B(j)`) - reuses each side's own GROUP_REGISTRY entry (the same
  * metadata groupDisplayValueExpr/scatterGroupFromString already walk) so
  * every child (including a nested group child, recursed into, and a FILLER
- * child's own hidden flat var) gets copied from the source row index to the
- * target row index: `<childCamel> = <childCamel>.updated(<targetIdx>,
- * <childCamel>(<sourceIdx>))`. Each child is already a `Vector[...]` (one
- * layer per OCCURS-bearing ancestor - here, the row's own OCCURS) regardless
- * of the child's own further nesting, so a single `.updated` correctly
- * copies an entire nested structure (further nested groups/OCCURS within the
- * row) as one unit - only a child that has an *additional* OCCURS clause of
- * its own (a table nested inside each row, a two-dimensional shape no corpus
- * program - old or new - exercises) can't be represented this way, since its
- * flat var would need a *second* Vector index dimension threaded through the
- * whole recursion; that (narrow, unexercised) shape bails out to null so the
- * caller can fall back to a visible marker rather than emit a wrong/
- * non-compiling copy.
+ * child's own hidden flat var) gets copied from the source row's subscript
+ * position to the target row's: `<targetChildCamel> = <nested .updated
+ * chain ending in <sourceChildCamel><nested reads>>`.
  *
- * Only a single subscript dimension on each side is supported (matches every
- * corpus program's own shape, including w05's) - a multi-dimensional row
- * reference bails out to null for the same reason.
+ * Two round-15 generalizations over the original (round-9) version:
+ *   - `sourceGroupKey`/`targetGroupKey` may now be DIFFERENT tables (finding
+ *     5, d07: `MOVE WS-ROW-A(i) TO WS-ROW-B(j)`, two distinct 01-records)
+ *     as well as the same one (the original, still-supported same-table
+ *     shift/copy idiom, w05) - children are matched POSITIONALLY (same rule
+ *     generateGroupMove's groupLayoutsIdentical already applies for a bare,
+ *     non-subscripted cross-record group MOVE): same count, and each
+ *     positional pair's own Scala representation (type/width/decimals) must
+ *     agree, or this bails out to null (caller falls back to a visible
+ *     marker) rather than emit a type-mismatched assignment.
+ *   - `targetIdxs`/`sourceIdxs` may now carry more than one dimension
+ *     (finding 6, d08: `MOVE WS-INNER(1,1) TO WS-INNER(2,2)`, a
+ *     two-dimensional OCCURS-within-OCCURS row) - nestedReadExpr/
+ *     nestedUpdateExpr build the full N-deep `.updated`/read chain instead
+ *     of the original single-`.updated` shape, so any dimension count works
+ *     uniformly (a 1-dimensional row, still the overwhelmingly common case,
+ *     produces byte-for-byte the same single-`.updated` output as before).
+ *
+ * A child that itself has an *additional* OCCURS clause of its own (a table
+ * nested inside each row, not just the row's own ancestor OCCURS chain) still
+ * can't be represented this way (its flat var would need yet another,
+ * independently-driven Vector index no corpus program supplies), so that
+ * (narrow, unexercised) shape still bails out to null.
  */
-function subscriptedGroupMoveChildLines(groupKey, targetIdx, sourceIdx, indent) {
+function subscriptedGroupMoveChildLines(sourceGroupKey, targetGroupKey, targetIdxs, sourceIdxs, indent) {
   const indentStr = '  '.repeat(indent);
-  const children = GROUP_REGISTRY.get(groupKey);
-  if (!children || children.length === 0) return null;
+  const sourceChildren = GROUP_REGISTRY.get(sourceGroupKey);
+  const targetChildren = GROUP_REGISTRY.get(targetGroupKey);
+  if (!sourceChildren || !targetChildren || sourceChildren.length === 0 ||
+      sourceChildren.length !== targetChildren.length) {
+    return null;
+  }
 
   const lines = [];
-  for (const c of children) {
-    if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) return null;
-    if (c.groupKey) {
-      const nested = subscriptedGroupMoveChildLines(c.groupKey, targetIdx, sourceIdx, indent);
+  for (let i = 0; i < sourceChildren.length; i++) {
+    const s = sourceChildren[i];
+    const t = targetChildren[i];
+    if ((s.nameUpper && TABLE_REGISTRY.has(s.nameUpper)) || (t.nameUpper && TABLE_REGISTRY.has(t.nameUpper))) {
+      return null;
+    }
+    if (s.groupKey || t.groupKey) {
+      if (!s.groupKey || !t.groupKey) return null;
+      const nested = subscriptedGroupMoveChildLines(s.groupKey, t.groupKey, targetIdxs, sourceIdxs, indent);
       if (nested == null) return null;
       lines.push(...nested);
       continue;
     }
-    if (!c.camel) return null;
-    lines.push(`${indentStr}${c.camel} = ${c.camel}.updated(${targetIdx}, ${c.camel}(${sourceIdx}))`);
+    if (!s.camel || !t.camel) return null;
+    if (s.info && t.info) {
+      if (s.info.scalaType !== t.info.scalaType) return null;
+      if ((s.info.picLength || 0) !== (t.info.picLength || 0)) return null;
+      if ((s.info.decimalDigits || 0) !== (t.info.decimalDigits || 0)) return null;
+    }
+    const readExpr = nestedReadExpr(s.camel, sourceIdxs);
+    lines.push(`${indentStr}${t.camel} = ${nestedUpdateExpr(t.camel, targetIdxs, readExpr)}`);
   }
   return lines;
 }
 
-function generateSubscriptedGroupMove(groupKey, targetSubscripts, sourceSubscripts, indent) {
-  if (!Array.isArray(targetSubscripts) || targetSubscripts.length !== 1 ||
-      !Array.isArray(sourceSubscripts) || sourceSubscripts.length !== 1) {
+function generateSubscriptedGroupMove(sourceGroupKey, targetGroupKey, targetSubscripts, sourceSubscripts, indent) {
+  if (!Array.isArray(targetSubscripts) || !Array.isArray(sourceSubscripts) ||
+      targetSubscripts.length === 0 || targetSubscripts.length !== sourceSubscripts.length) {
     return null;
   }
-  const targetIdx = subscriptIndexExpr(targetSubscripts[0]);
-  const sourceIdx = subscriptIndexExpr(sourceSubscripts[0]);
-  return subscriptedGroupMoveChildLines(groupKey, targetIdx, sourceIdx, indent);
+  const targetIdxs = targetSubscripts.map(subscriptIndexExpr);
+  const sourceIdxs = sourceSubscripts.map(subscriptIndexExpr);
+  return subscriptedGroupMoveChildLines(sourceGroupKey, targetGroupKey, targetIdxs, sourceIdxs, indent);
 }
 
 /**
@@ -2666,21 +2721,29 @@ export function generateMove(statement, indent = 0) {
 
     // round-9 finding 4: MOVE of a subscripted whole-group table row (e.g.
     // `MOVE WS-ROW(1) TO WS-ROW(3)`) - see subscriptedGroupRowRef's doc
-    // comment. Narrowed to the same table on both sides (the common
-    // shift/copy-a-row-within-one-table idiom, and w05's own shape); a
-    // cross-table row MOVE falls through to the pre-existing (elementary)
-    // path below, unchanged.
+    // comment. round-15 findings 5/6 generalized generateSubscriptedGroupMove
+    // to also cover a CROSS-table row MOVE (different groupKey on each side,
+    // e.g. d07's `MOVE WS-ROW-A(i) TO WS-ROW-B(j)`, two distinct 01-records)
+    // and a multi-dimensional row reference (e.g. d08's `MOVE WS-INNER(1,1)
+    // TO WS-INNER(2,2)`, OCCURS nested inside OCCURS) - both now routed
+    // through the SAME call below (previously restricted to
+    // `sourceRow.groupKey === targetRow.groupKey` and exactly one subscript
+    // dimension); generateSubscriptedGroupMove/subscriptedGroupMoveChildLines
+    // themselves still bail out to null (falling through to the visible
+    // marker) for the one shape that genuinely isn't representable this way -
+    // a child with its OWN additional OCCURS clause.
     const sourceRow = subscriptedGroupRowRef(source);
     const targetRow = subscriptedGroupRowRef(target);
-    if (sourceRow && targetRow && sourceRow.groupKey === targetRow.groupKey) {
-      const rowLines = generateSubscriptedGroupMove(sourceRow.groupKey, targetRow.subscripts, sourceRow.subscripts, indent);
+    if (sourceRow && targetRow) {
+      const rowLines = generateSubscriptedGroupMove(sourceRow.groupKey, targetRow.groupKey, targetRow.subscripts, sourceRow.subscripts, indent);
       if (rowLines != null) {
         lines.push(rowLines.join('\n'));
         continue;
       }
       lines.push(
         `${indentStr}() // MOVE ${source.name}(...) TO ${target.name}(...): ??? TODO - whole-row MOVE with a ` +
-        'nested-OCCURS or multi-dimensional row child is not supported; row left unchanged'
+        'nested-OCCURS row child (a table nested inside each row, independent of the row\'s own subscript ' +
+        'dimensions) or a differing-layout cross-table row shape is not supported; row left unchanged'
       );
       continue;
     }
@@ -3658,6 +3721,25 @@ function stringSegmentValueExpr(node) {
   }
 
   if (node && node.type === 'VariableReference') {
+    if (node.refMod) {
+      // round-15 finding 8: reference modification (`identifier(start:
+      // length)`, Known Gap #1) used as a STRING segment source. Ref-mod
+      // itself stays unimplemented (out of scope - see convertIdentifier's
+      // own `???`-typed placeholder, used everywhere else a ref-mod read
+      // appears), but that placeholder's static type is `Nothing`, and
+      // STRING's own per-character copy loop (generateString, below) calls
+      // `.indices`/`.length` directly on this segment's value - `Nothing`
+      // has neither member, so this combination was a HARD COMPILE ERROR
+      // ("Found: Nothing, Required: ?{indices}") instead of an honest,
+      // compiling gap. A concrete, STRING-typed empty-string placeholder
+      // fixes that: `"".indices`/`"".length` both compile and evaluate to
+      // "contributes zero characters, never advances `_ptr`" - visibly
+      // wrong output (the segment's real content is simply missing), but a
+      // compiling, running honest decline rather than a crash. Do NOT
+      // implement real ref-mod slicing here - that's a separate, larger,
+      // deliberately out-of-scope fix (see the known-gaps note).
+      return '"" /* TODO: reference modification not implemented as a STRING source - see tests/oracle/README.md known gaps */';
+    }
     const info = lookupFieldForRef(node);
     if (info && info.scalaType !== 'String') {
       return numericDigitsExpr(rawExpr, info);

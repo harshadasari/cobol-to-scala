@@ -1,0 +1,12 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. D05.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-REC VALUE "AB12CD".
+           05 WS-CODE   PIC X(2).
+           05 WS-AMT    PIC 9(4) COMP-4.
+           05 WS-TAIL   PIC X(2).
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           DISPLAY "CODE=" WS-CODE " AMT=" WS-AMT " TAIL=" WS-TAIL.
+           STOP RUN.

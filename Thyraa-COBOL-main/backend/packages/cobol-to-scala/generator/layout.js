@@ -170,13 +170,70 @@ export function syncPadBytes(item, offset) {
 }
 
 /**
+ * round-15 finding 3: the byte-alignment size a SYNC binary item itself
+ * requires (same 2/4/8 sizing syncPadBytes/elementaryByteLength already use),
+ * or 1 (no alignment requirement) for anything else - including a group,
+ * whose OWN alignment need is whatever the widest SYNC descendant anywhere
+ * within it requires (searched recursively, not just its direct children -
+ * an OCCURS table's stride must stay aligned for a SYNC item at ANY nesting
+ * depth inside one occurrence, not only an immediate child).
+ */
+function syncAlignmentSize(item) {
+  if (!item) return 1;
+  let max = 1;
+  if (item.sync) {
+    const usage = (item.usage || '').toUpperCase();
+    const isBinary = usage === 'COMP' || usage === 'COMP-4' || usage === 'COMP-5' ||
+      usage === 'COMPUTATIONAL' || usage === 'COMPUTATIONAL-4' ||
+      usage === 'COMPUTATIONAL-5' || usage === 'BINARY';
+    if (isBinary) max = elementaryByteLength(item);
+  }
+  const children = (item.children || []).filter(c => c.level !== 88 && !c.redefines);
+  for (const child of children) {
+    const childMax = syncAlignmentSize(child);
+    if (childMax > max) max = childMax;
+  }
+  return max;
+}
+
+/**
  * Total storage bytes of a data item including all occurrences.
  * Group items sum their children recursively (honoring each child's own
  * SYNC alignment padding - round-14 finding 4 - relative to this group's own
  * start). Level-88 condition entries and REDEFINES entries occupy no
  * additional storage.
+ *
+ * `baseOffset` (round-15 finding 2) is the ABSOLUTE byte offset, from the
+ * enclosing record's own start, at which `item` itself begins - needed so a
+ * SYNC binary item nested inside a sub-group that itself sits at a non-zero
+ * record offset aligns against its TRUE absolute position, not a position
+ * relative to its immediate enclosing group's own start (which is what a
+ * bare, always-reset-to-0 local `offset` would otherwise imply). Real cobc
+ * aligns purely by absolute record position - a sub-group's own start offset
+ * has no special "re-basing" effect on its children's alignment decisions.
+ * Every existing call site either omits this (defaults to 0, correct for any
+ * item actually at the record's own start - including every pre-round-15
+ * corpus program, none of which combines SYNC with a non-zero-offset
+ * enclosing sub-group) or is itself already anchored at 0 (a bare top-level
+ * 01-record, or the deliberate "one occurrence width" convention used via
+ * `itemByteLength({ ...item, occurs: null })`, which measures a single
+ * occurrence in isolation and was never offset-sensitive to begin with).
+ *
+ * round-15 finding 3: when `item` itself carries OCCURS > 1, its own
+ * per-occurrence stride (`single`, before the `* occursCount` multiply) is
+ * rounded up to the widest SYNC alignment any descendant anywhere inside one
+ * occurrence requires (syncAlignmentSize) - real cobc pads the *end* of each
+ * occurrence so every repetition starts at the same alignment-class byte
+ * offset the first one does (occurrence 0 starts at `baseOffset`, which is
+ * always used, unmodified, for every occurrence's own internal SYNC pad
+ * decisions here - exactly matching the fixed, compile-time-static layout a
+ * repeated OCCURS structure actually has in generated code, where one
+ * static per-element layout is reused for every element of the table).
+ * A no-op whenever no descendant of `item` carries SYNC on a binary item
+ * (syncAlignmentSize returns 1), so this is a no-op for every pre-round-15
+ * OCCURS table.
  */
-export function itemByteLength(item) {
+export function itemByteLength(item, baseOffset = 0) {
   if (!item) return 0;
   if (item.level === 88) return 0;
 
@@ -188,8 +245,14 @@ export function itemByteLength(item) {
   if (realChildren.length > 0) {
     let offset = 0;
     for (const child of realChildren) {
-      offset += syncPadBytes(child, offset);
-      offset += itemByteLength(child);
+      offset += syncPadBytes(child, baseOffset + offset);
+      offset += itemByteLength(child, baseOffset + offset);
+    }
+    if (hasOccurs(item) && occursCount(item) > 1) {
+      const align = syncAlignmentSize(item);
+      if (align > 1 && offset % align !== 0) {
+        offset += align - (offset % align);
+      }
     }
     single = offset;
   } else {

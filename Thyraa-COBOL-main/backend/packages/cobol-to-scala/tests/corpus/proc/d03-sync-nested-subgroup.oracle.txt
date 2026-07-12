@@ -1,0 +1,4 @@
+LEN=6
+LEAD=X
+F2=+0258
+TAIL=Y

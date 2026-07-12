@@ -149,7 +149,8 @@ function declarativeHandlerFor(fileName, mode) {
  * actually touches java.io (all but the `default`/unrecognized-mode
  * fallback, which never opens anything) is now wrapped in try/catch:
  *   - `java.io.FileNotFoundException` (by far the most common case - the
- *     file/path doesn't exist) -> FILE STATUS "35".
+ *     file/path doesn't exist) -> FILE STATUS "35" for INPUT/I-O, but "30"
+ *     for OUTPUT/EXTEND (round-15 finding 7 - see below).
  *   - any other `java.io.IOException` -> FILE STATUS "30" (cobc's generic
  *     "permanent error" code).
  * A registered DECLARATIVES `USE AFTER STANDARD ERROR PROCEDURE ON
@@ -162,6 +163,27 @@ function declarativeHandlerFor(fileName, mode) {
  * past a failed OPEN with no other visible effect (x02, when FILE STATUS is
  * absent - not exercised by any corpus program, since x02 always declares
  * one, but this keeps the fallback honest either way).
+ *
+ * round-15 finding 7: `java.io.FileNotFoundException` was mapped to FILE
+ * STATUS "35" ("file not found") uniformly, regardless of OPEN mode - wrong
+ * for OUTPUT (and by the same reasoning, EXTEND): "35" is specifically
+ * documented (both in the COBOL standard and GnuCOBOL's own FILE STATUS
+ * table) as "an OPEN statement with the INPUT or I-O phrase was attempted on
+ * a nonexistent file" - it is meaningless for OUTPUT/EXTEND, which are
+ * defined to CREATE the target file, not require it to already exist. A
+ * `java.io.FileNotFoundException` from `new FileOutputStream(...)` under
+ * OPEN OUTPUT/EXTEND therefore never means "the file wasn't found" (OUTPUT
+ * doesn't care whether it already exists) - it means the file genuinely
+ * could NOT be created (its parent directory doesn't exist, or a permission
+ * error), which is exactly cobc's generic permanent-I/O-error code, "30".
+ * Verified against installed GnuCOBOL (d10: `OPEN OUTPUT` against
+ * `/no/such/dir/D10BADOUT.DAT`, a path whose PARENT directory doesn't exist,
+ * reports FILE STATUS "30", not "35"). Distinguished by OPEN mode (not a
+ * runtime parent-directory existence probe) - the mode alone already
+ * determines which status is even meaningful per the FILE STATUS
+ * specification above, so this needs no additional runtime check and can't
+ * disagree with it. INPUT/I-O keep the pre-existing "35" mapping unchanged
+ * (x01/x02, both OPEN INPUT, are unaffected).
  */
 export function generateOpen(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -250,8 +272,13 @@ export function generateOpen(statement, indent = 0) {
       return body;
     }
 
+    // round-15 finding 7: OUTPUT/EXTEND creates the file, so a
+    // FileNotFoundException under those modes means "couldn't create it"
+    // (permanent error, "30"), never "file not found" ("35" - only
+    // meaningful when the mode requires the file to already exist).
+    const fileNotFoundStatus = (mode === 'OUTPUT' || mode === 'EXTEND') ? '30' : '35';
     lines.push(`${bi}case _: java.io.FileNotFoundException =>`);
-    lines.push(...catchBody('35'));
+    lines.push(...catchBody(fileNotFoundStatus));
     lines.push(`${bi}case _: java.io.IOException =>`);
     lines.push(...catchBody('30'));
   }

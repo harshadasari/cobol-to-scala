@@ -112,10 +112,13 @@ CORRESPONDING, GO TO ... DEPENDING ON, intrinsic FUNCTIONs, PERFORM forms,
 EVALUATE, STRING/UNSTRING/INSPECT, RELEASE/RETURN) go through the exact same
 `oracleCompare()` data-driven pattern as Phase 1, in a separate "Phase 2
 oracle compare" suite: match -> hard `assert.ok`, mismatch ->
-`t.todo('Phase 2 work queue - ...')`. As of this writing every
-`tests/corpus/proc/*.cbl` program matches end-to-end (0 todo); a todo only
-reappears here if a new proc/ program is added ahead of the generator support
-it needs.
+`t.todo('Phase 2 work queue - ...')`. As of this writing 203 of 204
+`tests/corpus/proc/*.cbl` programs match end-to-end; the one exception,
+`d12`, is a *deliberate* todo (see the round-15 table and "Known gaps" below -
+it intentionally exercises the pre-existing, out-of-scope reference-
+modification gap to regression-test round-15 finding 8's crash fix, not a
+generator gap awaiting support). A todo otherwise only reappears here if a
+new proc/ program is added ahead of the generator support it needs.
 
 The `p10`-`p18` programs are the original Phase 2 baseline corpus. The
 `r01`-`r14` programs (including `*b`/`*c` isolation/bisection follow-ups) were
@@ -172,25 +175,26 @@ cobc at all; previously the harness had no copybook support whatsoever, so
 `u09`/`u10` could only be spot-checked with a throwaway script, never run
 through this data-driven suite.
 
-## Current inventory (last recorded run: 2026-07-11)
+## Current inventory (last recorded run: 2026-07-12)
 
 Toolchain: cobc and scala-cli both available.
 
-**cobc oracle capture / expected-vs-oracle check** - 209 corpus programs found
-(19 under `data/`, 190 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
+**cobc oracle capture / expected-vs-oracle check** - 223 corpus programs found
+(19 under `data/`, 204 under `proc/`; `tests/corpus/sql/`'s 5 EXEC-SQL programs are
 excluded from this cobc sweep - plain GnuCOBOL can't compile embedded SQL without a
 precompiler, see `tests/sql.test.js` instead; two round-9 repros, `w09`/`w12`, are
 deliberately excluded entirely - see the round-9 table below - since cobc itself
-rejects them), all 209 compiled and ran cleanly under cobc (exit 0). 28 of the 209
+rejects them), all 223 compiled and ran cleanly under cobc (exit 0). 28 of the 223
 (19 `data/` + 9 `proc/` baseline programs) already have a hand-written `.expected.txt`
 that matches the captured `.oracle.txt` exactly - 0 mismatches. The 20 `r01`-`r14*`,
 15 `n01`-`n16*`, 16 `q01`-`q12*`, 14 `s01`-`s12*`, 11 `t01`-`t12*` (`t09` excluded),
 14 `u01`-`u13*`, 12 `v01`-`v12*`, 12 `w01`-`w14*` (`w09`/`w12` excluded), 12
 `x01`-`x12`, 16 `y01`-`y17*` (see the round-11 table below for the exact subset),
 15 `z01`-`z15*` (see the round-12 table below for the exact subset), 11
-`aa01`-`aa10*` (see the round-13 table above for the exact subset), and 11
+`aa01`-`aa10*` (see the round-13 table above for the exact subset), 11
 `b1`-`b6`/`c1`/`c3`/`c4b`/`c5`/`c6` (see the round-14 table above for the exact
-subset) programs have no hand-written `.expected.txt` by design (they're verified
+subset), and 14 `d01`-`d14` (see the round-15 table below for the exact subset)
+programs have no hand-written `.expected.txt` by design (they're verified
 directly against cobc via `oracleCompare()` below, not a separately hand-authored
 expectation) and show up here as a diagnostic-only capture ("no `<name>.expected.txt`
 alongside ... yet").
@@ -198,12 +202,18 @@ alongside ... yet").
 **Phase 1 (`data/`) COBOL-vs-generated-Scala oracle compare** - 19/19 programs match
 end-to-end (0 todo).
 
-**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 190/190 programs
-match end-to-end (0 todo), including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
+**Phase 2 (`proc/`) COBOL-vs-generated-Scala oracle compare** - 203/204 programs
+match end-to-end, 1 todo, including all 20 `r01`-`r14*`, all 15 `n01`-`n16*`, all 16
 `q01`-`q12*`, all 14 `s01`-`s12*`, all 11 `t01`-`t12*` (`t09` excluded), all 14
 `u01`-`u13*`, all 12 `v01`-`v12*`, all 12 `w01`-`w14*` (`w09`/`w12` excluded), all
-12 `x01`-`x12`, all 16 `y01`-`y17*`, all 15 `z01`-`z15*`, all 11 `aa01`-`aa10*`, and
-all 11 `b1`-`b6`/`c1`/`c3`/`c4b`/`c5`/`c6` adversarial-refutation programs below.
+12 `x01`-`x12`, all 16 `y01`-`y17*`, all 15 `z01`-`z15*`, all 11 `aa01`-`aa10*`, all
+11 `b1`-`b6`/`c1`/`c3`/`c4b`/`c5`/`c6`, and 13 of the 14 `d01`-`d14`
+adversarial-refutation programs below. The one todo (`d12`) is a deliberate,
+documented exception - see the round-15 table below and "Known gaps" - it
+exercises the pre-existing, deliberately out-of-scope reference-modification
+gap (round-3 finding 3) on purpose, to regression-test round-15 finding 8's
+fix (STRING no longer hard-crashes when combined with ref-mod) without
+requiring ref-mod's own semantics to be implemented.
 
 ### Phase 2 adversarial-refutation findings (r01-r14) and their fixes
 
@@ -737,6 +747,66 @@ KEY/EVALUATE WHEN, each with AND without its own explicit `END-*`
 terminator, plus a doubly-nested-IF-with-no-END-IF case (one period closing
 two levels of implicit scope at once).
 
+### Round-15 adversarial-refutation findings (d01-d14) and their fixes
+
+A round-15 refuter found 8 more dishonest divergences. 7 are fixed in full -
+every promoted program for those hard-passes `oracleCompare()`. The 8th
+(finding 8, `d12`) is fixed exactly to the scope its own instructions called
+for: it previously turned a documented, out-of-scope, already-visible gap
+(reference modification, round-3 finding 3) into a hard COMPILE crash when
+combined with STRING - this round stops the crash (STRING now compiles and
+runs cleanly around a ref-mod segment source) without implementing ref-mod's
+own semantics, which stays exactly as out-of-scope as before. `d12` therefore
+still shows as the Phase 2 suite's one todo (see "Known gaps"), by design -
+not a regression, and not the crash finding 8 was reported against.
+
+Findings 1-3 are one connected thread: `layout.js`'s SYNC-alignment
+machinery (round-14 finding 4) was correct only for a SYNC item directly
+under a flat, non-repeating, non-nested group - the three narrower
+combinations its own doc comment flagged as unverified (group-VALUE
+inheritance offset drift, a nested sub-group's non-zero absolute offset, and
+OCCURS-stride rounding) turned out to all be real, oracle-confirmed bugs.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | SYNC binary child inheriting a GROUP-level VALUE clause - `scala-generator.js`'s `buildFieldRegistry` offset-walk (`walk()`) never consulted `syncPadBytes` when advancing its own running `offset` (used both to slice each child's span out of the group's VALUE literal, and - after this round's finding 2 - as the absolute base offset threaded into a nested group), even though `layout.js`'s `itemByteLength` (used for the group's *total* width) already applied it - the two offsets silently drifted apart the instant a SYNC child needed padding, corrupting which bytes of the VALUE literal every SYNC child (and everything declared after it) actually read | `walk()` now computes `syncPadBytes(item, baseOffset + offset)` and adds it to `offset` BEFORE using `offset` for anything - identical padding decision to `itemByteLength`'s own, by construction (same function, same inputs) | d02 |
+| 2 | SYNC alignment inside a nested sub-group that itself sits at a non-zero ABSOLUTE record offset - both `itemByteLength` and `walk()` aligned relative to the sub-group's own local `offset` (always reset to 0 per recursive call), not the item's true absolute record position - a SYNC item whose sub-group happens to start at an odd absolute offset could be wrongly judged "already aligned" (or vice versa) purely because its *local* offset within the sub-group looked aligned | Threaded a `baseOffset` parameter through both functions' recursion - `itemByteLength(item, baseOffset = 0)` and `walk(list, occursChain, ancestorNames, parentValueText, baseOffset = 0)` - each nested group's own recursive call now passes its own absolute start (`baseOffset + offset` at the point the group itself was reached) instead of implicitly restarting at 0. Every pre-round-15 call site either omits the parameter (defaults to 0, correct for a record's own top level) or was already effectively anchored at 0, so this is a no-op for every existing corpus program. Verified against installed GnuCOBOL (d03): `W-LEAD PIC X(1)` + `W-GRP { F1 PIC X(1), F2 PIC S9(4) COMP SYNC, F3 PIC X(1) }` + `W-TAIL PIC X(1)` totals `LEN=6` - F2's absolute offset (2, right after W-LEAD+F1) is ALREADY even, so cobc inserts NO padding; the pre-fix engine, aligning against F2's local offset within W-GRP (1, odd), wrongly inserted one, reporting `LEN=7` | d03 |
+| 3 | SYNC binary item inside an OCCURS table - `itemByteLength` only padded *before* the SYNC child within one occurrence, never rounding the OCCURRENCE'S OWN STRIDE up afterward to the alignment boundary - so occurrence 0 laid out correctly, but occurrence 1 (and beyond) started at whatever offset occurrence 0's unrounded width happened to leave, silently drifting out of alignment after the first repetition | New `layout.js`-internal `syncAlignmentSize(item)` (recursive - the widest SYNC alignment any descendant anywhere inside one occurrence requires, 1 when none). `itemByteLength` now rounds its own per-occurrence `single` width up to that alignment whenever `item` itself carries `OCCURS > 1` - real cobc pads the END of each occurrence so every repetition starts at the same alignment-class offset the first one does. A no-op whenever no descendant of an OCCURS item carries SYNC on a binary item (every pre-round-15 OCCURS table). Verified against installed GnuCOBOL (d04): `WS-ROW OCCURS 2 { R-LEAD PIC X(1), R-NUM PIC S9(4) COMP SYNC, R-TAIL PIC X(1) }` totals `LEN=12` (stride rounded 5 -> 6, times 2) - the pre-fix engine reported `LEN=10` (naive `5 * 2`, unrounded), and - worse - `R-NUM(2)`'s own bytes would have been read from the wrong (mis-aligned) offset entirely had the table's stride ever needed to line up with real file-record bytes | d04 |
+| 4 | Group-VALUE slicing over a COMP-5 (native/host binary) child - `scala-generator.js`'s `nonDisplayInheritedNumericText` truncated the DISPLAY-derived value to the PICTURE's declared digit count for every non-DISPLAY USAGE uniformly (COMP-3/COMP/COMP-4/COMP-5/BINARY alike) - correct for COMP-3/COMP/COMP-4/BINARY (real cobc's `binary-truncate` convention DOES clip those to their low-order declared digits - re-confirmed, not just assumed, by this round's own d02 - a plain `COMP` case - now passing end-to-end), but WRONG for COMP-5: cobc's FILE STATUS "35"-style low-order clipping is documented as specific to non-native binary storage; COMP-5's DISPLAY shows the TRUE stored magnitude even past the declared digit count | `nonDisplayInheritedNumericText` now skips the truncate-to-`digits` step specifically for COMP-5 (`magnitudeStr.padStart(digits, '0')` only - a no-op when already wide enough); `defaultElementaryValueWithInheritance`'s own downstream numeric-literal construction widens the synthetic item's own `pic.integerDigits` to match whenever the decoded value came back wider than declared, so `defaultElementaryValue`'s shared `truncateNumericLiteralText` call (used for an ORDINARY too-wide VALUE literal, which legitimately DOES truncate) doesn't independently re-clip a COMP-5 value this fix already decided to leave alone. Verified against installed GnuCOBOL (d06): `PIC 9(4) COMP-5` reading raw bytes `"12"` (native/little-endian) decodes to 12849 and DISPLAYs `AMT=12849` in full - the pre-fix engine reported `AMT=2849` (12849 mod 10^4, the COMP-3/COMP/COMP-4/BINARY truncation rule wrongly applied to COMP-5 too) | d06 |
+| 5 | Subscripted whole-row MOVE across two DIFFERENT tables (`MOVE WS-ROW-A(i) TO WS-ROW-B(j)`, two distinct 01-records) fell through the pre-existing single-table-only guard (`sourceRow.groupKey === targetRow.groupKey`) straight into the ordinary elementary-MOVE codegen path, which has no flat var for a group-with-OCCURS name at all - a hard `Not found: wsRowB` compile error (`wsRowB = wsRowB.updated(...)`, referencing a name that was never declared) | **Real fix, not a degraded marker** (a natural generalization of the existing single-table logic): `subscriptedGroupMoveChildLines`/`generateSubscriptedGroupMove` (`generator/expression-gen.js`) now accept two (possibly different) group keys, matching each side's children POSITIONALLY (same count, same per-position Scala type/width/decimals - the identical rule `generateGroupMove`'s own `groupLayoutsIdentical` already applies for a bare, non-subscripted cross-record group MOVE) and copying `<targetChildCamel> = <targetChildCamel>.updated(<targetIdx>, <sourceChildCamel>(<sourceIdx>))` per matched pair; a layout mismatch (different child count, or a positional type/width/decimals disagreement) still falls back to the pre-existing visible `??? TODO` marker rather than emit a wrong assignment. The same-table case (`sourceGroupKey === targetGroupKey`, w05's own shape) is unaffected - matching itself against itself positionally produces byte-for-byte the same output as the pre-round-15 single-groupKey code path. Verified against installed GnuCOBOL (d07): `MOVE WS-ROW-A(1) TO WS-ROW-B(2)` correctly copies `A-CODE(1)`/`A-NUM(1)` into `B-CODE(2)`/`B-NUM(2)` (`B2-CODE=AAA B2-NUM=111`), leaving `WS-ROW-A(1)` itself untouched (`A1-CODE=AAA A1-NUM=111`) | d07 |
+| 6 | Subscripted whole-row MOVE with TWO subscript dimensions (`MOVE WS-INNER(1,1) TO WS-INNER(2,2)`, OCCURS nested inside OCCURS) was rejected by `generateSubscriptedGroupMove`'s own `targetSubscripts.length !== 1` guard, falling back to a comment-only marker (`() // ... row left unchanged`) that left the target's stale value completely untouched at runtime - a SILENT wrong-output bug (worse than finding 5's hard compile error: the generated code compiled and ran, just silently did nothing) | **Real fix, not a degraded marker**: new `nestedReadExpr`/`nestedUpdateExpr` helpers build a full N-dimension-deep `.updated(...)`/read chain (mirroring `renderAssignment`'s own local nested-update shape for an ordinary elementary multi-dimensional subscript write) instead of the original single-`.updated` shape; `subscriptedGroupMoveChildLines`/`generateSubscriptedGroupMove` now accept an ARRAY of subscript index expressions per side (any length, source/target must match) - a 1-dimensional row (the common case, w05) still produces byte-for-byte the same single-`.updated` output as before. Verified against installed GnuCOBOL (d08): `MOVE WS-INNER(1,1) TO WS-INNER(2,2)` correctly copies `IN-CODE(1,1)`/`IN-NUM(1,1)` ("AA"/11) into `IN-CODE(2,2)`/`IN-NUM(2,2)` (`OUT22=AA 11`), leaving `WS-INNER(1,1)` itself untouched (`OUT11=AA 11`) - the pre-fix engine printed `OUT22=ZZ 99` (the stale, never-overwritten value) | d08 |
+| 7 | SORT with DECLARATIVES firing from inside the OUTPUT PROCEDURE - traced to `file-io-gen.js`'s OPEN-failure classifier: EVERY `java.io.FileNotFoundException` mapped to FILE STATUS "35" regardless of OPEN mode. "35" ("file not found") is specifically documented (COBOL standard and GnuCOBOL's own FILE STATUS table) as an INPUT/I-O-only condition (those modes require the file to already exist); OPEN OUTPUT/EXTEND instead CREATE the target file, so a `FileNotFoundException` there means the file genuinely couldn't be CREATED (parent directory missing, permission error, ...) - cobc's generic permanent-I/O-error code, "30" | `generateOpen`'s FileNotFoundException-to-status mapping now branches on OPEN mode: INPUT/I-O keep the pre-existing "35" (unaffected - x01/x02 regression-verified still "35"); OUTPUT/EXTEND now map to "30". Distinguished by mode alone (not a runtime parent-directory-existence probe) - the FILE STATUS specification itself already ties "35"'s meaning to INPUT/I-O, so mode is a direct, unambiguous signal, not a heuristic. Verified against installed GnuCOBOL (d10): `OPEN OUTPUT` against `/no/such/dir/D10BADOUT.DAT` (nonexistent parent directory) reports FILE STATUS "30" - both from a DECLARATIVES handler fired on the failure AND from the FILE STATUS field read immediately after OPEN - the pre-fix engine reported "35" for both | d10 |
+
+**Honest-degradation finding** (compiles and runs cleanly - no crash - but
+does not implement the underlying capability, by explicit design; see "Known
+gaps" below):
+
+| # | Finding | Route taken | Program |
+|---|---|---|---|
+| 8 | Reference modification (`identifier(start:length)`, round-3 finding 3 - a documented, ALREADY-VISIBLE gap: read/write both degrade to a `???`-typed, Nothing-valued placeholder) used as a STRING segment source combined with STRING's own segment-copy loop calling `.indices`/`.length` directly on that placeholder - `Nothing` has neither member, so this combination was a HARD COMPILE ERROR (`Found: Nothing, Required: ?{indices}`) instead of an honest, compiling gap | **Honest-decline route, ref-mod semantics still explicitly out of scope**: `stringSegmentValueExpr` (`generator/expression-gen.js`) now detects a ref-mod'd `VariableReference` segment source directly and substitutes a concrete, String-typed placeholder (`"" /* TODO: ... */`) instead of routing through the shared `convertIdentifier` Nothing-typed `???` - `"".indices`/`"".length` both compile AND run (contributing zero characters to the STRING result, never advancing the pointer) rather than crashing. Reference modification's own read/write semantics are NOT implemented by this fix (deliberately - see this round's own instructions) - a program combining STRING-with-ref-mod with any OTHER ref-mod usage (d12 also has an UNSTRING-INTO-ref-mod-target and an INSPECT-of-a-ref-mod'd-substring) still reaches the pre-existing `???` placeholder for THOSE uses and throws `NotImplementedError` at runtime if actually executed - exactly Known Gap #1's own long-documented, accepted behavior, unrelated to and unaffected by this fix. Verified against installed GnuCOBOL/scala-cli (d12): the generated Scala now COMPILES cleanly (previously a hard compile error) and RUNS the STRING statement to completion (prints `TARGET=          ` - wrong content, since the ref-mod segments contribute nothing, but a compiling, non-crashing, honestly-marked decline) before reaching the still-unimplemented UNSTRING-INTO-ref-mod line and throwing there, exactly as Known Gap #1 predicts for any program that actually exercises ref-mod | d12 (not fully passing `oracleCompare()` by design - see "Known gaps") |
+
+14 valid round-15 probes were promoted: 7 files backing the 7 fully-fixed
+findings (`d02` finding 1, `d03` finding 2, `d04` finding 3, `d06` finding 4,
+`d07` finding 5, `d08` finding 6, `d10` finding 7) plus `d12` backing finding
+8's honest-decline fix (see above - deliberately still 1 todo, not a
+regression), plus 6 survivors that already passed unmodified before this
+round, locking in existing behavior as regression guards: `d01` a 3-way
+DECLARATIVES/CALL/file-I/O integration, `d05` an ordinary (non-SYNC)
+COMP-4 group-VALUE child (confirms the truncation rule finding 4 narrowed to
+COMP-5-only is still correct for COMP-4), `d09` a non-DISPLAY (COMP-3) field
+sharing a record with an OCCURS table across a WRITE/READ round trip, `d11`
+EVALUATE/PERFORM combined with a DECLARATIVES handler, `d13` the same CALLed
+subprogram invoked three times in one run (state-isolation regression
+guard), and `d14` a qualified `PERFORM ... THRU` crossing two SECTIONs
+combined with `GO TO ... DEPENDING ON`.
+
+See `tests/round15-fixes.test.js` for focused, toolchain-independent unit
+tests of all 8 findings above, including direct `itemByteLength`/
+`syncPadBytes` unit coverage for findings 1-3 (isolated from the cobc/
+scala-cli toolchain) and regression guards confirming the multi-dimension
+row-move generalization (finding 6) produces byte-for-byte the same output
+as before for a 1-dimensional row (w05's own shape).
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -750,7 +820,15 @@ two levels of implicit scope at once).
   fail `oracleCompare()` by design, which would misrepresent a *known, intentional*
   gap as a regression. Revisit by implementing substring-read / splice-write against
   the field's own display text (its own declared width is already known via the field
-  registry) if a future pass has time for it.
+  registry) if a future pass has time for it. **Round-15 update**: `d12` IS now
+  promoted (deliberately, unlike every other program exercising this gap) - it
+  exists specifically to regression-test round-15 finding 8 (STRING no longer
+  hard-crashes when a segment source is a ref-mod expression - see the round-15
+  table above), not to exercise ref-mod's own semantics. `d12` still shows as the
+  Phase 2 suite's one `t.todo(...)` entry, exactly as this note predicts for any
+  program that reaches the `???` placeholder at runtime (its own UNSTRING-INTO-
+  ref-mod-target and INSPECT-of-a-ref-mod'd-substring both still do) - this is
+  expected, by design, and not a regression.
 
 - **A bare, UNQUALIFIED out-of-line `PERFORM <paragraph-name>` (or `GO TO`) that
   targets one specific paragraph whose bare name is ambiguous across sections
@@ -881,35 +959,37 @@ two levels of implicit scope at once).
   external name) if a future pass needs to convert a program that genuinely
   calls out to a separately-compiled subprogram.
 
-- **Group-level VALUE slicing over a BINARY (COMP/COMP-4/COMP-5) child,
-  round-9 finding 3's narrower half** - `nonDisplayInheritedNumericText`
-  (`generator/scala-generator.js`) reuses `codecs.js`'s `binaryDecode` for a
-  BINARY child exactly the same way it reuses `packedDecode` for a COMP-3
-  child, and truncates the decoded two's-complement value to the child's own
-  low-order declared digit count for consistency with the COMP-3 case and
-  with this generator's usual high-order-truncation convention
-  (`CobolFmt.truncNumeric`) - but only the COMP-3 path is compiler-verified
-  (w03); no corpus program exercises a BINARY child inheriting a group VALUE
-  clause, so this half of the fix has not been checked against real cobc.
-  Revisit by adding a BINARY-specific probe once a use case surfaces.
+- ~~Group-level VALUE slicing over a BINARY (COMP/COMP-4/COMP-5) child,
+  round-9 finding 3's narrower half~~ **RESOLVED by round-15 findings 1 and
+  4.** `nonDisplayInheritedNumericText` (`generator/scala-generator.js`)
+  reuses `codecs.js`'s `binaryDecode` for a BINARY child exactly the same way
+  it reuses `packedDecode` for a COMP-3 child; the "truncates to the child's
+  own low-order declared digit count" behavior is now compiler-verified for
+  an ordinary (non-COMP-5) binary child too - `d02` (COMP, combined with
+  SYNC - round-15 finding 1's own fix was needed for `d02` to reach the
+  right offset at all) and the pre-existing `d05` (COMP-4, no SYNC) both
+  confirm the truncation rule is correct there, matching the already-
+  verified COMP-3 case (w03). COMP-5 turned out to be the genuine exception,
+  not an unverified guess: round-15 finding 4 found (and fixed) that COMP-5
+  is EXEMPT from this truncation - its DISPLAY shows the full native-binary
+  magnitude even past the declared digit count (`d06`). All four non-DISPLAY
+  USAGEs this function handles (COMP-3/COMP/COMP-4/COMP-5/BINARY-as-COMP)
+  are now compiler-verified, one way or the other.
 
-- **A subscripted whole-row MOVE (`MOVE WS-ROW(i) TO WS-ROW(j)`) across TWO
+- ~~A subscripted whole-row MOVE (`MOVE WS-ROW(i) TO WS-ROW(j)`) across TWO
   DIFFERENT tables, or with more than one subscript dimension, round-9
-  finding 4's narrower edge** - `subscriptedGroupRowRef`/
-  `generateSubscriptedGroupMove` (`generator/expression-gen.js`) only handle
-  the same table on both sides (`sourceRow.groupKey === targetRow.groupKey`)
-  with exactly one subscript per side (w05's own shape, and the common
-  shift/copy-a-row-within-one-table idiom) - a cross-table row MOVE, a
-  two-dimensional (OCCURS-within-OCCURS) row reference, or a row child that
-  itself has its own further OCCURS clause all fall back to a visible,
-  still-compiling `??? TODO` marker (the multi-table/multi-dimension cases
-  fall through to the pre-existing elementary-MOVE path instead, unchanged)
-  rather than emitting a wrong/non-compiling copy. Not exercised by any
-  corpus program. Revisit by threading a second Vector-index dimension
-  through `subscriptedGroupMoveChildLines`'s recursion, and by extending
-  `generateGroupMove`'s existing differing-layout (byte-level case-class
-  round-trip) strategy to a subscripted-row shape, if a future program needs
-  either.
+  finding 4's narrower edge~~ **RESOLVED by round-15 findings 5 and 6** (both
+  as REAL fixes, not degraded markers) - see the round-15 table above (`d07`
+  cross-table, `d08` two-dimensional). What remains unaddressed is only a row
+  child that itself has its OWN additional OCCURS clause (a table nested
+  inside each row, independent of the row's own subscript dimensions) -
+  `subscriptedGroupMoveChildLines` (`generator/expression-gen.js`) still
+  bails out to `null` for that one shape (falling back to the pre-existing
+  visible `??? TODO` marker) since its flat var would need yet another,
+  independently-driven Vector index no corpus program supplies. Not
+  exercised by any corpus program. Revisit by threading a THIRD, independent
+  index dimension through the recursion (distinct from the row's own
+  subscript chain) if a future program needs it.
 
 - ~~A backward `PERFORM x THRU y` range's post-start-paragraph fallthrough,
   round-9 finding 5's narrower edge~~ **RESOLVED by round-10's `x08`.**
@@ -1031,22 +1111,33 @@ two levels of implicit scope at once).
   file-record storage elsewhere) through a per-element byte-slice view over
   the target's own underlying storage, if a future pass has time.
 
-- **SYNCHRONIZED/SYNC alignment (round-14 finding 4) combined with a NESTED
-  sub-group, or with OCCURS, on the SYNC item's own enclosing structure** -
-  `layout.js`'s `syncPadBytes`/`itemByteLength` compute alignment padding
-  relative to the immediately-enclosing group's own start (offset 0) - fully
-  correct and compiler-verified for a flat, non-repeating group (c6's own
-  shape: a single 01-level record with SYNC binary children directly under
-  it). Two combinations are NOT independently handled/verified: (a) a SYNC
-  binary item nested two or more group-levels deep, where the OUTER group
-  itself starts at a non-zero *absolute* offset within some further
-  enclosing record - alignment is computed relative to the immediate parent
-  group's own start, not threaded through as a true whole-record absolute
-  offset; (b) a SYNC binary item combined with OCCURS on some enclosing
-  item - each occurrence's own internal padding is computed as if that
-  occurrence starts fresh at relative offset 0, which is not independently
-  verified against cobc for a case where that assumption might not hold.
-  Neither combination is exercised by any corpus program (c6 is deliberately
-  a single flat record). Revisit by threading a true absolute offset through
-  `itemByteLength`'s own recursion (a `startOffset` parameter, rather than
-  always assuming 0) if a future program needs either combination.
+- ~~SYNCHRONIZED/SYNC alignment (round-14 finding 4) combined with a NESTED
+  sub-group, or with OCCURS, on the SYNC item's own enclosing structure~~
+  **RESOLVED by round-15 findings 2 and 3** (`layout.js`'s `itemByteLength`
+  now takes a `baseOffset` parameter threaded through its own recursion - a
+  nested sub-group's children align against their TRUE absolute record
+  position, not a position relative to the sub-group's own local start -
+  `d03`; an OCCURS item's own per-occurrence stride now rounds up to its
+  widest SYNC descendant's alignment requirement, keeping every repetition
+  self-consistent - `d04`; see the round-15 table above for both). What
+  remains unaddressed is only `case-class-gen.js`'s OWN independent real-
+  file-record byte-layout codegen (`generateFieldsFromChildren`'s
+  `totalLength` accumulator, and each nested group's own separately-
+  generated `parse`/`format` methods) - it still computes each nested case
+  class's own field offsets/`recordLength` starting fresh at local offset 0,
+  unaware of where that nested group's OWN case class instance will actually
+  sit within some enclosing FILE SECTION record's real byte stream, and its
+  own per-occurrence stride (used by a `Vector`-of-groups field's `parse`/
+  `format` loop) is `itemByteLength({ ...child, occurs: null })` - occurs
+  deliberately stripped, the pre-existing "one occurrence width" convention -
+  so it does NOT pick up finding 3's new stride-rounding either. Neither gap
+  is exercised by any corpus program (`d03`/`d04` are both plain
+  WORKING-STORAGE, with no FILE SECTION/WRITE/case-class byte round trip
+  involved) - `layout.js`'s own `itemByteLength`/`groupByteLengthRegistry`
+  (used for `FUNCTION LENGTH` and the group-VALUE-inheritance offset walk)
+  are fully fixed and is what both `d03`/`d04` actually verify. Revisit by
+  threading the same `baseOffset` (for absolute-offset alignment) and
+  `syncAlignmentSize`-based stride rounding (for OCCURS) into
+  `case-class-gen.js`'s own field-offset computation and the `parse`/
+  `format` codegen it emits, if a future program needs a real FILE SECTION
+  record combining SYNC with a nested sub-group or an OCCURS table.

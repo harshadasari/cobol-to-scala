@@ -1,0 +1,51 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. D10.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT WORK-FILE ASSIGN TO "D10WORK".
+           SELECT OUT-FILE ASSIGN TO "/no/such/dir/D10BADOUT.DAT"
+               ORGANIZATION IS LINE SEQUENTIAL
+               FILE STATUS IS WS-OUT-STATUS.
+       DATA DIVISION.
+       FILE SECTION.
+       SD  WORK-FILE.
+       01  WORK-REC.
+           05  WR-KEY PIC 9(2).
+       FD  OUT-FILE.
+       01  OUT-REC PIC X(10).
+       WORKING-STORAGE SECTION.
+       01  WS-OUT-STATUS PIC XX.
+       01  WS-EOF-FLAG PIC X VALUE "N".
+           88 SORT-EOF VALUE "Y".
+       PROCEDURE DIVISION.
+       DECLARATIVES.
+       OUT-ERR-SECTION SECTION.
+           USE AFTER STANDARD ERROR PROCEDURE ON OUT-FILE.
+       OUT-ERR-PARA.
+           DISPLAY "OUTPUT HANDLER FIRED STATUS=" WS-OUT-STATUS.
+       END DECLARATIVES.
+       MAIN-SECTION SECTION.
+       MAIN-PARA.
+           SORT WORK-FILE ASCENDING KEY WR-KEY
+               INPUT PROCEDURE IS 1000-FILL
+               OUTPUT PROCEDURE IS 2000-PRINT.
+           STOP RUN.
+
+       1000-FILL.
+           MOVE 30 TO WR-KEY.
+           RELEASE WORK-REC.
+           MOVE 10 TO WR-KEY.
+           RELEASE WORK-REC.
+
+       2000-PRINT.
+           OPEN OUTPUT OUT-FILE.
+           DISPLAY "AFTER OUTFILE OPEN STATUS=" WS-OUT-STATUS.
+           PERFORM UNTIL SORT-EOF
+               RETURN WORK-FILE
+                   AT END
+                       SET SORT-EOF TO TRUE
+                   NOT AT END
+                       DISPLAY "KEY=" WR-KEY
+               END-RETURN
+           END-PERFORM.

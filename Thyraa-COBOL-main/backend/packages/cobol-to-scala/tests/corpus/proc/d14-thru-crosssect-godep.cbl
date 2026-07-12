@@ -1,0 +1,23 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. D14.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-X PIC 9 VALUE 2.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           PERFORM SECA-P1 THRU SECB-P2.
+           DISPLAY "DONE".
+           STOP RUN.
+
+       SECTION-A SECTION.
+       SECA-P1.
+           DISPLAY "IN SECA-P1".
+           GO TO SECA-P2 SECB-P1 SECB-P2 DEPENDING ON WS-X.
+       SECA-P2.
+           DISPLAY "IN SECA-P2".
+
+       SECTION-B SECTION.
+       SECB-P1.
+           DISPLAY "IN SECB-P1".
+       SECB-P2.
+           DISPLAY "IN SECB-P2".

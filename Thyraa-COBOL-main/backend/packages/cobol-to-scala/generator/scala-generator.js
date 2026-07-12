@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { toPascalCase, toCamelCase, generateCaseClass, collectAmbiguousGroupClassNames } from './case-class-gen.js';
-import { getPicPattern, scalaBaseType, occursCount, hasOccurs, itemByteLength } from './layout.js';
+import { getPicPattern, scalaBaseType, occursCount, hasOccurs, itemByteLength, syncPadBytes } from './layout.js';
 import { packedDecode, binaryDecode } from './codecs.js';
 import { generateAllEnums, groupLevel88sByParent } from './enum-gen.js';
 import {
@@ -730,17 +730,34 @@ function ownValueStorageText(item, width) {
 function nonDisplayInheritedNumericText(inheritedSlice, digits, usage) {
   const bytes = Uint8Array.from(inheritedSlice, ch => ch.charCodeAt(0) & 0xff);
   const isPacked = usage === 'COMP-3' || usage === 'COMPUTATIONAL-3' || usage === 'PACKED-DECIMAL';
+  const isComp5 = usage === 'COMP-5' || usage === 'COMPUTATIONAL-5';
   try {
     let unscaled;
     if (isPacked) {
       ({ unscaled } = packedDecode(bytes));
     } else {
-      const endianness = usage === 'COMP-5' || usage === 'COMPUTATIONAL-5' ? 'LITTLE' : 'BIG';
+      const endianness = isComp5 ? 'LITTLE' : 'BIG';
       unscaled = binaryDecode(bytes, { endianness });
     }
     const negative = unscaled < 0n;
     const magnitudeStr = (negative ? -unscaled : unscaled).toString();
-    const truncated = magnitudeStr.length > digits ? magnitudeStr.slice(-digits) : magnitudeStr.padStart(digits, '0');
+    // round-15 finding 4: COMP-5 (native/host binary) is exempt from real
+    // cobc's default binary-truncate convention - unlike COMP-3/COMP/
+    // COMP-4/BINARY (all of which cobc silently clips to the low-order
+    // `digits` decimal digits of the PICTURE, verified via d02's oracle:
+    // a group-VALUE-inherited SYNC `S9(4) COMP` reads raw bytes that decode
+    // to 17220, and DISPLAYs "+7220" - the low-order 4 digits, not the full
+    // value), COMP-5's DISPLAY shows the TRUE full stored magnitude even
+    // when it exceeds the PICTURE's own declared digit count - verified via
+    // d06's oracle: a group-VALUE-inherited `9(4) COMP-5` reads raw bytes
+    // that decode (native/little-endian) to 12849, and DISPLAYs "12849" in
+    // full, not "2849" (12849 mod 10^4). Only the truncating (non-COMP-5)
+    // side pads short values up to `digits` with leading zeros - a COMP-5
+    // value never needs that (its own untruncated decimal text is used as-is,
+    // already whatever width it naturally is).
+    const truncated = !isComp5 && magnitudeStr.length > digits
+      ? magnitudeStr.slice(-digits)
+      : magnitudeStr.padStart(digits, '0');
     return (negative ? '-' : '') + truncated;
   } catch {
     return null;
@@ -769,10 +786,27 @@ function defaultElementaryValueWithInheritance(item, scalaType, inheritedSlice) 
     if (digitsText == null) return defaultElementaryValue(item, scalaType);
     const neg = digitsText.startsWith('-');
     const unsignedDigits = neg ? digitsText.slice(1) : digitsText;
+    // round-15 finding 4: `unsignedDigits` can be WIDER than `digits` now
+    // (COMP-5 only - nonDisplayInheritedNumericText deliberately declines to
+    // truncate it, see its own doc comment) - split integer/decimal parts by
+    // the ACTUAL length, not the PICTURE's nominal intDigits, so a too-wide
+    // COMP-5 value's decimal point (if any) still lands in the right place
+    // instead of losing high-order digits to a stale intDigits-sized slice.
+    const actualIntDigits = decDigits > 0 ? Math.max(unsignedDigits.length - decDigits, 0) : unsignedDigits.length;
     const numericText = decDigits > 0
-      ? `${neg ? '-' : ''}${unsignedDigits.slice(0, intDigits)}.${unsignedDigits.slice(intDigits)}`
+      ? `${neg ? '-' : ''}${unsignedDigits.slice(0, actualIntDigits)}.${unsignedDigits.slice(actualIntDigits)}`
       : digitsText;
-    return defaultElementaryValue({ ...item, value: { type: 'numeric', value: numericText } }, scalaType);
+    // Widen the synthetic item's own pic.integerDigits to match whenever the
+    // decoded value came back wider than the declared PICTURE (COMP-5 only) -
+    // otherwise defaultElementaryValue's generic truncateNumericLiteralText
+    // call (shared with the ordinary too-wide-VALUE-literal path, which
+    // legitimately DOES truncate) would re-clip a value this function already
+    // decided to leave alone. A no-op (effectiveIntDigits === intDigits)
+    // whenever unsignedDigits is already exactly `digits` wide, which is
+    // every case except an untruncated COMP-5 overflow.
+    const effectiveIntDigits = Math.max(intDigits, actualIntDigits);
+    const effectivePic = pic ? { ...pic, integerDigits: effectiveIntDigits } : { integerDigits: effectiveIntDigits, decimalDigits: decDigits };
+    return defaultElementaryValue({ ...item, pic: effectivePic, value: { type: 'numeric', value: numericText } }, scalaType);
   }
 
   if (!/^\d+$/.test(inheritedSlice)) return defaultElementaryValue(item, scalaType);
@@ -1434,7 +1468,16 @@ function buildFieldRegistry(ast) {
   // generateGroupMove with no changes to any of them - RENAMES becomes "just
   // another group" from their point of view.
   const flatLeafOrder = [];
-  function walk(list, occursChain, ancestorNames, parentValueText) {
+  // round-15 finding 1/2: `baseOffset` is the ABSOLUTE byte offset (from the
+  // whole record's own start) at which THIS `list` begins - threaded down
+  // through nested-group recursion (see the group branch below) exactly like
+  // layout.js's itemByteLength now does, so a SYNC binary item's alignment
+  // padding is computed against its true absolute record position, not a
+  // position relative to whichever immediate enclosing (sub-)group's own
+  // local `offset` happens to be 0 at. Defaults to 0 for the top-level calls
+  // (`walk(wsItems, [], [])` and friends) below, which is already correct -
+  // a top-level 01-record's own children genuinely do start at absolute 0.
+  function walk(list, occursChain, ancestorNames, parentValueText, baseOffset = 0) {
     let offset = 0;
     for (const item of list) {
       if (isLevel(item, 88)) continue;
@@ -1539,6 +1582,21 @@ function buildFieldRegistry(ast) {
         continue; // shares storage with what it renames - no offset advance
       }
 
+      // round-15 finding 1: a SYNC binary item's alignment padding must be
+      // consulted HERE too, exactly like layout.js's itemByteLength already
+      // does when summing a group's total width - otherwise this walk's own
+      // `offset` (used below to slice this item's inherited span out of
+      // `parentValueText`, and threaded down as the absolute base offset for
+      // any nested group) silently drifts out of sync with the byte position
+      // itemByteLength itself assigns this same item, corrupting which bytes
+      // of the group's own VALUE literal this item (and everything after it)
+      // reads. `groupStartOffset` (this item's own ABSOLUTE record offset,
+      // after padding) is what a nested group's own recursive walk() call
+      // needs too - see round-15 finding 2's baseOffset threading below.
+      const padBefore = syncPadBytes(item, baseOffset + offset);
+      offset += padBefore;
+      const groupStartOffset = baseOffset + offset;
+
       // round-8 finding 4: this item's own span within `parentValueText`
       // (null when there is no VALUE-bearing ancestor in scope at all - see
       // walk()'s own doc comment). `itemWidth` (used to advance `offset` for
@@ -1550,7 +1608,7 @@ function buildFieldRegistry(ast) {
       // enclosing group's VALUE clause is not a shape this fix (or any corpus
       // program) exercises, and guessing at a per-element split would risk a
       // wrong value rather than the safe, pre-existing zero/blank default.
-      const itemWidth = itemByteLength(item);
+      const itemWidth = itemByteLength(item, groupStartOffset);
       const itemWidthSingle = hasOccurs(item) ? null : itemWidth;
       const inheritedSlice = (parentValueText != null && itemWidthSingle != null)
         ? parentValueText.substr(offset, itemWidthSingle)
@@ -1584,9 +1642,12 @@ function buildFieldRegistry(ast) {
         // reaches its children regardless - only *inheriting* an ancestor's
         // VALUE across an OCCURS boundary is left unsupported (inheritedSlice
         // is already null for an OCCURS item, above).
-        const ownGroupValueText = ownValueStorageText(item, itemByteLength({ ...item, occurs: null }));
+        const ownGroupValueText = ownValueStorageText(item, itemByteLength({ ...item, occurs: null }, groupStartOffset));
         const effectiveValueText = ownGroupValueText ?? inheritedSlice;
-        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain, [...ancestorNames, parentUpper], effectiveValueText);
+        // round-15 finding 2: thread this group's own absolute start offset
+        // down as the new baseOffset for its children's recursive walk() -
+        // see the doc comment on walk()'s own `baseOffset` parameter above.
+        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain, [...ancestorNames, parentUpper], effectiveValueText, groupStartOffset);
 
         // Group registry: immediate child names (COBOL name + camel), used
         // by MOVE/ADD CORRESPONDING to match children between two group
@@ -1640,7 +1701,7 @@ function buildFieldRegistry(ast) {
         // OCCURS - a bare, unsubscripted `FUNCTION LENGTH(tbl-group)` refers
         // to one occurrence's width) so expression-gen.js's functionLength
         // can look it up by name alone.
-        groupByteLengthRegistry.set(parentUpper, itemByteLength({ ...item, occurs: null }));
+        groupByteLengthRegistry.set(parentUpper, itemByteLength({ ...item, occurs: null }, groupStartOffset));
         continue;
       }
 

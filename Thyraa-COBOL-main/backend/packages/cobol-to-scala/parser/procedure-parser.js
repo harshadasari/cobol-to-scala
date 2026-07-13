@@ -2507,7 +2507,30 @@ function parseGoToStatement(ctx) {
   // than one target, and (unlike PERFORM's single targetParagraph/
   // throughParagraph pair) each one can independently carry its own
   // qualifier.
-  while (ctx.check(TokenType.IDENTIFIER)) {
+  while (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.COMMA)) {
+    // round-22 finding 2: `GO TO t1 OF s1, t2 OF s2, t3 OF s3 DEPENDING ON
+    // sel` (DEPENDING ON's own multi-target list, comma-separated) - the
+    // exact same comma-consumption bug round-7 finding 1a already fixed for
+    // CALL ... USING's own operand list (see parseCallStatement's doc
+    // comment above for the full mechanism): this loop's own continuation
+    // condition never listed TokenType.COMMA, so it unconditionally stopped
+    // after the FIRST target the moment it saw a separating comma, leaving
+    // every token from that comma onward (", t2 OF s2, t3 OF s3 DEPENDING ON
+    // sel.") completely unconsumed. Those leftover tokens then corrupted the
+    // rest of the PROCEDURE DIVISION parse the same way: eventually the
+    // DEPENDING ON identifier itself was reached as a bare token followed by
+    // a PERIOD, satisfying isParagraphName's own pattern - silently splitting
+    // this one paragraph into two, with the spurious second paragraph named
+    // after that identifier (colliding with its own LINKAGE/WORKING-STORAGE
+    // Scala var - see k02's own header comment). Skipping a comma and
+    // continuing (rather than treating it as a target or a terminator) fixes
+    // this without changing behavior for any comma-free GO TO (a bare `GO TO
+    // TARGET.`, or a single-target DEPENDING ON, neither of which ever had a
+    // comma to skip).
+    if (ctx.check(TokenType.COMMA)) {
+      ctx.advance();
+      continue;
+    }
     stmt.targets.push(ctx.advance().value);
     let section = null;
     if (ctx.matchValue('OF', 'IN')) {
@@ -2629,8 +2652,26 @@ function parseSetStatement(ctx) {
 
   const stmt = new SetStatement();
 
-  // Parse targets
-  while (isIdentifierOperand(ctx)) {
+  // Parse targets. round-22 finding 4: `SET condition-name-1,
+  // condition-name-2 TO TRUE` (a comma-separated list of MULTIPLE targets) -
+  // the same comma-consumption bug round-7 finding 1a/round-22 finding 2
+  // already fixed for CALL ... USING/GO TO ... DEPENDING ON's own operand
+  // lists (see parseCallStatement's doc comment for the full mechanism):
+  // this loop's own continuation condition never listed TokenType.COMMA, so
+  // it unconditionally stopped after the FIRST target the moment it saw a
+  // separating comma, leaving every token from that comma onward (", B TO
+  // TRUE.") completely unconsumed - stmt.value never got set at all (the
+  // very next token was a comma, not TO/UP/DOWN), and the leftover tokens
+  // corrupted the rest of the PROCEDURE DIVISION parse the same way every
+  // other unfixed comma-list bug in this file did. generateSet
+  // (generator/expression-gen.js) already iterates `statement.targets`
+  // independently for each one - it only ever needed this parser-side fix to
+  // ever see more than one target in the first place.
+  while (isIdentifierOperand(ctx) || ctx.check(TokenType.COMMA)) {
+    if (ctx.check(TokenType.COMMA)) {
+      ctx.advance();
+      continue;
+    }
     stmt.targets.push(parseVariableReference(ctx));
     if (ctx.checkValue('TO') || ctx.checkValue('UP') || ctx.checkValue('DOWN')) break;
   }

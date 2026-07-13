@@ -194,6 +194,28 @@ export function setGroupRegistry(registry, keyRegistry) {
 }
 
 /**
+ * round-22 finding 1: accessors for the currently-installed GROUP_REGISTRY/
+ * GROUP_KEY_REGISTRY/TABLE_REGISTRY globals, so a scala-generator.js call
+ * site that already has these globals correctly installed for the ast it's
+ * generating (e.g. generateEntryMethod, mid-generateScala) can pass them
+ * explicitly into a shared helper (computeParamLeafShapes) that also needs
+ * to run BEFORE any globals are installed at all, from an ast's own freshly
+ * built registries (generateMultiProgramScala's pre-loop) - see that
+ * function's own doc comment.
+ */
+export function getGroupRegistry() {
+  return GROUP_REGISTRY;
+}
+
+export function getGroupKeyRegistry() {
+  return GROUP_KEY_REGISTRY;
+}
+
+export function getTableRegistry() {
+  return TABLE_REGISTRY;
+}
+
+/**
  * Resolve a bare (unqualified) uppercased group name - as read directly off
  * a MOVE/ADD CORRESPONDING source/target or a RELEASE/RETURN FROM/INTO
  * reference, none of which carry OF/IN qualification in the Phase 2 corpus -
@@ -5368,6 +5390,54 @@ export function scatterGroupFromString(groupKey, sourceExpr, indent) {
 }
 
 /**
+ * round-22 finding 1: flattens a group's own children (walking `groupRegistry`
+ * exactly like groupDisplayValueExpr/scatterGroupFromString do), recursing
+ * into any nested-group child, into an ORDERED list of `{ camel, scalaType }`
+ * leaf descriptors - one entry per elementary field actually reachable inside
+ * the group, in declaration order. This is the per-child analogue of
+ * groupDisplayValueExpr's own concatenation-order traversal: same bail-out
+ * conditions (an OCCURS-bearing child, a FILLER child with no addressable
+ * COBOL name, or a child with no registered field info at all all return
+ * `null` - never a guessed/partial list).
+ *
+ * Used by generateRecursiveEntryMethod/generateCall's RECURSIVE-target branch
+ * (generator/scala-generator.js, generator/expression-gen.js) to extend
+ * round-21 finding 2's per-scalar getter/setter closure-aliasing convention
+ * to a GROUP LINKAGE parameter: one closure pair PER LEAF child, instead of
+ * the single flat Scala var a scalar LINKAGE parameter has - a group has no
+ * such single var of its own to alias (see groupDisplayValueExpr's own doc
+ * comment), only its children do, so the aliasing must happen one level
+ * deeper, per child, exactly where those flat vars actually live.
+ *
+ * `groupRegistry`/`tableRegistry` are passed explicitly (defaulting to the
+ * currently-installed GROUP_REGISTRY/TABLE_REGISTRY globals) so this same
+ * traversal can also run BEFORE those globals are installed for a given
+ * program - see generateMultiProgramScala's own pre-loop (scala-generator.js),
+ * which must decide every program's RECURSIVE-entry-method eligibility up
+ * front, across every program in the source, before any one of them installs
+ * its own globals via generateScala.
+ */
+export function flattenGroupLeaves(groupKey, groupRegistry = GROUP_REGISTRY, tableRegistry = TABLE_REGISTRY) {
+  const children = groupRegistry.get(groupKey);
+  if (!children || children.length === 0) return null;
+
+  const leaves = [];
+  for (const c of children) {
+    if (c.isFiller) return null;
+    if (c.nameUpper && tableRegistry.has(c.nameUpper)) return null;
+    if (c.groupKey) {
+      const nested = flattenGroupLeaves(c.groupKey, groupRegistry, tableRegistry);
+      if (nested == null) return null;
+      leaves.push(...nested);
+      continue;
+    }
+    if (!c.info) return null;
+    leaves.push({ camel: c.camel, scalaType: c.info.scalaType });
+  }
+  return leaves;
+}
+
+/**
  * Render one DISPLAYed operand. Plain numeric (non-edited) PIC items print
  * through CobolFmt.num() so the output matches cobc's zero-padded,
  * leading-sign DISPLAY format (e.g. PIC S9(5) value 100 -> "+00100");
@@ -7075,9 +7145,10 @@ function generateCall(statement, indent = 0) {
     return convertArithmeticExpression(param.value || param);
   });
 
-  // round-21 finding 2: a RECURSIVE target (scala-generator.js's
+  // round-21 finding 2 (extended by round-22 finding 1 for a GROUP LINKAGE
+  // parameter - see below): a RECURSIVE target (scala-generator.js's
   // generateRecursiveEntryMethod - see its own doc comment) does not take
-  // plain values at all; it takes a getter/setter CLOSURE pair per
+  // plain values at all; it takes a getter/setter CLOSURE pair per LEAF
   // parameter, so its own LINKAGE item can be a live alias of whatever
   // variable THIS specific CALL actually names, instead of a module-level
   // var every recursive activation would otherwise stomp on. A plain,
@@ -7086,26 +7157,73 @@ function generateCall(statement, indent = 0) {
   // extends true aliasing to) gets a LIVE getter/setter pair that reads/
   // writes that exact variable; every other operand shape (BY CONTENT/
   // VALUE, a literal/computed expression, OMITTED, or one of the rarer
-  // ref-mod/group/subscripted-scalar operand shapes handled above) gets a
-  // getter that returns its own already-computed `argExprs[i]` value (a
-  // snapshot, taken once - real BY VALUE/CONTENT semantics, and the closest
-  // safe approximation for the rarer shapes this fix doesn't extend true
-  // aliasing to) and a no-op setter, matching "the callee's own copy is
-  // local to that call" exactly like the ordinary (non-recursive) CALL
-  // convention already does for those same shapes.
+  // ref-mod/subscripted-scalar operand shapes handled above) gets a getter
+  // that returns its own already-computed `argExprs[i]` value (a snapshot,
+  // taken once - real BY VALUE/CONTENT semantics, and the closest safe
+  // approximation for the rarer shapes this fix doesn't extend true aliasing
+  // to) and a no-op setter, matching "the callee's own copy is local to that
+  // call" exactly like the ordinary (non-recursive) CALL convention already
+  // does for those same shapes.
+  //
+  // round-22 finding 1: a GROUP LINKAGE parameter has no single flat Scala
+  // var of its own to alias this same way (see flattenGroupLeaves's own doc
+  // comment) - only its children do. `target.paramLeafShapes[i]` (built by
+  // generateMultiProgramScala, scala-generator.js, from the SAME
+  // flattenGroupLeaves traversal the callee's own generateRecursiveEntryMethod
+  // uses) is the callee's own ordered leaf list for this USING position: a
+  // 1-element list `[{ scalaType }]` for a plain scalar parameter, or an
+  // N-element list (one per elementary child, recursing into any nested
+  // group) for a GROUP parameter. A plain named GROUP operand (REFERENCE or
+  // CONTENT/VALUE - reading a caller-side child var is always safe, since the
+  // caller is blocked for the whole duration of this CALL) gets ITS OWN
+  // per-child aliasing, one getter/setter pair per leaf, keyed off that same
+  // operand's own children (flattenGroupLeaves again, this time over the
+  // CALLER's group) - the exact per-scalar aliasing above, just fanned out
+  // over every leaf instead of one flat var. Only a BY REFERENCE operand's
+  // setter actually writes back; BY CONTENT/VALUE's setter is a no-op,
+  // exactly like the plain-scalar case. Any shape that can't be aliased this
+  // way (no caller-side name at all - OMITTED/literal/computed - a ref-mod'd
+  // or subscripted operand, or a caller/callee leaf-count mismatch) falls
+  // back to each leaf's own zero/spaces default and a no-op setter, matching
+  // the callee's own default-parameter convention for an un-supplied
+  // argument.
   if (target.recursive) {
-    const closureArgs = usingParams.map((param, i) => {
-      const scalaType = target.paramTypes?.[i] || 'String';
+    const closureArgs = [];
+    usingParams.forEach((param, i) => {
+      const leafShapes = target.paramLeafShapes?.[i] || [{ scalaType: target.paramTypes?.[i] || 'String' }];
       const mode = String(param.mode || 'REFERENCE').toUpperCase();
       const name = !param.omitted ? param.value?.name : null;
       const hasSubscripts = Array.isArray(param.value?.subscripts) && param.value.subscripts.length > 0;
-      const isPlainRefVar = mode === 'REFERENCE' && name && !param.value?.refMod && !hasSubscripts &&
-        !isRegisteredGroupName(String(name).toUpperCase());
+      const isNamedGroup = name && !param.value?.refMod && !hasSubscripts &&
+        isRegisteredGroupName(String(name).toUpperCase());
+      const isPlainRefVar = name && !param.value?.refMod && !hasSubscripts && !isNamedGroup;
+
       if (isPlainRefVar) {
         const camel = toCamelCase(name);
-        return `() => ${camel}, (v: ${scalaType}) => ${camel} = v`;
+        const scalaType = leafShapes[0]?.scalaType || target.paramTypes?.[i] || 'String';
+        const setter = mode === 'REFERENCE' ? `(v: ${scalaType}) => ${camel} = v` : `(_: ${scalaType}) => ()`;
+        closureArgs.push(`() => ${camel}, ${setter}`);
+        return;
       }
-      return `() => (${argExprs[i]}), (_: ${scalaType}) => ()`;
+
+      if (isNamedGroup) {
+        const callerLeaves = flattenGroupLeaves(resolveGroupKey(String(name).toUpperCase()));
+        if (callerLeaves && callerLeaves.length === leafShapes.length) {
+          callerLeaves.forEach(leaf => {
+            const setter = mode === 'REFERENCE' ? `(v: ${leaf.scalaType}) => ${leaf.camel} = v` : `(_: ${leaf.scalaType}) => ()`;
+            closureArgs.push(`() => ${leaf.camel}, ${setter}`);
+          });
+          return;
+        }
+        // Shape mismatch (defensive - not exercised by any corpus program):
+        // falls through to the zero-default fallback below, one entry per
+        // callee-declared leaf.
+      }
+
+      leafShapes.forEach(leaf => {
+        const scalaType = leaf.scalaType || 'String';
+        closureArgs.push(`() => (${leafShapes.length === 1 ? argExprs[i] : defaultZeroValueForScalaType(scalaType)}), (_: ${scalaType}) => ()`);
+      });
     });
     return `${indentStr}${target.objectName}.entry(${closureArgs.join(', ')})`;
   }

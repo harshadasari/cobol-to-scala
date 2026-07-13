@@ -1,0 +1,4 @@
+{
+  "OUTERCPY": "       01 :PFX:-REC.\n          05 :PFX:-MSG PIC X(20) VALUE :QVAL:.\n          05 :PFX:-DECOY PIC X(20) VALUE \"ANOTHER COPY DONE X\".\n",
+  "DONE": "       01 DECOY-REC.\n          05 DECOY-FIELD PIC X(4) VALUE \"OOPS\".\n"
+}

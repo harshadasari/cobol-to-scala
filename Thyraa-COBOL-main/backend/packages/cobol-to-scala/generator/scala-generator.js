@@ -45,6 +45,10 @@ import {
   resolveGroupKey,
   groupDisplayValueExpr,
   scatterGroupFromString,
+  flattenGroupLeaves,
+  getGroupRegistry,
+  getGroupKeyRegistry,
+  getTableRegistry,
 } from './expression-gen.js';
 import {
   generateMethod,
@@ -3507,6 +3511,55 @@ export function generateScala(ast, options = {}) {
  * (groupDisplayValueExpr) - the exact inverse pairing generateCall uses on
  * the caller side for the same operand.
  */
+/**
+ * round-22 finding 1: builds the ordered per-USING-parameter "leaf shape"
+ * list a RECURSIVE program's entry() needs - one `{ camel, scalaType }`
+ * per plain scalar parameter, or the flattened list of elementary children
+ * flattenGroupLeaves (generator/expression-gen.js) finds for a GROUP
+ * parameter - or `null` overall the instant any single parameter's shape
+ * can't be resolved this way (an unregistered name, or a GROUP whose own
+ * flattenGroupLeaves bails - an OCCURS-bearing child, a FILLER child, or a
+ * child with no registered field info at all).
+ *
+ * This is the single shared decision generateEntryMethod's own RECURSIVE
+ * gating (below) and generateMultiProgramScala's pre-loop callRegistry
+ * construction both consult - see generateMultiProgramScala's own doc
+ * comment on why the two call sites must agree bit-for-bit on the same
+ * program: this one runs AFTER this ast's own GROUP_REGISTRY/TABLE_REGISTRY
+ * globals are installed (generateEntryMethod's call site, mid-generateScala),
+ * the other BEFORE any program's globals are installed at all (every
+ * program's callRegistry entry is built up front) - so it takes the
+ * relevant registries as explicit parameters (defaulting to the
+ * currently-installed globals via flattenGroupLeaves's own defaults) rather
+ * than reading GROUP_REGISTRY/TABLE_REGISTRY directly, so the exact same
+ * traversal logic works correctly at both times.
+ */
+function computeParamLeafShapes(usingNames, fieldRegistry, groupRegistry, groupKeyRegistry, tableRegistry) {
+  const shapes = [];
+  for (const rawName of usingNames) {
+    const name = String(rawName);
+    const nameUpper = name.toUpperCase();
+    const info = fieldRegistry.get(nameUpper);
+    if (info) {
+      shapes.push([{ camel: toCamelCase(name), scalaType: info.scalaType }]);
+      continue;
+    }
+    const groupKey = (groupKeyRegistry && groupKeyRegistry.get(nameUpper)) || nameUpper;
+    if (!groupRegistry || !groupRegistry.has(groupKey)) {
+      // Unregistered name (defensive - every corpus program's LINKAGE item
+      // is registered): treat as a single opaque String leaf, matching
+      // generateEntryMethod's own scalarType fallback for an unresolved
+      // parameter.
+      shapes.push([{ camel: toCamelCase(name), scalaType: 'String' }]);
+      continue;
+    }
+    const leaves = flattenGroupLeaves(groupKey, groupRegistry, tableRegistry);
+    if (leaves == null) return null;
+    shapes.push(leaves);
+  }
+  return shapes;
+}
+
 function generateEntryMethod(ast, fieldRegistry, indent = 1) {
   const indentStr = '  '.repeat(indent);
   const bi = '  '.repeat(indent + 1);
@@ -3528,19 +3581,25 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
   const units = flattenProcedureUnits(topLevelParagraphs, sections);
   const ambiguousNames = collectAmbiguousParagraphNames(topLevelParagraphs, sections);
 
-  // round-21 finding 2: a RECURSIVE program (PROGRAM-ID ... RECURSIVE - can
+  // round-21 finding 2 (extended by round-22 finding 1 to also cover a GROUP
+  // LINKAGE parameter): a RECURSIVE program (PROGRAM-ID ... RECURSIVE - can
   // CALL itself while an outer activation is still on the Scala call stack)
   // must NOT model its own LINKAGE SECTION parameter(s) as shared
   // module-level `var`s the way the ordinary convention below safely does
   // for a non-recursive callee - see generateRecursiveEntryMethod's own doc
   // comment for the full bug this avoids and why. Gated on every LINKAGE
-  // parameter being a plain scalar (no GROUP item): a GROUP LINKAGE
-  // parameter falls through to the ordinary convention below unconditionally
-  // (an out-of-scope combination no corpus program exercises - matches this
-  // project's established honest-decline-for-a-narrow-shape practice rather
-  // than a half-working mix of both conventions in one entry method).
-  if (isRecursiveProgram(ast) && paramInfos.length > 0 && paramInfos.every(p => !p.isGroup)) {
-    return generateRecursiveEntryMethod(paramInfos, units, ambiguousNames, indent);
+  // parameter's own leaf shape being resolvable (computeParamLeafShapes,
+  // above): a plain scalar is trivially one leaf; a GROUP parameter's leaves
+  // are its own elementary children (flattenGroupLeaves,
+  // generator/expression-gen.js) - only a GROUP containing an OCCURS table,
+  // a FILLER child, or a child with no registered field info at all still
+  // falls through to the ordinary convention below (an out-of-scope shape no
+  // corpus program exercises).
+  const paramLeafShapes = computeParamLeafShapes(
+    usingNames, fieldRegistry, getGroupRegistry(), getGroupKeyRegistry(), getTableRegistry()
+  );
+  if (isRecursiveProgram(ast) && paramInfos.length > 0 && paramLeafShapes !== null) {
+    return generateRecursiveEntryMethod(paramInfos, paramLeafShapes, units, ambiguousNames, indent);
   }
 
   // round-12 finding 3: every parameter gets a default (its type's own
@@ -3602,10 +3661,12 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
 }
 
 /**
- * round-21 finding 2: CALL entry point for a RECURSIVE program - see
- * generateEntryMethod's own doc comment above for the ordinary,
+ * round-21 finding 2 (extended by round-22 finding 1 to also cover a GROUP
+ * LINKAGE parameter - see below): CALL entry point for a RECURSIVE program -
+ * see generateEntryMethod's own doc comment above for the ordinary,
  * non-recursive case this specializes, and isRecursiveProgram/its own call
- * site for the gating condition (every LINKAGE parameter a plain scalar).
+ * site for the gating condition (every LINKAGE parameter's own leaf shape
+ * resolvable via computeParamLeafShapes).
  *
  * The bug this fixes: the ordinary convention above assigns each incoming
  * argument into a shared, module-level `var` (e.g. `lsDepth = _arg0`) before
@@ -3668,29 +3729,54 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
  * own WORKING-STORAGE items being shared/static across every recursive
  * activation is cobc's own confirmed, reproducible behavior for a RECURSIVE
  * program (see j10's own header comment), not a bug to fix.
+ *
+ * round-22 finding 1: a GROUP LINKAGE parameter has no single flat Scala var
+ * of its own the way a scalar parameter does (see groupDisplayValueExpr's own
+ * doc comment, generator/expression-gen.js) - only its own elementary
+ * children do, each with its own flat var, exactly like a WORKING-STORAGE
+ * group's own children. `paramLeafShapes` (computeParamLeafShapes, above -
+ * the SAME list generateEntryMethod's own gating already computed to decide
+ * this function should even run) is this program's LINKAGE SECTION USING
+ * list, already flattened into one ordered leaf-descriptor list per
+ * parameter: a 1-element list for a plain scalar, or one element per
+ * elementary child (recursing into any nested group) for a GROUP parameter.
+ * Flattening every parameter's own leaf list together (`.flat()`) and
+ * building one getter/setter closure pair PER LEAF - instead of per
+ * parameter - extends the exact same per-scalar aliasing trick to a GROUP
+ * parameter's children: each child gets its own local `def <camel>: T =
+ * _getN()` / `def <camel>_=(v: T): Unit = _setN(v)` pair, so every reference
+ * to that child elsewhere in this program's body (already emitted as a bare
+ * `<camel>` identifier - GROUP children are flattened to their own named
+ * vars the same way a WORKING-STORAGE group's are) resolves to this
+ * activation's own live alias, with zero changes needed anywhere else in the
+ * generator.
  */
-function generateRecursiveEntryMethod(paramInfos, units, ambiguousNames, indent = 1) {
+function generateRecursiveEntryMethod(paramInfos, paramLeafShapes, units, ambiguousNames, indent = 1) {
   const indentStr = '  '.repeat(indent);
   const bi = '  '.repeat(indent + 1);
 
-  const paramList = paramInfos
-    .map((p, i) =>
-      `_get${i}: () => ${p.scalaType} = () => ${defaultZeroValueForScalaType(p.scalaType)}, ` +
-      `_set${i}: ${p.scalaType} => Unit = (_: ${p.scalaType}) => ()`
+  const flatLeaves = paramLeafShapes.flat();
+
+  const paramList = flatLeaves
+    .map((leaf, i) =>
+      `_get${i}: () => ${leaf.scalaType} = () => ${defaultZeroValueForScalaType(leaf.scalaType)}, ` +
+      `_set${i}: ${leaf.scalaType} => Unit = (_: ${leaf.scalaType}) => ()`
     )
     .join(', ');
 
   const lines = [
-    `${indentStr}// round-21 finding 2: RECURSIVE program's own CALL entry point - see`,
+    `${indentStr}// round-21 finding 2 (extended by round-22 finding 1 for a GROUP LINKAGE`,
+    `${indentStr}// parameter): RECURSIVE program's own CALL entry point - see`,
     `${indentStr}// generateRecursiveEntryMethod's own doc comment (generator/scala-generator.js)`,
     `${indentStr}// for the per-call-activation LINKAGE aliasing this uses instead of the`,
     `${indentStr}// ordinary shared-module-var convention generateEntryMethod uses for a`,
-    `${indentStr}// non-recursive callee.`,
+    `${indentStr}// non-recursive callee - one getter/setter closure pair per LEAF (a GROUP`,
+    `${indentStr}// parameter's own elementary children), not per parameter.`,
     `${indentStr}def entry(${paramList}): Unit =`,
   ];
-  paramInfos.forEach((p, i) => {
-    lines.push(`${bi}def ${p.camel}: ${p.scalaType} = _get${i}()`);
-    lines.push(`${bi}def ${p.camel}_=(v: ${p.scalaType}): Unit = _set${i}(v)`);
+  flatLeaves.forEach((leaf, i) => {
+    lines.push(`${bi}def ${leaf.camel}: ${leaf.scalaType} = _get${i}()`);
+    lines.push(`${bi}def ${leaf.camel}_=(v: ${leaf.scalaType}): Unit = _set${i}(v)`);
   });
   lines.push(...generateProgramFlowLinesNested(units, indent + 1, ambiguousNames));
 
@@ -3754,37 +3840,41 @@ export function generateMultiProgramScala(programs, options = {}) {
       registry: linkageFieldRegistry,
       groupRegistry: linkageGroupRegistry,
       groupKeyRegistry: linkageGroupKeyRegistry,
+      tableRegistry: linkageTableRegistry,
     } = buildFieldRegistry(ast);
     const paramTypes = usingNames.map(n => linkageFieldRegistry.get(String(n).toUpperCase())?.scalaType || 'String');
-    // round-21 finding 2: whether this program qualifies for the
+    // round-21 finding 2 (extended by round-22 finding 1 to also cover a
+    // GROUP LINKAGE parameter): whether this program qualifies for the
     // per-call-activation LINKAGE aliasing generateRecursiveEntryMethod
     // builds (see its own doc comment) - RECURSIVE-flagged, at least one
-    // LINKAGE parameter, and every one of them a plain scalar (a GROUP
-    // LINKAGE parameter is an out-of-scope combination that keeps the
-    // ordinary value-in/tuple-out convention entirely - see that function's
-    // own doc comment). Computed from THIS ast's own freshly-built
-    // groupRegistry/groupKeyRegistry, not the global isRegisteredGroupName/
-    // resolveGroupKey helpers (generator/expression-gen.js) - this loop runs
-    // for every program *before* any of their generateScala calls install
-    // those globals for the program actually being inspected, so the
-    // globals cannot be trusted here. generateEntryMethod (the callee side,
-    // invoked later, during this exact program's own generateScala call,
-    // once its globals are correctly installed) recomputes the identical
-    // gating condition independently via those now-valid globals - both
-    // sides must agree on the same decision for a given program, or the
-    // caller's closures-vs-values shape here would mismatch the callee's
-    // actual entry() signature and fail to compile.
-    const hasGroupLinkageParam = usingNames.some(n => {
-      const nameUpper = String(n).toUpperCase();
-      if (linkageFieldRegistry.get(nameUpper)) return false;
-      const groupKey = linkageGroupKeyRegistry.get(nameUpper) || nameUpper;
-      return linkageGroupRegistry.has(groupKey);
-    });
-    const recursive = isRecursiveProgram(ast) && usingNames.length > 0 && !hasGroupLinkageParam;
+    // LINKAGE parameter, and every one of them resolvable into an ordered
+    // leaf-shape list (computeParamLeafShapes, above): a plain scalar
+    // trivially is; a GROUP parameter is too UNLESS it contains an OCCURS
+    // table, a FILLER child, or a child with no registered field info at all
+    // (flattenGroupLeaves' own bail-outs - an out-of-scope shape no corpus
+    // program exercises, which keeps the ordinary value-in/tuple-out
+    // convention entirely). Computed from THIS ast's own freshly-built
+    // groupRegistry/groupKeyRegistry/tableRegistry, not the global
+    // isRegisteredGroupName/resolveGroupKey/flattenGroupLeaves-default
+    // helpers (generator/expression-gen.js) - this loop runs for every
+    // program *before* any of their generateScala calls install those
+    // globals for the program actually being inspected, so the globals
+    // cannot be trusted here. generateEntryMethod (the callee side, invoked
+    // later, during this exact program's own generateScala call, once its
+    // globals are correctly installed) recomputes the identical gating
+    // condition independently via those now-valid globals - both sides must
+    // agree on the same decision for a given program, or the caller's
+    // closures-vs-values shape here would mismatch the callee's actual
+    // entry() signature and fail to compile.
+    const paramLeafShapes = computeParamLeafShapes(
+      usingNames, linkageFieldRegistry, linkageGroupRegistry, linkageGroupKeyRegistry, linkageTableRegistry
+    );
+    const recursive = isRecursiveProgram(ast) && usingNames.length > 0 && paramLeafShapes !== null;
     callRegistry.set(String(name).toUpperCase(), {
       objectName,
       paramCount: usingNames.length,
       paramTypes,
+      paramLeafShapes: recursive ? paramLeafShapes : null,
       recursive,
     });
   }

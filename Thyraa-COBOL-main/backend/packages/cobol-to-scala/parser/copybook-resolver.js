@@ -20,9 +20,15 @@ import { detectFormat } from './lexer.js';
 
 const MAX_DEPTH = 10;
 
-// COPY <name> [OF|IN <library>] [REPLACING <pairs>] .
-// The trailing period is mandatory in COBOL and delimits the statement.
-const COPY_PATTERN = /\bCOPY\s+([A-Za-z0-9][A-Za-z0-9-]*)\s*(?:(?:OF|IN)\s+([A-Za-z0-9][A-Za-z0-9-]*)\s*)?(REPLACING\s+[\s\S]*?)?\./gi;
+// COPY <name> [OF|IN <library>] - matches only the HEADER of a COPY
+// statement (the copybook name and an optional OF/IN library qualifier),
+// deliberately NOT attempting to capture through to the statement's own
+// REPLACING clause/terminating period in this one regex - see
+// findStatementEnd's own doc comment (round-22 finding 3) for why a
+// REPLACING clause's own BY-text can contain a quoted literal with an
+// embedded period, which a single non-greedy `[\s\S]*?\.` capture (this
+// pattern's own pre-round-22 shape) can never safely bound.
+const COPY_HEADER_PATTERN = /\bCOPY\s+([A-Za-z0-9][A-Za-z0-9-]*)\s*(?:(?:OF|IN)\s+([A-Za-z0-9][A-Za-z0-9-]*)\s*)?/gi;
 
 /**
  * Find every quoted-string-literal span in text, as [start, end) character
@@ -118,19 +124,60 @@ function isInsideAnyRange(ranges, index) {
 }
 
 /**
- * Quote-and-comment-aware variant of `text.replace(pattern, replacer)`: a
- * match whose start index falls inside a quoted string literal, OR inside a
- * comment, is left completely untouched (not passed to `replacer` at all) -
- * this is what stops COPY_PATTERN from firing on ordinary literal text that
- * merely reads like a COPY statement (e.g. a data item declared
- * `VALUE "... COPY DONE. ..."`, where that text is just literal content,
- * never a real COPY statement to expand) or on descriptive prose inside a
- * source comment that happens to mention "COPY something." in passing.
+ * round-22 finding 3: find the index of the true statement-terminating
+ * period at or after `from` - the first `.` character whose own index does
+ * NOT fall inside any of `excludedRanges` (quoted literals/comments - see
+ * findQuotedRanges/findCommentRanges). Returns -1 if none exists (an
+ * unterminated COPY statement - left completely untouched by the caller,
+ * same as any other malformed input).
+ *
+ * This is what a REPLACING clause's own termination search needs and the
+ * old single-regex `(REPLACING\s+[\s\S]*?)?\.` capture could never provide:
+ * a REPLACING pair's own BY-text can itself be a quoted literal containing
+ * an embedded, doubled-quote-escaped period (e.g. `BY =="IT""S COPY
+ * DONE."==` - the COBOL doubled-quote convention for a literal quote
+ * character inside a literal) - a plain non-greedy regex capture stops at
+ * the FIRST `.` it finds, full stop, even when that period is itself inside
+ * the quoted replacement text, silently truncating the REPLACING clause (and
+ * dropping any pairs that come after it) right there. Scanning character by
+ * character and skipping any period inside `excludedRanges` - the exact same
+ * ranges COPY-statement DETECTION already uses to decide whether a match's
+ * own START falls inside a quote (round-21 finding 1) - extends that same
+ * quote-awareness to the clause's own END instead of assuming the first
+ * literal `.` is always it.
  */
-function replaceOutsideQuotes(text, pattern, replacer) {
+function findStatementEnd(text, from, excludedRanges) {
+  for (let i = from; i < text.length; i++) {
+    if (text[i] === '.' && !isInsideAnyRange(excludedRanges, i)) return i;
+  }
+  return -1;
+}
+
+/**
+ * Quote-and-comment-aware COPY-statement scanner: finds every real COPY
+ * statement in `text` (a HEADER match via COPY_HEADER_PATTERN whose own
+ * start index does NOT fall inside a quoted string literal or a comment -
+ * round-21 finding 1 - immediately followed by that statement's own true,
+ * quote-aware terminating period - round-22 finding 3), and calls
+ * `replacer(fullStatementText, name, library, replacingClause)` for each one,
+ * splicing its return value in place of the whole statement (header through
+ * terminating period, inclusive).
+ *
+ * A header match whose start falls inside a quote/comment is left completely
+ * untouched (not passed to `replacer` at all) - this is what stops a
+ * lookalike COPY-statement HEADER from firing on ordinary literal text that
+ * merely reads like a COPY statement (e.g. a data item declared `VALUE "...
+ * COPY DONE. ..."`, where that text is just literal content, never a real
+ * COPY statement to expand) or on descriptive prose inside a source comment
+ * that happens to mention "COPY something." in passing.
+ *
+ * A header match with no findable true terminating period (findStatementEnd
+ * returns -1 - an unterminated/malformed COPY) is likewise left untouched -
+ * there is no safe way to know where such a statement would even end.
+ */
+function replaceCopyStatements(text, replacer) {
   const excludedRanges = [...findQuotedRanges(text), ...findCommentRanges(text)];
-  const flags = pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g';
-  const re = new RegExp(pattern.source, flags);
+  const re = new RegExp(COPY_HEADER_PATTERN.source, COPY_HEADER_PATTERN.flags);
   let result = '';
   let lastIndex = 0;
   let match;
@@ -141,9 +188,28 @@ function replaceOutsideQuotes(text, pattern, replacer) {
       if (match[0].length === 0) re.lastIndex++;
       continue;
     }
+
+    const headerEnd = match.index + match[0].length;
+    const periodIdx = findStatementEnd(text, headerEnd, excludedRanges);
+    if (periodIdx === -1) {
+      // Unterminated COPY statement - can't safely determine its extent;
+      // leave it (and everything after it) exactly as-is.
+      continue;
+    }
+
+    // Everything between the header (name + optional OF/IN library) and the
+    // true terminating period is either blank/whitespace (a plain `COPY
+    // NAME.`) or a REPLACING clause - never anything else, per COBOL's own
+    // COPY statement grammar.
+    const tail = text.slice(headerEnd, periodIdx);
+    const replacingMatch = /^\s*(REPLACING[\s\S]*)$/i.exec(tail);
+    const replacingClause = replacingMatch ? replacingMatch[1] : undefined;
+    const fullStatement = text.slice(match.index, periodIdx + 1);
+
     result += text.slice(lastIndex, match.index);
-    result += replacer(...match, match.index, text);
-    lastIndex = match.index + match[0].length;
+    result += replacer(fullStatement, match[1], match[2], replacingClause);
+    lastIndex = periodIdx + 1;
+    re.lastIndex = lastIndex;
   }
   result += text.slice(lastIndex);
   return result;
@@ -231,7 +297,7 @@ export function expandCopybooks(source, copybooks = {}, options = {}) {
       return text;
     }
 
-    return replaceOutsideQuotes(text, COPY_PATTERN, (full, name, library, replacingClause) => {
+    return replaceCopyStatements(text, (full, name, library, replacingClause) => {
       const key = name.toUpperCase();
 
       if (stack.includes(key)) {

@@ -130,10 +130,47 @@ class ParserContext {
 }
 
 /**
- * Check if current token could be a paragraph/section name
+ * Verb-like reserved words that real GnuCOBOL still accepts as a paragraph/
+ * section name, but ONLY in the one truly unambiguous position: the very
+ * FIRST paragraph/section of a PROCEDURE DIVISION (or of a DECLARATIVES
+ * prologue) - i.e. before any other paragraph or section has been
+ * established there at all (round-20 finding 1, `isParagraphName`'s
+ * `allowReservedWord` callers below). Confirmed against installed GnuCOBOL:
+ * `i05-reserved-paragraph-name.cbl` - a PROCEDURE DIVISION consisting of
+ * exactly one, implicitly-entered paragraph named EXIT - compiles and runs
+ * fine, printing every statement in that paragraph's body (cobc does NOT
+ * treat it as a bare EXIT statement there). This is deliberately NOT a
+ * blanket "reserved word immediately after any period is a name" rule: the
+ * far more common idiom `SOME-EXIT. EXIT.` (a bare EXIT/CONTINUE used as an
+ * ordinary no-op statement, usually as a PERFORM-THRU range's own end
+ * marker - see aa01/i08/p14/x12 in this corpus) has EXACTLY the same
+ * "reserved-word-token then period, nothing else" shape, and MUST keep
+ * parsing as the statement, not a second, newly-declared paragraph named
+ * EXIT/CONTINUE (which would silently split that paragraph in two and,
+ * worse, collide by name if more than one paragraph in the same program
+ * uses the idiom). The narrow "nothing established yet" guard is exactly
+ * what tells these two identical-looking shapes apart: it is only ever true
+ * once, at the very start of a division/prologue's own paragraph-search
+ * loop, never once a real paragraph/section is already open and a
+ * statement is expected inside it.
  */
-function isParagraphName(ctx) {
-  if (!ctx.check(TokenType.IDENTIFIER)) return false;
+const PARAGRAPH_NAME_RESERVED_WORDS = new Set(['EXIT', 'CONTINUE']);
+
+/**
+ * Check if current token could be a paragraph/section name.
+ *
+ * `opts.allowReservedWord`, when true, additionally accepts one of
+ * PARAGRAPH_NAME_RESERVED_WORDS in the IDENTIFIER token's place - callers
+ * must only ever pass true from the narrow "nothing established yet"
+ * position described above (see its callers in parseDeclaratives/
+ * parseProcedureDivision) so an ordinary mid-body EXIT/CONTINUE statement
+ * is never affected.
+ */
+function isParagraphName(ctx, opts = {}) {
+  const isReservedNameCandidate = opts.allowReservedWord &&
+    PARAGRAPH_NAME_RESERVED_WORDS.has(ctx.current()?.value?.toUpperCase());
+
+  if (!ctx.check(TokenType.IDENTIFIER) && !isReservedNameCandidate) return false;
 
   // Look ahead for period (paragraph) or SECTION keyword
   const next = ctx.peek(1);
@@ -2931,7 +2968,12 @@ function parseDeclaratives(ctx) {
       continue;
     }
 
-    if (isParagraphName(ctx)) {
+    // allowReservedWord: only before the FIRST section/paragraph of this
+    // DECLARATIVES prologue has been recorded - see PARAGRAPH_NAME_RESERVED_
+    // WORDS' doc comment. A USE section is mandatory here in real COBOL, so
+    // this is a very narrow window in practice, but it stays symmetric with
+    // the identical guard in parseProcedureDivision's own main loop below.
+    if (isParagraphName(ctx, { allowReservedWord: !currentSection && !currentParagraph && declaratives.length === 0 })) {
       const name = ctx.advance().value;
 
       if (ctx.checkValue('SECTION')) {
@@ -3052,8 +3094,15 @@ export function parseProcedureDivision(tokens) {
       continue;
     }
 
-    // Check for paragraph or section name
-    if (isParagraphName(ctx)) {
+    // Check for paragraph or section name. allowReservedWord (round-20
+    // finding 1): only true before the FIRST section/paragraph of the whole
+    // PROCEDURE DIVISION has been recorded - i.e. this token is either
+    // immediately after `PROCEDURE DIVISION.` itself (optionally after a
+    // DECLARATIVES prologue) or nowhere at all, never once a real
+    // paragraph/section is already open - see PARAGRAPH_NAME_RESERVED_WORDS'
+    // doc comment for why this guard is what keeps an ordinary `SOME-EXIT.
+    // EXIT.` statement idiom completely unaffected.
+    if (isParagraphName(ctx, { allowReservedWord: !currentParagraph && !currentSection && division.paragraphs.length === 0 && division.sections.length === 0 })) {
       const name = ctx.advance().value;
 
       // Check if it's a SECTION

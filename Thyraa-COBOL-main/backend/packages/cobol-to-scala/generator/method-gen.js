@@ -1159,15 +1159,31 @@ export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
       if (stmt.type === 'PerformStatement' && stmt.throughParagraph) {
         addPerformThru(stmt.targetParagraph, stmt.targetSection, stmt.throughParagraph, stmt.throughSection);
       }
-      if (stmt.type === 'SortStatement') {
-        // SORT's own INPUT/OUTPUT PROCEDURE ... THRU clause has no OF/IN
+      if (stmt.type === 'SortStatement' || stmt.type === 'MergeStatement') {
+        // SORT/MERGE's own INPUT/OUTPUT PROCEDURE clause has no OF/IN
         // qualifier grammar of its own (parseSortProcedureClause never
-        // parses one) - always unqualified (null sections).
-        if (stmt.inputProcedure?.procedure && stmt.inputProcedure.through) {
-          addPerformThru(stmt.inputProcedure.procedure, null, stmt.inputProcedure.through, null);
+        // parses one) - always unqualified (null sections). Round-20
+        // finding (i06): even with NO THRU at all, "OUTPUT PROCEDURE IS X"
+        // is still its own implicit, single-paragraph range - `{procedure:
+        // X, through: X}` reuses the exact same range machinery
+        // annotateGoToThruEscapes already applies to an explicit `PERFORM x
+        // THRU y` (its startIndex===endIndex case already handles a
+        // one-paragraph range correctly) - so a GO TO from inside that one
+        // paragraph to anywhere else gets the identical honest-decline
+        // marker treatment (see annotateGoToThruEscapes's own doc comment)
+        // instead of silently returning to the SORT/MERGE statement's own
+        // caller the way this generator's `return x()` call-based model
+        // otherwise always would. Confirmed against installed GnuCOBOL
+        // (i06): a MERGE ... OUTPUT PROCEDURE IS EMIT-PARA (no THRU) whose
+        // sole paragraph's own AT-END arm does `GO TO EMIT-DONE` - a
+        // DIFFERENT, later paragraph, never part of the OUTPUT PROCEDURE's
+        // own range - never returns to the statement after MERGE at all;
+        // execution permanently continues from EMIT-DONE onward instead.
+        if (stmt.inputProcedure?.procedure) {
+          addPerformThru(stmt.inputProcedure.procedure, null, stmt.inputProcedure.through || stmt.inputProcedure.procedure, null);
         }
-        if (stmt.outputProcedure?.procedure && stmt.outputProcedure.through) {
-          addPerformThru(stmt.outputProcedure.procedure, null, stmt.outputProcedure.through, null);
+        if (stmt.outputProcedure?.procedure) {
+          addPerformThru(stmt.outputProcedure.procedure, null, stmt.outputProcedure.through || stmt.outputProcedure.procedure, null);
         }
       }
     });

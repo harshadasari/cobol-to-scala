@@ -1053,6 +1053,68 @@ unaffected).
 See `tests/round19-fixes.test.js` for focused, toolchain-independent unit
 tests of all 4 findings above.
 
+### Round-20 adversarial-refutation findings (i01-i14) and their fixes
+
+A round-20 refuter found 2 more dishonest divergences: a paragraph-name
+recognition gap that could make an entire generated program's real body dead
+code, and a MERGE-internal file-open bug that wrongly invoked a program's own
+DECLARATIVES error handler. Both are fixed at their root cause. Investigating
+finding 2's own repro also surfaced a third, SEPARATE, previously-
+uncatalogued instance of round-19 finding 2's own already-accepted GO-TO/
+implicit-range limitation - handled the identical honest-decline way, per
+that same established precedent, rather than attempted as a new fix.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | A paragraph literally named `EXIT` (i05: a whole PROCEDURE DIVISION consisting of exactly one, implicitly-entered paragraph named `EXIT`) truncated its own body to nothing: `isParagraphName` (`parser/procedure-parser.js`) required `ctx.check(TokenType.IDENTIFIER)`, but the lexer tokenizes `EXIT` (like `CONTINUE`) as its own reserved-word token type, never `IDENTIFIER` - so the parser instead dispatched it to `parseExitStatement`, producing a bare `ExitStatement` (defaulting to `exitType: 'PARAGRAPH'`) as the FIRST statement of round-18's implicit-main-paragraph mechanism. That `EXIT PARAGRAPH` immediately `return`s, so every statement physically after it (DISPLAY/ADD/DISPLAY/STOP RUN) became dead code - silently wrong, not a crash | `isParagraphName` gained an opt-in `allowReservedWord` flag: when set, a token whose value is `EXIT` or `CONTINUE` (`PARAGRAPH_NAME_RESERVED_WORDS`) is accepted in an IDENTIFIER's place, subject to the exact same PERIOD-or-SECTION lookahead ordinary paragraph names already require. Threaded from the two genuine "paragraph name expected" call sites (`parseProcedureDivision`'s main loop, `parseDeclaratives`' own loop) - but ONLY while NOTHING has been recorded there yet (`!currentParagraph && !currentSection && division.paragraphs.length === 0 && division.sections.length === 0`, or the DECLARATIVES-scope equivalent) - i.e. this token is either immediately after `PROCEDURE DIVISION.` itself (optionally after a DECLARATIVES prologue) or nowhere at all. This narrow guard is the whole fix's precision: without it, the far more common `SOME-EXIT. EXIT.` idiom (a bare EXIT/CONTINUE used as an ordinary no-op statement, usually marking a PERFORM-THRU range's own end - see aa01/i08/p14/x12, all pre-existing corpus programs) has the EXACT SAME "reserved word then period" shape, but occurs once a real paragraph is already open - completely unaffected by this fix, confirmed by re-running all four (all still `oracleCompare()`-clean). Verified against installed GnuCOBOL (i05): the fix makes the generated `exit()` method run its whole body (`IN-EXIT-PARA` / `X=005`), not just return | i05 |
+| 2 | `generateMergeUsingFileLines` (round-18/19's MERGE implementation, `generator/expression-gen.js`) reused `generateOpen`'s own OPEN codegen verbatim for its internal per-USING-file open - including its `catch FileNotFoundException/IOException => <declarativesHandler>()` branch. Real cobc does NOT invoke a `USE AFTER STANDARD ERROR PROCEDURE ON <file>` handler for a MERGE statement's own internal access to one of its USING files (confirmed against installed GnuCOBOL, i06: a MERGE whose USING file doesn't exist on disk silently contributes zero records from that file - no error, no handler call - and merges whatever OTHER USING file(s) it does have normally) | New `generateMergeUsingFileOpenLines` (`generator/expression-gen.js`) replaces the `generateOpen` call for just this one step: it opens the same reader/iterator variables `generateOpen`'s INPUT case would, but on ANY `java.io.IOException` (a superclass of `FileNotFoundException`, so one catch arm covers both) just leaves the iterator `Iterator.empty` - no FILE STATUS write, no handler dispatch at all, regardless of whether a DECLARATIVES handler happens to be registered for that file name. Everything downstream (the drain loop, `readAssignLines`/`positionalPairs`/`scatterGroupFromString` for the per-line decode, `generateClose` for the close - already null-guarded, so it's a harmless no-op when the open above failed) is unchanged. Verified against installed GnuCOBOL (i06): the generated Scala's MERGE USING open for `IN-FILE-2` (missing, with a DECLARATIVES handler registered on it) no longer calls that handler anywhere - confirmed by direct codegen inspection, since `file2Err()` (the handler's own section-wrapper method `declarativeHandlerFor` would have resolved to) now appears exactly once in the whole generated program: its own `def` header, never a call site | i06 (fix verified directly; see "addendum" note below for why `i06` does not itself achieve a hard `oracleCompare()` pass) |
+
+**Addendum, discovered while verifying finding 2 (not part of finding 2's own
+described scope - it reproduces even with finding 2 fully fixed, and is
+unrelated to the DECLARATIVES/FILE-STATUS codegen finding 2 actually
+describes):** i06's `MERGE ... OUTPUT PROCEDURE IS EMIT-PARA` (no `THRU`) has
+an AT END arm that does `GO TO EMIT-DONE` - a DIFFERENT, later paragraph that
+is never part of that OUTPUT PROCEDURE's own range (with no `THRU` clause,
+the range is exactly the one named paragraph, per the COBOL standard).
+Confirmed directly against installed GnuCOBOL (both via the harness and a
+hand-compiled `cobc -x` run of the isolated repro): control never returns to
+the statement after MERGE once this fires - real cobc's own i06 oracle stops
+at `MERGED=020 BBB`, never printing `MAIN-END`, exit code 0. This is EXACTLY
+round-19 finding 2's own already-accepted "GO TO escaping an active PERFORM
+... THRU range is a PERMANENT transfer in real COBOL, but this generator's
+method-call-based paragraph model can only ever resume normally" limitation
+(see the round-19 table above) - just manifested through SORT/MERGE's own
+implicit PROCEDURE-clause range instead of an explicit `PERFORM x THRU y`
+statement. Per round-19's own deliberate, explicitly-reaffirmed precedent for
+declining the large, invasive "thrown control-flow signal + top-level
+trampoline" refactor a genuine general fix would require (threading "which
+range is lexically active" through every statement-generation call site) -
+disproportionate blast radius for what remains a narrow finding - this is
+handled the identical HONEST-DECLINE way, reusing the existing mechanism
+rather than building a new one: `method-gen.js`'s `annotateGoToThruEscapes`
+collection pass (via its caller, `generateAllMethods`) now also treats a
+SORT/MERGE INPUT/OUTPUT PROCEDURE clause as an implicit range even with NO
+`THRU` at all (`{procedure: X, through: X}` - a one-paragraph range - reuses
+the exact same `startIndex === endIndex` range machinery an explicit `PERFORM
+X THRU X` would, with zero changes to `annotateGoToThruEscapes` itself), so a
+GO TO escaping it gets the identical visible, compiling `TODO(round-19
+finding 2)` marker `generateGoTo` already renders for an explicit `PERFORM
+... THRU` escape. Runtime behavior is UNCHANGED (i06 still prints the extra
+`MAIN-END`, exactly like round-19's own h11 still prints its own extra
+`MAIN-DONE`) - only the divergence's visibility improves, from invisible to
+grep-able. A SORT/MERGE PROCEDURE clause whose body has no escaping GO TO at
+all (the pre-existing g12/h09 `PERFORM UNTIL`/`RETURN` shape - no `GO TO`
+anywhere in either) is completely unaffected, confirmed by re-running both
+(still `oracleCompare()`-clean).
+
+12 further round-20 probes were valid and already passed/were already honest
+before any of the above fixes: the remaining `i01`-`i14` programs not named
+above (confirmed unaffected by either fix, re-verified green/honest after
+both).
+
+See `tests/round20-fixes.test.js` for focused, toolchain-independent unit
+tests of both findings (and the addendum) above.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read

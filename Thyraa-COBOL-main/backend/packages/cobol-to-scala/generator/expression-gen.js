@@ -6118,16 +6118,57 @@ function generateMerge(statement, indent = 0) {
 }
 
 /**
+ * Lines to open one MERGE ... USING file for reading, WITHOUT reusing
+ * generateOpen's own DECLARATIVES-dispatching codegen (see
+ * generateMergeUsingFileLines's doc comment below for why) - just enough to
+ * populate the same reader/iterator variables generateOpen's INPUT case
+ * would, or leave the iterator empty on any I/O failure.
+ */
+function generateMergeUsingFileOpenLines(fileName, indent = 0) {
+  const indentStr = '  '.repeat(indent);
+  const bi = `${indentStr}  `;
+  const { fileVar, readerVar, iteratorVar } = fileHandleVarNames(fileName);
+
+  const lines = [];
+  lines.push(`${indentStr}try`);
+  lines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
+  lines.push(`${bi}${readerVar} = scala.io.Source.fromFile(${fileVar})(scala.io.Codec.ISO8859)`);
+  lines.push(`${bi}${iteratorVar} = ${readerVar}.getLines()`);
+  lines.push(`${indentStr}catch`);
+  lines.push(`${bi}case _: java.io.IOException =>`);
+  lines.push(
+    `${bi}  ${iteratorVar} = Iterator.empty // MERGE USING ${fileName}: missing/unreadable file ` +
+    `silently contributes zero records - no FILE STATUS update, no DECLARATIVES handler (round-20 ` +
+    `finding 2: real cobc never invokes a USE AFTER ERROR PROCEDURE for MERGE's own internal ` +
+    `per-USING-file access, regardless of whether one is registered for this file name)`
+  );
+  return lines.join('\n');
+}
+
+/**
  * Lines to OPEN one MERGE ... USING file, drain every one of its records
  * into the shared SD merge buffer (positionally copied into the SD record's
  * own fields - see generateMerge's own doc comment above), then CLOSE it
- * again. Reuses file-io-gen.js's own generateOpen/generateClose (the exact
- * same OPEN/CLOSE codegen an explicit COBOL OPEN/CLOSE statement would
- * produce) so this gets the same FILE STATUS/exception handling for free,
- * and reuses readDestination/readAssignLines (the same per-line decode
- * READ already uses) plus positionalPairs/coerceCorrespondingValue (the same
- * position-matched copy RELEASE ... FROM already uses) rather than
- * reimplementing either.
+ * again.
+ *
+ * round-20 finding 2: this used to reuse file-io-gen.js's generateOpen
+ * verbatim for the open step - convenient (shares the exact FILE STATUS/
+ * exception-mapping codegen an explicit OPEN statement gets), but WRONG: a
+ * MERGE's own internal access to one of its USING files is not a COBOL
+ * OPEN statement at all, so a registered `USE AFTER STANDARD ERROR
+ * PROCEDURE ON <this-file>` DECLARATIVES handler must NEVER be invoked for
+ * it - confirmed against installed GnuCOBOL (i06): a MERGE USING file that
+ * does not exist on disk silently contributes zero records (no error, no
+ * handler call, the other USING file(s) still merge normally), even though
+ * the very same program registers and successfully invokes that same
+ * handler for an ordinary explicit OPEN of a different file elsewhere.
+ * `generateMergeUsingFileOpenLines` (above) is the file-not-found-tolerant,
+ * handler-free replacement for just the open step; everything downstream
+ * (readDestination/readAssignLines for the per-line decode, positionalPairs/
+ * coerceCorrespondingValue for the position-matched copy RELEASE ... FROM
+ * already uses, generateClose for the close - already null-guarded, so it's
+ * a harmless no-op when the open above failed and left the reader null) is
+ * unchanged.
  */
 function generateMergeUsingFileLines(fileRef, sortInfo, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -6141,7 +6182,7 @@ function generateMergeUsingFileLines(fileRef, sortInfo, indent = 0) {
   const pairs = recordNameUpper ? positionalPairs(resolveGroupKey(recordNameUpper), sdGroupKey) : [];
 
   const lines = [];
-  lines.push(generateOpen({ files: [fileName], mode: 'INPUT' }, indent));
+  lines.push(generateMergeUsingFileOpenLines(fileName, indent));
   lines.push(`${indentStr}while ${iteratorVar}.hasNext do`);
   const bi = `${indentStr}  `;
   lines.push(`${bi}val _mergeLine = ${iteratorVar}.next()`);

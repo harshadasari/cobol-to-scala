@@ -1,0 +1,4 @@
+{
+  "I04OUTERCPY": "       01 :OPFX:-REC.\n          05 :OPFX:-TAG PIC X(4) VALUE \"TAGV\".\n          COPY I04INNERCPY REPLACING ==:IPFX:== BY ==SUB1==.\n",
+  "I04INNERCPY": "          05 :IPFX:-VAL PIC 9(3).\n"
+}

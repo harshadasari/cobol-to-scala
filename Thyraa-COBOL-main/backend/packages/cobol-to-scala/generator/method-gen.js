@@ -936,6 +936,35 @@ export function generateProgramFlowLines(units, indent, ambiguousNames) {
 }
 
 /**
+ * Body-duplicating counterpart to generateProgramFlowLines, for a RECURSIVE
+ * program's own CALL entry point (scala-generator.js's
+ * generateRecursiveEntryMethod - round-21 finding 2). An ordinary
+ * (non-recursive) program's entry point safely calls each paragraph's
+ * already-generated, shared, top-level method (generateProgramFlowLines/
+ * renderNestedFallthroughSteps above), because only one activation is ever
+ * mid-flight there. A RECURSIVE program can re-enter its own entry point
+ * while an outer activation is still on the Scala call stack (a same-program
+ * self CALL), so its LINKAGE SECTION parameter(s) must NOT be shared
+ * module-level state in that case - every paragraph reachable from the
+ * entry point is instead nested as a local `def` *inside* the entry method
+ * itself (exactly generatePerformThruMethod's existing body-duplicating
+ * `renderNestedFallthroughDefs` pattern - same helper, reused verbatim),
+ * so each recursive call to the entry point gets its own fresh local
+ * getter/setter LINKAGE binding that every nested paragraph def closes over,
+ * matching real per-activation aliasing instead of one shared var stomped
+ * by whichever activation is currently deepest.
+ */
+export function generateProgramFlowLinesNested(units, indent, ambiguousNames) {
+  if (!units || units.length === 0) {
+    return [`${'  '.repeat(indent)}()`];
+  }
+  const nameFor = (u) => resolveParagraphMethodName(u.name, u.sectionName, ambiguousNames);
+  const lines = renderNestedFallthroughDefs(units, indent, nameFor);
+  lines.push(`${'  '.repeat(indent)}${nameFor(units[0])}()`);
+  return lines;
+}
+
+/**
  * Statement-node fields that carry a NESTED, ordinary (non-WhenClause-
  * wrapped) statement array - shared by every AST statement class that can
  * itself hold an imperative-statement block (see parser/ast.js): inline
@@ -1231,6 +1260,7 @@ export default {
   generatePerformThruMethod,
   generateSectionMethod,
   generateProgramFlowLines,
+  generateProgramFlowLinesNested,
   generateAllMethods,
   collectAmbiguousParagraphNames,
   resolveParagraphMethodName,

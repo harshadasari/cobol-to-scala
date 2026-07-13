@@ -1115,6 +1115,59 @@ both).
 See `tests/round20-fixes.test.js` for focused, toolchain-independent unit
 tests of both findings (and the addendum) above.
 
+### Round-21 adversarial-refutation findings (j01-j12) and their fixes
+
+A round-21 refuter found 3 more dishonest divergences, each a hard/silent
+failure in a different layer this campaign hadn't exercised yet: the
+COPY-statement resolver (a preprocessing step, ahead of the lexer/parser
+entirely), RECURSIVE CALL's own LINKAGE SECTION parameter binding, and GO
+TO's own OF/IN section qualifier (PERFORM's own qualifier was extended in
+rounds 12/14, but GO TO's was explicitly flagged - see "Known gaps" below -
+as unaddressed until a program actually needed it). All 3 are now fixed at
+their root cause; every promoted program hard-passes `oracleCompare()`.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | `parser/copybook-resolver.js`'s `COPY_PATTERN` regex matched a `COPY <name>[ REPLACING ...].` lookalike sequence ANYWHERE in the source text during its recursive `expand()` pass - including inside a quoted string literal's own `VALUE` text (j05: a copybook declaring `VALUE "SEE COPY DONE."` - ordinary literal content, not a real COPY statement) and, separately, inside an ordinary source comment (j05's own header commentary happens to mention `"COPY DONE."` in prose, with no quotes around it at all on one line - a second, independent way the same purely-textual regex over-matched). `convertToScala()` did not throw on either shape - it silently spliced an unrelated copybook's own record layout into the middle of the literal/comment, corrupting the source with no visible marker anywhere: the resulting Scala still compiled and ran, with `REC1-MSG` silently truncated to `"SEE"` (padded) | Quote-and-comment-aware COPY-statement detection, mirroring - not reinventing - how the rest of this codebase already tracks this exact context during source scanning. New `findQuotedRanges` (`parser/copybook-resolver.js`) walks the text the same way `parser/lexer.js`'s own `Lexer#scanString` does (either quote character opens a literal, a doubled quote of the same kind is an escaped literal quote that stays inside it, an unterminated literal bails at end-of-line - the same fallback `scanString` uses), producing `[start, end)` spans. New `findCommentRanges` mirrors `lexer.js`'s own `detectFormat`/`preprocessFixedFormat`/`preprocessFreeFormat` comment recognition (a fixed-format line whose column-7 indicator is `*`/`/`/`D` is a whole comment line; a free-format inline `*>` strips from there to end of line, honored regardless of detected format, exactly like `preprocessFreeFormat` already does unconditionally). New `replaceOutsideQuotes` (a quote-and-comment-aware drop-in for `text.replace(pattern, replacer)`) skips any `COPY_PATTERN` match whose start index falls inside either range set entirely - the match is left completely untouched, not passed to the replacer at all - and `expand()`'s single `text.replace(COPY_PATTERN, ...)` call now goes through it instead. Applied uniformly at every recursion depth (the same helper handles the top-level source text and each recursively-expanded copybook body), so a lookalike inside a *nested* copybook's own literal is caught exactly the same way as one at the top level. Verified against installed GnuCOBOL (j05): `MSG=SEE COPY DONE.` (the full, un-truncated 20-byte literal), `VAL=005`, `DECOY=OOPS` - three independent, uncorrupted values, matching cobc exactly; confirmed zero regressions on every pre-existing COPY-bearing corpus program (u09, u10, i03, i04, and this round's own j02, all re-verified `oracleCompare()`-clean) | j05 |
+| 2 | A RECURSIVE subprogram's LINKAGE SECTION parameter(s) were modeled as a single, object-level (module-scoped) Scala `var` (e.g. `var lsDepth`) - every activation, at every recursion depth, read and wrote the SAME variable, exactly like every other (non-recursive) callable subprogram's LINKAGE item already safely does, since only one activation is ever mid-flight there. A RECURSIVE program can CALL itself while an outer activation is still on the Scala call stack, so the DEEPEST recursive call's own `lsDepth = _arg0` assignment silently clobbered the OUTERMOST frame's own value too: once the deepest call returned, the outer frame's own subsequent statements read the (now-corrupted) shared var instead of its own original parameter (j10, verified against installed GnuCOBOL first: cobc's own WORKING-STORAGE for a RECURSIVE program actually IS shared/static across recursive activations, confirmed reproducible, not assumed - `WS-N` legitimately keeps counting up across all three levels, and even a deeper-level's own `WS-NEXT` writeback legitimately becomes visible through a shallower level's own aliased `LS-DEPTH` - but cobc's LINKAGE SECTION *parameter passing* still keeps the OUTERMOST call's own parameter binding completely distinct, because that outermost call's actual BY REFERENCE argument, `WS-D`, lives in a totally different program/object's storage, never touched by anything inside the recursive subprogram itself: cobc's own oracle shows `EXIT DEPTH=01` for the outermost frame, `EXIT DEPTH=03`/`EXIT DEPTH=03` for the two inner ones - the generated Scala, before this fix, showed `EXIT DEPTH=03` for every single frame, including the outermost) | New `generateRecursiveEntryMethod` (`generator/scala-generator.js`), gated on a new `isRecursiveProgram(ast)` (scans this program's own `PROGRAM-ID ... RECURSIVE.` clause the same tokens-based way `extractProgramName` already resolves the program's own name) AND every one of this program's LINKAGE parameters being a plain scalar (a GROUP LINKAGE parameter falls back to the ordinary `generateEntryMethod` convention entirely - an out-of-scope combination no corpus program exercises, matching this project's established practice of an honest, narrowly-scoped decline over a half-working mixed convention). Real cobc doesn't have this bug because a BY REFERENCE CALL passes the ADDRESS of whatever variable the caller named - each activation's own LINKAGE item is a true alias of that one variable, never a fresh copy; this fix reproduces that aliasing directly instead of copying a value into a module var: `entry(...)` now accepts a getter/setter CLOSURE pair per parameter (`_getN: () => T`, `_setN: T => Unit`), and a local `def <camel>: T = _getN()` / `def <camel>_=(v: T): Unit = _setN(v)` pair (Scala's own getter/setter assignment sugar - the identical pattern round-3 finding 6's REDEFINES-of-GROUP accessor pair already uses) lets every reference to the LINKAGE item elsewhere in the program's body read/write straight through to whichever variable the CURRENT call activation was actually invoked with, with zero changes needed to how `expression-gen.js` reads/writes an ordinary identifier. Because these getter/setter defs are local to `entry()`'s own call - Scala's ordinary per-call parameter/local scoping, no different from any other recursive method - every recursive self-CALL gets its own fresh, independent binding, exactly matching cobc's own per-activation pointer; every paragraph reachable from the entry point is nested as a local `def` *inside* `entry()` itself (new `generateProgramFlowLinesNested`, `generator/method-gen.js` - body-duplicating, reusing `generatePerformThruMethod`'s existing `renderNestedFallthroughDefs` helper verbatim, NOT the ordinary `generateProgramFlowLines`/`renderNestedFallthroughSteps` wrapper that calls shared top-level paragraph methods) so each paragraph's own body closes over THIS SPECIFIC call's own getter/setter defs. `entry()` itself now returns `Unit`, not a value - any assignment to the LINKAGE item anywhere in the body already writes straight back through its setter closure, live, the instant it happens, rather than a single point-in-time round trip after the whole CALL returns. The caller side (`generateCall`, `generator/expression-gen.js`) checks the new `target.recursive` flag (set in `generateMultiProgramScala`'s `CALL_PROGRAM_REGISTRY`-population loop, using the SAME gating condition independently re-derived from that callee's own ast, so both sides always agree on the same convention) and, only for such a target, builds a live getter/setter for a plain BY REFERENCE variable operand (COBOL's default - the shape this fix extends true aliasing to) or a value-snapshot getter with a no-op setter for every other operand shape (BY CONTENT/VALUE, a literal/computed expression, `OMITTED`, or one of the rarer ref-mod/group/subscripted-scalar operand shapes) - matching "the callee's own copy is local to that call" exactly like the ordinary CALL convention already does for those same shapes. WORKING-STORAGE itself is left completely untouched by this fix (still an unconditional shared module `var`, recursive or not) - that sharing is cobc's own confirmed, deliberate behavior to preserve, not a bug. Verified against installed GnuCOBOL (j10): `ENTER DEPTH=01/02/03`, `EXIT DEPTH=03/03/01` (in that exact order) - byte-for-byte matching cobc; confirmed zero regressions on every pre-existing multi-level/DECLARATIVES CALL-chain corpus program (e07, h07, h09, h12, i06, u01, aa05, q09/q09b/q09c, all re-verified `oracleCompare()`-clean) | j10 |
+| 3 | `GO TO para OF section` (disambiguating a paragraph name that collides across multiple sections, exactly the same real-world shape `PERFORM para OF section` already resolves per rounds 12/14 - and explicitly flagged, in this very README's own "Known gaps" section below, as GO TO's still-unaddressed counterpart) was never parsed at all: `parseGoToStatement`'s target-collecting loop naturally stops the moment it hits the `OF`/`IN` token (its own reserved-word token type, never `IDENTIFIER`) - but nothing downstream ever consumed that `OF`/`IN` token or the section name after it, so it (and, corrupted from that point on, the rest of the PROCEDURE DIVISION parse) fell straight through every remaining clause check unconsumed. At codegen, `generateGoTo` unconditionally emitted a bare, unqualified `return para()` even where a real qualifier WAS present in-source, since it had nowhere to route one to. j11's own repro (three sections each declaring their own `1000-PARA`) produced a duplicate `def third(): Unit` collision - a downstream symptom of the corrupted parse, not a separate bug - plus the unresolved/wrong `return para()` itself: both a hard scala-cli compile error | Parser: `GoToStatement` (`parser/ast.js`) gained a new `targetSections` array, index-aligned with the pre-existing `targets` array (GO TO's `DEPENDING ON` form can list more than one target - unlike PERFORM's single `targetParagraph`/`throughParagraph` pair, each one can independently carry its own qualifier); `parseGoToStatement` (`parser/procedure-parser.js`) now consumes an optional `OF`/`IN` qualifier immediately after each target it collects, mirroring `parsePerformStatement`'s own pre-existing `targetSection`/`throughSection` handling immediately above it in the same file. Codegen: `generateGoTo` (`generator/expression-gen.js`) now passes each target's own resolved section (or `null`, for an unqualified target - the entire pre-existing corpus) through to `paragraphMethodName(name, sectionName)` - the exact same collision-aware resolver PERFORM's own qualified targets already route through (round-12 bonus finding, z12), which only actually qualifies a bare name by its section when that bare name is genuinely ambiguous (`AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM`, populated once per program by `generateAllMethods` before any GO TO/PERFORM codegen runs) - an unqualified GO TO to a non-colliding name is completely unaffected. A pure addition on both the plain and `DEPENDING ON` forms: an already-collision-free target list is untouched. Verified against installed GnuCOBOL (j11): `START` / `CORRECT-1000-IN-THIRD-SECTION` - the qualifier correctly resolves to the THIRD section's own paragraph, matching cobc exactly, with no duplicate-definition collision anywhere in the generated Scala | j11 |
+
+9 further round-21 probes were valid and already passed/were already honest
+before any of the above fixes, confirmed unaffected by all three: `j01` (a
+paragraph literally named GOBACK - the identical bug *class* round-20
+finding 1 fixed for EXIT/CONTINUE, but for a reserved word round-20's own
+narrow `PARAGRAPH_NAME_RESERVED_WORDS` allowlist doesn't cover - this
+generator dispatches bare `GOBACK.` in paragraph-name position to the
+GOBACK *statement* exactly like cobc's own parser does, so both sides
+happen to agree: a blank stdout, since the implicit first paragraph becomes
+just that one statement - not a gap this round needed to fix, since nothing
+here diverges from cobc), `j02` (MERGE ... USING with three input files,
+not just the two every prior MERGE finding tested - existing, already-
+working capability, confirmed unaffected), `j03` (GO TO ... DEPENDING ON
+falling through to the ordinary next-sentence no-op, in a program that also
+has an unrelated DECLARATIVES section registered - two independently-
+existing mechanisms, confirmed not to trip over each other), `j04` (a CALL
+BY REFERENCE writeback into a table element whose value then drives a
+DIFFERENT table's own OCCURS DEPENDING ON count - existing capability,
+confirmed to compose correctly), `j06` (PERFORM WITH TEST BEFORE/AFTER
+where the loop's own subscript is mutated via a CALL BY REFERENCE
+writeback rather than a plain in-line statement - existing TEST BEFORE/
+AFTER timing logic, confirmed unaffected by where the mutation textually
+lives), `j07` (STRING ... WITH POINTER whose pointer value arrives via a
+nested intrinsic FUNCTION call - existing capability, confirmed unaffected),
+`j08` (INITIALIZE ... REPLACING on a group with both an OCCURS table and a
+sibling REDEFINES - existing capability, confirmed unaffected), `j09` (an
+outer SORT whose OUTPUT PROCEDURE calls a subprogram running its own,
+separate, independent SORT mid-stream - existing capability, confirmed two
+independent SD/sort-work areas active across a CALL boundary don't
+interfere with each other), and `j12` (MOVE CORRESPONDING between two
+groups whose overlapping field names are declared in a completely different
+physical order in each - existing capability, confirmed the field-pairing
+logic matches strictly by name, never by positional alignment).
+
+See `tests/round21-fixes.test.js` for focused, toolchain-independent unit
+tests of all 3 findings above.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -1171,13 +1224,22 @@ tests of both findings (and the addendum) above.
   COBOL, which no corpus program (old or new) is; `sect01`/`q09`'s own only
   cross-paragraph reference is a `PERFORM` of the (never-ambiguous) *section*
   name, not one of its colliding paragraphs, and `z12`/`b3` themselves use
-  the (legally required) qualified form. `GO TO`'s own qualification is
-  unaffected by either fix (only `PERFORM` was addressed) and remains
-  exactly as unqualified/bare as before. Revisit by threading the calling
-  paragraph's own enclosing section through `generateExpression`/nested-
-  PERFORM resolution (for the bare-unqualified case) and by extending `GO
-  TO`'s own parsing/codegen the same way `PERFORM` was, if a future program
-  needs either.
+  the (legally required) qualified form. `GO TO`'s own qualification was
+  unaffected by either fix (only `PERFORM` was addressed) through round-20 -
+  **round-21 finding 3 closed this specific gap**: `GO TO para OF section`
+  (single-target and multi-target `DEPENDING ON` alike) now resolves through
+  the identical collision-aware `paragraphMethodName`/
+  `resolveParagraphMethodName` machinery PERFORM's own qualified form
+  already used - see the round-21 table above, `j11`. What remains
+  unaddressed is only a **bare, UNQUALIFIED** reference (GO TO, or PERFORM
+  single-target/THRU) to a paragraph name that happens to collide: real
+  COBOL requires qualification whenever it would otherwise be ambiguous - a
+  program using a bare, would-be-ambiguous reference is *already invalid
+  COBOL* without qualifying it - so this narrower residual gap only matters
+  for a program that is itself not valid COBOL, which no corpus program
+  (old or new) is. Revisit by threading the calling paragraph's own
+  enclosing section through `generateExpression`/nested-PERFORM/nested-GO-TO
+  resolution, if a future program needs the bare-unqualified case too.
 
 - **GO TO (or a nested PERFORM) into a paragraph that must then *itself* keep
   falling through, within a SECTION wrapper or the whole-program flow (round-4

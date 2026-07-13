@@ -1,0 +1,3 @@
+PTR-INIT=03
+OUT=[  XYZ               ]
+PTR-AFTER=06

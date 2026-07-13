@@ -2492,9 +2492,30 @@ function parseGoToStatement(ctx) {
 
   const stmt = new GoToStatement();
 
-  // Parse target paragraphs
+  // Parse target paragraphs, each optionally qualified by an OF/IN section
+  // name (round-21 finding 3 - mirrors PERFORM's own targetSection/
+  // throughSection qualifier just above in parsePerformStatement):
+  // `GO TO para OF section` disambiguates a bare paragraph name that
+  // collides across sections, exactly like `PERFORM para OF section`
+  // already does. Before this fix, an OF/IN token here (and the section
+  // name after it) was never consumed at all - it fell straight through
+  // every remaining clause check below (none of which recognize OF/IN
+  // either, and the while loop above it already stops on its own, since OF
+  // is its own reserved-word token type, never IDENTIFIER), silently
+  // corrupting the rest of the PROCEDURE DIVISION parse. `targetSections` is
+  // index-aligned with `targets` - GO TO's DEPENDING ON form can list more
+  // than one target, and (unlike PERFORM's single targetParagraph/
+  // throughParagraph pair) each one can independently carry its own
+  // qualifier.
   while (ctx.check(TokenType.IDENTIFIER)) {
     stmt.targets.push(ctx.advance().value);
+    let section = null;
+    if (ctx.matchValue('OF', 'IN')) {
+      if (ctx.check(TokenType.IDENTIFIER)) {
+        section = ctx.advance().value;
+      }
+    }
+    stmt.targetSections.push(section);
     if (ctx.checkValue('DEPENDING')) break;
   }
 

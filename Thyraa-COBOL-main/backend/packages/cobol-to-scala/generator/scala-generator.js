@@ -54,6 +54,7 @@ import {
   flattenProcedureUnits,
   collectAmbiguousParagraphNames,
   generateProgramFlowLines,
+  generateProgramFlowLinesNested,
 } from './method-gen.js';
 import {
   generateFileIO,
@@ -144,6 +145,40 @@ function extractProgramName(ast) {
   }
 
   return 'CobolProgram';
+}
+
+/**
+ * True if this program's own PROGRAM-ID clause carries the RECURSIVE
+ * attribute (`PROGRAM-ID. NAME RECURSIVE.` - permits the program to CALL
+ * itself, directly or indirectly, while an outer activation of it is still
+ * on the call stack). round-21 finding 2: this is what
+ * generateRecursiveEntryMethod (below) is gated on. Scanned the same
+ * tokens-based way extractProgramName resolves the program's own name
+ * (parseCobolTokens, index.js, never builds a structured identification-
+ * division AST node at all - see that function's own doc comment above),
+ * since RECURSIVE is the only clause this needs to recognize.
+ */
+function isRecursiveProgram(ast) {
+  if (!ast.tokens || !Array.isArray(ast.tokens)) return false;
+  for (let i = 0; i < ast.tokens.length; i++) {
+    const token = ast.tokens[i];
+    if (token.value?.toUpperCase() === 'PROGRAM-ID' || token.type === 'PROGRAM-ID') {
+      let j = i + 1;
+      // Skip the period that immediately follows the PROGRAM-ID keyword
+      // itself, then the program-name token, then scan the remainder of
+      // this one clause (up to ITS OWN terminating period) for RECURSIVE.
+      while (j < ast.tokens.length && (ast.tokens[j].type === 'PERIOD' || ast.tokens[j].value === '.')) j++;
+      j++;
+      while (j < ast.tokens.length) {
+        const t = ast.tokens[j];
+        if (t.type === 'PERIOD' || t.value === '.') break;
+        if (String(t.value).toUpperCase() === 'RECURSIVE') return true;
+        j++;
+      }
+      return false;
+    }
+  }
+  return false;
 }
 
 /**
@@ -3493,6 +3528,21 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
   const units = flattenProcedureUnits(topLevelParagraphs, sections);
   const ambiguousNames = collectAmbiguousParagraphNames(topLevelParagraphs, sections);
 
+  // round-21 finding 2: a RECURSIVE program (PROGRAM-ID ... RECURSIVE - can
+  // CALL itself while an outer activation is still on the Scala call stack)
+  // must NOT model its own LINKAGE SECTION parameter(s) as shared
+  // module-level `var`s the way the ordinary convention below safely does
+  // for a non-recursive callee - see generateRecursiveEntryMethod's own doc
+  // comment for the full bug this avoids and why. Gated on every LINKAGE
+  // parameter being a plain scalar (no GROUP item): a GROUP LINKAGE
+  // parameter falls through to the ordinary convention below unconditionally
+  // (an out-of-scope combination no corpus program exercises - matches this
+  // project's established honest-decline-for-a-narrow-shape practice rather
+  // than a half-working mix of both conventions in one entry method).
+  if (isRecursiveProgram(ast) && paramInfos.length > 0 && paramInfos.every(p => !p.isGroup)) {
+    return generateRecursiveEntryMethod(paramInfos, units, ambiguousNames, indent);
+  }
+
   // round-12 finding 3: every parameter gets a default (its type's own
   // zero/spaces value, matching real COBOL's un-passed-LINKAGE-item
   // semantics - see expression-gen.js's defaultZeroValueForScalaType) so a
@@ -3552,6 +3602,102 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
 }
 
 /**
+ * round-21 finding 2: CALL entry point for a RECURSIVE program - see
+ * generateEntryMethod's own doc comment above for the ordinary,
+ * non-recursive case this specializes, and isRecursiveProgram/its own call
+ * site for the gating condition (every LINKAGE parameter a plain scalar).
+ *
+ * The bug this fixes: the ordinary convention above assigns each incoming
+ * argument into a shared, module-level `var` (e.g. `lsDepth = _arg0`) before
+ * running the program's own paragraphs, then returns that SAME var's final
+ * value for the caller-side writeback (generateCall's "value-in/tuple-out",
+ * generator/expression-gen.js). That is safe for a non-recursive callee -
+ * only one activation is ever mid-flight at a time - but a RECURSIVE program
+ * can CALL itself while an outer activation's own entry() call is still on
+ * the Scala stack; the inner activation's `lsDepth = _arg0` assignment
+ * overwrites the very same var the outer activation is still using, so once
+ * the inner call returns, the outer activation's own subsequent reads of its
+ * LINKAGE parameter silently observe the INNER activation's value instead of
+ * its own (verified against installed GnuCOBOL - see
+ * tests/corpus/proc/j10-recursive-call-ws.cbl's own header comment for the
+ * full oracle trace: the outermost call must still read back its OWN
+ * original parameter value, `EXIT DEPTH=01`, even though two deeper
+ * recursive activations both legitimately share one aliased storage cell
+ * and both correctly read `EXIT DEPTH=03`).
+ *
+ * Real cobc does not have this problem because a BY REFERENCE CALL passes
+ * the ADDRESS of whatever variable the caller named - each activation's own
+ * LINKAGE item is a true alias of that one specific variable, never a fresh
+ * copy. This reproduces that aliasing directly: instead of copying the
+ * incoming value into a module var, entry() accepts a getter/setter CLOSURE
+ * pair per parameter (`_getN: () => T`, `_setN: T => Unit`) built by the
+ * CALLER (generateCall, generator/expression-gen.js) to read/write whatever
+ * variable expression was actually passed - a live alias of the caller's own
+ * storage, exactly like cobc's own pointer. A local `def <camel>: T =
+ * _getN()` / `def <camel>_=(v: T): Unit = _setN(v)` pair (Scala's own
+ * getter/setter assignment sugar - the same pattern round-3 finding 6's
+ * REDEFINES-of-GROUP accessor pair already uses) then lets every reference
+ * to the LINKAGE item elsewhere in this program's body read/write straight
+ * through to whichever variable the CURRENT activation was actually called
+ * with, with zero changes needed to how expression-gen.js reads/writes an
+ * ordinary identifier (Scala resolves `lsDepth`/`lsDepth = x` to the nearest
+ * lexically enclosing `def`/`def ..._=`, exactly as if it were a real var).
+ *
+ * Because these getter/setter defs are local to entry()'s own call - Scala's
+ * ordinary per-call parameter/local scoping, no different from any other
+ * recursive method - every recursive self-CALL creates its OWN fresh
+ * binding, entirely independent of any other activation's, exactly matching
+ * cobc's own per-activation LINKAGE pointer. Every paragraph reachable from
+ * this program's entry point is nested as a local `def` *inside* entry()
+ * itself (body-duplicating - generateProgramFlowLinesNested, mirroring
+ * generatePerformThruMethod's existing `renderNestedFallthroughDefs`
+ * pattern, NOT the ordinary `generateProgramFlowLines`/
+ * `renderNestedFallthroughSteps` wrapper that calls shared TOP-LEVEL
+ * paragraph methods) so each paragraph's own body closes over THIS
+ * SPECIFIC call's own getter/setter defs, not some other activation's.
+ *
+ * No return value at all (`Unit`, unlike the ordinary convention's
+ * return-then-caller-assigns writeback): any assignment to the LINKAGE item
+ * anywhere in this program's body already writes straight back through the
+ * setter closure, live, the instant it happens - matching cobc's own
+ * continuous aliasing, not a single point-in-time round trip after the
+ * whole CALL returns.
+ *
+ * WORKING-STORAGE itself is deliberately left exactly as before (a shared,
+ * module-level `var`, unconditionally, recursive or not) - this program's
+ * own WORKING-STORAGE items being shared/static across every recursive
+ * activation is cobc's own confirmed, reproducible behavior for a RECURSIVE
+ * program (see j10's own header comment), not a bug to fix.
+ */
+function generateRecursiveEntryMethod(paramInfos, units, ambiguousNames, indent = 1) {
+  const indentStr = '  '.repeat(indent);
+  const bi = '  '.repeat(indent + 1);
+
+  const paramList = paramInfos
+    .map((p, i) =>
+      `_get${i}: () => ${p.scalaType} = () => ${defaultZeroValueForScalaType(p.scalaType)}, ` +
+      `_set${i}: ${p.scalaType} => Unit = (_: ${p.scalaType}) => ()`
+    )
+    .join(', ');
+
+  const lines = [
+    `${indentStr}// round-21 finding 2: RECURSIVE program's own CALL entry point - see`,
+    `${indentStr}// generateRecursiveEntryMethod's own doc comment (generator/scala-generator.js)`,
+    `${indentStr}// for the per-call-activation LINKAGE aliasing this uses instead of the`,
+    `${indentStr}// ordinary shared-module-var convention generateEntryMethod uses for a`,
+    `${indentStr}// non-recursive callee.`,
+    `${indentStr}def entry(${paramList}): Unit =`,
+  ];
+  paramInfos.forEach((p, i) => {
+    lines.push(`${bi}def ${p.camel}: ${p.scalaType} = _get${i}()`);
+    lines.push(`${bi}def ${p.camel}_=(v: ${p.scalaType}): Unit = _set${i}(v)`);
+  });
+  lines.push(...generateProgramFlowLinesNested(units, indent + 1, ambiguousNames));
+
+  return lines.join('\n');
+}
+
+/**
  * Generate Scala for a multi-PROGRAM-ID COBOL source - contained or
  * sequential programs sharing one file (round-7 finding 1; see u01's own
  * repro shape: a calling program followed by its own callee, both full
@@ -3604,12 +3750,42 @@ export function generateMultiProgramScala(programs, options = {}) {
     // CALL ... USING ... OMITTED (generator/expression-gen.js's generateCall)
     // can substitute a type-correct zero/spaces default in that positional
     // slot instead of guessing "String" for every callee.
-    const { registry: linkageFieldRegistry } = buildFieldRegistry(ast);
+    const {
+      registry: linkageFieldRegistry,
+      groupRegistry: linkageGroupRegistry,
+      groupKeyRegistry: linkageGroupKeyRegistry,
+    } = buildFieldRegistry(ast);
     const paramTypes = usingNames.map(n => linkageFieldRegistry.get(String(n).toUpperCase())?.scalaType || 'String');
+    // round-21 finding 2: whether this program qualifies for the
+    // per-call-activation LINKAGE aliasing generateRecursiveEntryMethod
+    // builds (see its own doc comment) - RECURSIVE-flagged, at least one
+    // LINKAGE parameter, and every one of them a plain scalar (a GROUP
+    // LINKAGE parameter is an out-of-scope combination that keeps the
+    // ordinary value-in/tuple-out convention entirely - see that function's
+    // own doc comment). Computed from THIS ast's own freshly-built
+    // groupRegistry/groupKeyRegistry, not the global isRegisteredGroupName/
+    // resolveGroupKey helpers (generator/expression-gen.js) - this loop runs
+    // for every program *before* any of their generateScala calls install
+    // those globals for the program actually being inspected, so the
+    // globals cannot be trusted here. generateEntryMethod (the callee side,
+    // invoked later, during this exact program's own generateScala call,
+    // once its globals are correctly installed) recomputes the identical
+    // gating condition independently via those now-valid globals - both
+    // sides must agree on the same decision for a given program, or the
+    // caller's closures-vs-values shape here would mismatch the callee's
+    // actual entry() signature and fail to compile.
+    const hasGroupLinkageParam = usingNames.some(n => {
+      const nameUpper = String(n).toUpperCase();
+      if (linkageFieldRegistry.get(nameUpper)) return false;
+      const groupKey = linkageGroupKeyRegistry.get(nameUpper) || nameUpper;
+      return linkageGroupRegistry.has(groupKey);
+    });
+    const recursive = isRecursiveProgram(ast) && usingNames.length > 0 && !hasGroupLinkageParam;
     callRegistry.set(String(name).toUpperCase(), {
       objectName,
       paramCount: usingNames.length,
       paramTypes,
+      recursive,
     });
   }
 

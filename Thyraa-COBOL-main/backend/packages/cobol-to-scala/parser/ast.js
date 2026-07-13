@@ -683,6 +683,12 @@ export class GoToStatement extends Statement {
   constructor(options = {}) {
     super('GoToStatement', options);
     this.targets = options.targets || [];
+    // round-21 finding 3: index-aligned with `targets` - an explicit OF/IN
+    // section qualifier on a given target (`GO TO para OF section`), or null
+    // where a target carries none. Mirrors PerformStatement's own
+    // targetSection/throughSection qualifier (see parsePerformStatement),
+    // extended to GO TO's own (possibly multi-target, DEPENDING ON) form.
+    this.targetSections = options.targetSections || [];
     this.dependingOn = options.dependingOn || null;
   }
 }

@@ -1,0 +1,5 @@
+{
+  "OUTERCPY": "       01 :PFX:-REC.\n          05 :PFX:-MSG PIC X(20) VALUE \"SEE COPY DONE.\".\n          COPY MIDCPY REPLACING ==:Q:== BY ==SUB1==.\n",
+  "MIDCPY": "          05 :Q:-VAL PIC 9(3) VALUE 5.\n",
+  "DONE": "       01 DECOY-REC.\n          05 DECOY-FIELD PIC X(4) VALUE \"OOPS\".\n"
+}

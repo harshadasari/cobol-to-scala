@@ -16,11 +16,138 @@
  * .copy, .cbl). Expansion is recursive with cycle detection.
  */
 
+import { detectFormat } from './lexer.js';
+
 const MAX_DEPTH = 10;
 
 // COPY <name> [OF|IN <library>] [REPLACING <pairs>] .
 // The trailing period is mandatory in COBOL and delimits the statement.
 const COPY_PATTERN = /\bCOPY\s+([A-Za-z0-9][A-Za-z0-9-]*)\s*(?:(?:OF|IN)\s+([A-Za-z0-9][A-Za-z0-9-]*)\s*)?(REPLACING\s+[\s\S]*?)?\./gi;
+
+/**
+ * Find every quoted-string-literal span in text, as [start, end) character
+ * ranges (end is exclusive, one past the closing quote). Mirrors
+ * parser/lexer.js's own `Lexer#scanString` quote handling exactly: either
+ * quote character opens a literal, a doubled quote of the SAME kind inside
+ * it is an escaped literal quote (stays inside), and an unterminated
+ * literal is cut off at end-of-line (same "string continues on next line"
+ * bail-out the real tokenizer uses). Reusing this same walk (rather than a
+ * regex-lookahead guess) is what lets COPY-statement detection agree with
+ * the main tokenizer about what "inside a literal" means.
+ */
+function findQuotedRanges(text) {
+  const ranges = [];
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text[i];
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      const start = i;
+      i++;
+      while (i < n) {
+        if (text[i] === quote) {
+          if (text[i + 1] === quote) {
+            i += 2; // doubled quote - escaped, stays inside the literal
+            continue;
+          }
+          i++; // consume closing quote
+          break;
+        }
+        if (text[i] === '\n') {
+          // Unterminated on this line - same bail-out scanString uses
+          break;
+        }
+        i++;
+      }
+      ranges.push([start, i]);
+    } else {
+      i++;
+    }
+  }
+  return ranges;
+}
+
+/**
+ * Find every comment span in text, as [start, end) character ranges,
+ * mirroring lexer.js's own `detectFormat`/`preprocessFixedFormat`/
+ * `preprocessFreeFormat` comment recognition: a fixed-format comment line
+ * (indicator column - column 7 - holding `*`, `/`, or `D`/`d` for a debug
+ * line) is stripped in its entirety; a free-format inline `*>` comment
+ * (honored regardless of detected format, exactly like
+ * `preprocessFreeFormat` already does unconditionally) strips from `*>` to
+ * end of line. This is what keeps a COPY-statement lookalike that only
+ * ever appears in a source comment (e.g. this very file's own header
+ * commentary describing this bug) from being mistaken for a real COPY
+ * statement, matching cobc's own preprocessor, which never looks at
+ * comment text at all.
+ */
+function findCommentRanges(text) {
+  const ranges = [];
+  const format = detectFormat(text);
+  let offset = 0;
+  for (const line of text.split('\n')) {
+    if (format === 'fixed') {
+      const indicator = line.length > 6 ? line.charAt(6) : ' ';
+      if (indicator === '*' || indicator === '/' || indicator === 'D' || indicator === 'd') {
+        ranges.push([offset, offset + line.length]);
+        offset += line.length + 1;
+        continue;
+      }
+    }
+    const commentIdx = line.indexOf('*>');
+    if (commentIdx !== -1) {
+      ranges.push([offset + commentIdx, offset + line.length]);
+    }
+    offset += line.length + 1; // +1 for the '\n' split on
+  }
+  return ranges;
+}
+
+/**
+ * True if `index` falls inside one of the ranges built by findQuotedRanges/
+ * findCommentRanges (each individually start-ascending by construction, but
+ * the merged/concatenated list passed in here may not be, hence the full
+ * scan rather than an early break).
+ */
+function isInsideAnyRange(ranges, index) {
+  for (const [start, end] of ranges) {
+    if (index >= start && index < end) return true;
+  }
+  return false;
+}
+
+/**
+ * Quote-and-comment-aware variant of `text.replace(pattern, replacer)`: a
+ * match whose start index falls inside a quoted string literal, OR inside a
+ * comment, is left completely untouched (not passed to `replacer` at all) -
+ * this is what stops COPY_PATTERN from firing on ordinary literal text that
+ * merely reads like a COPY statement (e.g. a data item declared
+ * `VALUE "... COPY DONE. ..."`, where that text is just literal content,
+ * never a real COPY statement to expand) or on descriptive prose inside a
+ * source comment that happens to mention "COPY something." in passing.
+ */
+function replaceOutsideQuotes(text, pattern, replacer) {
+  const excludedRanges = [...findQuotedRanges(text), ...findCommentRanges(text)];
+  const flags = pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g';
+  const re = new RegExp(pattern.source, flags);
+  let result = '';
+  let lastIndex = 0;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    if (isInsideAnyRange(excludedRanges, match.index)) {
+      // Not a real COPY statement - leave this occurrence untouched and
+      // keep scanning past it.
+      if (match[0].length === 0) re.lastIndex++;
+      continue;
+    }
+    result += text.slice(lastIndex, match.index);
+    result += replacer(...match, match.index, text);
+    lastIndex = match.index + match[0].length;
+  }
+  result += text.slice(lastIndex);
+  return result;
+}
 
 /**
  * Build a case-insensitive, extension-tolerant lookup for copybook content.
@@ -104,7 +231,7 @@ export function expandCopybooks(source, copybooks = {}, options = {}) {
       return text;
     }
 
-    return text.replace(COPY_PATTERN, (full, name, library, replacingClause) => {
+    return replaceOutsideQuotes(text, COPY_PATTERN, (full, name, library, replacingClause) => {
       const key = name.toUpperCase();
 
       if (stack.includes(key)) {

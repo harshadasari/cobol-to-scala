@@ -7074,6 +7074,42 @@ function generateCall(statement, indent = 0) {
     if (name) return toCamelCase(name);
     return convertArithmeticExpression(param.value || param);
   });
+
+  // round-21 finding 2: a RECURSIVE target (scala-generator.js's
+  // generateRecursiveEntryMethod - see its own doc comment) does not take
+  // plain values at all; it takes a getter/setter CLOSURE pair per
+  // parameter, so its own LINKAGE item can be a live alias of whatever
+  // variable THIS specific CALL actually names, instead of a module-level
+  // var every recursive activation would otherwise stomp on. A plain,
+  // unsubscripted, non-ref-mod, BY REFERENCE variable operand (COBOL's
+  // default - the overwhelmingly common shape, and the only one this fix
+  // extends true aliasing to) gets a LIVE getter/setter pair that reads/
+  // writes that exact variable; every other operand shape (BY CONTENT/
+  // VALUE, a literal/computed expression, OMITTED, or one of the rarer
+  // ref-mod/group/subscripted-scalar operand shapes handled above) gets a
+  // getter that returns its own already-computed `argExprs[i]` value (a
+  // snapshot, taken once - real BY VALUE/CONTENT semantics, and the closest
+  // safe approximation for the rarer shapes this fix doesn't extend true
+  // aliasing to) and a no-op setter, matching "the callee's own copy is
+  // local to that call" exactly like the ordinary (non-recursive) CALL
+  // convention already does for those same shapes.
+  if (target.recursive) {
+    const closureArgs = usingParams.map((param, i) => {
+      const scalaType = target.paramTypes?.[i] || 'String';
+      const mode = String(param.mode || 'REFERENCE').toUpperCase();
+      const name = !param.omitted ? param.value?.name : null;
+      const hasSubscripts = Array.isArray(param.value?.subscripts) && param.value.subscripts.length > 0;
+      const isPlainRefVar = mode === 'REFERENCE' && name && !param.value?.refMod && !hasSubscripts &&
+        !isRegisteredGroupName(String(name).toUpperCase());
+      if (isPlainRefVar) {
+        const camel = toCamelCase(name);
+        return `() => ${camel}, (v: ${scalaType}) => ${camel} = v`;
+      }
+      return `() => (${argExprs[i]}), (_: ${scalaType}) => ()`;
+    });
+    return `${indentStr}${target.objectName}.entry(${closureArgs.join(', ')})`;
+  }
+
   const callExpr = `${target.objectName}.entry(${argExprs.join(', ')})`;
 
   // Which caller-side variable (if any) each USING operand writes its
@@ -7202,20 +7238,34 @@ function generateCall(statement, indent = 0) {
 function generateGoTo(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const targets = statement.targets && statement.targets.length > 0 ? statement.targets : [statement.target];
+  // round-21 finding 3: index-aligned with `targets` (see GoToStatement's
+  // own doc comment, parser/ast.js, and parseGoToStatement's own comment,
+  // parser/procedure-parser.js) - an explicit `OF`/`IN` qualifier
+  // disambiguating a bare paragraph name that collides across sections
+  // (`GO TO para OF section`), exactly mirroring how PERFORM's own
+  // targetSection/throughSection qualifier (rounds 12/14) already resolves
+  // the identical ambiguity for PERFORM - see paragraphMethodName's own doc
+  // comment above for the shared resolution logic both statements now use.
+  // Falls back to an all-null list for a statement built via the older
+  // `.target` (singular) shape, or one with no targetSections recorded at
+  // all, so every pre-existing (unqualified) GO TO is completely unaffected.
+  const targetSections = statement.targetSections && statement.targetSections.length > 0
+    ? statement.targetSections
+    : targets.map(() => null);
   const escapeTargets = statement._thruEscapeTargets;
   const escapeNote = (target) => escapeTargets && escapeTargets.has(target)
     ? ` // TODO(round-19 finding 2): "${target}" lies outside the enclosing PERFORM ${statement._thruEscapeRange} range - real COBOL never returns to the PERFORM's caller once this fires, but this generator's method-call-based PERFORM model silently resumes there once nested calls unwind - see tests/oracle/README.md known gaps`
     : '';
 
   if (!statement.dependingOn) {
-    return `${indentStr}return ${paragraphMethodName(targets[0])}() // GO TO${escapeNote(targets[0])}`;
+    return `${indentStr}return ${paragraphMethodName(targets[0], targetSections[0])}() // GO TO${escapeNote(targets[0])}`;
   }
 
   const dependingOn = convertArithmeticExpression(statement.dependingOn);
   const lines = [`${indentStr}${dependingOn} match`];
 
   targets.forEach((target, idx) => {
-    lines.push(`${indentStr}  case ${idx + 1} => return ${paragraphMethodName(target)}()${escapeNote(target)}`);
+    lines.push(`${indentStr}  case ${idx + 1} => return ${paragraphMethodName(target, targetSections[idx])}()${escapeNote(target)}`);
   });
 
   lines.push(`${indentStr}  case _ => ()`);

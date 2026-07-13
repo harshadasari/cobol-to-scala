@@ -209,8 +209,11 @@ test('generator: WS-T(WS-I + 1) renders the full subscript expression, not just 
   // full `+ 1` expression is preserved (the original finding), just against
   // the new shape - verified semantically equivalent via
   // tests/corpus/data/a06-table-boundary.cbl's cobc oracleCompare, which
-  // still hard-passes.
-  assert.match(code, /wsT\(\(\(\(wsI \+ 1\)\) - 1\)\.toInt\)/);
+  // still hard-passes. round-18 finding 8 added a further defensive
+  // `.max(0)` guard against a negative computed index (see
+  // subscriptIndexExpr's own doc comment) - a no-op here (WS-I+1 is always
+  // in range), but present in every non-literal subscript's rendered text.
+  assert.match(code, /wsT\(\(\(\(wsI \+ 1\)\) - 1\)\.toInt\.max\(0\)\)/);
 });
 
 // ---------------------------------------------------------------------------

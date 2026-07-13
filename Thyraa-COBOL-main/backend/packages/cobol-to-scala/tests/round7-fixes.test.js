@@ -313,7 +313,10 @@ test('Finding 4: a COMP-3 PERFORM VARYING control variable used as a table subsc
            STOP RUN.
 `;
   const code = scalaOf(source);
-  assert.match(code, /wsItem = wsItem\.updated\(\(wsI - 1\)\.toInt, /, 'write site');
+  // round-18 finding 8 added a defensive `.max(0)` guard to every
+  // non-literal subscript index (see subscriptIndexExpr's own doc comment) -
+  // a no-op here, but present in the rendered text.
+  assert.match(code, /wsItem = wsItem\.updated\(\(wsI - 1\)\.toInt\.max\(0\), /, 'write site');
   assert.match(code, /wsItem\(\(3 - 1\)\)|wsItem\(2\)/, 'a literal subscript is still folded, unaffected by this fix');
 });
 

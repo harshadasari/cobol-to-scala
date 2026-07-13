@@ -2299,9 +2299,23 @@ function parseWriteStatement(ctx) {
     stmt.recordName = ctx.advance().value;
   }
 
-  // Parse FROM
+  // Parse FROM. round-18 finding 2's g12 companion gap: `WRITE rec FROM
+  // "literal text"` (or a numeric/figurative-constant literal) is entirely
+  // legal COBOL - the literal is implicitly MOVEd into `rec` before it's
+  // written, exactly like `WRITE rec FROM some-identifier` already does for
+  // a variable source - but `parseVariableReference` only ever recognizes
+  // an IDENTIFIER token and returns null for anything else, silently
+  // dropping `stmt.from` to null AND leaving the literal's own token(s)
+  // unconsumed in the stream, which the outer PROCEDURE DIVISION loop then
+  // misparsed as a separate, unrelated garbage UnknownStatement immediately
+  // afterward. `parseOperand` recognizes a literal (string/numeric/
+  // figurative) in addition to every shape `parseVariableReference` already
+  // did (it falls through to `parseVariableReference` for a plain
+  // IDENTIFIER - see its own definition above), so this is a pure
+  // extension, not a behavior change, for the pre-existing
+  // identifier-FROM case.
   if (ctx.matchValue('FROM')) {
-    stmt.from = parseVariableReference(ctx);
+    stmt.from = parseOperand(ctx);
   }
 
   // Parse ADVANCING
@@ -2344,8 +2358,11 @@ function parseRewriteStatement(ctx) {
     stmt.recordName = ctx.advance().value;
   }
 
+  // Same `FROM <literal>` companion gap as parseWriteStatement's own FROM
+  // parse above (parseOperand recognizes a literal in addition to every
+  // identifier shape parseVariableReference already did).
   if (ctx.matchValue('FROM')) {
-    stmt.from = parseVariableReference(ctx);
+    stmt.from = parseOperand(ctx);
   }
 
   if (ctx.matchValue('INVALID')) {
@@ -3072,6 +3089,34 @@ export function parseProcedureDivision(tokens) {
     // Parse statement
     const stmt = parseStatement(ctx);
     if (stmt) {
+      if (!currentParagraph && !currentSection) {
+        // g14 finding: a PROCEDURE DIVISION whose very first thing (after
+        // any USING/RETURNING clause) is a STATEMENT, not a paragraph- or
+        // section-name declaration, is entirely legal COBOL - an unnamed,
+        // implicit top-level "main" body (no PARAGRAPH-NAME/SECTION header
+        // at all anywhere before it). Previously neither the
+        // `currentParagraph` nor `currentSection` branch below matched in
+        // this state, so the statement was silently discarded - repeated for
+        // every subsequent statement until (if ever) a real paragraph/
+        // section name appeared, meaning a whole no-paragraph-name PROCEDURE
+        // DIVISION produced ZERO paragraphs/sections and an entirely empty
+        // generated run()/entry() body. Synthesizing an implicit top-level
+        // paragraph here - exactly the same "leading anonymous block becomes
+        // its own unit" idea round-7 finding 8's sectionLeadingUnit already
+        // applies one level down, inside a SECTION - routes these statements
+        // into `division.paragraphs` (as its own first unit, so
+        // flattenProcedureUnits/generateAllMethods/findMainProcedure all see
+        // it exactly like any other paragraph, including as the program's
+        // true entry point) instead of vanishing. The synthetic name can
+        // never collide with a real COBOL paragraph name (COBOL paragraph-
+        // names are a single word/hyphenated token, never containing
+        // spaces).
+        currentParagraph = new Procedure({
+          name: IMPLICIT_MAIN_PARAGRAPH_NAME,
+          procedureType: 'paragraph',
+        });
+        division.paragraphs.push(currentParagraph);
+      }
       if (currentParagraph) {
         currentParagraph.statements.push(stmt);
       } else if (currentSection) {
@@ -3083,6 +3128,15 @@ export function parseProcedureDivision(tokens) {
       // silently discarding one token at a time) so it is visible in the
       // AST rather than vanishing without a trace.
       const unknown = parseUnknownStatement(ctx, []);
+      if (!currentParagraph && !currentSection) {
+        // Same no-paragraph-name-yet case as above, for an unrecognized
+        // leading verb.
+        currentParagraph = new Procedure({
+          name: IMPLICIT_MAIN_PARAGRAPH_NAME,
+          procedureType: 'paragraph',
+        });
+        division.paragraphs.push(currentParagraph);
+      }
       if (currentParagraph) {
         currentParagraph.statements.push(unknown);
       } else if (currentSection) {
@@ -3093,6 +3147,20 @@ export function parseProcedureDivision(tokens) {
 
   return division;
 }
+
+/**
+ * Synthetic paragraph name for an entirely unnamed PROCEDURE DIVISION body
+ * (round-18 finding "g14" - see parseProcedureDivision's own doc comment at
+ * the "Parse statement" branch above). Hyphen-separated, matching ordinary
+ * COBOL paragraph-name shape (and round-7 finding 8's own
+ * `${section.name}-SECTION-BODY` synthetic-name convention one level down),
+ * since `toMethodName`/`toPascalCase` (generator/case-class-gen.js) only
+ * ever split a name on `-`/`_` - a name containing a space or other
+ * character COBOL's own word-forming rules disallow would otherwise survive
+ * unsplit into the generated Scala method name (e.g. `def implicit main
+ * paragraph()`), which is not valid Scala syntax at all.
+ */
+const IMPLICIT_MAIN_PARAGRAPH_NAME = 'IMPLICIT-MAIN-PARAGRAPH';
 
 export {
   ParserContext,

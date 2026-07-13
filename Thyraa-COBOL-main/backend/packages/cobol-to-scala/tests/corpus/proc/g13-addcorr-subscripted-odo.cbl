@@ -1,0 +1,24 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. G13.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-COUNT PIC 9(2) VALUE 3.
+       01  WS-TABLE-A.
+           05  WS-ROW-A OCCURS 1 TO 5 TIMES DEPENDING ON WS-COUNT.
+               10  A-AMT1 PIC 9(4).
+               10  A-AMT2 PIC 9(4).
+       01  WS-TABLE-B.
+           05  WS-ROW-B OCCURS 1 TO 5 TIMES DEPENDING ON WS-COUNT.
+               10  A-AMT1 PIC 9(4) VALUE 1000.
+               10  A-AMT2 PIC 9(4) VALUE 2000.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           MOVE 10 TO A-AMT1 OF WS-ROW-A(1).
+           MOVE 20 TO A-AMT2 OF WS-ROW-A(1).
+           MOVE 30 TO A-AMT1 OF WS-ROW-A(2).
+           MOVE 40 TO A-AMT2 OF WS-ROW-A(2).
+           ADD CORRESPONDING WS-ROW-A(1) TO WS-ROW-B(2).
+           DISPLAY "B2-AMT1=" A-AMT1 OF WS-ROW-B(2).
+           DISPLAY "B2-AMT2=" A-AMT2 OF WS-ROW-B(2).
+           DISPLAY "B1-AMT1=" A-AMT1 OF WS-ROW-B(1).
+           STOP RUN.

@@ -554,6 +554,11 @@ test('Finding 14: UNSTRING COUNT IN populates the per-field count receiver with 
            STOP RUN.
 `;
   const code = convertToScala(source, {}).scala;
-  assert.match(code, /wsC1 = _parts\.lift\(0\)\.map\(_\.length\)\.getOrElse\(0\)/);
-  assert.match(code, /wsC2 = _parts\.lift\(1\)\.map\(_\.length\)\.getOrElse\(0\)/);
+  // round-18 finding 4 restructured UNSTRING to one per-target field call
+  // (`_parts0`/`_parts1`, each that target's own one-field result) instead
+  // of a single whole-statement `_parts` list - see tests/round4-fixes.
+  // test.js's "Finding 13" test and tests/oracle/README.md's round-18 table
+  // for the full rationale.
+  assert.match(code, /wsC1 = _parts0\.headOption\.map\(_\.length\)\.getOrElse\(0\)/);
+  assert.match(code, /wsC2 = _parts1\.headOption\.map\(_\.length\)\.getOrElse\(0\)/);
 });

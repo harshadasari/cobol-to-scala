@@ -216,7 +216,10 @@ const RESIDUAL_CONJUNCT_SEARCH_SOURCE = `       IDENTIFICATION DIVISION.
 test('Finding 2e: a non-key residual conjunct (WS-FLAG, not a declared key) is re-verified at the narrowed candidate index before declaring a match', () => {
   const code = scalaOf(RESIDUAL_CONJUNCT_SEARCH_SOURCE);
   assert.match(code, /if \(_key0 == \(20\)\) then/, 'the binary search itself narrows only on the declared key WS-K1');
-  assert.match(code, /if \(\(wsFlag\(\(wsIdx - 1\)\.toInt\) == "Y"\)\) then/, 'the non-key conjunct must be re-checked at the candidate index');
+  // round-18 finding 8 added a defensive `.max(0)` guard to every non-literal
+  // subscript index (see subscriptIndexExpr's own doc comment) - a no-op
+  // here, but present in the rendered text.
+  assert.match(code, /if \(\(wsFlag\(\(wsIdx - 1\)\.toInt\.max\(0\)\) == "Y"\)\) then/, 'the non-key conjunct must be re-checked at the candidate index');
   assert.match(code, /_lo = _hi \+ 1/, 'a residual-conjunct failure must force-terminate the search as not-found, not keep narrowing');
 });
 
@@ -250,14 +253,17 @@ const INITIALIZE_TABLE_ELEMENT_SOURCE = `       IDENTIFICATION DIVISION.
 
 test('Finding 3a: INITIALIZE of a subscripted GROUP table element rebuilds only that ONE row via .updated, never the whole Vector', () => {
   const code = scalaOf(INITIALIZE_TABLE_ELEMENT_SOURCE);
+  // round-18 finding 8 added a defensive `.max(0)` guard to every
+  // non-literal subscript index (see subscriptIndexExpr's own doc comment) -
+  // a no-op here, but present in the rendered text.
   assert.match(
     code,
-    /wsName = wsName\.updated\(\(wsI - 1\)\.toInt, "\s+"\)/,
+    /wsName = wsName\.updated\(\(wsI - 1\)\.toInt\.max\(0\), "\s+"\)/,
     'WS-NAME (alphanumeric) must be reset to spaces at ONLY the WS-I row via .updated'
   );
   assert.match(
     code,
-    /wsAmt = wsAmt\.updated\(\(wsI - 1\)\.toInt, 0\)/,
+    /wsAmt = wsAmt\.updated\(\(wsI - 1\)\.toInt\.max\(0\), 0\)/,
     'WS-AMT (numeric) must be reset to zero at ONLY the WS-I row via .updated'
   );
   assert.doesNotMatch(code, /wsName = Vector\.fill\(3\)/, 'must NOT wipe the whole 3-element table');
@@ -278,9 +284,11 @@ const INITIALIZE_ELEMENTARY_TABLE_ELEMENT_SOURCE = `       IDENTIFICATION DIVISI
 
 test('Finding 3b: INITIALIZE of a subscripted, directly-OCCURS-bearing ELEMENTARY item also rebuilds only the one indexed element', () => {
   const code = scalaOf(INITIALIZE_ELEMENTARY_TABLE_ELEMENT_SOURCE);
+  // round-18 finding 8 added a defensive `.max(0)` guard (see
+  // subscriptIndexExpr's own doc comment) - a no-op here.
   assert.match(
     code,
-    /wsElem = wsElem\.updated\(\(wsI - 1\)\.toInt, 0\)/,
+    /wsElem = wsElem\.updated\(\(wsI - 1\)\.toInt\.max\(0\), 0\)/,
     'must reset only the WS-I-th element via .updated, not the whole table'
   );
   assert.doesNotMatch(code, /wsElem = Vector\.fill\(4\)/, 'must NOT wipe the whole 4-element table');

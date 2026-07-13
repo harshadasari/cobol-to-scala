@@ -522,6 +522,51 @@ export function setAmbiguousParagraphNamesForPerform(names) {
 }
 
 /**
+ * Local mirror of method-gen.js's `performThruWrapperName`, duplicated for
+ * the same reason `paragraphMethodName` above is (method-gen.js imports
+ * *from* this module, so the reverse import would cycle). Produces the
+ * IDENTICAL wrapper-method name generateAllMethods actually generates
+ * (via method-gen.js's own performThruWrapperName, called from the exact
+ * same `stmt.targetParagraph`/`targetSection`/`throughParagraph`/
+ * `throughSection` fields) for a `PERFORM x THRU y` range.
+ */
+function performThruWrapperNameLocal(fromParagraph, fromSection, toParagraph, toSection) {
+  let fromStripped = String(fromParagraph || '').replace(/^\d+[-_]?/, '');
+  if (!fromStripped) fromStripped = '_' + fromParagraph;
+  const fromBase = toCamelCase(fromStripped);
+  const toBase = toPascalCase(String(toParagraph || '').replace(/^\d+[-_]?/, ''));
+  const fromQualifier = fromSection ? 'In' + toPascalCase(String(fromSection).replace(/^\d+[-_]?/, '')) : '';
+  const toQualifier = toSection ? 'In' + toPascalCase(String(toSection).replace(/^\d+[-_]?/, '')) : '';
+  return `${fromBase}${fromQualifier}To${toBase}${toQualifier}`;
+}
+
+/**
+ * Round-18 finding 3's PERFORM ... THRU companion gap: `generatePerform`
+ * (the nested-statement sibling of method-gen.js's generatePerformFromAST,
+ * used for a PERFORM inside an IF/EVALUATE/SEARCH branch body etc.)
+ * previously called `paragraphMethodName(statement.targetParagraph, ...)`
+ * directly at every one of its call sites, completely ignoring
+ * `statement.throughParagraph` - so `PERFORM STEP-ONE THRU STEP-THREE`
+ * nested inside (for example) an EVALUATE WHEN body silently called ONLY
+ * `stepOne()` (the single FROM paragraph's own standalone method, with no
+ * fallthrough into STEP-TWO/STEP-THREE) instead of the THRU range's real
+ * wrapper method (`stepOneToStepThree()`, which method-gen.js's
+ * generateAllMethods always generates whenever ANY PERFORM THRU anywhere in
+ * the program - nested or not - names that range, since round-16 finding
+ * 4's collectStatementsDeep). method-gen.js's own top-level counterpart
+ * (generatePerformFromAST) already checked `stmt.throughParagraph` - this
+ * was specifically a NESTED-PERFORM-THRU gap. A pure generalization: an
+ * ordinary (non-THRU) nested PERFORM is completely unaffected (falls
+ * through to the exact same `paragraphMethodName(...)()` text as before).
+ */
+function performTargetCallExpr(statement, fallbackName = 'procedure') {
+  if (statement.throughParagraph) {
+    return `${performThruWrapperNameLocal(statement.targetParagraph || '', statement.targetSection, statement.throughParagraph, statement.throughSection)}()`;
+  }
+  return `${paragraphMethodName(statement.targetParagraph || fallbackName, statement.targetSection)}()`;
+}
+
+/**
  * Scala expression for one subscript, 1-based COBOL -> 0-based Scala.
  * Literal subscripts are folded at generation time (`WS-QTY(1)` -> `0`);
  * bare-variable subscripts render as `<camelName> - 1`; anything else (any
@@ -547,13 +592,31 @@ function subscriptIndexExpr(sub) {
   // produce a plain Int constant string) - a no-op for the common case where
   // the subscript already *is* a plain Scala Int (Int#toInt returns itself),
   // so this is a pure addition with no behavior change for that case.
+  //
+  // round-18 finding 8: every DYNAMIC (non-literal) branch also clamps the
+  // computed 0-based index to `.max(0)` - a purely defensive guard against a
+  // garbage-but-plausible upstream value (most concretely, round-17 finding
+  // 1's ref-mod numeric-MOVE honest placeholder, `BigDecimal(0)` - see
+  // renderVariableMoveSource/refModNumericPlaceholder - which is itself a
+  // legitimate, documented, deliberately-out-of-scope decline, not a bug in
+  // its own right) from ever propagating into a NEGATIVE Vector index and
+  // throwing `IndexOutOfBoundsException` (g03: a 1-based COBOL subscript
+  // computed from a still-zero placeholder becomes 0-based index -1). This
+  // does not (and cannot, without threading each specific table's own
+  // runtime length into every subscript call site) guard the UPPER bound -
+  // an implausibly-large computed subscript can still throw, matching real
+  // cobc's own equally unsafe behavior for an out-of-range subscript when
+  // SSRANGE checking isn't enabled (the default). A no-op for every
+  // legitimately in-range subscript value (`.max(0)` only ever changes a
+  // computed result that was already negative - i.e. already wrong - never
+  // a valid 0-based index, which is never negative to begin with).
   if (sub && typeof sub === 'object') {
     if (sub.type === 'literal') {
       const n = parseInt(sub.value, 10);
       return String(Number.isFinite(n) ? n - 1 : 0);
     }
     if (sub.type === 'variable') {
-      return `(${toCamelCase(sub.value)} - 1).toInt`;
+      return `(${toCamelCase(sub.value)} - 1).toInt.max(0)`;
     }
     if (sub.type === 'ArithmeticExpression' && !sub.operator && !sub.unaryMinus && !sub.functionCall) {
       if (sub.value !== null && sub.value !== undefined) {
@@ -561,11 +624,11 @@ function subscriptIndexExpr(sub) {
         return String(Number.isFinite(n) ? n - 1 : 0);
       }
       if (sub.variable) {
-        return `(${convertIdentifier(sub.variable)} - 1).toInt`;
+        return `(${convertIdentifier(sub.variable)} - 1).toInt.max(0)`;
       }
     }
   }
-  return `((${convertArithmeticExpression(sub)}) - 1).toInt`;
+  return `((${convertArithmeticExpression(sub)}) - 1).toInt.max(0)`;
 }
 
 /**
@@ -3113,6 +3176,24 @@ function generateAddCorresponding(statement, indent = 0) {
     return `${indentStr}() // ADD CORRESPONDING ${sourceUpper} TO ${targetUpper}: no matching child field names found in the group registry`;
   }
 
+  // round-18 finding 5: ADD CORRESPONDING between two SUBSCRIPTED rows of
+  // an OCCURS table (`ADD CORRESPONDING WS-ROW-A(1) TO WS-ROW-B(2)`)
+  // previously dropped BOTH operands' own subscripts entirely - sourceRef/
+  // targetRef's `.subscripts` were never consulted at all - so every
+  // matched pair fed the BARE (whole-table) `Vector[Int]` flat var straight
+  // into `BigDecimal(...)`: a hard compile error, and even had it compiled,
+  // it would have overwritten the wrong (unsubscripted) variable wholesale
+  // rather than one row's own scalar field. `subscriptSuffixExpr` (empty
+  // for an ordinary non-OCCURS group - a pure no-op for every pre-round-18
+  // ADD CORRESPONDING call site, none of which exercised a subscripted
+  // operand) resolves each side's own subscript expression down to its
+  // actual scalar read; `renderCamelAssignment` (already used by
+  // generateReturn's own subscripted INTO target, for the identical reason)
+  // writes the result back through `.updated(...)` instead of a bare
+  // (type-mismatched, whole-Vector) `=`.
+  const sourceSuffix = subscriptSuffixExpr(sourceRef?.subscripts);
+  const targetSuffix = subscriptSuffixExpr(targetRef?.subscripts);
+
   // Each matched pair is stored through the same ROUNDED-or-truncated
   // store-time coercion every other arithmetic statement now uses (round-3
   // findings 8/13). round-10 finding 5: `ADD CORRESPONDING ... ROUNDED` is
@@ -3122,9 +3203,13 @@ function generateAddCorresponding(statement, indent = 0) {
   const rounded = !!statement.rounded;
   return pairs
     .map(pair => {
-      const sumBD = `(${fieldRefToBigDecimalExpr(pair.targetCamel, pair.targetInfo)} + ${fieldRefToBigDecimalExpr(pair.sourceCamel, pair.sourceInfo)})`;
-      const rawExpr = `${pair.targetCamel} + (${coerceCorrespondingValue(pair)})`;
-      return `${indentStr}${pair.targetCamel} = ${storeNumericByInfo(pair.targetInfo, sumBD, rawExpr, rounded)}`;
+      const sourceRead = `${pair.sourceCamel}${sourceSuffix}`;
+      const targetRead = `${pair.targetCamel}${targetSuffix}`;
+      const sumBD = `(${fieldRefToBigDecimalExpr(targetRead, pair.targetInfo)} + ${fieldRefToBigDecimalExpr(sourceRead, pair.sourceInfo)})`;
+      const coercedSource = coerceCorrespondingValue({ ...pair, sourceCamel: sourceRead });
+      const rawExpr = `${targetRead} + (${coercedSource})`;
+      const stored = storeNumericByInfo(pair.targetInfo, sumBD, rawExpr, rounded);
+      return `${indentStr}${renderCamelAssignment(pair.targetCamel, targetRef?.subscripts, stored)}`;
     })
     .join('\n');
 }
@@ -3153,13 +3238,25 @@ function generateSubtractCorresponding(statement, indent = 0) {
     return `${indentStr}() // SUBTRACT CORRESPONDING ${sourceUpper} FROM ${targetUpper}: no matching child field names found in the group registry`;
   }
 
+  // round-18 finding 5 (same audit, and same fix, applied to SUBTRACT
+  // CORRESPONDING - see generateAddCorresponding's own doc comment above
+  // for the full rationale: both operands' own subscripts, previously
+  // dropped entirely, must be resolved down to the actual scalar field
+  // before building the arithmetic expression).
+  const sourceSuffix = subscriptSuffixExpr(sourceRef?.subscripts);
+  const targetSuffix = subscriptSuffixExpr(targetRef?.subscripts);
+
   // round-10 finding 5 (same audit applied to SUBTRACT CORRESPONDING).
   const rounded = !!statement.rounded;
   return pairs
     .map(pair => {
-      const diffBD = `(${fieldRefToBigDecimalExpr(pair.targetCamel, pair.targetInfo)} - ${fieldRefToBigDecimalExpr(pair.sourceCamel, pair.sourceInfo)})`;
-      const rawExpr = `${pair.targetCamel} - (${coerceCorrespondingValue(pair)})`;
-      return `${indentStr}${pair.targetCamel} = ${storeNumericByInfo(pair.targetInfo, diffBD, rawExpr, rounded)}`;
+      const sourceRead = `${pair.sourceCamel}${sourceSuffix}`;
+      const targetRead = `${pair.targetCamel}${targetSuffix}`;
+      const diffBD = `(${fieldRefToBigDecimalExpr(targetRead, pair.targetInfo)} - ${fieldRefToBigDecimalExpr(sourceRead, pair.sourceInfo)})`;
+      const coercedSource = coerceCorrespondingValue({ ...pair, sourceCamel: sourceRead });
+      const rawExpr = `${targetRead} - (${coercedSource})`;
+      const stored = storeNumericByInfo(pair.targetInfo, diffBD, rawExpr, rounded);
+      return `${indentStr}${renderCamelAssignment(pair.targetCamel, targetRef?.subscripts, stored)}`;
     })
     .join('\n');
 }
@@ -3811,10 +3908,71 @@ function evaluateConditionExpr(subject, cond) {
  * first match wins, exactly like COBOL WHEN clauses - covers every shape
  * without needing a separate strategy per condition kind.
  */
+/**
+ * Merge cascading (empty-bodied) WHEN clauses into the next clause in the
+ * same run that actually carries a body - round-18 finding 3: `EVALUATE
+ * subject WHEN "A" WHEN "B" WHEN "C" <shared-body>` is legal COBOL (repeated
+ * WHEN keywords, not a single WHEN's comma/ALSO-separated multi-value list)
+ * meaning "if A or B or C, run the shared body" - real cobc's own
+ * documented "multiple WHEN phrases sharing one imperative-statement-list"
+ * form. `parseEvaluateStatement` (parser/procedure-parser.js) has always
+ * parsed each `WHEN <cond>` as its OWN separate WhenClause node, and a WHEN
+ * with no imperative statements before the next WHEN/END-EVALUATE gets an
+ * EMPTY `.statements` list (correctly - COBOL genuinely allows an empty
+ * WHEN body written that way) - but `generateEvaluate` previously rendered
+ * every WhenClause as its OWN independent `if`/`else if` branch, each with
+ * ONLY that one clause's own (possibly empty) body. That silently turned
+ * "A or B or C share this body" into "A does nothing, B does nothing, only
+ * C runs the body" - correct only when the subject happened to equal the
+ * LAST condition in the cascade; any other match (g08: `WS-CODE = "B"`)
+ * silently ran nothing instead of the shared body at all (not even a
+ * fallthrough - the whole EVALUATE effectively no-oped for every non-final
+ * condition in every multi-WHEN cascade in the entire corpus). This merge
+ * pass runs BEFORE codegen so the actual `if`/`else if` cascade below only
+ * ever sees one WhenClause per real body, each carrying every OR'd
+ * condition-set (one per originally-separate empty-bodied WHEN that fed
+ * into it) that should trigger it - a pure generalization of the
+ * pre-existing single-condition-set case (an ordinary WHEN with a body of
+ * its own becomes a one-element conditionSets list, rendering byte-for-byte
+ * the same `if`/`else if` text as before this fix).
+ *
+ * A trailing run of empty-bodied WHEN clauses with no later body-bearing
+ * WHEN to share (WHEN OTHER never joins a cascade - parseEvaluateStatement
+ * detects it separately and never adds it to `whenClauses` at all) is
+ * preserved as-is (each kept as its own no-op branch) - matching this
+ * function's own pre-fix behavior for that narrow, unexercised shape, since
+ * there's no well-defined body to attribute them to.
+ */
+function mergeCascadingWhenClauses(whenClauses) {
+  const merged = [];
+  let pendingConditionSets = [];
+
+  for (const when of whenClauses) {
+    const conds = when.conditions || [];
+    const hasBody = Array.isArray(when.statements) && when.statements.length > 0;
+    if (!hasBody) {
+      pendingConditionSets.push(conds);
+      continue;
+    }
+    pendingConditionSets.push(conds);
+    merged.push({ conditionSets: pendingConditionSets, statements: when.statements });
+    pendingConditionSets = [];
+  }
+
+  // Any left over (a trailing empty-bodied run with nothing after it to
+  // share a body with) - keep each as its own no-op branch, unchanged from
+  // this function's own pre-fix rendering.
+  for (const conds of pendingConditionSets) {
+    merged.push({ conditionSets: [conds], statements: [] });
+  }
+
+  return merged;
+}
+
 export function generateEvaluate(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const subjects = statement.subjects || [];
-  const whenClauses = statement.whenClauses || [];
+  const whenClauses = mergeCascadingWhenClauses(statement.whenClauses || []);
 
   function statementsOrNoop(stmts, bodyIndent) {
     if (stmts && stmts.length > 0) {
@@ -3823,12 +3981,23 @@ export function generateEvaluate(statement, indent = 0) {
     return `${'  '.repeat(bodyIndent)}()`;
   }
 
-  const lines = [];
-  whenClauses.forEach((when, i) => {
-    const conds = when.conditions || [];
-    const cond = conds.length > 0
+  function conditionSetExpr(conds) {
+    return conds.length > 0
       ? conds.map((c, j) => evaluateConditionExpr(subjects[j], c)).join(' && ')
       : 'true';
+  }
+
+  const lines = [];
+  whenClauses.forEach((when, i) => {
+    // A single condition-set (the overwhelmingly common case - an ordinary
+    // WHEN whose own body follows immediately, or the only WHEN left in a
+    // cascade after mergeCascadingWhenClauses) renders byte-for-byte the
+    // same text as before this fix (no extra OR-grouping parens); only a
+    // genuinely merged multi-WHEN cascade (round-18 finding 3) adds the
+    // `(...) || (...)` grouping.
+    const cond = when.conditionSets.length > 1
+      ? when.conditionSets.map(conds => `(${conditionSetExpr(conds)})`).join(' || ')
+      : conditionSetExpr(when.conditionSets[0] || []);
     lines.push(`${indentStr}${i === 0 ? 'if' : 'else if'} (${cond}) then`);
     lines.push(statementsOrNoop(when.statements, indent + 1));
   });
@@ -4076,6 +4245,19 @@ function unstringDelimiterLiteralText(node) {
  * UNSTRING statements in the same paragraph don't collide over `_parts`/
  * `_delims`/`_newPtr` (round-4 finding 13).
  */
+/**
+ * Declared full storage width of an UNSTRING INTO target, when it's a
+ * registered String-typed (alphanumeric) field - see generateUnstring's own
+ * doc comment on why this padding matters. `null` for anything else
+ * (unregistered name, or a non-String target - UNSTRING into a numeric
+ * field isn't exercised by any corpus program and is left exactly as
+ * before, unpadded).
+ */
+function unstringTargetWidth(target) {
+  const info = lookupFieldForRef(target);
+  return info && info.scalaType === 'String' && info.picLength ? info.picLength : null;
+}
+
 export function generateUnstring(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const bi = '  '.repeat(indent + 1);
@@ -4094,43 +4276,125 @@ export function generateUnstring(statement, indent = 0) {
   const initialPtr = statement.pointer ? convertIdentifier(statement.pointer) : '1';
 
   const lines = [`${indentStr}{`];
-  lines.push(
-    `${bi}val (_parts, _delims, _newPtr, _overflow) = CobolUnstring.unstring(${source}, (${initialPtr}) - 1, Seq(${delimsScala}), ${targets.length})`
-  );
 
-  targets.forEach((t, index) => {
-    lines.push(`${bi}${renderAssignment(t.target, `_parts.lift(${index}).getOrElse("")`)}`);
-    if (t.count) {
-      // COUNT IN identifier: the number of characters actually delimited
-      // into the corresponding target from the (full fixed-width, already
-      // space-padded - see defaultElementaryValue/renderVariableMoveSource)
-      // source field - i.e. the matched substring's own length, not the
-      // receiving field's declared width (which the previous code silently
-      // left unpopulated, at its default-initialized 0).
-      lines.push(`${bi}${renderAssignment(t.count, `_parts.lift(${index}).map(_.length).getOrElse(0)`)}`);
+  // round-18 finding 4: real cobc's UNSTRING reads its SOURCE and writes its
+  // INTO targets against the SAME live storage - when a target happens to
+  // alias the very field being unstrung (g09: `UNSTRING R-FIELD(1)
+  // DELIMITED BY "-" INTO R-FIELD(1) R-FIELD(3)`), the FIRST target write
+  // (into R-FIELD(1)) is visible to every SUBSEQUENT field's own scan of
+  // R-FIELD(1) (compiler-verified against installed GnuCOBOL: after writing
+  // "AB" back into R-FIELD(1), its remaining bytes are now blank/padded, so
+  // there's no more "-" to find - the second field silently consumes
+  // nothing but trailing spaces, and the pointer ends up one past the
+  // field's own full width, not wherever the ORIGINAL (pre-overwrite) text
+  // would have put it). The previous single `CobolUnstring.unstring(source,
+  // ..., targets.length)` batch call evaluated `source` (a live Scala
+  // expression, e.g. `rField(0)`) into its arguments exactly ONCE, before
+  // any target write happened - a frozen snapshot, diverging from cobc's
+  // own live-aliasing the moment source and a target coincide.
+  //
+  // Fixed by processing exactly one field per target, re-evaluating
+  // `source` FRESH for every single-field call (never hoisted into a `val`)
+  // - so a call made after an earlier target's write sees that write's
+  // effect, exactly like real cobc's in-place storage does. `_ptr` (a local
+  // var, separate from WS-PTR's own field, which COBOL only ever writes
+  // back once at the very end) threads the running 0-based cursor across
+  // calls; `_uActive` mirrors CobolUnstring.unstring's own internal
+  // `continue_` flag (false once a call finds no more delimiter - an empty
+  // DELIMITER IN result signals this exactly per that field's own
+  // documented meaning below) - once false, every LATER target is left at
+  // "" without even attempting another call, matching real COBOL leaving
+  // any INTO identifier past the last actually-delimited field untouched
+  // (approximated here, as before this fix, as an explicit empty-string
+  // write - every target is a flat, already-declared var with no
+  // "leave completely unassigned" concept). This whole restructuring is a
+  // pure no-op for the overwhelmingly common non-aliased case: re-reading
+  // an unchanged `source` expression produces byte-for-byte the same split
+  // a single batch call would, one field at a time.
+  if (targets.length === 0) {
+    // Degenerate (invalid COBOL - UNSTRING always has at least one INTO
+    // target) - preserve the old single zero-field batch call verbatim
+    // rather than special-casing further; only the ON OVERFLOW/POINTER
+    // wiring below can observe it, and no corpus program exercises this
+    // shape.
+    lines.push(
+      `${bi}val (_parts, _delims, _newPtr, _overflow) = CobolUnstring.unstring(${source}, (${initialPtr}) - 1, Seq(${delimsScala}), 0)`
+    );
+    if (statement.pointer) {
+      lines.push(`${bi}${renderAssignment(statement.pointer, '_newPtr + 1')}`);
     }
-    if (t.delimiter) {
-      // DELIMITER IN identifier: the literal delimiter text that actually
-      // matched at this field's boundary (empty when this field was the last
-      // one, consumed with no following delimiter at all) - round-4 finding 12.
-      lines.push(`${bi}${renderAssignment(t.delimiter, `_delims.lift(${index}).getOrElse("")`)}`);
+  } else {
+    lines.push(`${bi}var _ptr = (${initialPtr}) - 1`);
+    lines.push(`${bi}var _overflow = false`);
+    lines.push(`${bi}var _uActive = true`);
+    if (statement.tallying) lines.push(`${bi}var _uFilled = 0`);
+
+    const bi2 = `${bi}  `;
+    targets.forEach((t, index) => {
+      // round-18 finding 4 companion: real COBOL UNSTRING populates a
+      // receiving field exactly like an alphanumeric MOVE would - the
+      // matched text, space-padded (or truncated) out to the field's own
+      // FULL declared storage width - not the bare matched substring left
+      // otherwise unpadded. This was already a latent (if usually invisible
+      // - DISPLAY re-pads to full width anyway) gap even before this
+      // round's live-aliasing fix, but it becomes directly observable the
+      // moment a target is re-read as a later field's own SOURCE in the
+      // same UNSTRING (g09): without padding, R-FIELD(1)'s in-model value
+      // after its own write-back is the short unpadded "AB" (length 2), so
+      // the very next field's scan (also reading R-FIELD(1)) clamps its
+      // start position against a 2-character string instead of the real
+      // 10-byte fixed storage cobc actually has - silently producing the
+      // wrong final WITH POINTER value even once the *target values*
+      // themselves are otherwise correct. Only applied when the target is a
+      // registered String-typed (alphanumeric) field with a known width;
+      // any other shape (unregistered/numeric target - not exercised by any
+      // corpus program) falls back to the prior unpadded text, unchanged.
+      const targetWidth = unstringTargetWidth(t.target);
+      const fit = (expr) => (targetWidth ? `CobolFmt.fitLeft(${expr}, ${targetWidth})` : expr);
+
+      lines.push(`${bi}if _uActive then`);
+      lines.push(
+        `${bi2}val (_parts${index}, _delims${index}, _newPtr${index}, _ovf${index}) = ` +
+        `CobolUnstring.unstring(${source}, _ptr, Seq(${delimsScala}), 1)`
+      );
+      lines.push(`${bi2}${renderAssignment(t.target, fit(`_parts${index}.headOption.getOrElse("")`))}`);
+      if (t.count) {
+        // COUNT IN identifier: the number of characters actually delimited
+        // into the corresponding target - the matched substring's own
+        // length, not the receiving field's declared width.
+        lines.push(`${bi2}${renderAssignment(t.count, `_parts${index}.headOption.map(_.length).getOrElse(0)`)}`);
+      }
+      if (t.delimiter) {
+        // DELIMITER IN identifier: the literal delimiter text that actually
+        // matched at this field's boundary (empty when this field was the
+        // last one, consumed with no following delimiter at all) - round-4
+        // finding 12.
+        lines.push(`${bi2}${renderAssignment(t.delimiter, `_delims${index}.headOption.getOrElse("")`)}`);
+      }
+      lines.push(`${bi2}_ptr = _newPtr${index}`);
+      lines.push(`${bi2}_overflow = _ovf${index}`);
+      if (statement.tallying) lines.push(`${bi2}_uFilled += 1`);
+      lines.push(`${bi2}if _delims${index}.headOption.getOrElse("") == "" then _uActive = false`);
+      lines.push(`${bi}else`);
+      lines.push(`${bi2}${renderAssignment(t.target, fit('""'))}`);
+      if (t.count) lines.push(`${bi2}${renderAssignment(t.count, '0')}`);
+      if (t.delimiter) lines.push(`${bi2}${renderAssignment(t.delimiter, '""')}`);
+    });
+
+    if (statement.tallying) {
+      lines.push(`${bi}${renderAssignment(statement.tallying, '_uFilled')}`);
     }
-  });
 
-  if (statement.tallying) {
-    lines.push(`${bi}${renderAssignment(statement.tallying, '_parts.length')}`);
-  }
-
-  if (statement.pointer) {
-    // CobolUnstring.unstring returns a 0-based "next unconsumed character"
-    // index; WITH POINTER's own field is COBOL's 1-based position.
-    lines.push(`${bi}${renderAssignment(statement.pointer, '_newPtr + 1')}`);
+    if (statement.pointer) {
+      // The running cursor is 0-based internally; WITH POINTER's own field
+      // is COBOL's 1-based position.
+      lines.push(`${bi}${renderAssignment(statement.pointer, '_ptr + 1')}`);
+    }
   }
 
   // ON OVERFLOW / NOT ON OVERFLOW (round-6 finding 6) - the clauses are now
   // parsed (parser/procedure-parser.js's parseUnstringStatement); `_overflow`
-  // (CobolUnstring.unstring's own 4th return value - see its doc comment) is
-  // set exactly when the source had more delimited fields than there were
+  // is set exactly when the source had more delimited fields than there were
   // INTO targets to receive them. Only emitted when the statement actually
   // has one of these clauses, mirroring generateString's identical pattern.
   const hasOverflowClauses = (statement.onOverflow && statement.onOverflow.length > 0) ||
@@ -4388,6 +4652,8 @@ export function generateExpression(statement, indent = 0) {
       return generateSearch(statement, indent);
     case 'SORT':
       return generateSort(statement, indent);
+    case 'MERGE':
+      return generateMerge(statement, indent);
     case 'RELEASE':
       return generateRelease(statement, indent);
     case 'RETURN':
@@ -5704,30 +5970,7 @@ function generateSort(statement, indent = 0) {
     lines.push(`${indentStr}() // TODO: SORT ... USING ${statement.using.join(', ')} not yet supported (no corpus target exercises it; only INPUT PROCEDURE is implemented)`);
   }
 
-  const flat = flattenSortKeys(statement.keys);
-  if (flat.length === 0) {
-    lines.push(`${indentStr}() // SORT ${statement.fileName}: no ASCENDING/DESCENDING KEY found - buffer left in RELEASE order`);
-  } else {
-    // True multi-key ordering with per-key ASCENDING/DESCENDING, evaluated
-    // as a tie-breaking cascade (first key decides unless equal, then the
-    // next key, ...) via sortInPlaceWith rather than sortInPlaceBy building
-    // one shared tuple Ordering - a single shared Ordering can't flip
-    // direction per-component for a mixed ASCENDING/DESCENDING key list (the
-    // previous approximation only ever reversed the *whole* comparison,
-    // which is only correct when every key shares the same direction).
-    // ArrayBuffer's sort is stable either way (verified), so ties still
-    // preserve RELEASE order exactly like the single-ascending-key case did.
-    const bi = `${indentStr}  `;
-    const cmpLines = [`${indentStr}${info.bufferVar}.sortInPlaceWith { (a, b) =>`];
-    flat.forEach((k, i) => {
-      const op = k.order === 'DESCENDING' ? '>' : '<';
-      const kw = i === 0 ? 'if' : 'else if';
-      cmpLines.push(`${bi}${kw} a.${k.camel} != b.${k.camel} then a.${k.camel} ${op} b.${k.camel}`);
-    });
-    cmpLines.push(`${bi}else false`);
-    cmpLines.push(`${indentStr}}`);
-    lines.push(cmpLines.join('\n'));
-  }
+  lines.push(sortCascadeLines(statement.fileName, info.bufferVar, flattenSortKeys(statement.keys), indentStr));
 
   lines.push(`${indentStr}${info.idxVar} = 0`);
 
@@ -5736,6 +5979,145 @@ function generateSort(statement, indent = 0) {
   } else if (statement.giving && statement.giving.length > 0) {
     lines.push(`${indentStr}() // TODO: SORT ... GIVING ${statement.giving.join(', ')} not yet supported (no corpus target exercises it; only OUTPUT PROCEDURE is implemented)`);
   }
+
+  return lines.join('\n');
+}
+
+/**
+ * The key-ordering cascade shared by SORT and MERGE (round-18 finding 2:
+ * MERGE previously had no codegen support at all - see generateMerge's own
+ * doc comment below): true multi-key ordering with per-key ASCENDING/
+ * DESCENDING, evaluated as a tie-breaking cascade (first key decides unless
+ * equal, then the next key, ...) via sortInPlaceWith rather than
+ * sortInPlaceBy building one shared tuple Ordering - a single shared
+ * Ordering can't flip direction per-component for a mixed ASCENDING/
+ * DESCENDING key list (an approximation that only reverses the *whole*
+ * comparison is only correct when every key shares the same direction).
+ * ArrayBuffer's sort is stable either way (verified), so ties preserve
+ * RELEASE/append order.
+ *
+ * `fileNameForComment` is only used in the "no key found" fallback comment
+ * (SORT's own file name, or MERGE's) - purely cosmetic, never affects
+ * behavior.
+ */
+function sortCascadeLines(fileNameForComment, bufferVar, flat, indentStr) {
+  if (flat.length === 0) {
+    return `${indentStr}() // SORT/MERGE ${fileNameForComment}: no ASCENDING/DESCENDING KEY found - buffer left in append order`;
+  }
+  const bi = `${indentStr}  `;
+  const cmpLines = [`${indentStr}${bufferVar}.sortInPlaceWith { (a, b) =>`];
+  flat.forEach((k, i) => {
+    const op = k.order === 'DESCENDING' ? '>' : '<';
+    const kw = i === 0 ? 'if' : 'else if';
+    cmpLines.push(`${bi}${kw} a.${k.camel} != b.${k.camel} then a.${k.camel} ${op} b.${k.camel}`);
+  });
+  cmpLines.push(`${bi}else false`);
+  cmpLines.push(`${indentStr}}`);
+  return cmpLines.join('\n');
+}
+
+/**
+ * Generate MERGE statement.
+ *
+ * Round-18 finding 2: MERGE previously had NO generator support at all -
+ * `generateExpression`'s statement-type switch had no 'MERGE' case, so a
+ * `MergeStatement` node silently fell through to the generic default no-op
+ * (`docs/CAPABILITY_AUDIT_AND_ROADMAP.md`'s claim that MERGE was oracle-
+ * equivalent was simply never actually tested before this round).
+ *
+ * MERGE ... USING file1 file2 ... OUTPUT PROCEDURE reuses almost all of
+ * SORT's own machinery (the SD work-file model: buildSortFileRegistry/
+ * generateSortFileSupport's row case class + Vector buffer + read-cursor
+ * var, and the same sortCascadeLines key-ordering cascade above) - the only
+ * genuinely new piece is *filling* the buffer, since MERGE (unlike SORT) has
+ * no INPUT PROCEDURE clause at all - every USING file is opened, read to
+ * exhaustion, and closed by MERGE itself (real COBOL semantics: a MERGE
+ * ... USING file requires that file to NOT already be open), each record
+ * copied into the SD record's own fields BY POSITION (the same convention
+ * RELEASE ... FROM already uses for a WORKING-STORAGE source), then appended
+ * to the shared buffer exactly like RELEASE does.
+ *
+ * This is a real multi-way-merge-equivalent, not a mere approximation
+ * disguised as one: real MERGE assumes every USING file is ALREADY sorted
+ * (ascending/descending, per its own KEY clause) - concatenating every
+ * file's records (each internally already in the declared key order) and
+ * then applying one single STABLE sort by that same key produces exactly
+ * the same final ordering a genuine k-way merge would, including tie-
+ * breaking (a stable sort preserves each input file's own internal relative
+ * order for equal keys, and preserves USING's own listed file order for an
+ * equal key straddling two different files - matching a textbook merge's
+ * left-to-right tie-break). Verified against installed GnuCOBOL (g12):
+ * `MERGE MERGE-FILE ASCENDING KEY M-KEY USING IN-FILE-1 IN-FILE-2 OUTPUT
+ * PROCEDURE IS EMIT-PARA` correctly interleaves IN-FILE-1's (010, 030) and
+ * IN-FILE-2's (020, 040) into 010/020/030/040 order.
+ */
+function generateMerge(statement, indent = 0) {
+  const indentStr = '  '.repeat(indent);
+  const info = lookupSortFile(statement.fileName);
+  if (!info) {
+    return `${indentStr}() // MERGE ${statement.fileName}: no matching SD record found - cannot generate a merge buffer`;
+  }
+
+  const lines = [];
+  lines.push(`${indentStr}${info.bufferVar}.clear()`);
+
+  if (statement.using && statement.using.length > 0) {
+    for (const fileRef of statement.using) {
+      lines.push(generateMergeUsingFileLines(fileRef, info, indent));
+    }
+  } else {
+    lines.push(`${indentStr}() // MERGE ${statement.fileName}: no USING files found - buffer left empty`);
+  }
+
+  lines.push(sortCascadeLines(statement.fileName, info.bufferVar, flattenSortKeys(statement.keys), indentStr));
+
+  lines.push(`${indentStr}${info.idxVar} = 0`);
+
+  if (statement.outputProcedure) {
+    lines.push(`${indentStr}${procedureCallExpr(statement.outputProcedure)}`);
+  } else if (statement.giving && statement.giving.length > 0) {
+    lines.push(`${indentStr}() // TODO: MERGE ... GIVING ${statement.giving.join(', ')} not yet supported (no corpus target exercises it; only OUTPUT PROCEDURE is implemented)`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Lines to OPEN one MERGE ... USING file, drain every one of its records
+ * into the shared SD merge buffer (positionally copied into the SD record's
+ * own fields - see generateMerge's own doc comment above), then CLOSE it
+ * again. Reuses file-io-gen.js's own generateOpen/generateClose (the exact
+ * same OPEN/CLOSE codegen an explicit COBOL OPEN/CLOSE statement would
+ * produce) so this gets the same FILE STATUS/exception handling for free,
+ * and reuses readDestination/readAssignLines (the same per-line decode
+ * READ already uses) plus positionalPairs/coerceCorrespondingValue (the same
+ * position-matched copy RELEASE ... FROM already uses) rather than
+ * reimplementing either.
+ */
+function generateMergeUsingFileLines(fileRef, sortInfo, indent = 0) {
+  const indentStr = '  '.repeat(indent);
+  const fileName = typeof fileRef === 'string' ? fileRef : (fileRef?.name || fileRef?.fileName || String(fileRef || ''));
+  const fileNameUpper = String(fileName).toUpperCase();
+  const { iteratorVar } = fileHandleVarNames(fileName);
+
+  const dest = readDestination({ into: null }, fileName);
+  const recordNameUpper = String(FILE_RECORD_REGISTRY.get(fileNameUpper) || '').toUpperCase();
+  const pairs = recordNameUpper
+    ? positionalPairs(resolveGroupKey(recordNameUpper), resolveGroupKey(String(sortInfo.recordNameUpper || '').toUpperCase()))
+    : [];
+
+  const lines = [];
+  lines.push(generateOpen({ files: [fileName], mode: 'INPUT' }, indent));
+  lines.push(`${indentStr}while ${iteratorVar}.hasNext do`);
+  const bi = `${indentStr}  `;
+  lines.push(`${bi}val _mergeLine = ${iteratorVar}.next()`);
+  lines.push(...readAssignLines(dest, '_mergeLine', bi));
+  for (const pair of pairs) {
+    lines.push(`${bi}${pair.targetCamel} = ${coerceCorrespondingValue(pair)}`);
+  }
+  const ctorArgs = sortInfo.fields.map(f => f.camel).join(', ');
+  lines.push(`${bi}${sortInfo.bufferVar} += ${sortInfo.caseClassName}(${ctorArgs})`);
+  lines.push(generateClose({ files: [fileName] }, indent));
 
   return lines.join('\n');
 }
@@ -6063,6 +6445,42 @@ function generateReadStatement(statement, indent = 0) {
  *   - `{ mode: 'text', expr: <bare camelCase fallback> }` - nothing else
  *     resolved (matches the old, pre-round-10 fallback exactly).
  */
+/**
+ * Plan for `WRITE rec FROM <literal>` (a string/numeric/figurative-constant
+ * literal operand, not an identifier) - round-18 finding 2's g12 companion
+ * gap. Real COBOL semantics: the literal is implicitly MOVEd into `rec`
+ * (fit/padded to `rec`'s own total declared width, exactly like an ordinary
+ * `MOVE "..." TO rec` would) before the record is written - so this reuses
+ * `renderLiteralForTarget` (the exact same literal-into-alphanumeric-target
+ * rendering `generateScalarIntoGroupMove`'s MOVE-into-a-whole-group path
+ * already uses) against a synthetic alphanumeric target descriptor sized to
+ * `rec`'s own width (its elementary FIELD_REGISTRY width, or - for a group
+ * record - GROUP_BYTE_LENGTH_REGISTRY's total byte length), producing a
+ * compile-time-constant, already-fitted Scala string literal - never a
+ * plain unpadded/untruncated literal, and never the record's own (unrelated,
+ * default-initialized) current field values the way falling through to
+ * writeRecordPlan(recordName) would.
+ *
+ * Returns null when `rec`'s width can't be resolved at all (not a
+ * registered elementary field or group) - callers fall back to
+ * writeRecordPlan's own pre-existing (non-literal) handling in that case.
+ */
+function writeFromLiteralPlan(literal, recordName) {
+  const info = lookupField(recordName);
+  let width = null;
+  if (info) {
+    width = info.picLength || null;
+  } else {
+    const nameUpper = String(recordName || '').toUpperCase();
+    const lenRaw = GROUP_BYTE_LENGTH_REGISTRY.get(nameUpper);
+    width = lenRaw != null ? Number(lenRaw) : null;
+  }
+  if (width == null) return null;
+
+  const syntheticInfo = { scalaType: 'String', dataType: 'alphanumeric', picLength: width, justified: false };
+  return { mode: 'text', expr: renderLiteralForTarget(literal, syntheticInfo) };
+}
+
 function writeRecordPlan(recordName) {
   const info = lookupField(recordName);
   if (info) {
@@ -6162,8 +6580,17 @@ function generateWriteStatement(statement, indent = 0) {
   const recordName = statement.recordName || statement.record || 'record';
   const fileName = fileNameForRecord(recordName);
   const { writerVar } = fileHandleVarNames(fileName);
+  // round-18 finding 2's g12 companion gap: `WRITE rec FROM "literal"` (a
+  // string/numeric/figurative-constant literal, not an identifier) needs its
+  // own plan - see writeFromLiteralPlan's doc comment. Falls back to the
+  // ordinary identifier-FROM/no-FROM plan whenever the literal's own target
+  // width can't be resolved (should not happen for any registered record,
+  // but never silently substitutes the wrong value in that case either).
+  const literalPlan = statement.from && statement.from.type === 'Literal'
+    ? writeFromLiteralPlan(statement.from, recordName)
+    : null;
   const sourceName = statement.from ? (statement.from.name || statement.from) : recordName;
-  const plan = writeRecordPlan(sourceName);
+  const plan = literalPlan || writeRecordPlan(sourceName);
   // round-6 finding 2/3 companion: this generator never models a WRITE
   // failure path, so a registered FILE STATUS field always goes to "00"
   // (successful write) here - see FILE_STATUS_REGISTRY's doc comment.
@@ -6271,7 +6698,7 @@ function generatePerform(statement, indent = 0) {
   function body(bodyIndent) {
     const bodyLines = [];
     if (statement.targetParagraph) {
-      bodyLines.push(`${'  '.repeat(bodyIndent)}${paragraphMethodName(statement.targetParagraph, statement.targetSection)}()`);
+      bodyLines.push(`${'  '.repeat(bodyIndent)}${performTargetCallExpr(statement)}`);
     }
     if (statement.statements) {
       for (const stmt of statement.statements) {
@@ -6296,7 +6723,7 @@ function generatePerform(statement, indent = 0) {
   // inside that *paragraph* is a separate, out-of-scope case (see
   // generateExit's doc comment) - so it needs no boundary.
   if (statement.performType === 'simple') {
-    lines.push(`${indentStr}${paragraphMethodName(statement.targetParagraph || 'procedure', statement.targetSection)}()`);
+    lines.push(`${indentStr}${performTargetCallExpr(statement)}`);
   } else if (statement.performType === 'times') {
     const times = statement.times?.value || statement.times || '1';
     const bi = '  '.repeat(indent + 1);
@@ -6368,7 +6795,7 @@ function generatePerform(statement, indent = 0) {
     }
     lines.push(`${indentStr}}`);
   } else if (statement.targetParagraph) {
-    lines.push(`${indentStr}${paragraphMethodName(statement.targetParagraph, statement.targetSection)}()`);
+    lines.push(`${indentStr}${performTargetCallExpr(statement)}`);
   }
 
   return lines.join('\n');

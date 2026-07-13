@@ -248,16 +248,23 @@ test('Finding 6a: parseUnstringStatement parses ON OVERFLOW / NOT ON OVERFLOW in
   assert.equal(stmt.notOnOverflow[0].type, 'DisplayStatement');
 });
 
-test('Finding 6b: generateUnstring destructures CobolUnstring.unstring\'s 4th (overflow) element and gates ON OVERFLOW/NOT ON OVERFLOW on it', () => {
+test('Finding 6b: generateUnstring threads CobolUnstring.unstring\'s 4th (overflow) element (from whichever per-target call actually ran last) and gates ON OVERFLOW/NOT ON OVERFLOW on it', () => {
   const code = scalaOf(UNSTRING_OVERFLOW_SOURCE);
-  assert.match(code, /val \(_parts, _delims, _newPtr, _overflow\) = CobolUnstring\.unstring/);
+  // round-18 finding 4 restructured UNSTRING to one per-target field call
+  // (`_ovf0`/`_ovf1`, assigned into a shared `_overflow` var after each real
+  // call) instead of a single whole-statement 4-tuple destructure - see
+  // tests/round4-fixes.test.js's "Finding 13" test and tests/oracle/
+  // README.md's round-18 table for the full rationale (real cobc's UNSTRING
+  // reads/writes source and targets against the same live storage).
+  assert.match(code, /var _overflow = false/);
+  assert.match(code, /_overflow = _ovf1/);
   assert.match(code, /if _overflow then/);
   assert.match(code, /"OVERFLOWED"/);
   assert.match(code, /"FIT-OK"/);
   assert.match(code, /def unstring\(source: String, startPos: Int, delims: Seq\[\(String, Boolean\)\], maxFields: Int\): \(Vector\[String\], Vector\[String\], Int, Boolean\)/);
 });
 
-test('Finding 6 (regression guard): UNSTRING with neither overflow clause still compiles to the plain 4-tuple destructure with no overflow branch', () => {
+test('Finding 6 (regression guard): UNSTRING with neither overflow clause still threads _overflow with no overflow branch emitted', () => {
   const source = `       IDENTIFICATION DIVISION.
        PROGRAM-ID. T.
        DATA DIVISION.
@@ -271,6 +278,7 @@ test('Finding 6 (regression guard): UNSTRING with neither overflow clause still 
            STOP RUN.
 `;
   const code = scalaOf(source);
-  assert.match(code, /val \(_parts, _delims, _newPtr, _overflow\) = CobolUnstring\.unstring/);
+  assert.match(code, /var _overflow = false/);
+  assert.match(code, /_overflow = _ovf1/);
   assert.doesNotMatch(code, /if _overflow then/);
 });

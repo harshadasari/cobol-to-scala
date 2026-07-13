@@ -881,7 +881,39 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
   const lines = [];
   let offset = 0;
 
-  for (const child of realChildren) {
+  // round-18 finding 7: the redefining item's own children can themselves be
+  // nested GROUPs, arbitrarily many levels deep (g10: `01 WS-ALT REDEFINES
+  // WS-L1. 05 WS-ALT-L2. 10 WS-ALT-L3. 15 WS-ALT-L4. 20 WS-ALT-FLAT PIC
+  // X(8).` - WS-ALT-FLAT is 4 levels below WS-ALT itself). This loop
+  // previously only ever handled ONE flat level of ELEMENTARY (or OCCURS-
+  // elementary) children directly - a child that is itself a group (real
+  // children of its own, no `.pic`) fell through to the elementary-sizing
+  // logic below, which reads `child.pic.length` - `undefined` for a group,
+  // silently producing a zero-width slice (`substring(start, start)`) for
+  // that whole child AND everything nested inside it, so the true leaf
+  // (WS-ALT-FLAT) was NEVER declared or registered at all - a hard "Not
+  // found: wsAltFlat" compile error the instant PROCEDURE DIVISION code
+  // referenced it. Recursing into a nested (non-OCCURS-bearing) group
+  // child's own children here - using the SAME running `offset`, exactly
+  // like an ordinary (non-REDEFINES) group's own recursive registration
+  // does - reaches the true leaves regardless of nesting depth; only a
+  // nested group that ALSO carries its own OCCURS (a table-of-groups nested
+  // inside a REDEFINES's own children - a rarer shape no corpus program
+  // exercises) still falls through to the pre-existing (zero-width, honest
+  // limitation - unchanged by this fix) elementary-sizing path below,
+  // rather than attempting an unverified nested-table character model.
+  function walk(children) {
+    for (const child of children) {
+      const realGrandchildren = (child.children || []).filter(c => !isLevel(c, 88));
+      if (realGrandchildren.length > 0 && !hasOccurs(child)) {
+        walk(realGrandchildren);
+        continue;
+      }
+      processLeaf(child);
+    }
+  }
+
+  function processLeaf(child) {
     const camel = toCamelCase(child.name);
     const count = hasOccurs(child) && occursCount(child) > 1 ? occursCount(child) : 1;
     const usage = (child.usage || 'DISPLAY').toUpperCase();
@@ -923,7 +955,7 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
           justified: false,
           blankWhenZero: false,
         });
-        continue;
+        return;
       }
       // No real byte width, or a 'legacy' codec (COMP-1/COMP-2 float/
       // double, no byte-level codec support here) - fall through to the
@@ -995,6 +1027,7 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
     }
   }
 
+  walk(realChildren);
   return lines;
 }
 
@@ -1150,6 +1183,64 @@ function flattenRedefinesLeaves(groupItem) {
       if (real.length > 0) {
         if (hasOccurs(child)) return false;
         if (!walk(real)) return false;
+        continue;
+      }
+      const baseType = scalaBaseType(child);
+      if (baseType !== 'Int' && baseType !== 'String') return false;
+      const pic = child.pic && typeof child.pic === 'object' ? child.pic : null;
+      if (!pic || !pic.length) return false;
+      if (baseType === 'Int' && pic.signed) return false;
+      const count = hasOccurs(child) && occursCount(child) > 1 ? occursCount(child) : 1;
+      if (count > 1 && baseType !== 'String') return false;
+      leaves.push({
+        camel: toCamelCase(child.name),
+        baseType,
+        count,
+        elementWidth: pic.length,
+        totalWidth: pic.length * count,
+        intDigits: pic.integerDigits || pic.length,
+      });
+    }
+    return true;
+  }
+  const ok = walk((groupItem.children || []).filter(c => !isLevel(c, 88)));
+  return ok ? leaves : null;
+}
+
+/**
+ * round-18 finding 6 companion: a FILLER-tolerant variant of
+ * flattenRedefinesLeaves, used ONLY by occursOnRedefinesItemLines below.
+ * flattenRedefinesLeaves bails outright on a FILLER target child because
+ * IT needs to expose the target's own named fields THROUGH the redefining
+ * view - a nameless FILLER has nothing to expose there. This flattening
+ * only ever needs a flat, whole-target CONCATENATED TEXT VIEW (get/set) to
+ * slice the REDEFINING item's own children out of - a FILLER's bytes are
+ * just as real, and just as readable/writable via its own hidden
+ * `_fillerCamel` var (buildFieldRegistry's own elementary-FILLER branch
+ * always runs for the target BEFORE this REDEFINES branch is ever reached,
+ * since REDEFINES must name an earlier-declared sibling - so `_fillerCamel`
+ * is always already stashed by this point), as a named sibling's own flat
+ * var. g07's own WS-SRC-TABLE (three `05 FILLER PIC X(8) VALUE "..."`
+ * items, redefined by an OCCURS-bearing WS-SRC-ARR) is exactly this shape -
+ * flattenRedefinesLeaves alone would bail on the very first FILLER and
+ * leave nothing to build a flat view from at all.
+ */
+function flattenRedefinesLeavesAllowingFiller(groupItem) {
+  const leaves = [];
+  function walk(children) {
+    for (const child of children) {
+      if (isLevel(child, 88)) continue;
+      const real = (child.children || []).filter(c => !isLevel(c, 88));
+      if (real.length > 0) {
+        if (hasOccurs(child)) return false;
+        if (!walk(real)) return false;
+        continue;
+      }
+      if (child.isFiller || !child.name) {
+        if (!child._fillerCamel || child._fillerInfo?.scalaType !== 'String') return false;
+        const width = child._fillerInfo?.picLength || (child.pic && typeof child.pic === 'object' ? child.pic.length : 0) || 0;
+        if (!width) return false;
+        leaves.push({ camel: child._fillerCamel, baseType: 'String', count: 1, elementWidth: width, totalWidth: width, intDigits: 0 });
         continue;
       }
       const baseType = scalaBaseType(child);
@@ -1705,6 +1796,33 @@ function todoStubRedefinesLines(redefiningItem, registry, tableRegistry) {
  */
 function groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry, targetAbsOffset = 0) {
   const redefiningRealChildren = (item.children || []).filter(c => !isLevel(c, 88));
+
+  // round-18 finding 6: OCCURS directly on the REDEFINES item ITSELF (not on
+  // a nested row-group descendant of it - characterSlicedGroupRedefinesLines
+  // already handles THAT shape, an OCCURS-bearing CHILD of the redefining
+  // group) means item's own children are PER-ROW fields of a table, not
+  // per-occurrence scalars. g07: `01 WS-SRC-ARR REDEFINES WS-SRC-TABLE
+  // OCCURS 3 TIMES. 05 A-KEY PIC 9(3). 05 A-VAL PIC X(5).` - A-KEY/A-VAL are
+  // each one field of EVERY one of the 3 rows, not a single scalar sliced
+  // once. Before this fix, `hasOccurs(item)` was never even consulted here -
+  // A-KEY/A-VAL always got a single, zero-parameter accessor (`def aKey:
+  // Int`, sliced from only the FIRST occurrence's bytes) - a hard "method
+  // aKey does not take parameters" compile error the moment PROCEDURE
+  // DIVISION code subscripted it (`A-KEY(WS-IDX)`), exactly like any other
+  // registered scalar field would reject a subscript.
+  if (hasOccurs(item) && redefiningRealChildren.length > 0) {
+    const count = occursCount(item);
+    if (count > 1) {
+      const rowLines = occursOnRedefinesItemLines(item, targetItem, redefiningRealChildren, registry, count, targetAbsOffset);
+      if (rowLines) return rowLines;
+      // Falls through to the ordinary (scalar, single-occurrence) handling
+      // below only when the target's own shape can't be flattened at all
+      // (see occursOnRedefinesItemLines' own doc comment) - matches this
+      // function's pre-existing honest-decline behavior for that shape
+      // rather than inventing a new failure mode.
+    }
+  }
+
   const textLeaves = flattenRedefinesLeaves(targetItem);
 
   // round-16 finding 1: flattenRedefinesLeaves' text-digit model is tried
@@ -1733,6 +1851,123 @@ function groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry,
   ];
 
   lines.push(...characterSlicedGroupRedefinesLines(redefiningRealChildren, flatName, registry));
+  return lines;
+}
+
+/**
+ * round-18 finding 6: builds TABLE (Vector) accessors for each of the
+ * REDEFINES item's own children when OCCURS sits on the REDEFINES item
+ * ITSELF (`count` occurrences of one row, each row being `realChildren` in
+ * declaration order) - see groupOverGroupRedefinesLines' own doc comment
+ * above for the motivating shape. Builds the identical synthetic flat-
+ * character view over the TARGET's storage that the scalar (non-OCCURS)
+ * path builds (flattenRedefinesLeavesAllowingFiller's text model first,
+ * flattenRedefinesLeavesBytes' byte-accurate codec model second - the
+ * FILLER-tolerant variant is needed here specifically because g07's own
+ * target is a group of THREE bare FILLERs with no named fields of its own
+ * at all), then slices each row's own children out of it positionally:
+ * row `i`'s child at within-row byte offset `start` occupies
+ * `flatName.substring(i*rowWidth + start, i*rowWidth + start + width)`.
+ *
+ * Only supports a DISPLAY (character/zoned-numeric), non-signed, non-nested
+ * child - the same restriction flattenRedefinesLeaves/textLeafOp already
+ * apply to the scalar case (a byte-accurate/signed/COMP child of the
+ * REDEFINING item's own row is a rarer shape no corpus program exercises;
+ * returns `null` in that case so the caller falls back to its pre-existing
+ * scalar handling rather than emit a wrong table view).
+ *
+ * Each child's SETTER must rebuild the ENTIRE flat view, not just its own
+ * row slices - a row's other children's bytes are interleaved with this
+ * child's own (row 0: child A bytes then child B bytes, row 1: child A
+ * bytes then child B bytes, ...), so overwriting only this child's own
+ * positions the way a scalar REDEFINES child's setter does (prefix + new
+ * middle + suffix, all contiguous) isn't possible here. Every sibling
+ * child's CURRENT row value is read back through its own generated getter
+ * (`<siblingCamel>(i)`) and re-encoded, exactly preserving it, while this
+ * child's row values come from the new `v` being assigned.
+ */
+function occursOnRedefinesItemLines(item, targetItem, realChildren, registry, count, targetAbsOffset = 0) {
+  const tolerantLeaves = flattenRedefinesLeavesAllowingFiller(targetItem);
+  const ops = tolerantLeaves
+    ? tolerantLeaves.map(textLeafOp)
+    : (flattenRedefinesLeavesBytes(targetItem, targetAbsOffset) || []).map(byteLeafOp);
+  if (ops.length === 0) return null;
+
+  // Build each row-child's own within-row offset/width - restricted to a
+  // plain DISPLAY, unsigned, non-nested, non-OCCURS-of-its-own child (see
+  // this function's own doc comment).
+  const specs = [];
+  let rowOffset = 0;
+  for (const child of realChildren) {
+    if (child.isFiller || !child.name) return null;
+    if ((child.children || []).some(c => !isLevel(c, 88))) return null;
+    if (hasOccurs(child)) return null;
+    const baseType = scalaBaseType(child);
+    if (baseType !== 'Int' && baseType !== 'String') return null;
+    const pic = child.pic && typeof child.pic === 'object' ? child.pic : null;
+    if (!pic || !pic.length) return null;
+    if (baseType === 'Int' && pic.signed) return null;
+    specs.push({
+      nameUpper: child.name.toUpperCase(),
+      camel: toCamelCase(child.name),
+      baseType,
+      start: rowOffset,
+      width: pic.length,
+      intDigits: pic.integerDigits || pic.length,
+      signed: !!pic.signed,
+      justified: String(child.justified || '').toUpperCase() === 'RIGHT',
+    });
+    rowOffset += pic.length;
+  }
+  const rowWidth = rowOffset;
+
+  const flatName = `${toCamelCase(item.name)}BaseFlat`;
+  const lines = [
+    `  // REDEFINES ${item.redefines}: OCCURS ${count} on ${item.name} itself - ${flatName} is a synthetic`,
+    `  // flat-character view over the target's own storage; ${item.name}'s children below are`,
+    `  // TABLE (Vector) accessors, one row of ${rowWidth} characters per occurrence, sliced from it.`,
+    ...buildFlatViewLines(flatName, ops),
+  ];
+
+  function decodeExpr(spec, sliceExpr) {
+    return spec.baseType === 'Int' ? `${sliceExpr}.toInt` : sliceExpr;
+  }
+  function encodeExpr(spec, valueExpr) {
+    return spec.baseType === 'Int'
+      ? `CobolFmt.digitsOf(BigDecimal(${valueExpr}), ${spec.intDigits}, 0)`
+      : `CobolFmt.fitLeft(${valueExpr}, ${spec.width})`;
+  }
+
+  for (const spec of specs) {
+    const rowSliceExpr = `${flatName}.substring(i * ${rowWidth} + ${spec.start}, i * ${rowWidth} + ${spec.start + spec.width})`;
+    lines.push(`  def ${spec.camel}: Vector[${spec.baseType}] =`);
+    lines.push(`    (0 until ${count}).map(i => ${decodeExpr(spec, rowSliceExpr)}).toVector`);
+
+    const rowExprs = specs.map(s => encodeExpr(s, s === spec ? 'v(i)' : `${s.camel}(i)`));
+    lines.push(`  def ${spec.camel}_=(v: Vector[${spec.baseType}]): Unit =`);
+    lines.push(`    ${flatName} = (0 until ${count}).map(i => ${rowExprs.join(' + ')}).mkString`);
+
+    // Register each row-child in FIELD_REGISTRY as an occursDepth: 1 table
+    // field - the same shape characterSlicedGroupRedefinesLines' own
+    // OCCURS-on-CHILD branch already registers (see its Vector[String]
+    // case), so every existing subscripted-reference/DISPLAY/MOVE call site
+    // treats a table field built this way identically to one built any
+    // other way.
+    registry.set(spec.nameUpper, {
+      camel: spec.camel,
+      scalaType: spec.baseType,
+      dataType: spec.baseType === 'Int' ? 'numeric' : 'alphanumeric',
+      integerDigits: spec.baseType === 'Int' ? spec.intDigits : 0,
+      decimalDigits: 0,
+      signed: spec.signed,
+      editPattern: null,
+      occursDepth: 1,
+      picLength: spec.width,
+      justified: spec.justified,
+      blankWhenZero: false,
+    });
+  }
+
   return lines;
 }
 

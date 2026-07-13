@@ -485,7 +485,13 @@ describe('round-17 finding 7: SEARCH ALL over a 3-dimension OCCURS table threads
            STOP RUN.
 `;
     const scala = scalaOf(src);
-    assert.match(scala, /val _key0 = wsCellKey\(\(idx1 - 1\)\.toInt\)\(\(idx2 - 1\)\.toInt\)\(idx3 - 1\)/);
+    // round-18 finding 8 added a defensive `.max(0)` guard to every
+    // non-literal subscript index built via subscriptIndexExpr (see its own
+    // doc comment) - outerKeySubscriptChain's two outer (fixed) subscripts
+    // go through it (a no-op here), but the innermost search-driven index
+    // (idx3 - 1) is built directly by the binary search itself, not through
+    // subscriptIndexExpr, so it is unaffected.
+    assert.match(scala, /val _key0 = wsCellKey\(\(idx1 - 1\)\.toInt\.max\(0\)\)\(\(idx2 - 1\)\.toInt\.max\(0\)\)\(idx3 - 1\)/);
     assert.doesNotMatch(scala, /val _key0 = wsCellKey\(idx3 - 1\)/, 'must not drop the two outer (fixed) subscripts');
   });
 

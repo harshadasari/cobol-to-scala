@@ -162,8 +162,18 @@ test('Finding 10: UNSTRING WITH POINTER reads the starting position and writes b
            STOP RUN.
 `;
   const code = scalaOf(source);
-  assert.match(code, /CobolUnstring\.unstring\(wsSrc, \(wsPtr\) - 1, Seq\(.*\), 2\)/);
-  assert.match(code, /wsPtr = _newPtr \+ 1/);
+  // round-18 finding 4: UNSTRING now processes one field per target (a
+  // fresh CobolUnstring.unstring(..., 1) call each, re-reading the live
+  // source expression every time) rather than one batch call for all
+  // targets at once - see tests/round18-fixes.test.js finding 4 and
+  // tests/oracle/README.md's round-18 table for why (real cobc's UNSTRING
+  // reads/writes its source and targets against the same live storage, so a
+  // target aliasing the source must observe an earlier target's own write).
+  // The starting position still comes from WITH POINTER's own field, and
+  // the final position is still written back to it, unchanged in effect.
+  assert.match(code, /var _ptr = \(wsPtr\) - 1/);
+  assert.match(code, /CobolUnstring\.unstring\(wsSrc, _ptr, Seq\(.*\), 1\)/);
+  assert.match(code, /wsPtr = _ptr \+ 1/);
 });
 
 // ---------------------------------------------------------------------------
@@ -215,7 +225,11 @@ test('Finding 12: UNSTRING DELIMITER IN populates the matched-delimiter receiver
            STOP RUN.
 `;
   const code = scalaOf(source);
-  assert.match(code, /wsD1 = _delims\.lift\(0\)\.getOrElse\(""\)/);
+  // round-18 finding 4: DELIMITER IN's receiver now reads the first (only)
+  // target's own per-field call result (`_delims0`, the 0-indexed target's
+  // own one-field call - see the round-18 doc comment on the WITH POINTER
+  // test above), not a shared whole-statement `_delims` list.
+  assert.match(code, /wsD1 = _delims0\.headOption\.getOrElse\(""\)/);
 });
 
 // ---------------------------------------------------------------------------
@@ -244,13 +258,19 @@ test('Finding 13: multiple UNSTRING statements in one paragraph are each their o
   // run()'s whole-program fall-through nest - see finding 9 - which would
   // double this count for an unrelated reason).
   const code = convertToScala(source, {}).scala;
-  // round-6 finding 6 added a 4th (_overflow) element to this destructure -
-  // see tests/round6-fixes.test.js - so this now matches
-  // `(_parts, _delims, _newPtr, _overflow)`, not the pre-round-6 3-tuple.
-  const declCount = (code.match(/val \(_parts, _delims, _newPtr, _overflow\) =/g) || []).length;
+  // round-18 finding 4 restructured UNSTRING to one per-target field call
+  // (`_parts0`/`_parts1`, etc. - see the round-18 doc comment on the WITH
+  // POINTER test above) instead of a single whole-statement
+  // `(_parts, _delims, _newPtr, _overflow)` batch destructure - each
+  // UNSTRING statement's own per-target index numbering restarts at 0, so
+  // this finding's own scoping guarantee (two UNSTRING statements in one
+  // paragraph must not collide) now rests entirely on each statement still
+  // being wrapped in its own `{ ... }` block (Scala block scope), verified
+  // below by two independent per-statement `_parts0` declarations.
+  const declCount = (code.match(/val \(_parts0, _delims0, _newPtr0, _ovf0\) =/g) || []).length;
   assert.equal(declCount, 2);
   // Each UNSTRING's generated statement opens its own `{` block.
-  const openBraces = (code.match(/\{\s*\n\s*val \(_parts,/g) || []).length;
+  const openBraces = (code.match(/\{\s*\n\s*var _ptr = /g) || []).length;
   assert.equal(openBraces, 2);
 });
 

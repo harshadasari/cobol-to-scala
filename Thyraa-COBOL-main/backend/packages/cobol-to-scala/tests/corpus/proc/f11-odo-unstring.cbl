@@ -1,0 +1,20 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. F11.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-TABLE.
+           05 WS-COUNT PIC 9 VALUE 2.
+           05 WS-ROW OCCURS 1 TO 4 TIMES
+              DEPENDING ON WS-COUNT PIC X(10).
+       01 WS-SRC PIC X(11) VALUE "AA,BB,CC,DD".
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           UNSTRING WS-SRC DELIMITED BY ","
+               INTO WS-ROW(1) WS-ROW(2) WS-ROW(3) WS-ROW(4)
+               COUNT IN WS-COUNT.
+           DISPLAY "COUNT=" WS-COUNT.
+           DISPLAY "ROW1=" WS-ROW(1).
+           DISPLAY "ROW2=" WS-ROW(2).
+           DISPLAY "ROW3=" WS-ROW(3).
+           DISPLAY "ROW4=" WS-ROW(4).
+           STOP RUN.

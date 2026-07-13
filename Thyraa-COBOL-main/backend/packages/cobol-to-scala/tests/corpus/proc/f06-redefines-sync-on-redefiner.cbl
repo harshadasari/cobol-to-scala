@@ -1,0 +1,14 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. F06.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-A PIC X(4) VALUE "PQRS".
+       01 WS-B REDEFINES WS-A.
+          05 B-LEAD PIC X(1).
+          05 B-NUM PIC S9(4) COMP SYNC.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           DISPLAY "LEN=" FUNCTION LENGTH(WS-B).
+           DISPLAY "LEAD=" B-LEAD.
+           DISPLAY "NUM=" B-NUM.
+           STOP RUN.

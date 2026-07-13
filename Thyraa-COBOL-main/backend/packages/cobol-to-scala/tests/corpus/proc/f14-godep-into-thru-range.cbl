@@ -1,0 +1,29 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. F14.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-SEL PIC 9 VALUE 2.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           DISPLAY "MAIN-START".
+           PERFORM 1000-FIRST THRU 1300-THIRD.
+           DISPLAY "AFTER-THRU-CALL".
+           PERFORM 5000-JUMP-IN.
+           DISPLAY "AFTER-JUMP-CALL".
+           STOP RUN.
+
+       5000-JUMP-IN.
+           GO TO 1100-MID 1200-OTHER DEPENDING ON WS-SEL.
+           DISPLAY "5000-NO-MATCH".
+
+       1000-FIRST.
+           DISPLAY "IN-1000".
+
+       1100-MID.
+           DISPLAY "IN-1100".
+
+       1200-OTHER.
+           DISPLAY "IN-1200".
+
+       1300-THIRD.
+           DISPLAY "IN-1300".

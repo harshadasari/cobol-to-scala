@@ -839,6 +839,43 @@ function defaultElementaryValueWithInheritance(item, scalaType, inheritedSlice) 
  * (write - see renderAssignment) both work exactly as if `wsChunk` were a
  * real `Vector[String]` var, while the *actual* storage stays the shared
  * target String.
+ *
+ * round-17 finding 4: this is the OPPOSITE direction from round-16 finding
+ * 1's `elementaryOverGroupRedefinesLines`/`flattenRedefinesLeavesBytes` fix -
+ * here `realChildren` are the REDEFINING item's own children (a GROUP), and
+ * `targetCamel` is the single ELEMENTARY target's flat var being sliced
+ * (e.g. f06: `01 WS-B REDEFINES WS-A` where WS-A is a plain `PIC X(4)` and
+ * WS-B has a `B-NUM PIC S9(4) COMP SYNC` child). Before this fix, EVERY
+ * child - DISPLAY or not - was sized by `child.pic.length`, its PICTURE's
+ * DECIMAL DIGIT COUNT, never its true BINARY STORAGE WIDTH - correct for a
+ * DISPLAY child (1 character IS 1 byte IS 1 digit there) but wrong for a
+ * COMP/COMP-3/COMP-4/BINARY/COMP-5 child, whose real storage can be
+ * (usually is) NARROWER than its digit count implies (a 4-digit COMP field
+ * is 2 bytes, not 4 characters) - slicing by digit count instead of byte
+ * width silently walked `offset` past the target's own true length,
+ * eventually throwing `StringIndexOutOfBoundsException` the moment any
+ * later child's slice (or this one's own, once the running offset itself
+ * overflowed) fell outside the target String's actual bounds. Reproduces
+ * even without SYNC (SYNC only changes WHERE the pad bytes land, not
+ * whether the digit-count-vs-byte-width mismatch itself is wrong).
+ *
+ * Fixed the same way round-16 finding 1 fixed the reverse direction: a
+ * non-DISPLAY child is sized by its real `elementaryByteLength` (not
+ * `pic.length`), any SYNC alignment pad bytes real cobc inserts before it
+ * are accounted for as genuine, nameless character positions (via
+ * `syncPadBytes`, exactly like `flattenRedefinesLeavesBytes` does for the
+ * other direction), and its value is decoded/encoded through the same
+ * `classifyCodec`/`decodeFieldExpr`/`encodeFieldExpr` byte-level codec
+ * dispatch a record's own byte-level `parse`/`format` uses - not plain
+ * digit-text substring/concatenation, which can't represent binary/packed
+ * storage at all. A DISPLAY child (occurs or not) is completely unaffected -
+ * its byte width already equals its digit/character count, so this is a
+ * pure no-op for every pre-existing corpus program (none of which redefine
+ * an elementary target with a non-DISPLAY child). An OCCURS non-DISPLAY
+ * child (a rarer shape entirely unexercised by any corpus program, this
+ * one included) still falls back to the pre-existing PICTURE-digit-count
+ * model rather than risk a partial/incorrect byte-accurate table model no
+ * program here can verify.
  */
 function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry) {
   const lines = [];
@@ -847,6 +884,55 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
   for (const child of realChildren) {
     const camel = toCamelCase(child.name);
     const count = hasOccurs(child) && occursCount(child) > 1 ? occursCount(child) : 1;
+    const usage = (child.usage || 'DISPLAY').toUpperCase();
+    const isNonDisplay = usage !== 'DISPLAY';
+
+    if (isNonDisplay && count === 1) {
+      const byteWidth = elementaryByteLength(child);
+      const codec = classifyCodec(child, {});
+      if (byteWidth > 0 && codec.codecKind !== 'legacy') {
+        const padBefore = syncPadBytes(child, offset);
+        const start = offset + padBefore;
+        const end = start + byteWidth;
+        offset = end;
+
+        const baseType = scalaBaseType(child);
+        const codecField = { ...codec, type: baseType, length: byteWidth };
+        const sliceExpr = `${targetCamel}.substring(${start}, ${end})`;
+        const decodeExpr = truncateNonComp5NumericValue(
+          codecField,
+          decodeFieldExpr(codecField, `(${sliceExpr}).getBytes(java.nio.charset.StandardCharsets.ISO_8859_1)`)
+        );
+        const encodeExpr = `new String(${encodeFieldExpr(codecField, 'v')}, java.nio.charset.StandardCharsets.ISO_8859_1)`;
+        lines.push(`  def ${camel}: ${baseType} = ${decodeExpr}`);
+        lines.push(
+          `  def ${camel}_=(v: ${baseType}): Unit = ${targetCamel} = ${targetCamel}.substring(0, ${start}) + ${encodeExpr} + ${targetCamel}.substring(${end})`
+        );
+
+        const childPic = child.pic && typeof child.pic === 'object' ? child.pic : null;
+        registry.set((child.name || '').toUpperCase(), {
+          camel,
+          scalaType: baseType,
+          dataType: baseType === 'String' ? 'alphanumeric' : 'numeric',
+          integerDigits: childPic?.integerDigits || 0,
+          decimalDigits: childPic?.decimalDigits || 0,
+          signed: !!(childPic && childPic.signed),
+          editPattern: null,
+          occursDepth: 0,
+          picLength: byteWidth,
+          justified: false,
+          blankWhenZero: false,
+        });
+        continue;
+      }
+      // No real byte width, or a 'legacy' codec (COMP-1/COMP-2 float/
+      // double, no byte-level codec support here) - fall through to the
+      // pre-existing PICTURE-digit-count model below unchanged (`offset`
+      // untouched, exactly as if this child were never inspected for its
+      // byte width at all - the pre-round-17 behavior for this narrow,
+      // unexercised combination).
+    }
+
     const elementWidth = child.pic && typeof child.pic === 'object' ? (child.pic.length || 0) : 0;
     const totalWidth = elementWidth * count;
     const start = offset;
@@ -1874,6 +1960,83 @@ function buildFieldRegistry(ast) {
         const targetAbsOffset = itemAbsoluteOffsets.get(String(item.redefines).toUpperCase()) ?? 0;
         const accessorLines = redefinesAccessorLines(item, registry, list, tableRegistry, targetAbsOffset);
         if (accessorLines.length) lines.push(...accessorLines);
+
+        // round-17 finding 8: an 88-level condition-name declared under a
+        // REDEFINES item (e.g. f13's `01 WS-FLAG-NUM REDEFINES WS-FLAG PIC
+        // 9(1). 88 FLAG-LOW VALUE 0 1.`) was NEVER registered in
+        // conditionRegistry at all - this whole `if (item.redefines)`
+        // branch `continue`s before ever reaching the ordinary elementary-
+        // leaf's own conditionRegistry registration loop further down (only
+        // reached for a NON-redefines item), even though the parser
+        // attaches `item.conditions` to a REDEFINES item exactly the same
+        // way it does for an ordinarily-declared one (parser/data-division-
+        // parser.js's `currentItem.conditions.push(...)` doesn't care
+        // whether the item carries a REDEFINES clause). Left unregistered,
+        // `EVALUATE TRUE WHEN FLAG-LOW` (and a plain `IF FLAG-LOW`/`SET
+        // FLAG-LOW TO TRUE`) had no registry entry to resolve the condition
+        // name to at all - a hard "Not found: flagLow" compile error.
+        // Registered here using `registry.get(...)` for `item`'s own just-
+        // declared info (the elementary-alias or byte-/character-sliced
+        // accessor redefinesAccessorLines above just registered under
+        // `item`'s own bare name) - exactly the same `{ info, values,
+        // falseValue }` shape the ordinary path builds, so
+        // level88ConditionExpr/evaluateConditionExpr need no changes at all
+        // to consume it.
+        for (const cond of item.conditions || []) {
+          if (!cond || !cond.name) continue;
+          const ownInfo = registry.get((item.name || '').toUpperCase()) || null;
+          conditionRegistry.set(String(cond.name).toUpperCase(), {
+            info: ownInfo,
+            values: cond.values || [],
+            falseValue: cond.falseValue || null,
+          });
+        }
+
+        // round-17 finding 4 (companion bug uncovered while fixing f06's
+        // SYNC-on-redefiner StringIndexOutOfBoundsException): a REDEFINES
+        // item that is ITSELF a group (has real children of its own - e.g.
+        // `01 WS-B REDEFINES WS-A` with B-LEAD/B-NUM children) never got
+        // registered in groupRegistry/groupKeyRegistry/
+        // groupByteLengthRegistry at all - this whole branch `continue`s
+        // before ever reaching the ordinary group-registration code further
+        // down this loop (only reached for a NON-redefines item), since
+        // redefinesAccessorLines above already declares this item's own
+        // children's accessors directly (character-/byte-sliced views over
+        // the target - see characterSlicedGroupRedefinesLines - not a
+        // recursive walk() call the way an ordinary group's children get
+        // their own flat vars). Left unregistered, `FUNCTION LENGTH(WS-B)`
+        // (and MOVE/DISPLAY of the bare group name WS-B) had nowhere to
+        // resolve to at all - a hard "Not found: wsB" compile error, since a
+        // group has no flat var of its own. Registered here, mirroring the
+        // ordinary-group registration below, keyed off `registry`
+        // (FIELD_REGISTRY) rather than `qualifiedRegistry` since a REDEFINES
+        // item's own children are registered directly under their bare name
+        // by redefinesAccessorLines's own helpers, not under a qualified
+        // `name::parent` key.
+        const realRedefiningChildren = (item.children || []).filter(c => !isLevel(c, 88));
+        if (realRedefiningChildren.length > 0) {
+          const parentUpper = (item.name || '').toUpperCase();
+          const groupKey = [...ancestorNames, parentUpper].join('/');
+          groupKeyRegistry.set(parentUpper, groupKey);
+          groupRegistry.set(
+            groupKey,
+            realRedefiningChildren
+              .map(c => {
+                if (c.isFiller || !c.name) return null;
+                const nameUpper = (c.name || '').toUpperCase();
+                const info = registry.get(nameUpper) || null;
+                const childHasRealChildren = (c.children || []).some(cc => cc.level !== 88);
+                return {
+                  nameUpper,
+                  camel: info ? info.camel : toCamelCase(c.name),
+                  info,
+                  groupKey: childHasRealChildren ? `${groupKey}/${nameUpper}` : null,
+                };
+              })
+              .filter(Boolean)
+          );
+          groupByteLengthRegistry.set(parentUpper, itemByteLength({ ...item, occurs: null }, targetAbsOffset));
+        }
         continue; // shares storage with what it redefines - no offset advance
       }
 

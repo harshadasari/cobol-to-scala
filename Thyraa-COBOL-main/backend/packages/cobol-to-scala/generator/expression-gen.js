@@ -613,7 +613,7 @@ function subscriptIndexExpr(sub) {
   if (sub && typeof sub === 'object') {
     if (sub.type === 'literal') {
       const n = parseInt(sub.value, 10);
-      return String(Number.isFinite(n) ? n - 1 : 0);
+      return literalSubscriptIndexExpr(n);
     }
     if (sub.type === 'variable') {
       return `(${toCamelCase(sub.value)} - 1).toInt.max(0)`;
@@ -621,7 +621,7 @@ function subscriptIndexExpr(sub) {
     if (sub.type === 'ArithmeticExpression' && !sub.operator && !sub.unaryMinus && !sub.functionCall) {
       if (sub.value !== null && sub.value !== undefined) {
         const n = parseInt(sub.value, 10);
-        return String(Number.isFinite(n) ? n - 1 : 0);
+        return literalSubscriptIndexExpr(n);
       }
       if (sub.variable) {
         return `(${convertIdentifier(sub.variable)} - 1).toInt.max(0)`;
@@ -629,6 +629,41 @@ function subscriptIndexExpr(sub) {
     }
   }
   return `((${convertArithmeticExpression(sub)}) - 1).toInt.max(0)`;
+}
+
+/**
+ * round-19 finding 4: a bare, compile-time-known integer LITERAL subscript
+ * (e.g. `WS-VAL(0)`, `WS-VAL(-1)` - as opposed to a computed/dynamic
+ * subscript, which subscriptIndexExpr's other branches already `.max(0)`
+ * clamp per round-18 finding 8) that is ZERO or NEGATIVE is always
+ * out-of-range (COBOL subscripts are 1-based) - detectable with certainty at
+ * GENERATION time, unlike a dynamic subscript's runtime value. Before this
+ * fix, the literal branches above returned the raw folded 0-based index with
+ * NO clamp and NO marker at all - a literal negative/zero subscript rendered
+ * a bare negative Scala Int constant, crashing with IndexOutOfBoundsException
+ * the moment it was read/written, an inconsistency with the dynamic case
+ * (which at least degrades to a *clamped*, non-crashing, if silently wrong,
+ * value). This does not attempt to reproduce cobc's own behavior for this
+ * shape (reading whatever raw bytes happen to sit adjacent to the table in
+ * memory) - that is genuine platform/build-dependent UNDEFINED BEHAVIOR (no
+ * SSRANGE checking by default), and chasing it would mean guessing at
+ * non-reproducible output, which this campaign's own methodology explicitly
+ * warns against (see tests/oracle/README.md's round-19 table). Instead this
+ * only makes the CURRENT (deliberately non-cobc-matching) fallback honest:
+ * the same `.max(0)` clamp round-18 finding 8 already uses for a dynamic
+ * subscript (preventing a crash, not attempting correctness) plus a visible,
+ * compiling inline BLOCK comment (an asterisk-style comment, never a
+ * double-slash line comment - this text is always spliced into a larger
+ * single-line expression by every caller, and a line comment would silently
+ * swallow whatever follows on that same line) marking the literal subscript
+ * as out-of-range. A normal (>=1) literal subscript is completely
+ * unaffected - this only changes the n<=0 branch.
+ */
+function literalSubscriptIndexExpr(n) {
+  if (!Number.isFinite(n)) return '0';
+  const idx = n - 1;
+  if (idx >= 0) return String(idx);
+  return `(${idx}).max(0) /* TODO: literal COBOL subscript ${n} is out of range (COBOL subscripts are 1-based) - real cobc's own behavior here is an out-of-bounds memory read (undefined, platform/build-dependent - not reproduced here by design); this generator instead clamps to row 1 - see tests/oracle/README.md known gaps */`;
 }
 
 /**
@@ -6102,9 +6137,8 @@ function generateMergeUsingFileLines(fileRef, sortInfo, indent = 0) {
 
   const dest = readDestination({ into: null }, fileName);
   const recordNameUpper = String(FILE_RECORD_REGISTRY.get(fileNameUpper) || '').toUpperCase();
-  const pairs = recordNameUpper
-    ? positionalPairs(resolveGroupKey(recordNameUpper), resolveGroupKey(String(sortInfo.recordNameUpper || '').toUpperCase()))
-    : [];
+  const sdGroupKey = resolveGroupKey(String(sortInfo.recordNameUpper || '').toUpperCase());
+  const pairs = recordNameUpper ? positionalPairs(resolveGroupKey(recordNameUpper), sdGroupKey) : [];
 
   const lines = [];
   lines.push(generateOpen({ files: [fileName], mode: 'INPUT' }, indent));
@@ -6112,8 +6146,36 @@ function generateMergeUsingFileLines(fileRef, sortInfo, indent = 0) {
   const bi = `${indentStr}  `;
   lines.push(`${bi}val _mergeLine = ${iteratorVar}.next()`);
   lines.push(...readAssignLines(dest, '_mergeLine', bi));
-  for (const pair of pairs) {
-    lines.push(`${bi}${pair.targetCamel} = ${coerceCorrespondingValue(pair)}`);
+  if (pairs.length > 0) {
+    for (const pair of pairs) {
+      lines.push(`${bi}${pair.targetCamel} = ${coerceCorrespondingValue(pair)}`);
+    }
+  } else if (dest.mode === 'elementary' && dest.camel && sdGroupKey && GROUP_REGISTRY.has(sdGroupKey)) {
+    // round-19 finding 1: a USING file's FD record that is FLAT/ELEMENTARY
+    // (no named children of its own - e.g. `01 IN-REC-1 PIC X(6)`, the
+    // ordinary "raw line" FD shape) has no entry in GROUP_REGISTRY at all
+    // (that registry only ever holds GROUP items), so positionalPairs -
+    // which only walks GROUP_REGISTRY children on both sides - always
+    // returned an EMPTY pair list for this shape. The merged record then
+    // silently kept the SD record's stale/default field values (never
+    // actually assigned from the USING file at all), even though the
+    // read/sort/emit ORDERING was already correct - a silent data-loss bug,
+    // not a crash. Real cobc treats a flat FD record moved onto a group SD
+    // record exactly like any other elementary-source-into-group-target
+    // whole-record MOVE: the source's raw text is sliced across the
+    // target's own children BY POSITION/WIDTH - the SAME convention
+    // generateScalarIntoGroupMove/scatterGroupFromString already implement
+    // for MOVE (round-13 finding 4) and generateCall/generateEntryMethod
+    // already implement for a group CALL BY REFERENCE operand.
+    // readAssignLines (just above) already fitted `dest.camel` to the FD
+    // record's own declared width via CobolFmt.fitLeft, so it's already the
+    // correctly-sized raw text to scatter here with no further padding.
+    const scattered = scatterGroupFromString(sdGroupKey, dest.camel, indent + 1);
+    if (scattered) {
+      lines.push(...scattered);
+    } else {
+      lines.push(`${bi}() // TODO: MERGE USING ${fileName}: could not scatter elementary FD record "${dest.camel}" into SD record "${sortInfo.recordNameUpper}" - unsupported child shape (see tests/oracle/README.md known gaps)`);
+    }
   }
   const ctorArgs = sortInfo.fields.map(f => f.camel).join(', ');
   lines.push(`${bi}${sortInfo.bufferVar} += ${sortInfo.caseClassName}(${ctorArgs})`);
@@ -6953,6 +7015,21 @@ function generateCall(statement, indent = 0) {
       // tests/oracle/README.md's known gaps.
       return `("" /* TODO: CALL "${rawProgramName}" USING ${name}: group argument marshalling not supported for a group containing an OCCURS table - see tests/oracle/README.md known gaps */)`;
     }
+    // round-19 finding 3: a single already-subscripted SCALAR element of an
+    // OCCURS table (`WS-VAL(2)`) used as a CALL argument - distinct from the
+    // whole-group-containing-an-OCCURS-table gap above (that one has no flat
+    // Scala var to reference at all; this one is an ordinary scalar read,
+    // just at a computed index into the table's flat `Vector[...]` var).
+    // Before this fix, this fell straight into the plain `toCamelCase(name)`
+    // branch below, passing the WHOLE table Vector instead of the one
+    // requested element - a hard "Found: Vector[String], Required: String"
+    // compile crash at the call site. convertIdentifier already builds the
+    // correct `wsVal(idx)` scalar-read expression for a subscripted
+    // reference (the same helper MOVE/STRING/INSPECT of a subscripted
+    // element already reuse) - dispatch to it here instead of the bare name.
+    if (name && hasSubscripts && !isRegisteredGroupName(String(name).toUpperCase())) {
+      return convertIdentifier(param.value);
+    }
     if (name) return toCamelCase(name);
     return convertArithmeticExpression(param.value || param);
   });
@@ -6987,6 +7064,16 @@ function generateCall(statement, indent = 0) {
     if (!hasSubscripts && isRegisteredGroupName(nameUpperParam)) {
       return { kind: 'group', groupKey: resolveGroupKey(nameUpperParam) };
     }
+    // round-19 finding 3: a subscripted scalar element's BY REFERENCE
+    // writeback must land back in that SAME element (`.updated(idx, ...)`),
+    // not overwrite the whole table var with a scalar value (the pre-fix
+    // `{ kind: 'scalar', camel: toCamelCase(name) }` path did exactly that -
+    // `wsVal = <scalar return>` against a `Vector[String]` var, a second
+    // "Found: String, Required: Vector[String]" compile crash alongside the
+    // argument-side one above).
+    if (hasSubscripts && !isRegisteredGroupName(nameUpperParam)) {
+      return { kind: 'scalar-subscripted', ref: param.value };
+    }
     return { kind: 'scalar', camel: toCamelCase(name) };
   });
 
@@ -6999,6 +7086,7 @@ function generateCall(statement, indent = 0) {
   // path below, both of which evaluate the call exactly once first).
   const renderWriteback = (writer, sourceExpr) => {
     if (writer.kind === 'scalar') return [`${indentStr}${writer.camel} = ${sourceExpr}`];
+    if (writer.kind === 'scalar-subscripted') return [`${indentStr}${renderAssignment(writer.ref, sourceExpr)}`];
     if (writer.kind === 'refmod-unsupported') {
       return [
         `${indentStr}() // TODO: CALL ... USING BY REFERENCE ${writer.name}(...): reference modification not ` +
@@ -7059,20 +7147,34 @@ function generateCall(statement, indent = 0) {
  * the unmatched arm as `()` (a plain no-op, not wrapped in `return`) does
  * here, since this whole match expression is just one statement among
  * others in the paragraph's statement sequence, not itself in tail position.
+ *
+ * round-19 finding 2: a target this `return x()` translation can't actually
+ * honor - one lying OUTSIDE a PERFORM ... THRU range this GO TO is textually
+ * inside - is a documented, honest non-fix (see method-gen.js's
+ * annotateGoToThruEscapes, which runs before this function and tags the
+ * affected AST node(s)): the generated code is otherwise UNCHANGED (still
+ * silently resumes after the PERFORM once nested calls unwind, rather than
+ * never returning like real cobc), but gets a visible, compiling comment
+ * marking exactly which target(s) are affected, so this is grep-able as a
+ * known gap rather than invisible.
  */
 function generateGoTo(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const targets = statement.targets && statement.targets.length > 0 ? statement.targets : [statement.target];
+  const escapeTargets = statement._thruEscapeTargets;
+  const escapeNote = (target) => escapeTargets && escapeTargets.has(target)
+    ? ` // TODO(round-19 finding 2): "${target}" lies outside the enclosing PERFORM ${statement._thruEscapeRange} range - real COBOL never returns to the PERFORM's caller once this fires, but this generator's method-call-based PERFORM model silently resumes there once nested calls unwind - see tests/oracle/README.md known gaps`
+    : '';
 
   if (!statement.dependingOn) {
-    return `${indentStr}return ${paragraphMethodName(targets[0])}() // GO TO`;
+    return `${indentStr}return ${paragraphMethodName(targets[0])}() // GO TO${escapeNote(targets[0])}`;
   }
 
   const dependingOn = convertArithmeticExpression(statement.dependingOn);
   const lines = [`${indentStr}${dependingOn} match`];
 
   targets.forEach((target, idx) => {
-    lines.push(`${indentStr}  case ${idx + 1} => return ${paragraphMethodName(target)}()`);
+    lines.push(`${indentStr}  case ${idx + 1} => return ${paragraphMethodName(target)}()${escapeNote(target)}`);
   });
 
   lines.push(`${indentStr}  case _ => ()`);

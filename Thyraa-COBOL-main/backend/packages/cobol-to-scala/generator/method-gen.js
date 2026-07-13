@@ -991,6 +991,69 @@ function collectStatementsDeep(statements, visit) {
 }
 
 /**
+ * round-19 finding 2 (h11): a `GO TO` (plain or `... DEPENDING ON`) whose
+ * target paragraph lies OUTSIDE an active `PERFORM x THRU y` range it is
+ * textually inside is, in real COBOL, a PERMANENT transfer of control - the
+ * implicit "fall off the range's own end and return to the PERFORM's own
+ * caller" behavior a normal in-range exit gets is abandoned entirely; control
+ * never comes back, no matter how many PERFORM calls are currently nested.
+ * This generator models every paragraph as an ordinary Scala method and
+ * PERFORM as an ordinary method call (see generateGoTo's own doc comment) -
+ * which can only ever return normally once its callee(s) return, so a
+ * generated program instead silently RESUMES after the original PERFORM once
+ * every nested call unwinds, diverging from real cobc.
+ *
+ * A genuine fix (a thrown control-flow signal caught by a top-level dispatch
+ * loop, so the whole call stack actually unwinds and never resumes) would
+ * need "which THRU range, if any, is lexically active" threaded as context
+ * through every statement-generation call site in expression-gen.js/
+ * method-gen.js (arbitrarily deep inside IF/EVALUATE/PERFORM-VARYING bodies) -
+ * a large, invasive refactor whose blast radius is entirely out of proportion
+ * to this one narrow finding. Per this campaign's own precedent for an
+ * honest, VISIBLE non-fix (round-15 finding 8, round-16 through 18's various
+ * ref-mod-adjacent placeholders) - this function instead only ANNOTATES the
+ * affected GoToStatement AST nodes (never rewrites behavior) so generateGoTo
+ * can emit a compiling, grep-able comment marking the gap at the exact
+ * statement that has it; the runtime behavior itself is left exactly as
+ * (silently) wrong as before this round - see tests/oracle/README.md's round-19
+ * table and known gaps for the full writeup.
+ *
+ * Only covers a FORWARD, both-endpoints-resolved THRU range (the overwhelming
+ * common case, and h11's own shape) - a backward range (round-9 finding 5) or
+ * an unresolved endpoint is left unannotated rather than guessed at.
+ */
+function annotateGoToThruEscapes(units, performThrus) {
+  for (const thru of performThrus.values()) {
+    const startIndex = units.findIndex(
+      u => u.name === thru.from && (!thru.fromSection || u.sectionName === thru.fromSection)
+    );
+    const endIndex = units.findIndex(
+      u => u.name === thru.to && (!thru.toSection || u.sectionName === thru.toSection)
+    );
+    if (startIndex === -1 || endIndex === -1 || endIndex < startIndex) continue;
+
+    const rangeUnits = units.slice(startIndex, endIndex + 1);
+    const rangeNames = new Set(rangeUnits.map(u => u.name));
+    const rangeLabel = thru.to ? `${thru.from} THRU ${thru.to}` : thru.from;
+
+    for (const unit of rangeUnits) {
+      collectStatementsDeep(unit.statements, stmt => {
+        if (stmt.type !== 'GoToStatement') return;
+        const targets = stmt.targets && stmt.targets.length > 0 ? stmt.targets : [];
+        const outOfRange = targets.filter(t => {
+          const name = typeof t === 'string' ? t : (t?.name || t);
+          return name && !rangeNames.has(name);
+        });
+        if (outOfRange.length === 0) return;
+        if (!stmt._thruEscapeTargets) stmt._thruEscapeTargets = new Set();
+        for (const t of outOfRange) stmt._thruEscapeTargets.add(t);
+        stmt._thruEscapeRange = rangeLabel;
+      });
+    }
+  }
+}
+
+/**
  * Generate all methods from the PROCEDURE DIVISION's top-level (section-less)
  * paragraphs and its SECTIONs.
  *
@@ -1109,6 +1172,14 @@ export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
       }
     });
   }
+
+  // round-19 finding 2 (h11): annotate every GoToStatement AST node whose
+  // target lies OUTSIDE an enclosing PERFORM ... THRU range this same
+  // collection pass just discovered - see annotateGoToThruEscapes's own doc
+  // comment for why this is a documented, visible non-fix rather than a real
+  // fix. Must run before either generation loop below (both eventually reach
+  // generateGoTo, which reads the annotation).
+  annotateGoToThruEscapes(units, performThrus);
 
   // Flat standalone top-level methods - one per paragraph (collision-
   // qualified name), plus one per paragraphless section (never ambiguous:

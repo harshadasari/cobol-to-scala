@@ -8,6 +8,7 @@ import {
   generateExpression,
   convertCondition,
   setAmbiguousParagraphNamesForPerform as setAmbiguousParagraphNamesForPerformExpr,
+  assignExpr,
 } from './expression-gen.js';
 
 /**
@@ -276,8 +277,12 @@ ${indentStr}}`;
     // initiative). WITH TEST AFTER keeps its own pre-existing per-level
     // self-reset (unaffected by this fix - verified already correct against
     // installed GnuCOBOL, see generateVaryingNest's WITH TEST AFTER branch).
+    // round-24 audit: assignExpr, not a bare `=` string (the SAME centralization
+    // gap round-23 finding 1 fixed for renderAssignment/generateCall, found
+    // here in PERFORM VARYING's own loop-variable init/increment - the
+    // VARYING variable can be a RECURSIVE program's own LINKAGE-aliased leaf).
     const initLines = testBefore
-      ? levels.map(l => `${bi}${toCamelCase(l.variable || 'i')} = ${varyingOperandExpr(l.from, 1)}`).join('\n') + '\n'
+      ? levels.map(l => `${bi}${assignExpr(toCamelCase(l.variable || 'i'), varyingOperandExpr(l.from, 1))}`).join('\n') + '\n'
       : '';
     return `${indentStr}scala.util.boundary {
 ${initLines}${generateVaryingNest(levels, 0, stmt, indent + 1)}
@@ -344,14 +349,16 @@ function generateVaryingNest(levels, i, stmt, indent) {
   const bodyIndentStr = '  '.repeat(indent + 1);
 
   if (testBefore) {
+    // round-24 audit: assignExpr, not a bare `=` string - see this file's
+    // own import comment/generatePerformFromAST's initLines above.
     const resetDeeperLines = levels
       .slice(i + 1)
-      .map(l => `${bodyIndentStr}${toCamelCase(l.variable || 'i')} = ${varyingOperandExpr(l.from, 1)}`)
+      .map(l => `${bodyIndentStr}${assignExpr(toCamelCase(l.variable || 'i'), varyingOperandExpr(l.from, 1))}`)
       .join('\n');
     return [
       `${indentStr}while !(${until}) do`,
       body,
-      `${bodyIndentStr}${varName} = ${varName} + ${by}`,
+      `${bodyIndentStr}${assignExpr(varName, `${varName} + ${by}`)}`,
       resetDeeperLines,
     ].filter(Boolean).join('\n');
   }
@@ -368,12 +375,12 @@ function generateVaryingNest(levels, i, stmt, indent) {
   // WITH TEST AFTER form here - Scala 3 has no do-while postfix loop at all)
   // and the increment moves into the `do` body, which only runs between
   // iterations, never after the final (test-failing) one.
-  return `${indentStr}${varName} = ${from}
+  return `${indentStr}${assignExpr(varName, from)}
 ${indentStr}while
 ${body}
 ${bodyIndentStr}!(${until})
 ${indentStr}do
-${bodyIndentStr}${varName} = ${varName} + ${by}`;
+${bodyIndentStr}${assignExpr(varName, `${varName} + ${by}`)}`;
 }
 
 /**

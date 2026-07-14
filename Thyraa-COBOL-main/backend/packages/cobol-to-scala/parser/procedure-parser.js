@@ -1681,7 +1681,26 @@ function parseUnstringStatement(ctx) {
 
   // Parse INTO
   ctx.matchValue('INTO');
-  while (ctx.check(TokenType.IDENTIFIER)) {
+  // round-24 finding (m04): `UNSTRING ... INTO target1, target2, target3`
+  // (comma-separated - commas are optional noise words between INTO targets,
+  // like everywhere else in COBOL) - the SAME comma-consumption bug round-22
+  // findings 2/4 fixed for GO TO's own DEPENDING ON target list and SET's own
+  // condition-name list (see parseGoToStatement's doc comment above for the
+  // full mechanism): this loop's own continuation condition never listed
+  // TokenType.COMMA, so it stopped dead the instant it saw the separator
+  // after the FIRST target, leaving every token from that comma onward
+  // completely unconsumed - corrupting the rest of the PROCEDURE DIVISION
+  // parse (the second target's own identifier token eventually gets
+  // misparsed as a spurious paragraph name, splitting the enclosing
+  // paragraph in two and producing a hard compile-time var/def collision).
+  // Skipping a comma and continuing (rather than treating it as a target or
+  // a terminator) fixes this without changing behavior for any comma-free
+  // UNSTRING INTO list (the entire pre-existing corpus).
+  while (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.COMMA)) {
+    if (ctx.check(TokenType.COMMA)) {
+      ctx.advance();
+      continue;
+    }
     const target = { target: parseVariableReference(ctx), delimiter: null, count: null };
 
     if (ctx.matchValue('DELIMITER')) {

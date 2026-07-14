@@ -582,7 +582,7 @@ function truncateNumericLiteralText(raw, integerDigits, decimalDigits) {
  * its stored value to already be at its full declared width/precision (see
  * expression-gen.js's renderVariableMoveSource).
  */
-function defaultElementaryValue(item, scalaType) {
+function defaultElementaryValue(item, scalaType, isFileSection = false) {
   const raw = item.value;
   let literalKind = null; // 'numeric' | 'string'
   let literalText = null;
@@ -624,6 +624,30 @@ function defaultElementaryValue(item, scalaType) {
       const width = pic?.length || 0;
       const justifiedRight = String(item.justified || '').toUpperCase() === 'RIGHT';
       return `"${escapeScalaString(fitAlphanumericText(literalText, width, justifiedRight))}"`;
+    }
+    // round-24 finding (m08): a FILE SECTION (FD/SD) record's own
+    // alphanumeric field with no VALUE clause (COBOL disallows a VALUE
+    // clause on an FD/SD 01 record's children entirely, so this is always
+    // the "no VALUE" case for such a field) defaults to LOW-VALUES (NUL
+    // bytes, 0x00) in real cobc - confirmed against installed GnuCOBOL
+    // (m08): `DISPLAY "BEFORE-OPEN REC=[" SOME-REC "]"` before any
+    // successful OPEN/READ/WRITE ever touches SOME-REC shows 10 raw NUL
+    // bytes, not 10 spaces. An ordinary WORKING-STORAGE item with no VALUE
+    // clause is UNCHANGED by this - it still defaults to spaces (`'""'`
+    // below, padded with spaces at DISPLAY-time by CobolFmt.fitLeft/
+    // `.padTo(width, ' ')` - this project's own, separately-confirmed
+    // default for that section) - `isFileSection` is threaded down from
+    // buildFieldRegistry's own separate `walk(fileItems, ...)` call
+    // (distinct from `walk(wsItems, ...)`/`walk(linkageItems, ...)`), so
+    // this only ever fires for a FILE SECTION record's own field.
+    // Returning the FULL-WIDTH low-values string up front (rather than
+    // `'""'`) means the exact same `.padTo(width, ' ')` DISPLAY padding
+    // every other String field already uses is a no-op here (the string is
+    // already `width` bytes long), so no DISPLAY/padding logic needed any
+    // change at all to show the low-value bytes correctly.
+    if (isFileSection) {
+      const width = pic?.length || 0;
+      return `"${'\\u0000'.repeat(Math.max(width, 0))}"`;
     }
     return '""';
   }
@@ -812,11 +836,11 @@ function nonDisplayInheritedNumericText(inheritedSlice, digits, usage) {
   }
 }
 
-function defaultElementaryValueWithInheritance(item, scalaType, inheritedSlice) {
-  if (item.value || inheritedSlice == null) return defaultElementaryValue(item, scalaType);
+function defaultElementaryValueWithInheritance(item, scalaType, inheritedSlice, isFileSection = false) {
+  if (item.value || inheritedSlice == null) return defaultElementaryValue(item, scalaType, isFileSection);
 
   if (scalaType === 'String') {
-    return defaultElementaryValue({ ...item, value: { type: 'string', value: inheritedSlice } }, scalaType);
+    return defaultElementaryValue({ ...item, value: { type: 'string', value: inheritedSlice } }, scalaType, isFileSection);
   }
 
   const pic = item.pic && typeof item.pic === 'object' ? item.pic : null;
@@ -2159,7 +2183,7 @@ function buildFieldRegistry(ast) {
   // local `offset` happens to be 0 at. Defaults to 0 for the top-level calls
   // (`walk(wsItems, [], [])` and friends) below, which is already correct -
   // a top-level 01-record's own children genuinely do start at absolute 0.
-  function walk(list, occursChain, ancestorNames, parentValueText, baseOffset = 0) {
+  function walk(list, occursChain, ancestorNames, parentValueText, baseOffset = 0, isFileSection = false) {
     let offset = 0;
     // round-16 finding 1: every real (named, non-88) sibling's own ABSOLUTE
     // record offset (after its own SYNC padding, if any), keyed by its
@@ -2421,7 +2445,7 @@ function buildFieldRegistry(ast) {
         // round-15 finding 2: thread this group's own absolute start offset
         // down as the new baseOffset for its children's recursive walk() -
         // see the doc comment on walk()'s own `baseOffset` parameter above.
-        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain, [...ancestorNames, parentUpper], effectiveValueText, groupStartOffset);
+        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain, [...ancestorNames, parentUpper], effectiveValueText, groupStartOffset, isFileSection);
 
         // Group registry: immediate child names (COBOL name + camel), used
         // by MOVE/ADD CORRESPONDING to match children between two group
@@ -2508,7 +2532,7 @@ function buildFieldRegistry(ast) {
         // round-5 finding 3/s06 rationale as the flat-var mirroring above) -
         // so it inherits its own slice of the ancestor's VALUE text exactly
         // like a named leaf does, not just the plain zero/blank default.
-        let defaultExpr = defaultElementaryValueWithInheritance(item, baseType, inheritedSlice);
+        let defaultExpr = defaultElementaryValueWithInheritance(item, baseType, inheritedSlice, isFileSection);
         for (let i = fullChain.length - 1; i >= 0; i--) {
           defaultExpr = `Vector.fill(${fullChain[i]})(${defaultExpr})`;
         }
@@ -2571,7 +2595,7 @@ function buildFieldRegistry(ast) {
       // doc comment; a no-op (identical to the pre-existing
       // defaultElementaryValue call) whenever `inheritedSlice` is null, i.e.
       // no VALUE-bearing ancestor is in scope.
-      let defaultExpr = defaultElementaryValueWithInheritance(item, baseType, inheritedSlice);
+      let defaultExpr = defaultElementaryValueWithInheritance(item, baseType, inheritedSlice, isFileSection);
       for (let i = fullChain.length - 1; i >= 0; i--) {
         defaultExpr = `Vector.fill(${fullChain[i]})(${defaultExpr})`;
       }
@@ -2655,7 +2679,11 @@ function buildFieldRegistry(ast) {
   }
 
   walk(wsItems, [], []);
-  walk(fileItems, [], []);
+  // round-24 finding (m08): isFileSection=true - see defaultElementaryValue's
+  // own doc comment on why an FD/SD record's own alphanumeric field defaults
+  // to LOW-VALUES here, unlike a WORKING-STORAGE/LINKAGE item's own default
+  // (unaffected - both calls below are unchanged).
+  walk(fileItems, [], [], undefined, 0, true);
   walk(linkageItems, [], []);
 
   return { lines: lines.join('\n'), registry, tableRegistry, groupRegistry, groupKeyRegistry, groupByteLengthRegistry, qualifiedRegistry, conditionRegistry };

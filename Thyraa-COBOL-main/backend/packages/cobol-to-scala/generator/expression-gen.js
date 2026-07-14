@@ -821,7 +821,7 @@ function refModNumericPlaceholder(contextLabel) {
  * missed spot - a single centralized decision instead of duplicating the
  * `RECURSIVE_LEAF_NAMES.has(...)` check at every one of those sites.
  */
-function assignExpr(camel, valueExpr) {
+export function assignExpr(camel, valueExpr) {
   if (RECURSIVE_LEAF_NAMES.has(camel)) {
     return `${camel}_=(${valueExpr})`;
   }
@@ -2797,7 +2797,10 @@ function generateGroupMove(sourceNameUpper, targetNameUpper, indent) {
   }
 
   if (groupLayoutsIdentical(srcChildren, tgtChildren)) {
-    return tgtChildren.map((t, i) => `${indentStr}${t.camel} = ${srcChildren[i].camel}`).join('\n');
+    // round-24 audit: routes through assignExpr - a plain group-to-group
+    // MOVE (not MOVE CORRESPONDING) can write into a RECURSIVE program's own
+    // LINKAGE-aliased leaf just as easily as CORRESPONDING can.
+    return tgtChildren.map((t, i) => `${indentStr}${assignExpr(t.camel, srcChildren[i].camel)}`).join('\n');
   }
 
   // Byte-level round trip needs every real child to have both a flat-var
@@ -2846,7 +2849,7 @@ function generateGroupMove(sourceNameUpper, targetNameUpper, indent) {
   lines.push(`${bi}val _padded = _bytes.padTo(${tgtClass}.recordLength, ' '.toByte).take(${tgtClass}.recordLength)`);
   lines.push(`${bi}val _parsed = ${tgtClass}.parse(_padded)`);
   for (const t of tgtChildren) {
-    lines.push(`${bi}${t.camel} = _parsed.${t.ccField}`);
+    lines.push(`${bi}${assignExpr(t.camel, `_parsed.${t.ccField}`)}`);
   }
   lines.push(`${indentStr}}`);
   return lines.join('\n');
@@ -3229,8 +3232,14 @@ function subscriptSuffixExpr(subscripts) {
  * positionalPairs rather than starting from a VariableReference AST node.
  */
 function renderCamelAssignment(camel, subscripts, valueExpr) {
+  // round-24 audit: routes through assignExpr (same as renderAssignment's own
+  // unsubscripted branch) so a RECURSIVE program's LINKAGE-aliased leaf
+  // reached this way (e.g. via ADD/SUBTRACT CORRESPONDING or RETURN ...
+  // INTO) gets the explicit `<camel>_=(value)` setter-call form instead of a
+  // bare `<camel> = value` that would hit the "Reassignment to val" compile
+  // error round-23 finding 1 already fixed for every other write site.
   if (!Array.isArray(subscripts) || subscripts.length === 0) {
-    return `${camel} = ${valueExpr}`;
+    return assignExpr(camel, valueExpr);
   }
   const idxs = subscripts.map(subscriptIndexExpr);
   function rec(depth, baseExpr) {
@@ -3273,7 +3282,13 @@ export function generateMoveCorresponding(statement, indent = 0) {
       continue;
     }
     for (const pair of pairs) {
-      lines.push(`${indentStr}${pair.targetCamel} = ${coerceCorrespondingValue(pair)}`);
+      // round-24 finding: this built a bare `${pair.targetCamel} = ...`
+      // string directly, bypassing assignExpr - the SAME bug round-23
+      // finding 1 fixed for renderAssignment (a RECURSIVE program's
+      // LINKAGE-aliased leaf is a local getter/setter `def` pair, not a
+      // module var, so a bare `=` hits "Reassignment to val" at compile
+      // time; see assignExpr's own doc comment above).
+      lines.push(`${indentStr}${assignExpr(pair.targetCamel, coerceCorrespondingValue(pair))}`);
     }
   }
 
@@ -4626,18 +4641,20 @@ export function generateInspect(statement, indent = 0) {
     for (const t of statement.tallying) {
       const counter = convertIdentifier(t.counter);
       const scan = inspectTallyScanExpr(target, t.region);
+      // round-24 audit: assignExpr, not a bare `=` string - the TALLYING
+      // counter can be a RECURSIVE program's own LINKAGE-aliased leaf.
       if (t.type === 'CHARACTERS') {
-        lines.push(`${indentStr}${counter} = ${counter} + (${scan}).length`);
+        lines.push(`${indentStr}${assignExpr(counter, `${counter} + (${scan}).length`)}`);
       } else if (t.type === 'ALL') {
         const pattern = convertArithmeticExpression(t.what);
         // Non-overlapping substring count, scanning left to right - matches
         // COBOL's TALLYING FOR ALL semantics for both single- and
         // multi-character patterns (a plain .count(_ == char) would only be
         // correct for exactly-one-character patterns).
-        lines.push(`${indentStr}${counter} = ${counter} + CobolInspect.tallyAll(${scan}, ${pattern})`);
+        lines.push(`${indentStr}${assignExpr(counter, `${counter} + CobolInspect.tallyAll(${scan}, ${pattern})`)}`);
       } else if (t.type === 'LEADING') {
         const pattern = convertArithmeticExpression(t.what);
-        lines.push(`${indentStr}${counter} = ${counter} + CobolInspect.tallyLeading(${scan}, ${pattern})`);
+        lines.push(`${indentStr}${assignExpr(counter, `${counter} + CobolInspect.tallyLeading(${scan}, ${pattern})`)}`);
       }
     }
   }
@@ -5424,7 +5441,12 @@ export function scatterGroupFromString(groupKey, sourceExpr, indent) {
     if (info.scalaType === 'String') {
       const width = info.picLength || 0;
       const sliceExpr = width > 0 ? `(${sourceExpr}).substring(${offset}, ${offset + width})` : sourceExpr;
-      lines.push(`${indentStr}${c.camel} = ${sliceExpr}`);
+      // round-24 audit: assignExpr, not a bare `${c.camel} = ...` string -
+      // this is the CALL BY REFERENCE writeback path for a group operand,
+      // used from generateCall's ordinary-target branch and
+      // generateScalarIntoGroupMove's MOVE-into-group path alike; either
+      // caller can reach a RECURSIVE program's own LINKAGE-aliased leaf.
+      lines.push(`${indentStr}${assignExpr(c.camel, sliceExpr)}`);
       offset += width;
       continue;
     }
@@ -5452,7 +5474,7 @@ export function scatterGroupFromString(groupKey, sourceExpr, indent) {
       : info.scalaType === 'Float' ? `${bdExpr}.toFloat`
       : info.scalaType === 'Double' ? `${bdExpr}.toDouble`
       : `${bdExpr}.toInt`;
-    lines.push(`${indentStr}${c.camel} = ${finalExpr}`);
+    lines.push(`${indentStr}${assignExpr(c.camel, finalExpr)}`);
     offset += width;
   }
   return lines;
@@ -5817,7 +5839,13 @@ function generateSearch(statement, indent = 0) {
     lines.push(`${si}_searchDone = true`);
   });
   lines.push(`${wi}else`);
-  lines.push(`${si}${idxVar} = ${idxVar} + 1`);
+  // round-24 audit: assignExpr, not a bare `=` string - unlike SEARCH ALL's
+  // own idxVar (always an OCCURS table's INDEXED BY name, a shape that
+  // always falls back to the ordinary, non-aliased convention entirely - see
+  // flattenGroupLeaves's TABLE_REGISTRY bail-out), this plain SEARCH's own
+  // idxVar can be an arbitrary scalar `SEARCH ... VARYING identifier-2`,
+  // which COULD be a RECURSIVE program's own LINKAGE-aliased leaf.
+  lines.push(`${si}${assignExpr(idxVar, `${idxVar} + 1`)}`);
 
   lines.push(`${bi}if !_searchDone then`);
   const atEnd = statement.atEnd || [];
@@ -6352,7 +6380,9 @@ function generateMergeUsingFileLines(fileRef, sortInfo, indent = 0) {
   lines.push(...readAssignLines(dest, '_mergeLine', bi));
   if (pairs.length > 0) {
     for (const pair of pairs) {
-      lines.push(`${bi}${pair.targetCamel} = ${coerceCorrespondingValue(pair)}`);
+      // round-24 audit: assignExpr, not a bare `=` string - see assignExpr's
+      // own doc comment.
+      lines.push(`${bi}${assignExpr(pair.targetCamel, coerceCorrespondingValue(pair))}`);
     }
   } else if (dest.mode === 'elementary' && dest.camel && sdGroupKey && GROUP_REGISTRY.has(sdGroupKey)) {
     // round-19 finding 1: a USING file's FD record that is FLAT/ELEMENTARY
@@ -6417,7 +6447,10 @@ function generateRelease(statement, indent = 0) {
     const pairs = positionalPairs(resolveGroupKey(fromUpper), resolveGroupKey(recordUpper));
     for (const pair of pairs) {
       const sourceExpr = coerceCorrespondingValue({ ...pair, sourceCamel: `${pair.sourceCamel}${fromSuffix}` });
-      lines.push(`${indentStr}${pair.targetCamel} = ${sourceExpr}`);
+      // round-24 audit: assignExpr, not a bare `=` string (see assignExpr's
+      // own doc comment) - the SD record's own fields can, in principle, be
+      // reached from a RECURSIVE program's LINKAGE-aliased leaf too.
+      lines.push(`${indentStr}${assignExpr(pair.targetCamel, sourceExpr)}`);
     }
   }
 
@@ -6444,7 +6477,9 @@ function generateReturn(statement, indent = 0) {
   lines.push(`${bi}val _rec = ${info.bufferVar}(${info.idxVar})`);
   lines.push(`${bi}${info.idxVar} = ${info.idxVar} + 1`);
   for (const f of info.fields) {
-    lines.push(`${bi}${f.camel} = _rec.${f.camel}`);
+    // round-24 audit: assignExpr, not a bare `=` string - see assignExpr's
+    // own doc comment.
+    lines.push(`${bi}${assignExpr(f.camel, `_rec.${f.camel}`)}`);
   }
 
   if (statement.into) {
@@ -6550,7 +6585,9 @@ function readDestination(statement, fileName) {
 function readAssignLines(dest, lineExpr, indentStr) {
   if (dest.mode === 'elementary') {
     const rhs = dest.width > 0 ? `CobolFmt.fitLeft(${lineExpr}, ${dest.width})` : lineExpr;
-    return [`${indentStr}${dest.camel} = ${rhs}`];
+    // round-24 audit: assignExpr, not a bare `=` string - see assignExpr's
+    // own doc comment. A READ INTO's destination can be a LINKAGE item.
+    return [`${indentStr}${assignExpr(dest.camel, rhs)}`];
   }
   if (dest.mode === 'group') {
     const fitted = dest.width > 0 ? `CobolFmt.fitLeft(${lineExpr}, ${dest.width})` : lineExpr;
@@ -6564,7 +6601,7 @@ function readAssignLines(dest, lineExpr, indentStr) {
       `${indentStr}val _parsed = ${dest.className}.parse((${fitted}).getBytes(java.nio.charset.StandardCharsets.ISO_8859_1))`,
     ];
     for (const c of dest.children) {
-      lines.push(`${indentStr}${c.camel} = _parsed.${c.ccField}`);
+      lines.push(`${indentStr}${assignExpr(c.camel, `_parsed.${c.ccField}`)}`);
     }
     return lines;
   }
@@ -6617,7 +6654,10 @@ function generateReadStatement(statement, indent = 0) {
 
     lines.push(...readAssignLines(dest, '_record', `${indentStr}  `));
     if (statusVar) {
-      lines.push(`${indentStr}  ${statusVar} = "00"`);
+      // round-24 audit: assignExpr, not a bare `=` string - FILE STATUS may
+      // legally name a LINKAGE item, which could be a RECURSIVE program's
+      // own LINKAGE-aliased leaf.
+      lines.push(`${indentStr}  ${assignExpr(statusVar, '"00"')}`);
     }
 
     if (hasNotAtEnd) {
@@ -6631,7 +6671,7 @@ function generateReadStatement(statement, indent = 0) {
     lines.push(`${indentStr}else`);
 
     if (statusVar) {
-      lines.push(`${indentStr}  ${statusVar} = "10"`);
+      lines.push(`${indentStr}  ${assignExpr(statusVar, '"10"')}`);
     }
 
     if (hasAtEnd) {
@@ -6653,9 +6693,9 @@ function generateReadStatement(statement, indent = 0) {
     lines.push(`${indentStr}if ${iteratorVar}.hasNext then`);
     lines.push(`${indentStr}  val _record = ${iteratorVar}.next()`);
     lines.push(...readAssignLines(dest, '_record', `${indentStr}  `));
-    lines.push(`${indentStr}  ${statusVar} = "00"`);
+    lines.push(`${indentStr}  ${assignExpr(statusVar, '"00"')}`);
     lines.push(`${indentStr}else`);
-    lines.push(`${indentStr}  ${statusVar} = "10"`);
+    lines.push(`${indentStr}  ${assignExpr(statusVar, '"10"')}`);
     // round-10 finding 1: no AT END clause on this READ means nothing else
     // handles the end-of-file condition - a registered DECLARATIVES
     // handler for this file (or its INPUT mode generically) fires here,
@@ -6861,7 +6901,9 @@ function generateWriteStatement(statement, indent = 0) {
   // failure path, so a registered FILE STATUS field always goes to "00"
   // (successful write) here - see FILE_STATUS_REGISTRY's doc comment.
   const statusVar = fileStatusVarFor(fileName);
-  const statusSuffix = statusVar ? ` ${statusVar} = "00"` : '';
+  // round-24 audit: assignExpr, not a bare `=` string - see this function's
+  // own doc comment on statusVar/readAssignLines above.
+  const statusSuffix = statusVar ? ` ${assignExpr(statusVar, '"00"')}` : '';
 
   // round-10 finding 3: a record containing a non-DISPLAY (packed/binary/
   // float) child must be written through its own byte-level format(), not
@@ -7139,6 +7181,45 @@ function varyingOperandExprLocal(operand, fallback) {
  * positional argument the way a plain shorter argument list skips trailing
  * ones.
  */
+/**
+ * round-24 finding (m10): the caller-side names (uppercased) of every USING
+ * operand passed BY REFERENCE (COBOL's default) to a single CALL that names
+ * the exact SAME caller variable more than once (`CALL "X" USING WS-Y,
+ * WS-Y`) - real cobc passes the ADDRESS of WS-Y for both USING positions, so
+ * every one of the callee's own distinctly-named LINKAGE parameters bound to
+ * WS-Y is the SAME storage for the whole call: a write through one is
+ * visible through the other IMMEDIATELY, even from inside the callee's own
+ * body. This generator's ordinary (non-recursive) CALL convention scatters
+ * each USING argument into its own INDEPENDENT module-level var inside the
+ * callee (generateEntryMethod, scala-generator.js) - true aliasing here
+ * would need round 21-23's getter/setter-closure mechanism (built for a
+ * RECURSIVE program's own self-CALL) generalized to EVERY ordinary CALL, a
+ * change of comparable size to that whole mechanism applied across the
+ * entire non-recursive CALL corpus - out of scope for this narrow finding.
+ * (A RECURSIVE target is unaffected: `target.recursive`'s own closures
+ * already alias correctly for this exact shape - both USING positions
+ * resolve to the SAME caller-side Scala identifier, so their getter/setter
+ * pairs trivially read/write the same storage for free - see generateCall's
+ * own `target.recursive` branch above.) Returns `[]` for a recursive target
+ * or when no name repeats - the overwhelmingly common case, and the entire
+ * pre-existing corpus.
+ */
+function duplicateByReferenceCallArgNames(usingParams) {
+  const seen = new Set();
+  const dupes = new Set();
+  usingParams.forEach(param => {
+    if (param.omitted) return;
+    const mode = String(param.mode || 'REFERENCE').toUpperCase();
+    if (mode !== 'REFERENCE') return;
+    const name = param.value?.name;
+    if (!name) return;
+    const nameUpper = String(name).toUpperCase();
+    if (seen.has(nameUpper)) dupes.add(nameUpper);
+    seen.add(nameUpper);
+  });
+  return [...dupes];
+}
+
 function generateCall(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const rawProgramName = statement.programName?.value || statement.programName || 'subprogram';
@@ -7150,6 +7231,19 @@ function generateCall(statement, indent = 0) {
   if (!target) {
     return `${indentStr}() // TODO: CALL "${rawProgramName}" - external subprogram not available for conversion (no PROGRAM-ID "${nameUpper}" found in this source); call skipped - see tests/oracle/README.md known gaps`;
   }
+
+  // round-24 finding (m10): see duplicateByReferenceCallArgNames's own doc
+  // comment above - only relevant for an ORDINARY (non-recursive) target,
+  // since a RECURSIVE target's closures already alias this shape correctly.
+  const aliasedArgNames = target.recursive ? [] : duplicateByReferenceCallArgNames(usingParams);
+  const aliasWarningLine = aliasedArgNames.length > 0
+    ? `${indentStr}// TODO: CALL "${rawProgramName}" USING ...: ${aliasedArgNames.join(', ')} passed as more than one ` +
+      'BY REFERENCE argument to this one call - true aliasing between two of the callee\'s own distinctly-named ' +
+      'LINKAGE parameters bound to the SAME caller variable is not modeled (this generator scatters/gathers each ' +
+      'USING argument into its own independent copy); a write through one parameter inside the callee will NOT be ' +
+      'visible through the other until each parameter\'s own final value is separately written back after the ' +
+      'call returns (last write wins, not true aliasing) - see tests/oracle/README.md known gaps\n'
+    : '';
 
   // round-8 finding 1: a bare (no subscripts) reference to a registered
   // GROUP name - as opposed to an elementary field - needs the same
@@ -7405,15 +7499,15 @@ function generateCall(statement, indent = 0) {
   };
 
   if (target.paramCount === 0 || refWriters.every(w => w === null)) {
-    return `${indentStr}${callExpr}`;
+    return `${aliasWarningLine}${indentStr}${callExpr}`;
   }
 
   if (target.paramCount === 1) {
     const w = refWriters.find(Boolean);
-    if (!w) return `${indentStr}${callExpr}`;
-    if (w.kind === 'scalar') return `${indentStr}${assignExpr(w.camel, callExpr)}`;
+    if (!w) return `${aliasWarningLine}${indentStr}${callExpr}`;
+    if (w.kind === 'scalar') return `${aliasWarningLine}${indentStr}${assignExpr(w.camel, callExpr)}`;
     const retName = nextCallRetName();
-    return [`${indentStr}val ${retName} = ${callExpr}`, ...renderWriteback(w, retName)].join('\n');
+    return `${aliasWarningLine}${[`${indentStr}val ${retName} = ${callExpr}`, ...renderWriteback(w, retName)].join('\n')}`;
   }
 
   const retName = nextCallRetName();
@@ -7421,7 +7515,7 @@ function generateCall(statement, indent = 0) {
   refWriters.forEach((w, i) => {
     if (w) lines.push(...renderWriteback(w, `${retName}._${i + 1}`));
   });
-  return lines.join('\n');
+  return `${aliasWarningLine}${lines.join('\n')}`;
 }
 
 /**
@@ -7588,7 +7682,10 @@ function generateSet(statement, indent = 0) {
       // emitting `<condition-name camelCase> = true`, which referenced a
       // nonexistent identifier (e.g. `wsStatusActive = true` when only
       // `wsStatus` - the *parent* PIC X(1) field - actually exists).
-      lines.push(`${indentStr}${l88.camel} = ${l88.literal}`);
+      // round-24 audit: assignExpr, not a bare `=` string - the parent
+      // field of a condition-name can itself be a RECURSIVE program's own
+      // LINKAGE-aliased leaf.
+      lines.push(`${indentStr}${assignExpr(l88.camel, l88.literal)}`);
     } else if (l88False) {
       // SET condition-name-1 TO FALSE, mirroring the TRUE branch above
       // (round-12 finding 1): assign the parent field its own declared
@@ -7597,7 +7694,7 @@ function generateSet(statement, indent = 0) {
       // boolean var, so `<parent> = false` was never valid Scala for it
       // either (a compile error the pre-fix path never even reached, since
       // the parser hung indefinitely on this exact 88-level shape).
-      lines.push(`${indentStr}${l88False.camel} = ${l88False.literal}`);
+      lines.push(`${indentStr}${assignExpr(l88False.camel, l88False.literal)}`);
     } else if (statement.value?.type === 'TRUE') {
       lines.push(`${indentStr}${renderAssignment(target, 'true')}`);
     } else if (statement.value?.type === 'FALSE') {
@@ -7738,7 +7835,12 @@ function initializeAssignmentLines(groupKey, replacing, indentStr, subscripts) {
       const syntheticTarget = { name: c.nameUpper, subscripts };
       lines.push(`${indentStr}${renderAssignment(syntheticTarget, wrapped)}`);
     } else {
-      lines.push(`${indentStr}${c.camel} = ${wrapInitializeOccurs(scalarExpr, info)}`);
+      // round-24 finding (m01): this built a bare `${c.camel} = ...` string
+      // directly, bypassing assignExpr - the SAME bug round-23 finding 1
+      // fixed for renderAssignment (a RECURSIVE program's LINKAGE-aliased
+      // leaf is a local getter/setter `def` pair, not a module var, so a
+      // bare `=` hits "Reassignment to val" at compile time).
+      lines.push(`${indentStr}${assignExpr(c.camel, wrapInitializeOccurs(scalarExpr, info))}`);
     }
   }
   return lines;
@@ -7818,4 +7920,5 @@ export default {
   generateCobolInspectHelper,
   generateCobolUnstringHelper,
   formatEditedPicture,
+  assignExpr,
 };

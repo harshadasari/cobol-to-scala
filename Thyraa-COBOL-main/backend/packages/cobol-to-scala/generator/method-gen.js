@@ -458,24 +458,50 @@ function generateMethodNamed(methodName, statements, indent = 0, paramList = '')
  */
 export function collectAmbiguousParagraphNames(topLevelParagraphs, sections) {
   const counts = new Map();
-  const bump = (name) => {
+  // round-25 root cause 3: also track (section, bareName) pair counts, so
+  // resolveParagraphMethodName can detect when TWO (OR MORE) DIFFERENT
+  // paragraphs sharing the same bare (post-numeric-prefix-stripped) name
+  // ALSO happen to live in the exact same section (o13: `1000-PARA` and
+  // `2000-PARA`, both declared inside `SEC-A`, both strip to bare "para") -
+  // qualifying by section alone (the ordinary ambiguous-name fix, round-4
+  // finding 8) collapses onto the IDENTICAL qualified name for both in that
+  // case (`secAPara` declared twice - a hard "already defined"/"Conflicting
+  // definitions" compile error, reproducible even in an ordinary,
+  // non-RECURSIVE, non-THRU program with this exact paragraph-naming shape -
+  // a section qualifier can only distinguish paragraphs declared in
+  // DIFFERENT sections, never two colliding names within the identical one).
+  const sectionBareCounts = new Map();
+  const bump = (name, sectionName) => {
     const bare = toMethodName(name);
     counts.set(bare, (counts.get(bare) || 0) + 1);
+    if (sectionName) {
+      const key = `${String(sectionName).toUpperCase()}::${bare}`;
+      sectionBareCounts.set(key, (sectionBareCounts.get(key) || 0) + 1);
+    }
   };
 
-  for (const p of topLevelParagraphs || []) bump(p.name);
+  for (const p of topLevelParagraphs || []) bump(p.name, null);
   for (const s of sections || []) {
-    const paras = s.paragraphs && s.paragraphs.length > 0 ? s.paragraphs : [s];
-    if (s.paragraphs && s.paragraphs.length > 0) {
+    const hasParagraphs = s.paragraphs && s.paragraphs.length > 0;
+    const paras = hasParagraphs ? s.paragraphs : [s];
+    if (hasParagraphs) {
       const leading = sectionLeadingUnit(s);
-      if (leading) bump(leading.name);
+      if (leading) bump(leading.name, s.name);
     }
-    for (const p of paras) bump(p.name);
+    for (const p of paras) bump(p.name, hasParagraphs ? s.name : null);
   }
 
   const ambiguous = new Set();
   for (const [name, count] of counts) {
     if (count > 1) ambiguous.add(name);
+  }
+  // Attached to the same Set instance (not a second return value) so every
+  // existing call site that only ever calls `ambiguousNames.has(bare)` - the
+  // overwhelming majority - is completely unaffected; only
+  // resolveParagraphMethodName (below) reads this extra property.
+  ambiguous.sameSectionCollisions = new Set();
+  for (const [key, count] of sectionBareCounts) {
+    if (count > 1) ambiguous.sameSectionCollisions.add(key);
   }
   return ambiguous;
 }
@@ -527,6 +553,20 @@ export function resolveParagraphMethodName(paragraphName, sectionName, ambiguous
   const bare = toMethodName(paragraphName);
   if (ambiguousNames && ambiguousNames.has(bare) && sectionName) {
     const sectionPart = toMethodName(sectionName);
+    // round-25 root cause 3: qualifying by section alone is not unique when
+    // two (or more) paragraphs sharing THIS bare name also share THIS same
+    // section (collectAmbiguousParagraphNames' own sameSectionCollisions -
+    // o13: `1000-PARA`/`2000-PARA`, both in SEC-A, both stripping to bare
+    // "para") - fall back to a name built from the paragraph's own FULL
+    // (unstripped) text in that case. COBOL requires paragraph names to be
+    // unique within their own section, so `sectionPart + toPascalCase(full
+    // name)` is inherently collision-free here with no further bookkeeping
+    // needed - unlike the ordinary case just below, which only strips the
+    // numeric prefix and can still collide within one section.
+    const sameSectionKey = `${String(sectionName).toUpperCase()}::${bare}`;
+    if (ambiguousNames.sameSectionCollisions && ambiguousNames.sameSectionCollisions.has(sameSectionKey)) {
+      return sectionPart + toPascalCase(String(paragraphName || ''));
+    }
     return sectionPart + bare.charAt(0).toUpperCase() + bare.slice(1);
   }
   return bare;
@@ -967,6 +1007,37 @@ export function generateProgramFlowLinesNested(units, indent, ambiguousNames) {
   }
   const nameFor = (u) => resolveParagraphMethodName(u.name, u.sectionName, ambiguousNames);
   const lines = renderNestedFallthroughDefs(units, indent, nameFor);
+
+  // round-25 root cause 3: a `PERFORM x THRU y` range reachable from this
+  // RECURSIVE program's own entry point needs its OWN nested-local
+  // counterpart here too, not just the shared TOP-LEVEL wrapper method
+  // generateAllMethods unconditionally generates for every program
+  // (recursive or not, via generatePerformThruMethod). The pre-fix generator
+  // only ever built the top-level one - a qualified `PERFORM 1000-PARA OF
+  // SEC-A THRU 2000-PARA OF SEC-A` executed from inside a RECURSIVE
+  // program's own nested-def body (o13) called straight out to that shared
+  // top-level method, whose own nested paragraph defs close over nothing (no
+  // getter/setter closures - they read/write the ordinary shared module
+  // LINKAGE var generateEntryMethod's non-recursive convention uses), so
+  // every LINKAGE reference inside the THRU range silently read/wrote the
+  // WRONG (stale, always-default) storage instead of this call activation's
+  // own aliased value. generatePerformFromAST's own PERFORM ... THRU call
+  // site (this file) always emits a call to the bare, unqualified
+  // `performThruWrapperName(...)()` identifier - so declaring a nested `def`
+  // with the IDENTICAL name here, inside this same nested scope, makes
+  // Scala's ordinary lexical-shadowing rules resolve every such call made
+  // from within this program's own nested paragraph defs to THIS
+  // activation's version (closing over the correct getter/setter closures,
+  // via generatePerformThruMethod's own body-generation reused verbatim)
+  // instead of escaping out to the top-level, module-shared one - with zero
+  // change needed to the PERFORM ... THRU call-site codegen itself.
+  // collectPerformThrus runs the identical collection pass generateAllMethods
+  // itself uses, over this SAME `units` list, so every range this program
+  // can actually reach gets its nested counterpart, and nothing more.
+  for (const thru of collectPerformThrus(units).values()) {
+    lines.push(generatePerformThruMethod(thru.from, thru.to, units, ambiguousNames, indent, thru.fromSection, thru.toSection));
+  }
+
   lines.push(`${'  '.repeat(indent)}${nameFor(units[0])}()`);
   return lines;
 }
@@ -1024,6 +1095,77 @@ function collectStatementsDeep(statements, visit) {
       for (const when of stmt.whenClauses || []) collectStatementsDeep(when.statements, visit);
     }
   }
+}
+
+/**
+ * Collect every `PERFORM x [OF/IN secX] THRU y [OF/IN secY]` range (and
+ * SORT/MERGE's own INPUT PROCEDURE/OUTPUT PROCEDURE THRU-range clauses)
+ * reachable anywhere in `units`' own statement trees, keyed by (fromParagraph,
+ * fromSection, toParagraph, toSection) - not just the bare paragraph names -
+ * so two qualified THRU ranges sharing both bare endpoint names in DIFFERENT
+ * sections (`PERFORM PARA-ONE OF SEC-A THRU PARA-TWO OF SEC-A` vs `... OF
+ * SEC-B THRU ... OF SEC-B`, round-14 finding 1) are collected as two distinct
+ * entries, never collapsed into one.
+ *
+ * round-13 finding 2: a SORT statement's own INPUT PROCEDURE/OUTPUT PROCEDURE
+ * clauses (SortStatement.inputProcedure/.outputProcedure - a `{ procedure,
+ * through }` shape, parser/ast.js/parser/procedure-parser.js's
+ * parseSortProcedureClause) can ALSO name a THRU range (`INPUT PROCEDURE IS
+ * 1000-FILL THRU 1000-FILL-EXIT`), exactly like a PERFORM statement's own `x
+ * THRU y` - expression-gen.js's generateSort/procedureCallExpr already
+ * assumes a THRU-range procedure clause resolves to the same `<from>To<To>()`
+ * wrapper method generatePerformThruMethod builds for an ordinary PERFORM ...
+ * THRU, so this collection also has to look at SortStatement/MergeStatement,
+ * not just PerformStatement. Round-20 finding (i06): even with NO THRU at
+ * all, "OUTPUT PROCEDURE IS X" is still its own implicit, single-paragraph
+ * range - `{procedure: X, through: X}` reuses the exact same range machinery
+ * annotateGoToThruEscapes already applies to an explicit `PERFORM x THRU y`.
+ *
+ * round-16 finding 4: recurses via collectStatementsDeep (inline PERFORM
+ * VARYING/TIMES/UNTIL bodies, IF branches, EVALUATE/SEARCH WHEN bodies, every
+ * ON EXCEPTION/SIZE ERROR/OVERFLOW/INVALID KEY/AT END(-OF-PAGE) imperative
+ * list) so a PERFORM THRU (or SORT/MERGE ... THRU clause) at ANY nesting
+ * depth is found, not just at a paragraph's own top level.
+ *
+ * round-25 root cause 3: factored out of generateAllMethods (which builds one
+ * TOP-LEVEL wrapper method per entry here) so generateProgramFlowLinesNested
+ * can run the identical pass over the identical `units` list and build its
+ * OWN nested-local counterpart for a RECURSIVE program's entry() body - see
+ * that function's own doc comment for why a RECURSIVE program's PERFORM ...
+ * THRU needs this at all (the shared top-level wrapper's own nested defs
+ * close over nothing - they read/write the ordinary shared module LINKAGE
+ * var, not this specific call activation's own getter/setter closures).
+ */
+export function collectPerformThrus(units) {
+  const performThrus = new Map();
+  function addPerformThru(from, fromSection, to, toSection) {
+    if (!from || !to) return;
+    const key = JSON.stringify([from, fromSection || null, to, toSection || null]);
+    if (!performThrus.has(key)) {
+      performThrus.set(key, { from, fromSection: fromSection || null, to, toSection: toSection || null });
+    }
+  }
+
+  for (const unit of units) {
+    collectStatementsDeep(unit.statements, stmt => {
+      if (stmt.type === 'PerformStatement' && stmt.throughParagraph) {
+        addPerformThru(stmt.targetParagraph, stmt.targetSection, stmt.throughParagraph, stmt.throughSection);
+      }
+      if (stmt.type === 'SortStatement' || stmt.type === 'MergeStatement') {
+        // SORT/MERGE's own INPUT/OUTPUT PROCEDURE clause has no OF/IN
+        // qualifier grammar of its own (parseSortProcedureClause never
+        // parses one) - always unqualified (null sections).
+        if (stmt.inputProcedure?.procedure) {
+          addPerformThru(stmt.inputProcedure.procedure, null, stmt.inputProcedure.through || stmt.inputProcedure.procedure, null);
+        }
+        if (stmt.outputProcedure?.procedure) {
+          addPerformThru(stmt.outputProcedure.procedure, null, stmt.outputProcedure.through || stmt.outputProcedure.procedure, null);
+        }
+      }
+    });
+  }
+
+  return performThrus;
 }
 
 /**
@@ -1132,98 +1274,12 @@ export function generateAllMethods(topLevelParagraphs, sections, indent = 0) {
   }
 
   const methods = [];
-  // round-14 finding 1: keyed by (fromParagraph, fromSection, toParagraph,
-  // toSection) - not just the bare paragraph names - so two qualified THRU
-  // ranges that happen to share both bare endpoint names in DIFFERENT
-  // sections (`PERFORM PARA-ONE OF SEC-A THRU PARA-TWO OF SEC-A` vs `... OF
-  // SEC-B THRU ... OF SEC-B`) are collected as two distinct wrapper methods,
-  // not collapsed into a single Set entry (which previously resolved to
-  // whichever range `generatePerformThruMethod`'s own bare-name unit lookup
-  // happened to find first in program order, regardless of which one - or
-  // both - callers actually asked for).
-  const performThrus = new Map();
-  function addPerformThru(from, fromSection, to, toSection) {
-    if (!from || !to) return;
-    const key = JSON.stringify([from, fromSection || null, to, toSection || null]);
-    if (!performThrus.has(key)) {
-      performThrus.set(key, { from, fromSection: fromSection || null, to, toSection: toSection || null });
-    }
-  }
-
-  // First pass - collect PERFORM THRU targets (PerformStatement AST nodes
-  // use .targetParagraph/.throughParagraph - see parser/ast.js - not
-  // .target/.thru).
-  //
-  // round-13 finding 2: a SORT statement's own INPUT PROCEDURE/OUTPUT
-  // PROCEDURE clauses (SortStatement.inputProcedure/.outputProcedure - a
-  // `{ procedure, through }` shape, parser/ast.js/parser/procedure-parser.js's
-  // parseSortProcedureClause) can ALSO name a THRU range (`INPUT PROCEDURE IS
-  // 1000-FILL THRU 1000-FILL-EXIT`), exactly like a PERFORM statement's own
-  // `x THRU y` - but this collection loop previously only ever looked at
-  // PerformStatement nodes, never SortStatement. expression-gen.js's
-  // generateSort/procedureCallExpr already assumes (and always has assumed)
-  // that a THRU-range procedure clause resolves to the same
-  // `<from>To<To>()` wrapper method generatePerformThruMethod builds for an
-  // ordinary PERFORM ... THRU - so a SORT with an INPUT/OUTPUT PROCEDURE ...
-  // THRU clause called a wrapper method that generateAllMethods never
-  // actually generated (a hard "not found" compile error) unless some
-  // *other*, unrelated PERFORM statement in the same program happened to
-  // request the identical THRU range coincidentally. Collecting THRU ranges
-  // from SortStatement here too - the exact same targetParagraph/through
-  // Set entries generatePerformThruMethod's loop below already consumes -
-  // is a pure addition: it only ever adds wrapper methods that a SORT ...
-  // THRU clause elsewhere in this same collection loop's file will actually
-  // call, never changes anything for a program with no such clause.
-  //
-  // round-16 finding 4: this collection previously only walked each unit's
-  // own TOP-LEVEL `.statements` list - a PERFORM ... THRU nested inside any
-  // other control-flow construct's own body (an inline PERFORM VARYING/TIMES/
-  // UNTIL, an IF's then/else branch, an EVALUATE WHEN, a SEARCH WHEN) was
-  // invisible to it, so generatePerformThruMethod's own wrapper method never
-  // got generated at all - a hard "not found: <from>To<to>" compile error the
-  // moment such a nested PERFORM THRU actually executed (e10: two PERFORM
-  // VARYING loops nesting a `PERFORM SECA-P1 THRU SECB-P2`). `collectStatementsDeep`
-  // recurses into every statement-list-bearing field this AST defines
-  // (inline PERFORM's own body, IF's two branches, EVALUATE's WHEN/WHEN-OTHER
-  // bodies, SEARCH's AT END/WHEN bodies, and every ON EXCEPTION/SIZE ERROR/
-  // OVERFLOW/INVALID KEY/AT END(-OF-PAGE) imperative-statement list any
-  // other statement type carries) so a PERFORM THRU (or a SORT ... THRU
-  // procedure clause) at ANY nesting depth is found, not just at a
-  // paragraph's own top level.
-  for (const unit of units) {
-    collectStatementsDeep(unit.statements, stmt => {
-      if (stmt.type === 'PerformStatement' && stmt.throughParagraph) {
-        addPerformThru(stmt.targetParagraph, stmt.targetSection, stmt.throughParagraph, stmt.throughSection);
-      }
-      if (stmt.type === 'SortStatement' || stmt.type === 'MergeStatement') {
-        // SORT/MERGE's own INPUT/OUTPUT PROCEDURE clause has no OF/IN
-        // qualifier grammar of its own (parseSortProcedureClause never
-        // parses one) - always unqualified (null sections). Round-20
-        // finding (i06): even with NO THRU at all, "OUTPUT PROCEDURE IS X"
-        // is still its own implicit, single-paragraph range - `{procedure:
-        // X, through: X}` reuses the exact same range machinery
-        // annotateGoToThruEscapes already applies to an explicit `PERFORM x
-        // THRU y` (its startIndex===endIndex case already handles a
-        // one-paragraph range correctly) - so a GO TO from inside that one
-        // paragraph to anywhere else gets the identical honest-decline
-        // marker treatment (see annotateGoToThruEscapes's own doc comment)
-        // instead of silently returning to the SORT/MERGE statement's own
-        // caller the way this generator's `return x()` call-based model
-        // otherwise always would. Confirmed against installed GnuCOBOL
-        // (i06): a MERGE ... OUTPUT PROCEDURE IS EMIT-PARA (no THRU) whose
-        // sole paragraph's own AT-END arm does `GO TO EMIT-DONE` - a
-        // DIFFERENT, later paragraph, never part of the OUTPUT PROCEDURE's
-        // own range - never returns to the statement after MERGE at all;
-        // execution permanently continues from EMIT-DONE onward instead.
-        if (stmt.inputProcedure?.procedure) {
-          addPerformThru(stmt.inputProcedure.procedure, null, stmt.inputProcedure.through || stmt.inputProcedure.procedure, null);
-        }
-        if (stmt.outputProcedure?.procedure) {
-          addPerformThru(stmt.outputProcedure.procedure, null, stmt.outputProcedure.through || stmt.outputProcedure.procedure, null);
-        }
-      }
-    });
-  }
+  // round-25 root cause 3: collection logic factored out into
+  // collectPerformThrus (below) so generateProgramFlowLinesNested can reuse
+  // the identical pass over the identical `units` list, for a RECURSIVE
+  // program's own nested-def PERFORM ... THRU wrapper (see that function's
+  // own doc comment).
+  const performThrus = collectPerformThrus(units);
 
   // round-19 finding 2 (h11): annotate every GoToStatement AST node whose
   // target lies OUTSIDE an enclosing PERFORM ... THRU range this same
@@ -1272,4 +1328,5 @@ export default {
   collectAmbiguousParagraphNames,
   resolveParagraphMethodName,
   flattenProcedureUnits,
+  collectPerformThrus,
 };

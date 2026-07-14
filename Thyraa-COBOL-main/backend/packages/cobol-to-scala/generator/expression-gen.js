@@ -575,6 +575,19 @@ function paragraphMethodName(name, sectionName) {
     let sn = String(sectionName).replace(/^\d+[-_]?/, '');
     if (!sn) sn = '_' + sectionName;
     const sectionPart = toCamelCase(sn);
+    // round-25 root cause 3: mirrors method-gen.js's resolveParagraphMethodName
+    // fix exactly (same duplication-instead-of-import reason as this
+    // function's own pre-existing doc note) - qualifying by section alone is
+    // not unique when two paragraphs sharing this bare name also share this
+    // same section (AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM's own attached
+    // sameSectionCollisions property, installed by the SAME Set instance
+    // method-gen.js's setAmbiguousParagraphNamesForPerformExpr call passes
+    // through unchanged).
+    const sameSectionKey = `${String(sectionName).toUpperCase()}::${bare}`;
+    if (AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM.sameSectionCollisions &&
+        AMBIGUOUS_PARAGRAPH_NAMES_FOR_PERFORM.sameSectionCollisions.has(sameSectionKey)) {
+      return sectionPart + toPascalCase(String(name || ''));
+    }
     return sectionPart + bare.charAt(0).toUpperCase() + bare.slice(1);
   }
   return bare;
@@ -6955,23 +6968,88 @@ function generateWriteStatement(statement, indent = 0) {
 }
 
 /**
- * Generate REWRITE statement wrapper
+ * Generate REWRITE statement wrapper.
+ *
+ * round-25 root cause 1: this used to be a bare `// REWRITE ... - update
+ * current record in file` COMMENT with no runtime effect whatsoever - it
+ * compiled cleanly and looked exactly like working code, but never actually
+ * wrote anything back (silent, no distinguishing marker - see
+ * tests/oracle/README.md's round-25 entry). Real update-in-place: REWRITE
+ * replaces the record most recently READ (posVar - 1, generateOpen's I-O
+ * branch in file-io-gen.js) in the SAME in-memory line buffer that branch
+ * populates for an I-O-mode file - CLOSE (file-io-gen.js's generateClose)
+ * flushes that buffer back to disk, so the change is durably visible to any
+ * later OPEN INPUT/I-O of the same file. Matches cobc's own REWRITE
+ * semantics for a SEQUENTIAL-access RELATIVE/INDEXED file (this generator's
+ * only modeled file organization); a RANDOM/DYNAMIC-access REWRITE
+ * addressed by an explicit RELATIVE/RECORD KEY (rather than "whatever was
+ * just READ") is not modeled - no corpus program exercises it.
+ *
+ * The record's own rendered text reuses writeRecordPlan/writeFromLiteralPlan
+ * (the exact same content-building logic generateWriteStatement already
+ * uses for WRITE) so a REWRITE record's on-disk text is byte-identical to
+ * what a WRITE of the same record/value would have produced - required
+ * since CLOSE later flushes this buffer back out through an ordinary
+ * println-per-line writer, exactly like an OUTPUT-mode WRITE does.
  */
 function generateRewriteStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
-  const recordName = toCamelCase(statement.recordName || statement.record || 'record');
+  const recordNameRaw = statement.recordName || statement.record || 'record';
+  const fileName = fileNameForRecord(recordNameRaw);
+  const { bufVar, posVar } = fileHandleVarNames(fileName);
+  const statusVar = fileStatusVarFor(fileName);
+  // round-24 audit: assignExpr, not a bare `=` string - see assignExpr's own
+  // doc comment.
+  const statusSuffix = statusVar ? ` ${assignExpr(statusVar, '"00"')}` : '';
 
-  return `${indentStr}// REWRITE ${recordName} - update current record in file`;
+  const literalPlan = statement.from && statement.from.type === 'Literal'
+    ? writeFromLiteralPlan(statement.from, recordNameRaw)
+    : null;
+  const sourceName = statement.from ? (statement.from.name || statement.from) : recordNameRaw;
+  const plan = literalPlan || writeRecordPlan(sourceName);
+
+  let recordExpr;
+  if (plan.mode === 'bytes') {
+    const bytesExpr = `${plan.className}.format(${plan.className}(${plan.ctorArgs}))`;
+    recordExpr = `new String(${bytesExpr}, java.nio.charset.StandardCharsets.ISO_8859_1)`;
+  } else if (plan.mode === 'bytes-unsupported') {
+    return (
+      `${indentStr}() // TODO: REWRITE ${sourceName}: a byte-level (non-DISPLAY-child) record with a FILLER/OCCURS ` +
+      'child is not supported (see tests/oracle/README.md known gaps); record not rewritten'
+    );
+  } else {
+    recordExpr = `(${plan.expr}).stripTrailing()`;
+  }
+
+  // `bufVar`/`posVar` are only ever populated by an I-O-mode OPEN
+  // (file-io-gen.js's generateOpen); REWRITE without a preceding successful
+  // READ in that mode (illegal COBOL - real cobc reports FILE STATUS 44) is
+  // a harmless no-op here rather than an ArrayIndexOutOfBounds crash.
+  return `${indentStr}if ${bufVar} != null && ${posVar} > 0 then { ${bufVar}(${posVar} - 1) = ${recordExpr};${statusSuffix} }`;
 }
 
 /**
- * Generate DELETE statement wrapper
+ * Generate DELETE statement wrapper.
+ *
+ * round-25 root cause 1: sibling fix to generateRewriteStatement above - this
+ * used to be a bare `// DELETE record from ...` COMMENT with no runtime
+ * effect at all. Real removal: DELETE removes the record most recently READ
+ * (posVar - 1) from the SAME in-memory line buffer REWRITE/READ use for an
+ * I-O-mode file, and rewinds posVar so a subsequent sequential READ
+ * correctly continues with whatever record now occupies that slot; CLOSE
+ * flushes the buffer back to disk, so the removal is durable (a later OPEN
+ * INPUT of the same file simply never sees the deleted record again -
+ * exactly how cobc's own RELATIVE/INDEXED DELETE behaves for
+ * SEQUENTIAL access).
  */
 function generateDeleteStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
-  const fileName = toCamelCase(statement.fileName || statement.file || 'file');
+  const fileNameRaw = statement.fileName || statement.file || 'file';
+  const { bufVar, posVar } = fileHandleVarNames(fileNameRaw);
+  const statusVar = fileStatusVarFor(fileNameRaw);
+  const statusSuffix = statusVar ? ` ${assignExpr(statusVar, '"00"')}` : '';
 
-  return `${indentStr}// DELETE record from ${fileName}`;
+  return `${indentStr}if ${bufVar} != null && ${posVar} > 0 then { ${bufVar}.remove(${posVar} - 1); ${posVar} -= 1;${statusSuffix} }`;
 }
 
 /**
@@ -7682,10 +7760,25 @@ function generateSet(statement, indent = 0) {
       // emitting `<condition-name camelCase> = true`, which referenced a
       // nonexistent identifier (e.g. `wsStatusActive = true` when only
       // `wsStatus` - the *parent* PIC X(1) field - actually exists).
-      // round-24 audit: assignExpr, not a bare `=` string - the parent
-      // field of a condition-name can itself be a RECURSIVE program's own
-      // LINKAGE-aliased leaf.
-      lines.push(`${indentStr}${assignExpr(l88.camel, l88.literal)}`);
+      // round-25 root cause 2: `target` itself (the level-88 condition-name
+      // reference, e.g. `WS-FLAG-OK(2)`) carries the subscript when its
+      // 88-level is declared under an OCCURS table element's child - the
+      // condition name is never itself the table (CONDITION_REGISTRY's own
+      // `info.camel` already resolves to the PARENT field's flat var, e.g.
+      // `wsFlag`, a `Vector[...]` when occursDepth > 0), so that same
+      // subscript must apply to THIS write, exactly like any other write to
+      // that table (renderCamelAssignment - the shared "camel + optional
+      // subscript list" write primitive renderAssignment itself uses,
+      // factored out precisely so callers computing the target camel name
+      // some other way, like this one via l88.camel rather than directly
+      // from `target`, can still get the identical `.updated(...)` subscript
+      // handling instead of a bare scalar `=` that doesn't compile against
+      // a `Vector[...]`). A plain (unsubscripted) condition-name is
+      // completely unaffected (empty subscript list - renderCamelAssignment
+      // falls back to its own assignExpr call, byte-for-byte the same
+      // output as before this fix).
+      const subscripts = Array.isArray(target?.subscripts) ? target.subscripts : [];
+      lines.push(`${indentStr}${renderCamelAssignment(l88.camel, subscripts, l88.literal)}`);
     } else if (l88False) {
       // SET condition-name-1 TO FALSE, mirroring the TRUE branch above
       // (round-12 finding 1): assign the parent field its own declared
@@ -7694,7 +7787,10 @@ function generateSet(statement, indent = 0) {
       // boolean var, so `<parent> = false` was never valid Scala for it
       // either (a compile error the pre-fix path never even reached, since
       // the parser hung indefinitely on this exact 88-level shape).
-      lines.push(`${indentStr}${assignExpr(l88False.camel, l88False.literal)}`);
+      // round-25 root cause 2: same subscript threading as the TRUE branch
+      // just above.
+      const subscripts = Array.isArray(target?.subscripts) ? target.subscripts : [];
+      lines.push(`${indentStr}${renderCamelAssignment(l88False.camel, subscripts, l88False.literal)}`);
     } else if (statement.value?.type === 'TRUE') {
       lines.push(`${indentStr}${renderAssignment(target, 'true')}`);
     } else if (statement.value?.type === 'FALSE') {

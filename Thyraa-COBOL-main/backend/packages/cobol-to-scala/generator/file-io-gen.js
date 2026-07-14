@@ -41,6 +41,26 @@ function toRandomVarName(cobolFileName) {
 }
 
 /**
+ * round-25 root cause 1: in-memory line-buffer variable name for an
+ * I-O-mode-opened file - see generateOpen's I-O branch doc comment for why
+ * REWRITE/DELETE need a mutable, position-tracked view over this generator's
+ * existing "one text line per record" storage model instead of genuine
+ * byte-random access.
+ */
+function toBufVarName(cobolFileName) {
+  return toCamelCase(cobolFileName) + 'Buf';
+}
+
+/**
+ * round-25 root cause 1: read-position counter (0-based index of the NEXT
+ * record to read out of the I-O-mode buffer above) - `posVar - 1` is always
+ * "the record most recently READ," which is what REWRITE/DELETE act on.
+ */
+function toPosVarName(cobolFileName) {
+  return toCamelCase(cobolFileName) + 'Pos';
+}
+
+/**
  * Extract file name from various formats
  */
 function extractFileName(file) {
@@ -73,6 +93,8 @@ export function fileHandleVarNames(fileName) {
     writerVar: toWriterVarName(fileName),
     iteratorVar: toIteratorVarName(fileName),
     randomVar: toRandomVarName(fileName),
+    bufVar: toBufVarName(fileName),
+    posVar: toPosVarName(fileName),
   };
 }
 
@@ -193,7 +215,7 @@ export function generateOpen(statement, indent = 0) {
 
   for (const file of files) {
     const fileName = extractFileName(file);
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar } = fileHandleVarNames(fileName);
     const mode = (statement.mode || file?.mode || 'INPUT').toUpperCase();
     const statusVar = fileStatusVarFor(fileName);
     const handlerMethod = declarativeHandlerFor(fileName, mode);
@@ -224,10 +246,42 @@ export function generateOpen(statement, indent = 0) {
         break;
 
       case 'I-O':
-      case 'IO':
+      case 'IO': {
+        // round-25 root cause 1: this branch used to ONLY create randomVar
+        // (a java.io.RandomAccessFile never actually read from anywhere
+        // else in this generator - dead weight - whose "rw" open mode also
+        // has the further side effect of silently CREATING a missing file
+        // rather than failing with FILE STATUS 35 the way OPEN INPUT/I-O
+        // both must) and never touched iteratorVar at all - so any READ
+        // after OPEN I-O saw iteratorVar stuck at its Iterator.empty
+        // default (generateFileHandleDeclarations) and always reported
+        // FILE STATUS 10/no-record, no matter what was actually on disk.
+        // REWRITE/DELETE need a MUTABLE, position-tracked view over the
+        // exact same "one text line per record" storage model READ/WRITE
+        // already use (this generator's only modeled file organization,
+        // never genuine byte-random access), so the whole file's lines are
+        // loaded into an in-memory buffer up front (the same ISO-8859-1
+        // identity-mapped reading the INPUT case above uses); iteratorVar
+        // becomes a thin adapter over that buffer plus a position counter
+        // (posVar) instead of Source's own forward-only iterator, so
+        // REWRITE/DELETE (generateRewriteStatement/generateDeleteStatement,
+        // expression-gen.js) can find "the record just READ" (posVar - 1)
+        // and mutate the SAME buffer generateClose (below) flushes back to
+        // disk on CLOSE - durably persisting the change for a later OPEN
+        // INPUT/I-O of the same file, matching cobc's own REWRITE/DELETE
+        // semantics for a SEQUENTIAL-access RELATIVE/INDEXED file.
+        const srcVar = `_${toCamelCase(fileName)}Src`;
         openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
-        openLines.push(`${bi}${randomVar} = new java.io.RandomAccessFile(${fileVar}, "rw")`);
+        openLines.push(`${bi}val ${srcVar} = scala.io.Source.fromFile(${fileVar})(scala.io.Codec.ISO8859)`);
+        openLines.push(`${bi}${bufVar} = scala.collection.mutable.ArrayBuffer.from(${srcVar}.getLines())`);
+        openLines.push(`${bi}${srcVar}.close()`);
+        openLines.push(`${bi}${posVar} = 0`);
+        openLines.push(`${bi}${iteratorVar} = new Iterator[String] {`);
+        openLines.push(`${bi}  def hasNext: Boolean = ${posVar} < ${bufVar}.length`);
+        openLines.push(`${bi}  def next(): String = { val _v = ${bufVar}(${posVar}); ${posVar} += 1; _v }`);
+        openLines.push(`${bi}}`);
         break;
+      }
 
       case 'EXTEND':
         openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
@@ -297,7 +351,7 @@ export function generateClose(statement, indent = 0) {
 
   for (const file of files) {
     const fileName = extractFileName(file);
-    const { readerVar, writerVar, randomVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, randomVar, bufVar } = fileHandleVarNames(fileName);
 
     // Round-6 finding 1: a file using the ADVANCING deferred-terminator
     // WRITE model (see expression-gen.js's generateWriteStatement) leaves
@@ -308,6 +362,21 @@ export function generateClose(statement, indent = 0) {
     if (ADVANCING_FILES.has(String(fileName || '').toUpperCase())) {
       lines.push(`${indentStr}if ${writerVar} != null then { try ${writerVar}.print("\\n") catch case _: Exception => () }`);
     }
+
+    // round-25 root cause 1: an I-O-mode OPEN loads this file's records into
+    // an in-memory buffer instead of writing straight through (see
+    // generateOpen's I-O branch) - REWRITE/DELETE mutate that buffer in
+    // place, so it must be flushed back to disk (overwriting the file with
+    // its own current, possibly-mutated contents) here for those changes to
+    // actually persist for a later OPEN of the same file. A file never
+    // opened I-O in this run leaves bufVar at its null default
+    // (generateFileHandleDeclarations), so this is a harmless no-op for
+    // every pre-existing (non-I-O) corpus program.
+    lines.push(
+      `${indentStr}if ${bufVar} != null then { val _w = new java.io.PrintWriter(new java.io.OutputStreamWriter(` +
+      `new java.io.FileOutputStream(${fileVar}), java.nio.charset.StandardCharsets.ISO_8859_1)); ` +
+      `try ${bufVar}.foreach(_w.println) finally _w.close(); ${bufVar} = null }`
+    );
 
     // Only whichever handle OPEN actually assigned for this file is
     // non-null; guard each close so CLOSE-ing a file that was never opened
@@ -342,12 +411,18 @@ export function generateFileHandleDeclarations(fileNames, indent = 1) {
   const lines = [];
 
   for (const fileName of fileNames) {
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar } = fileHandleVarNames(fileName);
     lines.push(`${indentStr}var ${fileVar}: java.io.File = null`);
     lines.push(`${indentStr}var ${readerVar}: scala.io.BufferedSource = null`);
     lines.push(`${indentStr}var ${writerVar}: java.io.PrintWriter = null`);
     lines.push(`${indentStr}var ${iteratorVar}: Iterator[String] = Iterator.empty`);
     lines.push(`${indentStr}var ${randomVar}: java.io.RandomAccessFile = null`);
+    // round-25 root cause 1: OPEN I-O's in-memory line buffer + read-position
+    // counter (see generateOpen's I-O branch and generateRewriteStatement/
+    // generateDeleteStatement in expression-gen.js) - null/0 defaults are a
+    // pure addition with zero effect on any file never opened I-O.
+    lines.push(`${indentStr}var ${bufVar}: scala.collection.mutable.ArrayBuffer[String] = null`);
+    lines.push(`${indentStr}var ${posVar}: Int = 0`);
   }
 
   return lines.join('\n');

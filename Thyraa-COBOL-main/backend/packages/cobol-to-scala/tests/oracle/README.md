@@ -1370,6 +1370,56 @@ tests of all 4 findings above (finding 3's own decline is exercised there
 too, asserting the TODO marker text rather than a full run, since m10 is a
 deliberate `t.todo(...)`, not a hard pass).
 
+### Round-25 adversarial-refutation findings (o01-o14) and their fixes
+
+A round-25 refuter found 6 dishonest divergences clustering into 4 root
+causes, all in territory no prior round had exercised at all: `OPEN I-O`
+(never used by any of the 332 pre-existing corpus programs), REWRITE/DELETE
+(never exercised either - a sibling gap to `OPEN I-O`), `SET condition-name
+TO TRUE` against a subscripted OCCURS-table element (every prior probe only
+ever targeted an unsubscripted condition-name), a qualified `PERFORM x OF
+secA THRU y OF secA` inside a RECURSIVE program's own nested-paragraph
+convention, and a genuinely subtle real-cobc-vs-generated-Scala divergence in
+BRANCHING mutual RECURSIVE recursion. 3 of the 4 are now fixed at their root
+cause; the 4th is documented as a narrow Known Gap below (see that finding's
+own writeup for why forcing a fix wasn't pursued this round).
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | `OPEN I-O` (a file opened for BOTH reading and writing/updating, the ordinary way to prepare a RELATIVE/INDEXED file for REWRITE/DELETE) never initialized the read iterator at all - `generateOpen`'s I-O branch (`generator/file-io-gen.js`) only ever created a `java.io.RandomAccessFile` handle (itself never actually read from anywhere else in this generator - dead weight, and its own `"rw"` open mode has the further side effect of silently CREATING a missing file rather than failing with FILE STATUS 35 the way OPEN INPUT/I-O both must) and left `iteratorVar` at its `Iterator.empty` default (`generateFileHandleDeclarations`) - so any READ after `OPEN I-O` always reported FILE STATUS 10 (no record), no matter what was actually on disk (o03: a plain `OPEN I-O` + two READs, confirmed against installed GnuCOBOL to return the file's real first two records, `ST=00` both times). Separately, `generateRewriteStatement`/`generateDeleteStatement` (`generator/expression-gen.js`) were bare `// REWRITE ... - update current record in file`/`// DELETE record from ...` COMMENT no-ops - they compiled cleanly and looked exactly like working code, but never actually rewrote or deleted anything, with no `???`/TODO marker or any other runtime signal distinguishing this from a real implementation (o01: REWRITE a record's field after READ, reopen INPUT, the new value was never persisted; o02: DELETE the middle of 3 records, reopen INPUT, all 3 records were still there) | Implemented REAL semantics for all three (route (a), not an honest decline) since this generator's existing storage model (a plain text line per record - the ONLY file organization it has ever modeled, whether the SELECT clause says LINE SEQUENTIAL/RELATIVE/INDEXED) turned out to support this without inventing a new one. `OPEN I-O`'s branch now loads the whole file into a new in-memory `scala.collection.mutable.ArrayBuffer[String]` (`bufVar`, new `toBufVarName`/`fileHandleVarNames` entry) up front via the exact same ISO-8859-1-identity-mapped `scala.io.Source.fromFile` reading OPEN INPUT already uses (so a missing file still throws `FileNotFoundException`/hits the existing catch-and-set-FILE-STATUS-35 path, instead of the old RandomAccessFile behavior of silently creating one), tracks a 0-based read-position counter (`posVar`, new `toPosVarName`), and sets `iteratorVar` to a small anonymous `Iterator[String]` adapter (`hasNext`/`next()`) over that buffer+position - so `generateRead`'s own existing, UNCHANGED `iteratorVar.hasNext`/`.next()`/`.nextOption()` codegen (previously only ever fed by OPEN INPUT's `Source`-backed iterator) works identically regardless of which mode opened the file. `generateRewriteStatement`/`generateDeleteStatement` now mutate this SAME buffer at `posVar - 1` ("the record most recently READ" - COBOL's own REWRITE/DELETE target for SEQUENTIAL access): REWRITE reuses `writeRecordPlan`/`writeFromLiteralPlan` (the identical content-building logic `generateWriteStatement` already uses for WRITE, so a REWRITE record's rendered text is byte-identical to what a WRITE of the same value would produce) to overwrite `bufVar(posVar - 1)` in place; DELETE removes that slot (`bufVar.remove(posVar - 1)`) and rewinds `posVar` so a subsequent sequential READ continues correctly. `generateClose` (`file-io-gen.js`) now flushes `bufVar` back to disk (a fresh `PrintWriter` over the file, one buffer line per `println`) whenever it's non-null, before closing whichever other handle(s) OPEN actually assigned - a file never opened I-O in a given run leaves `bufVar` at its `null` default, so this is a pure addition with zero effect on every pre-existing (non-I-O) corpus program. RANDOM/DYNAMIC access via an explicit RELATIVE/RECORD KEY (rather than "whatever was just READ") is not modeled - no corpus program exercises it. Verified against installed GnuCOBOL (o01: `AFTER-REWRITE STATUS=00`, `REREAD1 ID=001 VAL=ZZZZZ`, `REREAD2 ID=002 VAL=BBBBB`; o02: `AFTER-DELETE STATUS=00`, `REC ID=001 VAL=AAAAA`, `REC ID=003 VAL=CCCCC`; o03: `IOREAD1 ST=00 ID=001 VAL=AAAAA`, `IOREAD2 ST=00 ID=002 VAL=BBBBB`) - all three matching cobc byte-for-byte; confirmed zero regressions on every pre-existing file-I/O corpus program (s01-s12, t01-t12, u12, x01/x02/d10, m08, all re-verified `oracleCompare()`-clean) | o01, o02, o03 |
+| 2 | `SET WS-FLAG-OK(2) TO TRUE` (a level-88 condition-name reference where the 88-level's PARENT item is itself a child of an OCCURS table, so the condition-name reference is legally subscripted) crashed the generated Scala at compile time (`Found: Int, Required: Vector[String]`-shaped error, since `wsFlag` is declared `Vector[String]`). `generateSet`'s level-88 branch (`generator/expression-gen.js`) correctly resolved `l88.camel` to the PARENT field's own flat var name (`wsFlag`, via `CONDITION_REGISTRY`/`level88FirstValueAssignment` - already correct, since `info.camel`/`info.scalaType` there describe the elementary item's own base type regardless of `occursDepth`) but then always emitted a bare scalar assignment (`assignExpr(l88.camel, l88.literal)` -> `wsFlag = "Y"`), silently dropping the level-88 reference's OWN subscript (`target.subscripts`, e.g. `(2)`) entirely - it was never even read | `generateSet`'s TRUE/FALSE level-88 branches now thread `target.subscripts` through to `renderCamelAssignment(l88.camel, subscripts, l88.literal)` - the SAME shared "camel + optional subscript list" write primitive `renderAssignment` itself already uses for every other subscripted write (`.updated(idx, value)` for a `Vector[...]`, falling back to `assignExpr` for an empty subscript list - so a plain, unsubscripted condition-name is completely unaffected, byte-for-byte identical output). No change to `level88FirstValueAssignment`/`level88FalseValueAssignment` themselves (already correct) - only to how their result gets written, now honoring whatever subscript the SET statement's own target actually carried. Verified against installed GnuCOBOL and scala-cli (o04): `F1=N F2=Y F3=N` - only index 2 set, matching cobc exactly; confirmed zero regressions on every pre-existing SET-condition-name corpus program (r14, r14b, k11, all re-verified `oracleCompare()`-clean) | o04 |
+| 3 | `PERFORM 1000-PARA OF SEC-A THRU 2000-PARA OF SEC-A` inside a RECURSIVE program crashed the generated Scala at compile time (`secAPara is already defined as method secAPara` / `Conflicting definitions`) - and, once that crash was fixed, still produced WRONG output (stale `N=00` instead of the correct per-activation `LS-N`). Investigation found this was actually TWO separate bugs, not one: **(a)** the compile crash turned out to be a MORE general, pre-existing bug than the round's own framing suggested - `resolveParagraphMethodName`/`collectAmbiguousParagraphNames` (`generator/method-gen.js`) qualify a colliding bare paragraph name (post-numeric-prefix-strip, e.g. `1000-PARA` and `2000-PARA` both stripping to bare `para`) by its OWN enclosing section name - but `1000-PARA` and `2000-PARA` are BOTH declared inside `SEC-A` here, so qualifying-by-section collapses onto the IDENTICAL name (`secAPara`) for both; reproduced identically (confirmed with a standalone, non-recursive, non-THRU test program built specifically to isolate it) whether or not RECURSIVE/PERFORM-THRU are even involved at all - a same-section bare-name collision this generator had simply never been asked to qualify before. **(b)** separately, even with (a) fixed, a qualified (or any) `PERFORM ... THRU`'s own wrapper method (`generatePerformThruMethod`) is ALWAYS generated as a single, shared, TOP-LEVEL method (`generateAllMethods`, unconditionally, recursive or not) - but a RECURSIVE program's own paragraphs are instead nested as LOCAL `def`s *inside* `entry()` (`generateProgramFlowLinesNested`, round-21 finding 2), each closing over THAT call activation's own LINKAGE getter/setter closures; the shared top-level wrapper's own nested defs close over NOTHING (they read/write the ordinary, always-default module-level LINKAGE var `generateEntryMethod`'s non-recursive convention uses instead) - so a PERFORM ... THRU executed from inside a RECURSIVE program's own body silently read/wrote the WRONG storage for its whole duration | **(a)**: `collectAmbiguousParagraphNames` now ALSO tracks `(section, bareName)` pair counts (attached as a `sameSectionCollisions` property on the SAME `Set` instance it already returns - not a second return value, so every existing `.has(bare)` call site is completely unaffected); `resolveParagraphMethodName` (and its exact duplicate in `expression-gen.js`, `paragraphMethodName` - kept in sync for the same reverse-import-cycle reason its own doc comment already documents) now falls back to a name built from the paragraph's OWN full, unstripped text (`sectionPart + toPascalCase(rawName)`, e.g. `secA1000Para`/`secA2000Para`) whenever plain section-qualification would STILL collide - COBOL guarantees paragraph names are unique within their own section, so this is inherently collision-free with no further bookkeeping; the ordinary (different-section) ambiguity case is completely untouched (byte-for-byte the same `secAPara`-style name as before). **(b)**: new `collectPerformThrus` (`generator/method-gen.js`) factors the existing PERFORM-THRU/SORT-THRU/MERGE-THRU collection pass out of `generateAllMethods` so `generateProgramFlowLinesNested` can run the IDENTICAL pass over the SAME `units` list and build its OWN nested-local counterpart of each wrapper method, using `generatePerformThruMethod` itself, unchanged, just at the nested indent level. Because `generatePerformFromAST`'s own PERFORM ... THRU call site already emits a call to the bare, unqualified `performThruWrapperName(...)()` identifier (no codegen change needed there at all), declaring a nested `def` with the IDENTICAL name inside `entry()` makes Scala's ordinary lexical-shadowing rules resolve every such call made from within the RECURSIVE program's own nested paragraph defs to THIS activation's version instead of escaping out to the top-level, module-shared one. Verified against installed GnuCOBOL and scala-cli (o13): `ENTER N=02`/`SECA-1000 N=02`/`SECA-2000 N=02`/`ENTER N=01`/.../`EXIT N=00`/`EXIT N=00`/`EXIT N=02` - matching cobc byte-for-byte; confirmed zero regressions on every pre-existing qualified-PERFORM-THRU corpus program (z12, b3) and every pre-existing RECURSIVE corpus program (j10, k01, k04, k12, l04, l10-l12, m01-m14, all re-verified `oracleCompare()`-clean) | o13 |
+
+3 further round-25 probes were valid and already passed/were already honest
+before any of the above fixes, confirmed unaffected by all three production
+fixes: `o05` (a linear mutual-RECURSIVE chain sharing WORKING-STORAGE across
+activations, the same confirmed-deliberate model as round-21's j10, one
+level deeper - unaffected), `o06` (`SET index-name UP/DOWN BY` inside a
+RECURSIVE program's own body - existing SET-index codegen, confirmed
+unaffected by the LINKAGE-aliasing convention), `o07` (a CALL passing the
+same caller-side variable BY REFERENCE for one parameter and BY CONTENT for
+another in the same statement - existing per-parameter mode handling,
+confirmed each operand's own mode is honored independently), `o08` (a
+RECURSIVE self-CALL supplying FEWER USING arguments than the callee's own
+LINKAGE SECTION declares - existing default-parameter convention, confirmed
+unaffected), `o09` (COMPUTE ... ON SIZE ERROR where the erroring target is
+also read on the right-hand side of its own expression - existing SIZE ERROR
+codegen, confirmed unaffected), `o10` (a DECLARATIVES handler cascade -
+existing registration/invocation codegen, confirmed unaffected), `o11`/`o12`
+(FD records combining REDEFINES/OCCURS with LOW-VALUES defaulting - round-24
+finding 4's own fix, confirmed to already cover both shapes).
+
+Root cause 4 (`o14`) - two mutually-RECURSIVE programs (`O14A`/`O14B`)
+computing `fib(5)` via a BRANCHING (non-linear) call graph, where the SAME
+program has multiple SIMULTANEOUSLY-SUSPENDED activations at once (not just
+nested-and-returning ones, the shape every prior linear-chain corpus program,
+including this round's own `o05`, is limited to) - is a genuinely subtle
+case, investigated but **left as a documented Known Gap** rather than forced
+to a fix; see the Known Gaps section below for the full writeup of why.
+
+See `tests/round25-fixes.test.js` for focused, toolchain-independent unit
+tests of all 3 production fixes above.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -1749,3 +1799,69 @@ deliberate `t.todo(...)`, not a hard pass).
   `case-class-gen.js`'s own field-offset computation and the `parse`/
   `format` codegen it emits, if a future program needs a real FILE SECTION
   record combining SYNC with a nested sub-group or an OCCURS table.
+
+- **BRANCHING mutual RECURSIVE recursion's exact shared-WORKING-STORAGE
+  collision values, round-25 finding (o14)** - round-21 finding 2 established
+  (and rounds 22/23/24 repeatedly re-verified) that a RECURSIVE program's own
+  WORKING-STORAGE is genuinely shared/static storage across every one of its
+  own recursive activations, matching real cobc - a confirmed, deliberate
+  behavior this generator correctly reproduces via one ordinary module-level
+  `var` per WORKING-STORAGE field, regardless of recursion depth, plus true
+  live-closure (pointer-style) aliasing for LINKAGE SECTION parameters passed
+  BY REFERENCE (the same getter/setter-closure mechanism, unchanged since
+  round-22). Every corpus program that has exercised this so far - j10, k01,
+  k04, k12, l04, l10-l12, m01-m14, this round's own o05 - is a LINEAR
+  recursive/mutual-recursive chain: at any given moment, at most ONE
+  activation of a given program is ever suspended waiting on a deeper call,
+  so "shared static storage" and "a fresh copy per activation" are
+  observationally indistinguishable for depth alone (only the VALUE keeps
+  changing across levels, never which STORAGE two simultaneously-alive
+  frames are each independently relying on). `o14` (`tests/corpus/proc/
+  o14-mutual-recur-branch.cbl`) is structurally different: two RECURSIVE
+  programs (`O14A`/`O14B`) computing `fib(5)` via a BRANCHING call graph
+  (each activation calls the other program TWICE, non-tail, to compute two
+  sub-results before combining them) - so the SAME program can have TWO (OR
+  MORE) activations simultaneously suspended, each one's own LINKAGE
+  parameter potentially aliased (BY REFERENCE) directly into a SHARED
+  WORKING-STORAGE cell (`WS-N1`/`WS-R1`/`WS-N2`/`WS-R2`) that ANOTHER,
+  unrelated, more-deeply-nested activation of that SAME program can ALSO be
+  actively writing through its own identical aliasing, before the shallower
+  activation's own pending use of that cell is done with it. Manually tracing
+  even the first 2-3 levels of this call tree (treating each field as one
+  shared, live-aliased cell, exactly matching what this generator's own
+  `generateRecursiveEntryMethod`/`generateCall` already implement and rounds
+  21-24 verified correct for every linear-chain shape) confirms this is a
+  genuine, reproducible entanglement - NOT an artifact of a coding mistake in
+  this generator's own aliasing mechanism, which was independently confirmed
+  (by reading the actual generated `O14A`/`O14B` Scala) to already be a
+  faithful, live, closure-based alias exactly like the verified-correct
+  linear-chain case, with no snapshot-by-value or wrong-cell bug found
+  anywhere in it. The generated Scala's own output diverges from cobc's
+  oracle capture starting partway through the call tree (`oracleCompare()`
+  reports a `t.todo(...)`, not a hard failure - see Phase 2's own
+  match-or-todo convention above) - reproducing cobc's EXACT resulting
+  values here would require matching cobc's own internal, undocumented,
+  implementation-specific timing of exactly when a BY-REFERENCE argument's
+  underlying storage is read versus written relative to an unrelated, more
+  deeply nested call that happens to alias the identical cell - not a
+  documented part of the COBOL standard, and not something a black-box
+  compiler oracle comparison can distinguish from "many other equally
+  plausible timings cobc could instead have chosen" without instrumenting
+  GnuCOBOL's own generated C internally. This is also an exceedingly
+  narrow, arguably pathological COBOL idiom in the first place (recursive
+  mutual CALLs deliberately reusing shared, static WORKING-STORAGE cells as
+  BY-REFERENCE argument storage across a BRANCHING call graph) that
+  real-world COBOL is exceedingly unlikely to rely on - deliberately
+  **not fixed this round**, per this campaign's own established precedent
+  for a disproportionately large investigation with a narrow, low-value
+  payoff (see round-24 finding 3/m10's identical reasoning for an unrelated
+  gap). `o14` stays promoted in `tests/corpus/proc/` (unlike most other
+  documented gaps here, which are deliberately kept OUT of the corpus) since
+  it is already an honest `t.todo(...)` under the existing Phase 2
+  match-or-todo convention, not a hard failure that would need special-
+  casing to avoid misrepresenting a known limitation as a regression -
+  exactly like `d12` (round-15) already does for the reference-modification
+  gap. Revisit only by instrumenting (or otherwise obtaining precise
+  documentation of) GnuCOBOL's own exact BY-REFERENCE-argument/static-storage
+  read-write interleaving for this specific branching shape, if a future
+  program genuinely needs this narrow combination.

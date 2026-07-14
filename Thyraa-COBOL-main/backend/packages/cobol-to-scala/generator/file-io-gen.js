@@ -61,6 +61,27 @@ function toPosVarName(cobolFileName) {
 }
 
 /**
+ * round-26 root cause 1: "does a currently-valid record exist to REWRITE/
+ * DELETE" flag - true immediately after a READ successfully establishes one
+ * (generateReadStatement, expression-gen.js), false again the instant a
+ * REWRITE or DELETE *consumes* it (generateRewriteStatement/
+ * generateDeleteStatement) or on a failed/AT-END read. `posVar > 0` alone
+ * (the round-25 guard) is necessary but not sufficient: DELETE already
+ * decrements posVar on success, so a second immediate DELETE with no
+ * intervening READ correctly re-fails that check on its own - but REWRITE
+ * never touched posVar at all, so a second immediate REWRITE with no
+ * intervening READ still satisfied `posVar > 0` and silently mutated the
+ * buffer a second time (bb04 - a genuinely invalid REWRITE must never
+ * mutate anything). This flag directly models the real COBOL rule ("a READ
+ * must be the most recent I-O statement against this file for REWRITE/
+ * DELETE to be valid - another REWRITE/DELETE doesn't count") instead of
+ * relying on posVar's own, only-incidentally-correct-for-DELETE side effect.
+ */
+function toHasCurrentVarName(cobolFileName) {
+  return toCamelCase(cobolFileName) + 'HasCurrent';
+}
+
+/**
  * Extract file name from various formats
  */
 function extractFileName(file) {
@@ -95,6 +116,7 @@ export function fileHandleVarNames(fileName) {
     randomVar: toRandomVarName(fileName),
     bufVar: toBufVarName(fileName),
     posVar: toPosVarName(fileName),
+    hasCurrentVar: toHasCurrentVarName(fileName),
   };
 }
 
@@ -128,6 +150,27 @@ export function setFileStatusRegistry(registry) {
 
 function fileStatusVarFor(fileName) {
   return FILE_STATUS_REGISTRY.get(String(fileName || '').toUpperCase()) || null;
+}
+
+/**
+ * round-26 root cause 3: FD file name (upper) -> its `ACCESS MODE IS
+ * <mode>` clause (upper - 'SEQUENTIAL'/'RANDOM'/'DYNAMIC'), defaulting to
+ * 'SEQUENTIAL' (COBOL's own default when the clause is omitted entirely) for
+ * a file this registry has no entry for. See expression-gen.js's identical
+ * copy for the full rationale; this module needs its own copy because OPEN
+ * (below) needs it to decide whether an INPUT/OUTPUT-mode open should build
+ * the same random-access-capable in-memory buffer round-25's I-O branch
+ * already does, independently of expression-gen.js's READ/WRITE/REWRITE/
+ * START.
+ */
+let ACCESS_MODE_REGISTRY = new Map();
+
+export function setAccessModeRegistry(registry) {
+  ACCESS_MODE_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+function accessModeFor(fileName) {
+  return ACCESS_MODE_REGISTRY.get(String(fileName || '').toUpperCase()) || 'SEQUENTIAL';
 }
 
 /**
@@ -215,17 +258,57 @@ export function generateOpen(statement, indent = 0) {
 
   for (const file of files) {
     const fileName = extractFileName(file);
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar } = fileHandleVarNames(fileName);
     const mode = (statement.mode || file?.mode || 'INPUT').toUpperCase();
     const statusVar = fileStatusVarFor(fileName);
     const handlerMethod = declarativeHandlerFor(fileName, mode);
+    // round-26 root cause 3: a RANDOM/DYNAMIC-access file needs the SAME
+    // indexable in-memory buffer an I-O-mode open already builds (round-25
+    // root cause 1) for EVERY open mode, not just I-O - READ/REWRITE/WRITE/
+    // START addressed by an explicit RELATIVE KEY value (expression-gen.js)
+    // need direct `bufVar(key - 1)` access regardless of whether the file
+    // happens to be open for INPUT, OUTPUT, or I-O. A plain SEQUENTIAL-access
+    // file (the pre-existing default, and every pre-round-26 corpus program)
+    // is completely unaffected - it keeps the exact INPUT/OUTPUT codegen
+    // below unchanged.
+    const isRandomAccess = accessModeFor(fileName) === 'RANDOM' || accessModeFor(fileName) === 'DYNAMIC';
 
     const bi = `${indentStr}  `;
     const openLines = [];
     let canFail = true;
 
+    // round-25 root cause 1 / round-26 root cause 3: load `fileVar`'s
+    // current on-disk lines into `bufVar`, reset `posVar`/`hasCurrentVar`,
+    // and adapt `iteratorVar` as a thin forward-only view over that SAME
+    // buffer (so a plain sequential READ/READ NEXT still works unchanged
+    // over a RANDOM/DYNAMIC-access file, exactly like it already does for
+    // I-O). Shared by the I-O case (every access mode) and, new this round,
+    // the INPUT/OUTPUT cases whenever access mode is RANDOM/DYNAMIC.
+    function pushBufferLoadLines() {
+      const srcVar = `_${toCamelCase(fileName)}Src`;
+      openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
+      openLines.push(`${bi}val ${srcVar} = scala.io.Source.fromFile(${fileVar})(scala.io.Codec.ISO8859)`);
+      openLines.push(`${bi}${bufVar} = scala.collection.mutable.ArrayBuffer.from(${srcVar}.getLines())`);
+      openLines.push(`${bi}${srcVar}.close()`);
+      openLines.push(`${bi}${posVar} = 0`);
+      openLines.push(`${bi}${hasCurrentVar} = false`);
+      openLines.push(`${bi}${iteratorVar} = new Iterator[String] {`);
+      openLines.push(`${bi}  def hasNext: Boolean = ${posVar} < ${bufVar}.length`);
+      openLines.push(`${bi}  def next(): String = { val _v = ${bufVar}(${posVar}); ${posVar} += 1; _v }`);
+      openLines.push(`${bi}}`);
+    }
+
     switch (mode) {
       case 'INPUT':
+        if (isRandomAccess) {
+          // round-26 root cause 3: OPEN INPUT of a RANDOM/DYNAMIC-access
+          // file (e.g. bb09's `ACCESS MODE IS DYNAMIC` + `START`/`READ
+          // NEXT`, bb10's `ACCESS MODE IS RANDOM` + keyed `READ`) needs the
+          // SAME indexable buffer as I-O, not just a forward-only iterator -
+          // see pushBufferLoadLines's own doc comment.
+          pushBufferLoadLines();
+          break;
+        }
         openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
         // round-10 finding 3 companion: ISO-8859-1 is a lossless 1:1
         // byte<->char identity mapping (unlike the JVM's UTF-8-by-default
@@ -238,6 +321,25 @@ export function generateOpen(statement, indent = 0) {
         break;
 
       case 'OUTPUT':
+        if (isRandomAccess) {
+          // round-26 root cause 3: OPEN OUTPUT of a RANDOM/DYNAMIC-access
+          // file always starts a brand-new, empty file (matches plain
+          // OUTPUT semantics for any organization) - no existing content to
+          // load, so the buffer starts empty rather than reading from disk.
+          // WRITE (expression-gen.js's generateWriteStatement) then indexes
+          // into this SAME buffer by the file's current RELATIVE KEY value
+          // instead of blindly appending through a PrintWriter, matching
+          // real cobc's own boundary-checked WRITE for RANDOM/DYNAMIC access
+          // (verified against installed GnuCOBOL: a WRITE with an invalid -
+          // non-positive - RELATIVE KEY reports FILE STATUS 24 and does NOT
+          // persist the record, rather than always succeeding the way a
+          // SEQUENTIAL-access WRITE does).
+          openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
+          openLines.push(`${bi}${bufVar} = new scala.collection.mutable.ArrayBuffer[String]()`);
+          openLines.push(`${bi}${posVar} = 0`);
+          openLines.push(`${bi}${hasCurrentVar} = false`);
+          break;
+        }
         openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
         openLines.push(
           `${bi}${writerVar} = new java.io.PrintWriter(new java.io.OutputStreamWriter(` +
@@ -270,16 +372,7 @@ export function generateOpen(statement, indent = 0) {
         // disk on CLOSE - durably persisting the change for a later OPEN
         // INPUT/I-O of the same file, matching cobc's own REWRITE/DELETE
         // semantics for a SEQUENTIAL-access RELATIVE/INDEXED file.
-        const srcVar = `_${toCamelCase(fileName)}Src`;
-        openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
-        openLines.push(`${bi}val ${srcVar} = scala.io.Source.fromFile(${fileVar})(scala.io.Codec.ISO8859)`);
-        openLines.push(`${bi}${bufVar} = scala.collection.mutable.ArrayBuffer.from(${srcVar}.getLines())`);
-        openLines.push(`${bi}${srcVar}.close()`);
-        openLines.push(`${bi}${posVar} = 0`);
-        openLines.push(`${bi}${iteratorVar} = new Iterator[String] {`);
-        openLines.push(`${bi}  def hasNext: Boolean = ${posVar} < ${bufVar}.length`);
-        openLines.push(`${bi}  def next(): String = { val _v = ${bufVar}(${posVar}); ${posVar} += 1; _v }`);
-        openLines.push(`${bi}}`);
+        pushBufferLoadLines();
         break;
       }
 
@@ -411,7 +504,7 @@ export function generateFileHandleDeclarations(fileNames, indent = 1) {
   const lines = [];
 
   for (const fileName of fileNames) {
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar } = fileHandleVarNames(fileName);
     lines.push(`${indentStr}var ${fileVar}: java.io.File = null`);
     lines.push(`${indentStr}var ${readerVar}: scala.io.BufferedSource = null`);
     lines.push(`${indentStr}var ${writerVar}: java.io.PrintWriter = null`);
@@ -423,6 +516,8 @@ export function generateFileHandleDeclarations(fileNames, indent = 1) {
     // pure addition with zero effect on any file never opened I-O.
     lines.push(`${indentStr}var ${bufVar}: scala.collection.mutable.ArrayBuffer[String] = null`);
     lines.push(`${indentStr}var ${posVar}: Int = 0`);
+    // round-26 root cause 1: see toHasCurrentVarName's own doc comment above.
+    lines.push(`${indentStr}var ${hasCurrentVar}: Boolean = false`);
   }
 
   return lines.join('\n');
@@ -691,4 +786,5 @@ export default {
   generateFileHandleDeclarations,
   fileHandleVarNames,
   setDeclarativeHandlers,
+  setAccessModeRegistry,
 };

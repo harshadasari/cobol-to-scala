@@ -105,13 +105,24 @@ describe('round-25 finding 1 (o01/o02/o03): OPEN I-O initializes the read iterat
     assert.match(scala, /def next\(\): String = \{ val _v = someFileBuf\(someFilePos\); someFilePos \+= 1; _v \}/);
   });
 
+  // round-26 root cause 1 update: the guard below is now `hasCurrentVar`
+  // (not the bare `posVar > 0` this round-25 assertion originally checked)
+  // and has a real `else` branch (FILE STATUS "43" + a DECLARATIVES handler
+  // if registered) instead of silently no-op'ing - see tests/oracle/
+  // README.md's round-26 entry and tests/round26-fixes.test.js for the full
+  // write-up/coverage of that fix. Still verifies REWRITE/DELETE are real
+  // buffer mutations, not bare comment stubs - round-25's own original
+  // point here is unchanged, only the exact guard shape is.
   test('REWRITE overwrites the current (most-recently-READ) buffer slot in place - no bare comment stub', () => {
-    assert.match(scala, /if someFileBuf != null && someFilePos > 0 then \{ someFileBuf\(someFilePos - 1\) = /);
+    assert.match(scala, /if someFileBuf != null && someFileHasCurrent then/);
+    assert.match(scala, /someFileBuf\(someFilePos - 1\) = /);
     assert.doesNotMatch(scala, /\/\/ REWRITE .* update current record in file/);
   });
 
   test('DELETE removes the current buffer slot and rewinds the position counter - no bare comment stub', () => {
-    assert.match(scala, /if someFileBuf != null && someFilePos > 0 then \{ someFileBuf\.remove\(someFilePos - 1\); someFilePos -= 1;/);
+    assert.match(scala, /if someFileBuf != null && someFileHasCurrent then/);
+    assert.match(scala, /someFileBuf\.remove\(someFilePos - 1\)/);
+    assert.match(scala, /someFilePos -= 1/);
     assert.doesNotMatch(scala, /\/\/ DELETE record from/);
   });
 

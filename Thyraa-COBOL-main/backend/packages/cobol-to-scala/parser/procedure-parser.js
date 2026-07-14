@@ -2400,6 +2400,16 @@ function parseWriteStatement(ctx) {
     stmt.invalidKey = parseStatementBlock(ctx, ['NOT', 'END-WRITE']);
   }
 
+  // round-26 root cause 3 companion: `NOT INVALID KEY` - see
+  // parseRewriteStatement's identical addition just below for the full
+  // rationale (WRITE against a RANDOM/DYNAMIC-access RELATIVE file can use
+  // INVALID KEY/NOT INVALID KEY exactly like REWRITE/READ/START can).
+  if (ctx.matchValue('NOT')) {
+    ctx.matchValue('INVALID');
+    ctx.matchValue('KEY');
+    stmt.notInvalidKey = parseStatementBlock(ctx, ['END-WRITE']);
+  }
+
   ctx.matchValue('END-WRITE');
 
   return stmt;
@@ -2424,6 +2434,17 @@ function parseRewriteStatement(ctx) {
   if (ctx.matchValue('INVALID')) {
     ctx.matchValue('KEY');
     stmt.invalidKey = parseStatementBlock(ctx, ['NOT', 'END-REWRITE']);
+  }
+
+  // round-26 root cause 3: `NOT INVALID KEY` companion clause (bb13's own
+  // exact idiom, `REWRITE ... INVALID KEY ... NOT INVALID KEY ...
+  // END-REWRITE`) - REWRITE never parsed this at all before this round
+  // (unlike READ, which already does), so its own trailing tokens were left
+  // unconsumed and silently misparsed as a bogus following statement.
+  if (ctx.matchValue('NOT')) {
+    ctx.matchValue('INVALID');
+    ctx.matchValue('KEY');
+    stmt.notInvalidKey = parseStatementBlock(ctx, ['END-REWRITE']);
   }
 
   ctx.matchValue('END-REWRITE');
@@ -2470,7 +2491,27 @@ function parseStartStatement(ctx) {
       operator = '=';
     } else if (ctx.matchValue('GREATER')) {
       ctx.matchValue('THAN');
-      operator = '>';
+      // round-26 root cause 2: `KEY IS GREATER THAN OR EQUAL <field>` (bb09's
+      // own exact idiom) is a second, equally legal COBOL spelling of `>=`
+      // alongside `NOT LESS THAN` below - this branch used to stop at plain
+      // `GREATER THAN` (`>`) and leave the trailing `OR EQUAL` tokens
+      // unconsumed, which then got misparsed as the start of the KEY's own
+      // field reference (`parseVariableReference` called against `OR`,
+      // producing garbage).
+      if (ctx.matchValue('OR')) {
+        ctx.matchValue('EQUAL');
+        operator = '>=';
+      } else {
+        operator = '>';
+      }
+    } else if (ctx.matchValue('LESS')) {
+      // round-26 root cause 2: bare `KEY IS LESS THAN <field>` (`<`) - listed
+      // alongside EQUAL/GREATER THAN/GREATER THAN OR EQUAL/NOT LESS THAN as a
+      // legal START key comparison, but had no branch of its own at all
+      // before this round (only the `NOT LESS THAN` -> `>=` idiom just below
+      // handled the word LESS in any form).
+      ctx.matchValue('THAN');
+      operator = '<';
     } else if (ctx.matchValue('NOT')) {
       ctx.matchValue('LESS');
       ctx.matchValue('THAN');
@@ -2484,6 +2525,9 @@ function parseStartStatement(ctx) {
     } else if (ctx.check(TokenType.OP_GREATER_EQUAL)) {
       ctx.advance();
       operator = '>=';
+    } else if (ctx.check(TokenType.OP_LESS)) {
+      ctx.advance();
+      operator = '<';
     }
 
     stmt.key = {
@@ -2495,6 +2539,16 @@ function parseStartStatement(ctx) {
   if (ctx.matchValue('INVALID')) {
     ctx.matchValue('KEY');
     stmt.invalidKey = parseStatementBlock(ctx, ['NOT', 'END-START']);
+  }
+
+  // round-26 root cause 2: `NOT INVALID KEY` companion clause - START never
+  // parsed this at all (unlike READ/DELETE, which already do), so a program
+  // using it (legal COBOL) left its own trailing tokens unconsumed, silently
+  // misparsed as a bogus following statement.
+  if (ctx.matchValue('NOT')) {
+    ctx.matchValue('INVALID');
+    ctx.matchValue('KEY');
+    stmt.notInvalidKey = parseStatementBlock(ctx, ['END-START']);
   }
 
   ctx.matchValue('END-START');

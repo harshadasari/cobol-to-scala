@@ -315,6 +315,64 @@ function fileStatusVarFor(fileName) {
 }
 
 /**
+ * round-26 root cause 3: FD file name (upper) -> its `RELATIVE KEY IS
+ * <field>` clause's camelCase flat-var name, for a RELATIVE-organization
+ * file that declared one. See file-io-gen.js's ACCESS_MODE_REGISTRY doc
+ * comment for why this module keeps its own independent copy. Absent (null)
+ * for a file with no RELATIVE KEY clause - every READ/REWRITE/WRITE/START of
+ * such a file falls back to this generator's pre-round-26 SEQUENTIAL-access
+ * (posVar-tracks-last-READ) behavior, unaffected.
+ */
+let RELATIVE_KEY_REGISTRY = new Map();
+/**
+ * round-26 root cause 3: FD file name (upper) -> its `ACCESS MODE IS <mode>`
+ * clause (upper), defaulting to 'SEQUENTIAL' - see file-io-gen.js's identical
+ * copy (consulted by generateOpen there) for the full rationale. Consulted
+ * here by READ/REWRITE/WRITE/START to decide whether a RELATIVE KEY value
+ * addresses the record directly (RANDOM, or DYNAMIC without NEXT/PREVIOUS)
+ * instead of the pre-round-26 "whatever the sequential position currently
+ * is" behavior (SEQUENTIAL, or DYNAMIC's own explicit NEXT/PREVIOUS forms).
+ */
+let ACCESS_MODE_REGISTRY = new Map();
+
+export function setRelativeKeyRegistry(registry) {
+  RELATIVE_KEY_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+export function setAccessModeRegistry(registry) {
+  ACCESS_MODE_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+function relativeKeyVarFor(fileName) {
+  return RELATIVE_KEY_REGISTRY.get(String(fileName || '').toUpperCase()) || null;
+}
+
+function accessModeFor(fileName) {
+  return ACCESS_MODE_REGISTRY.get(String(fileName || '').toUpperCase()) || 'SEQUENTIAL';
+}
+
+/**
+ * round-26 root cause 3: true when a READ/REWRITE/WRITE against this file
+ * should address its record directly by the file's CURRENT RELATIVE KEY
+ * value (`bufVar(key - 1)`) rather than by "whatever the sequential
+ * position/last-READ currently is" - RANDOM access always, or DYNAMIC access
+ * for a statement that is NOT an explicit sequential NEXT/PREVIOUS READ
+ * (real COBOL: DYNAMIC access lets a program mix both styles at runtime,
+ * chosen per-statement by whether NEXT/PREVIOUS is written). Requires a
+ * registered RELATIVE KEY field to actually do anything - a RANDOM/DYNAMIC-
+ * access file with no RELATIVE KEY clause (not legal COBOL for a RELATIVE
+ * file, so not exercised by any corpus program) safely falls back to the
+ * pre-round-26 sequential behavior instead of referencing an undeclared var.
+ */
+function isKeyedAccess(fileName, statement) {
+  if (!relativeKeyVarFor(fileName)) return false;
+  const mode = accessModeFor(fileName);
+  if (mode === 'RANDOM') return true;
+  if (mode === 'DYNAMIC') return !(statement && (statement.next || statement.previous));
+  return false;
+}
+
+/**
  * round-10 finding 1: DECLARATIVES handler registries, mirroring
  * file-io-gen.js's own identical copy (see that module's doc comment for the
  * full rationale) - this module needs its own copy because READ (below) is
@@ -2737,7 +2795,17 @@ function groupRefNameUpper(ref) {
 /** Per-child metadata for one group's immediate real children, combining GROUP_REGISTRY (names/flat-var identifiers) with the qualified field registry (types) and a second GROUP_REGISTRY lookup (nested-group detection). A FILLER child (round-5 finding 3/s06 - `nameUpper: null`, `isFiller: true`) has no case-class constructor field name of its own known to this function (case-class-gen.js names FILLERs by its own independent per-case-class sequence - see generateGroupMove's differing-layout branch, which bails out rather than guess) and no QUALIFIED_REGISTRY entry (nothing to qualify by name), so its already-computed `info` (stashed on the GROUP_REGISTRY entry itself) is used directly instead. */
 function groupChildInfos(nameUpper) {
   const children = GROUP_REGISTRY.get(nameUpper) || [];
-  return children.map(c => ({
+  // round-26 root cause 4: a REDEFINES child (e.g. `05 REC-TABLE REDEFINES
+  // REC-FLAT`) shares its target's own storage - it is never one of this
+  // group's own "real" children for MOVE/READ-INTO-group-decode purposes
+  // (case-class-gen.js's own generated case class already has no field for
+  // it either - see groupDisplayValueExpr's identical skip, expression-
+  // gen.js, for the WRITE-side counterpart of this same fix). Without this,
+  // a bare `READ` into a group containing a REDEFINES-over-OCCURS child
+  // (bb11) saw a childless-info "REC-TABLE" entry poison readDestination's
+  // own `usable` all-children-have-info check, silently degrading the ENTIRE
+  // read (including the base REC-FLAT field) to an unsupported no-op.
+  return children.filter(c => !c.isRedefines).map(c => ({
     nameUpper: c.nameUpper,
     camel: c.camel,
     ccField: c.isFiller ? null : toCamelCase(c.nameUpper),
@@ -5200,6 +5268,11 @@ export function groupDisplayValueExpr(groupKey) {
 
   const parts = [];
   for (const c of children) {
+    // round-26 root cause 4: a REDEFINES child shares its target's own
+    // storage - it must never contribute a SECOND copy of those same bytes
+    // to this group's own concatenated text (see scala-generator.js's
+    // isRedefines doc comment for the full rationale).
+    if (c.isRedefines) continue;
     if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) return null;
     if (c.groupKey) {
       const nested = groupDisplayValueExpr(c.groupKey);
@@ -5273,6 +5346,10 @@ function groupContainsNonDisplay(groupKey) {
   const children = GROUP_REGISTRY.get(groupKey);
   if (!children || children.length === 0) return false;
   for (const c of children) {
+    // round-26 root cause 4: a REDEFINES child's own USAGE must never force
+    // the BASE record into byte-level mode - it isn't independently written
+    // at all (see groupDisplayValueExpr's identical skip above).
+    if (c.isRedefines) continue;
     if (c.groupKey && groupContainsNonDisplay(c.groupKey)) return true;
     if (!c.groupKey && c.info && isNonDisplayUsage(c.info.usage)) return true;
   }
@@ -5307,6 +5384,11 @@ function groupChildConstructorExpr(groupKey) {
 
   const parts = [];
   for (const c of children) {
+    // round-26 root cause 4: see groupDisplayValueExpr's identical skip
+    // above - case-class-gen.js's own generated constructor already has no
+    // slot for a REDEFINES child (it shares its target's storage), so this
+    // must not contribute a constructor argument for it either.
+    if (c.isRedefines) continue;
     if (c.isFiller) return null;
     if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) return null;
     if (c.groupKey) {
@@ -5364,6 +5446,9 @@ function odoDisplayValueExpr(groupKey) {
 
   const parts = [];
   for (const c of children) {
+    // round-26 root cause 4: see groupDisplayValueExpr's identical skip just
+    // above for the full rationale.
+    if (c.isRedefines) continue;
     if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) {
       const tableInfo = TABLE_REGISTRY.get(c.nameUpper);
       if (!tableInfo || !c.info || isNonDisplayUsage(c.info.usage)) return null;
@@ -6627,10 +6712,75 @@ function readAssignLines(dest, lineExpr, indentStr) {
 /**
  * Generate READ statement wrapper
  */
+/**
+ * round-26 root cause 3: `READ file` for a RANDOM-access (or DYNAMIC-access,
+ * without NEXT/PREVIOUS - see isKeyedAccess) RELATIVE file addresses the
+ * record DIRECTLY by the file's current RELATIVE KEY value, completely
+ * independent of any sequential position - unlike the pre-round-26 behavior
+ * (unaffected below for SEQUENTIAL access and DYNAMIC's own NEXT/PREVIOUS
+ * forms), which always used "whatever the iterator's own forward position
+ * currently is."
+ *
+ * Compiler-verified against installed GnuCOBOL (bb10/bb13's own probes - see
+ * tests/oracle/README.md's round-26 entry):
+ *   - the buffer is completely EMPTY (zero records at all) -> FILE STATUS
+ *     "10", and NEITHER the INVALID KEY nor NOT INVALID KEY clause fires
+ *     (status 10 is the AT-END family, not the invalid-key family a RANDOM
+ *     READ normally reports through - a genuine, specific cobc quirk for a
+ *     truly empty relative file, confirmed empirically, not a textbook
+ *     COBOL rule).
+ *   - the key resolves to an existing record (1-based, within
+ *     `[1, bufVar.length]`) -> FILE STATUS "00", the NOT INVALID KEY
+ *     statements (if any) run, and `posVar`/`hasCurrentVar` are updated so a
+ *     subsequent REWRITE/DELETE or sequential continuation sees this as the
+ *     current record.
+ *   - the key is out of that range (but the buffer is non-empty) -> FILE
+ *     STATUS "23", the INVALID KEY statements (if any) run, and the record
+ *     area is left untouched (no assignment at all).
+ */
+function generateKeyedReadStatement(statement, fileName, dest, statusVar, indent) {
+  const indentStr = '  '.repeat(indent);
+  const bi = `${indentStr}  `;
+  const { bufVar, posVar, hasCurrentVar } = fileHandleVarNames(fileName);
+  const relKey = `(${relativeKeyVarFor(fileName)}).toInt`;
+
+  const lines = [];
+  lines.push(`${indentStr}if ${bufVar} == null || ${bufVar}.isEmpty then`);
+  lines.push(statusVar ? `${bi}${assignExpr(statusVar, '"10"')}` : `${bi}() // READ RANDOM: empty file`);
+
+  lines.push(`${indentStr}else if ${relKey} >= 1 && ${relKey} <= ${bufVar}.length then`);
+  lines.push(`${bi}val _record = ${bufVar}(${relKey} - 1)`);
+  lines.push(...readAssignLines(dest, '_record', bi));
+  lines.push(`${bi}${posVar} = ${relKey}`);
+  lines.push(`${bi}${hasCurrentVar} = true`);
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"00"')}`);
+  if (Array.isArray(statement.notInvalidKey)) {
+    for (const stmt of statement.notInvalidKey) {
+      lines.push(generateExpression(stmt, indent + 1));
+    }
+  }
+
+  lines.push(`${indentStr}else`);
+  const invalidBodyStart = lines.length;
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"23"')}`);
+  if (Array.isArray(statement.invalidKey)) {
+    for (const stmt of statement.invalidKey) {
+      lines.push(generateExpression(stmt, indent + 1));
+    }
+  }
+  if (lines.length === invalidBodyStart) {
+    // Neither a FILE STATUS field nor an INVALID KEY clause - avoid an empty
+    // `else` (round-7 finding 6's exact Scala-significant-indentation trap).
+    lines.push(`${bi}() // READ RANDOM: invalid key`);
+  }
+
+  return lines.join('\n');
+}
+
 function generateReadStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const fileName = statement.fileName || statement.file || 'file';
-  const { iteratorVar } = fileHandleVarNames(fileName);
+  const { iteratorVar, hasCurrentVar } = fileHandleVarNames(fileName);
   const dest = readDestination(statement, fileName);
   // round-6 finding 2/3 companion (t04): a registered FILE STATUS field must
   // become "00" on a successful READ and "10" once the iterator is
@@ -6642,6 +6792,16 @@ function generateReadStatement(statement, indent = 0) {
   // that case, so this is a pure addition with zero effect on any program
   // that doesn't declare FILE STATUS.
   const statusVar = fileStatusVarFor(fileName);
+
+  // round-26 root cause 3: a RANDOM-access (or DYNAMIC-access without
+  // NEXT/PREVIOUS) READ against a RELATIVE file with a declared RELATIVE KEY
+  // addresses the record directly by that key's current value - see
+  // generateKeyedReadStatement's own doc comment. Every other file (the
+  // overwhelming pre-round-26 default: SEQUENTIAL access, or DYNAMIC's own
+  // explicit NEXT/PREVIOUS forms) is completely unaffected below.
+  if (isKeyedAccess(fileName, statement)) {
+    return generateKeyedReadStatement(statement, fileName, dest, statusVar, indent);
+  }
 
   const lines = [];
 
@@ -6672,6 +6832,11 @@ function generateReadStatement(statement, indent = 0) {
       // own LINKAGE-aliased leaf.
       lines.push(`${indentStr}  ${assignExpr(statusVar, '"00"')}`);
     }
+    // round-26 root cause 1: a successful READ is what makes a SUBSEQUENT
+    // REWRITE/DELETE valid (see toHasCurrentVarName's doc comment,
+    // file-io-gen.js) - a pure addition, harmless for a file never REWRITE/
+    // DELETE-d.
+    lines.push(`${indentStr}  ${hasCurrentVar} = true`);
 
     if (hasNotAtEnd) {
       for (const stmt of statement.notAtEnd) {
@@ -6686,17 +6851,12 @@ function generateReadStatement(statement, indent = 0) {
     if (statusVar) {
       lines.push(`${indentStr}  ${assignExpr(statusVar, '"10"')}`);
     }
+    lines.push(`${indentStr}  ${hasCurrentVar} = false`);
 
     if (hasAtEnd) {
       for (const stmt of statement.atEnd) {
         lines.push(generateExpression(stmt, indent + 1));
       }
-    } else if (!statusVar) {
-      // Neither a real AT END clause nor a FILE STATUS assignment - this
-      // branch would otherwise be completely empty. Always emit the `()`
-      // placeholder (not conditionally per some other flag) so the `else`
-      // can never swallow a subsequent statement via indentation.
-      lines.push(`${indentStr}  () // AT END`);
     }
   } else if (statusVar) {
     // Bare READ, no AT END clause, but FILE STATUS IS declared: FILE STATUS
@@ -6707,8 +6867,10 @@ function generateReadStatement(statement, indent = 0) {
     lines.push(`${indentStr}  val _record = ${iteratorVar}.next()`);
     lines.push(...readAssignLines(dest, '_record', `${indentStr}  `));
     lines.push(`${indentStr}  ${assignExpr(statusVar, '"00"')}`);
+    lines.push(`${indentStr}  ${hasCurrentVar} = true`);
     lines.push(`${indentStr}else`);
     lines.push(`${indentStr}  ${assignExpr(statusVar, '"10"')}`);
+    lines.push(`${indentStr}  ${hasCurrentVar} = false`);
     // round-10 finding 1: no AT END clause on this READ means nothing else
     // handles the end-of-file condition - a registered DECLARATIVES
     // handler for this file (or its INPUT mode generically) fires here,
@@ -6721,11 +6883,16 @@ function generateReadStatement(statement, indent = 0) {
     lines.push(`${indentStr}val _record = ${iteratorVar}.nextOption()`);
     if (dest.mode !== 'none') {
       const assignLines = readAssignLines(dest, 'r', `${indentStr}  `);
-      if (assignLines.length === 1) {
-        // Elementary/unsupported case: a single-line body still fits neatly
-        // as `.foreach(r => <line>)` (matches the exact pre-round-7 output
-        // for every existing corpus program - none of which hit the group
-        // path here).
+      // round-26 (bb11 companion gap): a single-line body still fits neatly
+      // as `.foreach(r => <line>)` (matches the exact pre-round-7 output for
+      // every existing corpus program) UNLESS that line itself ends in a
+      // trailing `//` comment (readAssignLines' own 'unsupported'-mode TODO
+      // marker, e.g. a bare READ of a group record with a FILLER/nested-
+      // group/OCCURS child - bb11) - inlined onto one line, the comment
+      // swallows the rest of that physical line, including the foreach
+      // call's own closing `)`, a hard "',' or ')' expected" compile error.
+      // The block form below has no such trailing-token risk.
+      if (assignLines.length === 1 && !assignLines[0].includes('//')) {
         const body = assignLines[0].trim();
         lines.push(`${indentStr}_record.foreach(r => ${body})`);
       } else {
@@ -6734,6 +6901,11 @@ function generateReadStatement(statement, indent = 0) {
         lines.push(`${indentStr}}`);
       }
     }
+    // round-26 root cause 1: no FILE STATUS field AND no AT END clause -
+    // still need to track "did this READ actually get a record" for a later
+    // REWRITE/DELETE's own guard, even though nothing else here observes
+    // success/failure directly.
+    lines.push(`${indentStr}${hasCurrentVar} = _record.isDefined`);
   }
 
   return lines.join('\n');
@@ -6894,6 +7066,60 @@ function writeRecordPlan(recordName) {
  * unconditional final newline - a known, narrow, unverified edge case no
  * corpus program exercises (see tests/oracle/README.md's "Known gaps").
  */
+/**
+ * round-26 root cause 3: `WRITE record` against a RANDOM-access (or
+ * DYNAMIC-access - WRITE has no NEXT/PREVIOUS form, so DYNAMIC always means
+ * keyed here) RELATIVE file addresses the target slot DIRECTLY by the
+ * file's current RELATIVE KEY value, extending the in-memory buffer
+ * (round-25/round-26's own bufVar) as needed, rather than blindly appending
+ * through a PrintWriter the way plain SEQUENTIAL-access WRITE still does
+ * below.
+ *
+ * Compiler-verified against installed GnuCOBOL (bb09/bb10/bb13's own
+ * probes - see tests/oracle/README.md's round-26 entry): a WRITE whose
+ * current RELATIVE KEY value is NOT a positive integer (bb09/bb10/bb13's
+ * own exact idiom - none of them ever assign their RELATIVE KEY field
+ * before their OUTPUT-phase WRITEs, so it stays at its `VALUE 0` default)
+ * reports FILE STATUS "24" (boundary violation) and does NOT persist the
+ * record at all - confirmed empirically (the resulting file is genuinely
+ * EMPTY afterward) - while a WRITE with a valid (>= 1) key always succeeds,
+ * even addressing a slot far beyond the file's current length (REWRITE's
+ * own identical "auto-extend" quirk - see generateRewriteStatement).
+ */
+function generateKeyedWriteStatement(statement, fileName, finalTextExpr, statusVar, indent) {
+  const indentStr = '  '.repeat(indent);
+  const bi = `${indentStr}  `;
+  const { bufVar, posVar, hasCurrentVar } = fileHandleVarNames(fileName);
+  const relKey = `(${relativeKeyVarFor(fileName)}).toInt`;
+
+  const lines = [];
+  lines.push(`${indentStr}if ${relKey} >= 1 then`);
+  lines.push(`${bi}while ${bufVar}.length < ${relKey} do ${bufVar}.append("")`);
+  lines.push(`${bi}${bufVar}(${relKey} - 1) = ${finalTextExpr}`);
+  lines.push(`${bi}${posVar} = ${relKey}`);
+  lines.push(`${bi}${hasCurrentVar} = true`);
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"00"')}`);
+  if (Array.isArray(statement.notInvalidKey)) {
+    for (const stmt of statement.notInvalidKey) {
+      lines.push(generateExpression(stmt, indent + 1));
+    }
+  }
+
+  lines.push(`${indentStr}else`);
+  const invalidStart = lines.length;
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"24"')}`);
+  if (Array.isArray(statement.invalidKey)) {
+    for (const stmt of statement.invalidKey) {
+      lines.push(generateExpression(stmt, indent + 1));
+    }
+  }
+  if (lines.length === invalidStart) {
+    lines.push(`${bi}() // WRITE: invalid (non-positive) RELATIVE KEY - record not written`);
+  }
+
+  return lines.join('\n');
+}
+
 function generateWriteStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const recordName = statement.recordName || statement.record || 'record';
@@ -6918,6 +7144,25 @@ function generateWriteStatement(statement, indent = 0) {
   // own doc comment on statusVar/readAssignLines above.
   const statusSuffix = statusVar ? ` ${assignExpr(statusVar, '"00"')}` : '';
 
+  if (plan.mode === 'bytes-unsupported') {
+    return (
+      `${indentStr}() // TODO: WRITE ${sourceName}: a byte-level (non-DISPLAY-child) record with a FILLER/OCCURS ` +
+      'child is not supported (see tests/oracle/README.md known gaps); record not written'
+    );
+  }
+
+  // round-26 root cause 3: RANDOM/DYNAMIC access addresses the WRITE
+  // directly by the file's current RELATIVE KEY value - completely bypasses
+  // the writerVar/ADVANCING model below, which stays exactly as before for
+  // every SEQUENTIAL-access file (the pre-round-26 default, and every
+  // pre-existing corpus program).
+  if (isKeyedAccess(fileName, statement)) {
+    const finalTextExpr = plan.mode === 'bytes'
+      ? `new String(${plan.className}.format(${plan.className}(${plan.ctorArgs})), java.nio.charset.StandardCharsets.ISO_8859_1)`
+      : `(${plan.expr}).stripTrailing()`;
+    return generateKeyedWriteStatement(statement, fileName, finalTextExpr, statusVar, indent);
+  }
+
   // round-10 finding 3: a record containing a non-DISPLAY (packed/binary/
   // float) child must be written through its own byte-level format(), not
   // the display-text concatenation path below - see writeRecordPlan's doc
@@ -6932,12 +7177,9 @@ function generateWriteStatement(statement, indent = 0) {
       ? `${indentStr}{ ${writerVar}.print(${textExpr}); ${writerVar}.print("\\n");${statusSuffix} }`
       : `${indentStr}{ ${writerVar}.print(${textExpr}); ${writerVar}.print("\\n") }`;
   }
-  if (plan.mode === 'bytes-unsupported') {
-    return (
-      `${indentStr}() // TODO: WRITE ${sourceName}: a byte-level (non-DISPLAY-child) record with a FILLER/OCCURS ` +
-      'child is not supported (see tests/oracle/README.md known gaps); record not written'
-    );
-  }
+  // (plan.mode === 'bytes-unsupported' already returned early above, before
+  // the keyed-access check - kept there so it applies uniformly regardless
+  // of access mode.)
 
   const contentExpr = plan.expr;
 
@@ -6981,9 +7223,26 @@ function generateWriteStatement(statement, indent = 0) {
  * flushes that buffer back to disk, so the change is durably visible to any
  * later OPEN INPUT/I-O of the same file. Matches cobc's own REWRITE
  * semantics for a SEQUENTIAL-access RELATIVE/INDEXED file (this generator's
- * only modeled file organization); a RANDOM/DYNAMIC-access REWRITE
- * addressed by an explicit RELATIVE/RECORD KEY (rather than "whatever was
- * just READ") is not modeled - no corpus program exercises it.
+ * only modeled file organization).
+ *
+ * round-26 root cause 1: round-25's own guard (`posVar > 0`) had no `else`
+ * branch at all - an INVALID REWRITE (no preceding READ, or a SECOND
+ * REWRITE/DELETE with no intervening READ - bb02/bb04/bb07) silently no-op'd
+ * with ZERO visible effect: no FILE STATUS update (stale value kept) and no
+ * DECLARATIVES handler invocation, even though real cobc (a) sets FILE
+ * STATUS to "43" and (b) DOES invoke a registered `USE AFTER STANDARD ERROR
+ * PROCEDURE` handler for this file. Also, `posVar > 0` alone doesn't detect
+ * a SECOND consecutive REWRITE (bb04) - see toHasCurrentVarName's own doc
+ * comment (file-io-gen.js) for why a dedicated `hasCurrentVar` flag (true
+ * only immediately after a READ, consumed - set false - by the REWRITE/
+ * DELETE that follows it) is needed instead.
+ *
+ * round-26 root cause 3: a RANDOM-access (or DYNAMIC-access) REWRITE
+ * addresses its target directly by the file's current RELATIVE KEY value
+ * instead of "whatever was just READ" - completely bypassing the
+ * hasCurrentVar/posVar guard above (bb13: a RANDOM-access REWRITE with NO
+ * preceding READ at all still succeeds, unlike SEQUENTIAL access) - see
+ * generateKeyedRewriteStatement's own doc comment.
  *
  * The record's own rendered text reuses writeRecordPlan/writeFromLiteralPlan
  * (the exact same content-building logic generateWriteStatement already
@@ -6992,15 +7251,46 @@ function generateWriteStatement(statement, indent = 0) {
  * since CLOSE later flushes this buffer back out through an ordinary
  * println-per-line writer, exactly like an OUTPUT-mode WRITE does.
  */
+function generateKeyedRewriteStatement(statement, fileName, finalTextExpr, statusVar, indent) {
+  const indentStr = '  '.repeat(indent);
+  const bi = `${indentStr}  `;
+  const { bufVar, posVar, hasCurrentVar } = fileHandleVarNames(fileName);
+  const relKey = `(${relativeKeyVarFor(fileName)}).toInt`;
+
+  const lines = [];
+  lines.push(`${indentStr}if ${relKey} >= 1 then`);
+  lines.push(`${bi}while ${bufVar}.length < ${relKey} do ${bufVar}.append("")`);
+  lines.push(`${bi}${bufVar}(${relKey} - 1) = ${finalTextExpr}`);
+  lines.push(`${bi}${posVar} = ${relKey}`);
+  lines.push(`${bi}${hasCurrentVar} = true`);
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"00"')}`);
+  if (Array.isArray(statement.notInvalidKey)) {
+    for (const stmt of statement.notInvalidKey) {
+      lines.push(generateExpression(stmt, indent + 1));
+    }
+  }
+
+  lines.push(`${indentStr}else`);
+  const invalidStart = lines.length;
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"24"')}`);
+  if (Array.isArray(statement.invalidKey)) {
+    for (const stmt of statement.invalidKey) {
+      lines.push(generateExpression(stmt, indent + 1));
+    }
+  }
+  if (lines.length === invalidStart) {
+    lines.push(`${bi}() // REWRITE: invalid (non-positive) RELATIVE KEY - record not rewritten`);
+  }
+
+  return lines.join('\n');
+}
+
 function generateRewriteStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const recordNameRaw = statement.recordName || statement.record || 'record';
   const fileName = fileNameForRecord(recordNameRaw);
-  const { bufVar, posVar } = fileHandleVarNames(fileName);
+  const { bufVar, posVar, hasCurrentVar } = fileHandleVarNames(fileName);
   const statusVar = fileStatusVarFor(fileName);
-  // round-24 audit: assignExpr, not a bare `=` string - see assignExpr's own
-  // doc comment.
-  const statusSuffix = statusVar ? ` ${assignExpr(statusVar, '"00"')}` : '';
 
   const literalPlan = statement.from && statement.from.type === 'Literal'
     ? writeFromLiteralPlan(statement.from, recordNameRaw)
@@ -7008,24 +7298,50 @@ function generateRewriteStatement(statement, indent = 0) {
   const sourceName = statement.from ? (statement.from.name || statement.from) : recordNameRaw;
   const plan = literalPlan || writeRecordPlan(sourceName);
 
-  let recordExpr;
-  if (plan.mode === 'bytes') {
-    const bytesExpr = `${plan.className}.format(${plan.className}(${plan.ctorArgs}))`;
-    recordExpr = `new String(${bytesExpr}, java.nio.charset.StandardCharsets.ISO_8859_1)`;
-  } else if (plan.mode === 'bytes-unsupported') {
+  if (plan.mode === 'bytes-unsupported') {
     return (
       `${indentStr}() // TODO: REWRITE ${sourceName}: a byte-level (non-DISPLAY-child) record with a FILLER/OCCURS ` +
       'child is not supported (see tests/oracle/README.md known gaps); record not rewritten'
     );
+  }
+
+  let recordExpr;
+  if (plan.mode === 'bytes') {
+    const bytesExpr = `${plan.className}.format(${plan.className}(${plan.ctorArgs}))`;
+    recordExpr = `new String(${bytesExpr}, java.nio.charset.StandardCharsets.ISO_8859_1)`;
   } else {
     recordExpr = `(${plan.expr}).stripTrailing()`;
   }
 
-  // `bufVar`/`posVar` are only ever populated by an I-O-mode OPEN
-  // (file-io-gen.js's generateOpen); REWRITE without a preceding successful
-  // READ in that mode (illegal COBOL - real cobc reports FILE STATUS 44) is
-  // a harmless no-op here rather than an ArrayIndexOutOfBounds crash.
-  return `${indentStr}if ${bufVar} != null && ${posVar} > 0 then { ${bufVar}(${posVar} - 1) = ${recordExpr};${statusSuffix} }`;
+  // round-26 root cause 3: RANDOM/DYNAMIC access - see
+  // generateKeyedRewriteStatement's own doc comment above.
+  if (isKeyedAccess(fileName, statement)) {
+    return generateKeyedRewriteStatement(statement, fileName, recordExpr, statusVar, indent);
+  }
+
+  // round-24 audit: assignExpr, not a bare `=` string - see assignExpr's own
+  // doc comment.
+  const bi = `${indentStr}  `;
+  const lines = [];
+  lines.push(`${indentStr}if ${bufVar} != null && ${hasCurrentVar} then`);
+  lines.push(`${bi}${bufVar}(${posVar} - 1) = ${recordExpr}`);
+  // round-26 root cause 1: a REWRITE consumes the "fresh READ" this file
+  // currently has - a SECOND REWRITE/DELETE with no intervening READ must
+  // find this false (bb04).
+  lines.push(`${bi}${hasCurrentVar} = false`);
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"00"')}`);
+  lines.push(`${indentStr}else`);
+  const elseStart = lines.length;
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"43"')}`);
+  // round-26 root cause 1: a registered DECLARATIVES handler for this file
+  // (or its I-O mode generically) fires on this genuinely invalid REWRITE,
+  // exactly like OPEN's own failure path already does (bb07).
+  const rewriteHandler = declarativeHandlerFor(fileName, 'I-O');
+  if (rewriteHandler) lines.push(`${bi}${rewriteHandler}()`);
+  if (lines.length === elseStart) {
+    lines.push(`${bi}() // REWRITE: no valid prior READ`);
+  }
+  return lines.join('\n');
 }
 
 /**
@@ -7041,25 +7357,132 @@ function generateRewriteStatement(statement, indent = 0) {
  * INPUT of the same file simply never sees the deleted record again -
  * exactly how cobc's own RELATIVE/INDEXED DELETE behaves for
  * SEQUENTIAL access).
+ *
+ * round-26 root cause 1: same missing-`else`-branch gap as REWRITE (see
+ * generateRewriteStatement's own doc comment) - a DELETE with no valid prior
+ * READ (bb03's second, immediately-repeated DELETE) now sets FILE STATUS to
+ * "43" and invokes a registered DECLARATIVES handler instead of silently
+ * no-op'ing. Unlike REWRITE, DELETE's own posVar decrement already happened
+ * to make a *second* DELETE correctly re-fail the old guard on its own
+ * (round-25) - hasCurrentVar is consulted too anyway, both for symmetry with
+ * REWRITE and so a DELETE immediately followed by a REWRITE (or vice versa)
+ * with no intervening READ is caught the same way.
  */
 function generateDeleteStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const fileNameRaw = statement.fileName || statement.file || 'file';
-  const { bufVar, posVar } = fileHandleVarNames(fileNameRaw);
+  const { bufVar, posVar, hasCurrentVar } = fileHandleVarNames(fileNameRaw);
   const statusVar = fileStatusVarFor(fileNameRaw);
-  const statusSuffix = statusVar ? ` ${assignExpr(statusVar, '"00"')}` : '';
 
-  return `${indentStr}if ${bufVar} != null && ${posVar} > 0 then { ${bufVar}.remove(${posVar} - 1); ${posVar} -= 1;${statusSuffix} }`;
+  const bi = `${indentStr}  `;
+  const lines = [];
+  lines.push(`${indentStr}if ${bufVar} != null && ${hasCurrentVar} then`);
+  lines.push(`${bi}${bufVar}.remove(${posVar} - 1)`);
+  lines.push(`${bi}${posVar} -= 1`);
+  lines.push(`${bi}${hasCurrentVar} = false`);
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"00"')}`);
+  lines.push(`${indentStr}else`);
+  const elseStart = lines.length;
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"43"')}`);
+  const deleteHandler = declarativeHandlerFor(fileNameRaw, 'I-O');
+  if (deleteHandler) lines.push(`${bi}${deleteHandler}()`);
+  if (lines.length === elseStart) {
+    lines.push(`${bi}() // DELETE: no valid prior READ`);
+  }
+  return lines.join('\n');
 }
 
 /**
- * Generate START statement wrapper
+ * Generate START statement wrapper.
+ *
+ * round-26 root cause 2: this used to be a bare `// START ... - position
+ * file for reading` COMMENT with zero runtime effect and no FILE STATUS
+ * update at all (bb09). Real semantics: position the file's read cursor
+ * (posVar, shared with the SAME in-memory buffer round-25/round-26's own
+ * READ/REWRITE/WRITE already use) at the FIRST record whose 1-based
+ * relative record number satisfies `KEY IS <op> <field>`'s comparison
+ * against that field's CURRENT value, so a subsequent sequential
+ * `READ NEXT` continues from there - reusing the exact same buffer/position
+ * machinery round-25 built for REWRITE/DELETE, per this round's own brief.
+ *
+ * This generator's buffer is always DENSE (records 1..bufVar.length, no
+ * gaps - the only shape any corpus program's RELATIVE file ever has), so
+ * the smallest record number satisfying each comparison against the key
+ * field's current (runtime) value `k` is computable directly, without a
+ * runtime scan:
+ *   - `=`  : record `k` itself (if in range).
+ *   - `>=` (both `GREATER THAN OR EQUAL` and `NOT LESS THAN` - see
+ *     parseStartStatement, parser/procedure-parser.js): `max(k, 1)`.
+ *   - `>`  : `max(k, 0) + 1`.
+ *   - `<`  : always `1` (the smallest possible relative record number) when
+ *     `k > 1`, else no candidate exists at all.
+ * An empty buffer, or a computed candidate outside `[1, bufVar.length]`,
+ * fails: FILE STATUS "23" and the INVALID KEY statements run (bb09:
+ * `START-FAILED`/`23` for an entirely empty file - the OUTPUT-phase WRITEs
+ * of a RANDOM/DYNAMIC-access file whose RELATIVE KEY is never actually
+ * assigned before them all boundary-violate per generateKeyedWriteStatement,
+ * so the file genuinely has zero records - compiler-verified against
+ * installed GnuCOBOL, see tests/oracle/README.md's round-26 entry). A
+ * resolved candidate succeeds: FILE STATUS "00", `posVar` set so the record
+ * AT that position is the next one a sequential READ NEXT returns, and the
+ * NOT INVALID KEY statements (if any) run.
  */
 function generateStartStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
-  const fileName = toCamelCase(statement.fileName || statement.file || 'file');
+  const bi = `${indentStr}  `;
+  const fileNameRaw = statement.fileName || statement.file || 'file';
+  const { bufVar, posVar, hasCurrentVar } = fileHandleVarNames(fileNameRaw);
+  const statusVar = fileStatusVarFor(fileNameRaw);
+  const relKeyVar = relativeKeyVarFor(fileNameRaw);
 
-  return `${indentStr}// START ${fileName} - position file for reading`;
+  if (!statement.key || !relKeyVar) {
+    // Not tractable without a RELATIVE KEY clause on this file (not legal
+    // COBOL for a RELATIVE file to omit, so not exercised by any corpus
+    // program) - honest, visible, compiling decline rather than a guess.
+    return `${indentStr}() // TODO: START ${fileNameRaw}: no RELATIVE KEY registered for this file - position unchanged`;
+  }
+
+  const k = `(${convertArithmeticExpression(statement.key.field)}).toInt`;
+  let candidateExpr;
+  switch (statement.key.operator) {
+    case '=':
+      candidateExpr = k;
+      break;
+    case '>':
+      candidateExpr = `((${k}).max(0) + 1)`;
+      break;
+    case '<':
+      candidateExpr = `(if ${k} > 1 then 1 else 0)`;
+      break;
+    case '>=':
+    default:
+      candidateExpr = `((${k}).max(1))`;
+      break;
+  }
+
+  const lines = [];
+  lines.push(`${indentStr}val _startCandidate = ${candidateExpr}`);
+  lines.push(`${indentStr}if ${bufVar} != null && _startCandidate >= 1 && _startCandidate <= ${bufVar}.length then`);
+  lines.push(`${bi}${posVar} = _startCandidate - 1`);
+  lines.push(`${bi}${hasCurrentVar} = false`);
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"00"')}`);
+  if (Array.isArray(statement.notInvalidKey)) {
+    for (const stmt of statement.notInvalidKey) {
+      lines.push(generateExpression(stmt, indent + 1));
+    }
+  }
+  lines.push(`${indentStr}else`);
+  const elseStart = lines.length;
+  if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"23"')}`);
+  if (Array.isArray(statement.invalidKey)) {
+    for (const stmt of statement.invalidKey) {
+      lines.push(generateExpression(stmt, indent + 1));
+    }
+  }
+  if (lines.length === elseStart) {
+    lines.push(`${bi}() // START: invalid key`);
+  }
+  return lines.join('\n');
 }
 
 /**

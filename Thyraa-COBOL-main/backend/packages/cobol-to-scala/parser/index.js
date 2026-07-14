@@ -194,7 +194,11 @@ function parseEnvironmentDivision(tokens) {
 
       // Parse FILE-CONTROL entries
       if (upperValue === 'SELECT') {
-        const fileControl = { fileName: '', assignTo: '', organization: '', access: '', status: '' };
+        // round-26 root cause 3: `relativeKey` (the `RELATIVE KEY IS <field>`
+        // clause's own field name) - see generator/scala-generator.js's
+        // relativeKeyRegistry doc comment for how this feeds READ/REWRITE/
+        // WRITE/START's own RANDOM/DYNAMIC-access-mode addressing.
+        const fileControl = { fileName: '', assignTo: '', organization: '', access: '', status: '', relativeKey: '' };
 
         // Get file name
         i++;
@@ -229,6 +233,16 @@ function parseEnvironmentDivision(tokens) {
             if (tokens[i]?.value?.toUpperCase() === 'IS') i++;
             if (i < tokens.length) {
               fileControl.status = tokens[i].value;
+            }
+          } else if (val === 'RELATIVE' && tokens[i + 1]?.value?.toUpperCase() === 'KEY') {
+            // round-26 root cause 3: `RELATIVE KEY IS <field>` - distinct
+            // from `ORGANIZATION IS RELATIVE` (handled by the ORGANIZATION
+            // branch above, which already consumes its own 'RELATIVE' token
+            // before this one is ever reached).
+            i += 2;
+            if (tokens[i]?.value?.toUpperCase() === 'IS') i++;
+            if (i < tokens.length) {
+              fileControl.relativeKey = tokens[i].value;
             }
           }
           i++;

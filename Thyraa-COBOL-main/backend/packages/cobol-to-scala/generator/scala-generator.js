@@ -34,6 +34,8 @@ import {
   setAdvancingFiles as setAdvancingFilesExpr,
   setFileStatusRegistry as setFileStatusRegistryExpr,
   setDeclarativeHandlers as setDeclarativeHandlersExpr,
+  setRelativeKeyRegistry as setRelativeKeyRegistryExpr,
+  setAccessModeRegistry as setAccessModeRegistryExpr,
   setCallProgramRegistry,
   resetCallRetSeq,
   defaultZeroValueForScalaType,
@@ -68,6 +70,7 @@ import {
   setAdvancingFiles as setAdvancingFilesFileIO,
   setFileStatusRegistry as setFileStatusRegistryFileIO,
   setDeclarativeHandlers as setDeclarativeHandlersFileIO,
+  setAccessModeRegistry as setAccessModeRegistryFileIO,
 } from './file-io-gen.js';
 import { generateSql, generateDoobieImports, generateTransactorSetup } from './sql-gen.js';
 
@@ -2485,6 +2488,21 @@ function buildFieldRegistry(ast) {
                 camel: info ? info.camel : toCamelCase(c.name),
                 info: info || null,
                 groupKey: childHasRealChildren ? `${groupKey}/${nameUpper}` : null,
+                // round-26 root cause 4: `c.redefines` marks this child as an
+                // ALTERNATE VIEW over an earlier sibling's own storage (e.g.
+                // `05 REC-TABLE REDEFINES REC-FLAT`), not a second,
+                // independent thing occupying its own bytes in the parent
+                // record - see expression-gen.js's groupDisplayValueExpr/
+                // odoDisplayValueExpr/groupChildConstructorExpr/
+                // groupContainsNonDisplay, which all skip a child flagged
+                // this way when building a WRITE/REWRITE/DISPLAY-of-whole-
+                // group byte/text plan (case-class-gen.js's own constructor/
+                // field generation already excludes a REDEFINES child
+                // correctly - this flag brings this OTHER, separate
+                // GROUP_REGISTRY-driven text-concatenation path in line with
+                // it, instead of double-counting the same underlying bytes
+                // as if REC-TABLE were a second independent field).
+                isRedefines: !!c.redefines,
               };
             })
             .filter(Boolean)
@@ -3301,14 +3319,33 @@ export function generateScala(ast, options = {}) {
   // expression-gen.js (READ/WRITE) and file-io-gen.js (OPEN/CLOSE), which
   // each keep their own copy (see their doc comments).
   const fileStatusRegistry = new Map();
+  // round-26 root cause 3: RELATIVE KEY field (per file) and ACCESS MODE
+  // (per file, defaulting to SEQUENTIAL) registries - fed to expression-gen.js
+  // (READ/REWRITE/WRITE/START) and file-io-gen.js (OPEN), which each keep
+  // their own copy, mirroring every other per-file registry above. Built from
+  // the exact same FILE-CONTROL entries fileStatusRegistry already loops
+  // over, so a file with no RELATIVE KEY/ACCESS MODE clause at all (the
+  // overwhelming majority of the pre-round-26 corpus) is simply absent/
+  // defaulted, with zero effect on its own codegen.
+  const relativeKeyRegistry = new Map();
+  const accessModeRegistry = new Map();
   for (const fc of getFileControls(ast)) {
     const fname = fc.name || fc.fileName;
-    if (fname && fc.status) {
-      fileStatusRegistry.set(String(fname).toUpperCase(), toCamelCase(fc.status));
+    if (!fname) continue;
+    const fnameUpper = String(fname).toUpperCase();
+    if (fc.status) {
+      fileStatusRegistry.set(fnameUpper, toCamelCase(fc.status));
     }
+    if (fc.relativeKey) {
+      relativeKeyRegistry.set(fnameUpper, toCamelCase(fc.relativeKey));
+    }
+    accessModeRegistry.set(fnameUpper, String(fc.access || 'SEQUENTIAL').toUpperCase());
   }
   setFileStatusRegistryExpr(fileStatusRegistry);
   setFileStatusRegistryFileIO(fileStatusRegistry);
+  setRelativeKeyRegistryExpr(relativeKeyRegistry);
+  setAccessModeRegistryExpr(accessModeRegistry);
+  setAccessModeRegistryFileIO(accessModeRegistry);
 
   // DECLARATIVES `USE AFTER STANDARD ERROR PROCEDURE` handler methods +
   // registries (round-10 finding 1, registry-population ordering fixed by

@@ -198,7 +198,18 @@ function parseEnvironmentDivision(tokens) {
         // clause's own field name) - see generator/scala-generator.js's
         // relativeKeyRegistry doc comment for how this feeds READ/REWRITE/
         // WRITE/START's own RANDOM/DYNAMIC-access-mode addressing.
-        const fileControl = { fileName: '', assignTo: '', organization: '', access: '', status: '', relativeKey: '' };
+        // round-27 finding 8: `recordKey` (the `RECORD KEY IS <field>` clause,
+        // used by ORGANIZATION IS INDEXED files instead of RELATIVE KEY) -
+        // parsed purely so the generator can RECOGNIZE that an INDEXED file
+        // has a declared key (and so degrade RANDOM/DYNAMIC access on such a
+        // file to a visible, compiling decline instead of crashing - see
+        // generator/expression-gen.js's isIndexedRandomAccess) - this
+        // generator does NOT implement real RECORD-KEY-addressed random
+        // access (no INDEXED-file cobc oracle is available in this sandbox
+        // to verify a real implementation against - see tests/oracle/README.md's
+        // round-27 Known Gaps), so `recordKey` is otherwise unused beyond
+        // that recognition.
+        const fileControl = { fileName: '', assignTo: '', organization: '', access: '', status: '', relativeKey: '', recordKey: '' };
 
         // Get file name
         i++;
@@ -243,6 +254,25 @@ function parseEnvironmentDivision(tokens) {
             if (tokens[i]?.value?.toUpperCase() === 'IS') i++;
             if (i < tokens.length) {
               fileControl.relativeKey = tokens[i].value;
+            }
+          } else if (val === 'RECORD' && tokens[i + 1]?.value?.toUpperCase() === 'KEY') {
+            // round-27 finding 8: `RECORD KEY IS <field>` - the INDEXED-file
+            // counterpart of RELATIVE KEY above, previously not recognized at
+            // all (its tokens were simply skipped over one at a time by this
+            // loop's own trailing `i++`, silently ignored rather than
+            // misparsed - harmless on its own, but left the generator with no
+            // way to tell an INDEXED file even HAS a declared key). Does not
+            // feed RELATIVE_KEY_REGISTRY - a RECORD KEY is an arbitrary
+            // (non-relative-record-number) field, and this generator's
+            // RANDOM/DYNAMIC keyed-access codegen (isKeyedAccess) is only
+            // correct for a true RELATIVE-file relative-record-number key;
+            // see recordKeyRegistry's own doc comment (scala-generator.js) for
+            // how this field is used instead (recognition + honest decline,
+            // never real INDEXED semantics).
+            i += 2;
+            if (tokens[i]?.value?.toUpperCase() === 'IS') i++;
+            if (i < tokens.length) {
+              fileControl.recordKey = tokens[i].value;
             }
           }
           i++;

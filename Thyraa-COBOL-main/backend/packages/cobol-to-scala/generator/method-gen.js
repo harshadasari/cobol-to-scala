@@ -828,8 +828,40 @@ export function generatePerformThruMethod(fromParagraph, toParagraph, units, amb
  * plain toMethodName as an earlier version of this generator did (which
  * produced two identically-named nested `def paraA(): Unit` siblings in the
  * same wrapper method - a hard "paraA is already defined" compile error).
+ *
+ * round-27 finding 5: optional `noFallthroughAfter` (a Set of upper-cased
+ * paragraph names) - only ever passed non-null by generateProgramFlowLinesNested,
+ * over the WHOLE program's unit list, for a RECURSIVE program's own entry
+ * body. A SORT/MERGE's own INPUT PROCEDURE/OUTPUT PROCEDURE clause names a
+ * paragraph (or, with THRU, a range) that must be invoked ONLY out-of-line by
+ * the SORT/MERGE statement's own machinery (procedureCallExpr,
+ * expression-gen.js) - real COBOL never falls through from such a paragraph
+ * into whatever paragraph happens to follow it physically, exactly like an
+ * ordinary out-of-line `PERFORM <paragraph>` never does either. The ordinary
+ * (non-recursive) convention gets this for free: generateAllMethods' flat
+ * per-paragraph methods never have ANY auto-chain baked in at all (fall-
+ * through is modeled ONLY by the separate, uniquely-named `_stepN` wrapper
+ * chain renderNestedFallthroughSteps builds for the whole-program entry point
+ * - see its own doc comment and the p12-sort.cbl regression it fixed), so
+ * calling a bare paragraph name (SORT's own call site, when its procedure
+ * clause has no THRU) always resolves to that non-chaining flat method. This
+ * convention has no such split - one nested `def` per paragraph name serves
+ * BOTH "the whole program's own natural top-to-bottom fall-through" AND "an
+ * out-of-line call to this one paragraph," so the auto-chain baked into that
+ * SAME def would otherwise also fire whenever SORT/MERGE's own machinery
+ * calls it (cc10: `FILL-SORT`, an INPUT PROCEDURE with no THRU, auto-chained
+ * into the immediately-following `SHOW-SORT` - the OUTPUT PROCEDURE - running
+ * it once prematurely against the still-unsorted buffer, in addition to its
+ * own later, correct invocation). Suppressing the auto-chain specifically at
+ * each such paragraph's own through-endpoint (collectSortMergeThroughEndpoints)
+ * closes the gap without touching any other paragraph's fall-through - safe
+ * because a SORT/MERGE procedure-clause paragraph is never ALSO meant to be
+ * reached by genuine top-to-bottom fall-through in conforming COBOL (the
+ * ordinary convention's own _stepN chain would already collide with the SAME
+ * paragraph's flat method the identical way if it ever were, an equally-
+ * unmodeled edge case shared by both conventions, not one this fix changes).
  */
-function renderNestedFallthroughDefs(paragraphs, defIndent, nameFor) {
+function renderNestedFallthroughDefs(paragraphs, defIndent, nameFor, noFallthroughAfter = null) {
   const defIndentStr = '  '.repeat(defIndent);
   const lines = [];
 
@@ -839,7 +871,14 @@ function renderNestedFallthroughDefs(paragraphs, defIndent, nameFor) {
     lines.push(generateMethodBody(para.statements, defIndent + 1));
 
     const isLast = i === paragraphs.length - 1;
-    if (!isLast && !statementEndsInUnconditionalTransfer(para.statements)) {
+    // round-27 finding 5: a paragraph that is the "through" endpoint of a
+    // SORT/MERGE INPUT PROCEDURE or OUTPUT PROCEDURE clause (with or without
+    // an explicit THRU - see collectSortMergeThroughEndpoints) must never
+    // auto-chain into whatever paragraph physically follows it, even when it
+    // doesn't itself end in an unconditional transfer - see this function's
+    // own doc comment update below for why.
+    const suppressed = noFallthroughAfter && noFallthroughAfter.has(String(para.name || '').toUpperCase());
+    if (!isLast && !suppressed && !statementEndsInUnconditionalTransfer(para.statements)) {
       const nextName = nameFor(paragraphs[i + 1]);
       lines.push(`${'  '.repeat(defIndent + 1)}${nextName}() // implicit fall-through`);
     }
@@ -1006,7 +1045,11 @@ export function generateProgramFlowLinesNested(units, indent, ambiguousNames) {
     return [`${'  '.repeat(indent)}()`];
   }
   const nameFor = (u) => resolveParagraphMethodName(u.name, u.sectionName, ambiguousNames);
-  const lines = renderNestedFallthroughDefs(units, indent, nameFor);
+  // round-27 finding 5: see renderNestedFallthroughDefs' own doc comment - a
+  // SORT/MERGE INPUT/OUTPUT PROCEDURE paragraph must never auto-chain into
+  // whatever paragraph physically follows it.
+  const noFallthroughAfter = collectSortMergeThroughEndpoints(units);
+  const lines = renderNestedFallthroughDefs(units, indent, nameFor, noFallthroughAfter);
 
   // round-25 root cause 3: a `PERFORM x THRU y` range reachable from this
   // RECURSIVE program's own entry point needs its OWN nested-local
@@ -1166,6 +1209,36 @@ export function collectPerformThrus(units) {
   }
 
   return performThrus;
+}
+
+/**
+ * round-27 finding 5: the set of paragraph names (upper-cased) that are the
+ * "through" endpoint of a SORT/MERGE INPUT PROCEDURE or OUTPUT PROCEDURE
+ * clause - with an explicit THRU, the named end paragraph; without one, the
+ * clause's own single paragraph (round-20 finding i06's `{procedure: X,
+ * through: X}` shape - see collectPerformThrus' own doc comment). Used only by
+ * generateProgramFlowLinesNested (see renderNestedFallthroughDefs' own
+ * round-27 doc comment) to suppress the auto-fall-through edge FROM one of
+ * these paragraphs INTO whatever paragraph physically follows it - a
+ * RECURSIVE-program-specific gap an ordinary (non-recursive) program's flat
+ * per-paragraph methods never had to begin with.
+ */
+function collectSortMergeThroughEndpoints(units) {
+  const endpoints = new Set();
+  const add = (procClause) => {
+    if (!procClause || !procClause.procedure) return;
+    const through = procClause.through || procClause.procedure;
+    endpoints.add(String(through).toUpperCase());
+  };
+  for (const unit of units) {
+    collectStatementsDeep(unit.statements, stmt => {
+      if (stmt.type === 'SortStatement' || stmt.type === 'MergeStatement') {
+        add(stmt.inputProcedure);
+        add(stmt.outputProcedure);
+      }
+    });
+  }
+  return endpoints;
 }
 
 /**

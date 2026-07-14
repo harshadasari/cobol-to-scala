@@ -82,6 +82,48 @@ function toHasCurrentVarName(cobolFileName) {
 }
 
 /**
+ * round-27 findings 3/4: "has this specific 1-based buffer slot ever
+ * genuinely been WRITE/REWRITE-d into" flag array, parallel to `bufVar` (same
+ * length, grown in lockstep by every auto-extend loop that grows `bufVar` -
+ * see generateKeyedWriteStatement/generateKeyedRewriteStatement/
+ * generateKeyedDeleteStatement, expression-gen.js). WRITE/REWRITE's own
+ * "positive key always succeeds, auto-extend" rule (round-26 finding 2) fills
+ * any skipped slot with a blank `""` placeholder line purely so `bufVar`
+ * stays index-addressable - that placeholder is NOT a real record (cc01: a
+ * READ of such a slot must report FILE STATUS "23", not attempt to decode the
+ * placeholder's blank bytes as real field data and crash), and a WRITE must
+ * never silently overwrite an ALREADY-occupied slot the way REWRITE
+ * legitimately does (cc02: FILE STATUS "22", record untouched instead). Every
+ * place that currently sets `bufVar(i) = <real rendered record text>` also
+ * sets `occVar(i) = true` in the same statement; DELETE (round-27 finding 1)
+ * sets it back to `false` instead of removing the slot (a real RELATIVE
+ * file's records occupy FIXED positions - removing an array element would
+ * shift every LATER record's own position, corrupting subsequent keyed
+ * lookups).
+ */
+function toOccVarName(cobolFileName) {
+  return toCamelCase(cobolFileName) + 'Occ';
+}
+
+/**
+ * round-27 finding 7: "did the most recent keyed START against this file
+ * fail (INVALID KEY - no record satisfied its comparison)" flag - see
+ * generateStartStatement/generateReadStatement's own doc comments
+ * (expression-gen.js) for the full rationale. Compiler-verified against
+ * installed GnuCOBOL: a plain sequential READ NEXT/PREVIOUS performed right
+ * after a FAILED START on the same file fires NEITHER its AT END nor its NOT
+ * AT END clause at all (though FILE STATUS is still updated, to "46") - a
+ * genuinely surprising cobc runtime quirk, not a textbook rule. Cleared
+ * (false) by a SUBSEQUENT SUCCESSFUL START on the same file (compiler-
+ * verified: READ NEXT recovers its ordinary behavior immediately afterward);
+ * false by default, so a program that never uses START at all (the
+ * overwhelming majority of the corpus) is completely unaffected.
+ */
+function toStartInvalidVarName(cobolFileName) {
+  return toCamelCase(cobolFileName) + 'StartInvalid';
+}
+
+/**
  * Extract file name from various formats
  */
 function extractFileName(file) {
@@ -117,6 +159,8 @@ export function fileHandleVarNames(fileName) {
     bufVar: toBufVarName(fileName),
     posVar: toPosVarName(fileName),
     hasCurrentVar: toHasCurrentVarName(fileName),
+    occVar: toOccVarName(fileName),
+    startInvalidVar: toStartInvalidVarName(fileName),
   };
 }
 
@@ -171,6 +215,27 @@ export function setAccessModeRegistry(registry) {
 
 function accessModeFor(fileName) {
   return ACCESS_MODE_REGISTRY.get(String(fileName || '').toUpperCase()) || 'SEQUENTIAL';
+}
+
+/**
+ * round-27 finding 8: FD file name (upper) -> true when its FILE-CONTROL
+ * entry declared `ORGANIZATION IS INDEXED` - see expression-gen.js's own
+ * identical copy (isIndexedRandomAccess) for the full rationale. This module
+ * needs its own copy because generateOpen (below) has to decide, ahead of
+ * expression-gen.js's own READ/WRITE/etc., whether to build the keyed/bufVar
+ * handle at all for such a file.
+ */
+let INDEXED_ORGANIZATION_FILES = new Set();
+
+export function setIndexedOrganizationFiles(fileNames) {
+  INDEXED_ORGANIZATION_FILES = fileNames instanceof Set ? fileNames : new Set();
+}
+
+/** See expression-gen.js's identical isIndexedRandomAccess for the full rationale. */
+function isIndexedRandomAccess(fileName) {
+  if (!INDEXED_ORGANIZATION_FILES.has(String(fileName || '').toUpperCase())) return false;
+  const mode = accessModeFor(fileName);
+  return mode === 'RANDOM' || mode === 'DYNAMIC';
 }
 
 /**
@@ -258,10 +323,30 @@ export function generateOpen(statement, indent = 0) {
 
   for (const file of files) {
     const fileName = extractFileName(file);
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar } = fileHandleVarNames(fileName);
     const mode = (statement.mode || file?.mode || 'INPUT').toUpperCase();
     const statusVar = fileStatusVarFor(fileName);
     const handlerMethod = declarativeHandlerFor(fileName, mode);
+
+    // round-27 finding 8: an ORGANIZATION IS INDEXED file opened in RANDOM/
+    // DYNAMIC access mode is not implemented at all (see isIndexedRandomAccess's
+    // own doc comment) - decline visibly here too, BEFORE building either the
+    // keyed/bufVar handle below or a plain writer/reader, so this file's own
+    // handles are left entirely null/untouched and every later READ/WRITE/
+    // REWRITE/DELETE/START statement (expression-gen.js, gated on the SAME
+    // isIndexedRandomAccess check) consistently declines too, instead of the
+    // pre-fix mismatch (this OPEN silently built a keyed-only handle while
+    // WRITE assumed a plain writer existed - a guaranteed NullPointerException,
+    // cc04's own repro).
+    if (isIndexedRandomAccess(fileName)) {
+      lines.push(
+        `${indentStr}() // TODO: OPEN ${mode} ${fileName}: ORGANIZATION IS INDEXED with RANDOM/DYNAMIC access ` +
+        'is not supported (no INDEXED-file cobc oracle is available in this sandbox to verify a real ' +
+        'implementation against - see tests/oracle/README.md known gaps); file handle left unusable'
+      );
+      continue;
+    }
+
     // round-26 root cause 3: a RANDOM/DYNAMIC-access file needs the SAME
     // indexable in-memory buffer an I-O-mode open already builds (round-25
     // root cause 1) for EVERY open mode, not just I-O - READ/REWRITE/WRITE/
@@ -289,6 +374,13 @@ export function generateOpen(statement, indent = 0) {
       openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
       openLines.push(`${bi}val ${srcVar} = scala.io.Source.fromFile(${fileVar})(scala.io.Codec.ISO8859)`);
       openLines.push(`${bi}${bufVar} = scala.collection.mutable.ArrayBuffer.from(${srcVar}.getLines())`);
+      // round-27 findings 3/4: a slot reloaded from disk is "occupied" unless
+      // its own on-disk line is the exact empty string - the literal filler
+      // WRITE/REWRITE's own auto-extend loop uses for a never-actually-written
+      // gap slot (see toOccVarName's own doc comment) - so a gap a program
+      // creates, closes, and reopens (cc01's own shape) still reads back as a
+      // gap, not as a legitimate (blank) record.
+      openLines.push(`${bi}${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_.nonEmpty))`);
       openLines.push(`${bi}${srcVar}.close()`);
       openLines.push(`${bi}${posVar} = 0`);
       openLines.push(`${bi}${hasCurrentVar} = false`);
@@ -336,6 +428,10 @@ export function generateOpen(statement, indent = 0) {
           // SEQUENTIAL-access WRITE does).
           openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
           openLines.push(`${bi}${bufVar} = new scala.collection.mutable.ArrayBuffer[String]()`);
+          // round-27 findings 3/4: fresh empty buffer -> fresh empty occupied-
+          // slot tracker, grown in lockstep by every WRITE/REWRITE/DELETE from
+          // here on (see toOccVarName's own doc comment).
+          openLines.push(`${bi}${occVar} = new scala.collection.mutable.ArrayBuffer[Boolean]()`);
           openLines.push(`${bi}${posVar} = 0`);
           openLines.push(`${bi}${hasCurrentVar} = false`);
           break;
@@ -504,7 +600,7 @@ export function generateFileHandleDeclarations(fileNames, indent = 1) {
   const lines = [];
 
   for (const fileName of fileNames) {
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, startInvalidVar } = fileHandleVarNames(fileName);
     lines.push(`${indentStr}var ${fileVar}: java.io.File = null`);
     lines.push(`${indentStr}var ${readerVar}: scala.io.BufferedSource = null`);
     lines.push(`${indentStr}var ${writerVar}: java.io.PrintWriter = null`);
@@ -518,6 +614,10 @@ export function generateFileHandleDeclarations(fileNames, indent = 1) {
     lines.push(`${indentStr}var ${posVar}: Int = 0`);
     // round-26 root cause 1: see toHasCurrentVarName's own doc comment above.
     lines.push(`${indentStr}var ${hasCurrentVar}: Boolean = false`);
+    // round-27 findings 3/4: see toOccVarName's own doc comment above.
+    lines.push(`${indentStr}var ${occVar}: scala.collection.mutable.ArrayBuffer[Boolean] = null`);
+    // round-27 finding 7: see toStartInvalidVarName's own doc comment above.
+    lines.push(`${indentStr}var ${startInvalidVar}: Boolean = false`);
   }
 
   return lines.join('\n');
@@ -787,4 +887,5 @@ export default {
   fileHandleVarNames,
   setDeclarativeHandlers,
   setAccessModeRegistry,
+  setIndexedOrganizationFiles,
 };

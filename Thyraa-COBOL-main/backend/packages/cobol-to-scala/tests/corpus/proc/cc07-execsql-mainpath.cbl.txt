@@ -1,0 +1,26 @@
+      * cc07: EXEC SQL embedded directly in PROCEDURE DIVISION, run
+      * through the engine's MAIN convertToScala() entry point (not
+      * the separate tests/sql.test.js/generator/sql-gen.js pipeline).
+      * The roadmap doc (docs/CAPABILITY_AUDIT_AND_ROADMAP.md) claims
+      * EXEC SQL is "parsed + compile-verified Doobie generation, not
+      * yet wired into the main generator" - this probes whether that
+      * claim is still accurate (an honest, visible decline) or has
+      * quietly drifted (e.g. silently dropping the statement with no
+      * marker, or crashing convertToScala() outright).
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. CC07SQLM.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-CUSTID     PIC 9(5).
+       01  WS-CUSTNAME   PIC X(20).
+       PROCEDURE DIVISION.
+       MAIN-LOGIC.
+           DISPLAY "BEFORE-SQL".
+           MOVE 12345 TO WS-CUSTID.
+           EXEC SQL
+               SELECT CUST_NAME INTO :WS-CUSTNAME
+               FROM CUSTOMER
+               WHERE CUST_ID = :WS-CUSTID
+           END-EXEC.
+           DISPLAY "AFTER-SQL NAME=" WS-CUSTNAME.
+           STOP RUN.

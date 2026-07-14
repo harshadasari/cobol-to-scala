@@ -1,0 +1,56 @@
+cc09 finding notes (CICS command classification / coverage-honesty claim)
+==========================================================================
+
+Probe: cc09-cics-unknown-inventory.ccp mixes a KNOWN-but-not-specially-
+codegen'd command (GETMAIN - it IS in cics-parser.js's KNOWN_COMMANDS set,
+so classifies as command:'GETMAIN', not 'UNKNOWN' - but generator/
+cics-gen.js's groupCommands() has no dedicated bucket for it, only for
+SEND/RECEIVE MAP, LINK, XCTL, READ/WRITE/REWRITE/DELETE, and RETURN) with
+commands cics-parser.js's KNOWN_COMMANDS set has NO entry for at all at all
+(STARTBR/READNEXT/ENDBR - CICS file BROWSE operations - and DELAY), to
+verify docs/CAPABILITY_AUDIT_AND_ROADMAP.md's Phase 4 claim: "Every CICS
+command the parser saw but didn't turn into a method is still surfaced as a
+comment in an 'other CICS commands observed' inventory - never silently
+dropped."
+
+METHOD: ran parser/index.js's parseCobol() -> parser/cics-parser.js's
+parseAllCicsCommands() -> generator/cics-gen.js's generateCicsSkeleton()
+directly (the same 3-call pipeline tests/cics.test.js's own corpus tests
+use - CICS is not wired into the main convertToScala() entry point at all,
+confirmed by grep: index.js/generator/scala-generator.js have zero
+references to cics-gen.js or cics-parser.js, matching the roadmap's own
+"NOT a behavioral converter" / separate-pipeline framing). Compile-verified
+the generated skeleton with `scala-cli compile` (not `run` - a pure `???`
+scaffold has no @main entry point, matching tests/cics.test.js's own
+established verification method for this area, since cobc has no CICS
+translator and there is no real CICS runtime oracle available in this
+environment either).
+
+RESULT (see cc09-cics-unknown-inventory.expected-skeleton.scala for the
+full captured output):
+
+  - READ FILE('CUSTFILE') correctly became an abstract
+    `CustfileRepository.read(ridfld: String): Array[Byte]` trait member
+    (with the original EXEC CICS text preserved as a comment above it) -
+    the claimed repository-stub behavior.
+  - RETURN (no TRANSID) correctly became a documented "single-shot, no
+    continuation to model" comment block, not code - the claimed
+    RETURN/pseudo-conversational documentation-only behavior.
+  - GETMAIN (classified, but not given its own codegen section) correctly
+    fell through to the "Other CICS commands observed" inventory, tagged
+    `[GETMAIN]` (its real classified command name, not UNKNOWN).
+  - STARTBR / READNEXT / ENDBR / DELAY (all classified `UNKNOWN` -
+    confirmed via parseAllCicsCommands()'s own JSON output) ALSO correctly
+    appear in the SAME "Other CICS commands observed" inventory, each
+    tagged `[UNKNOWN]` with its full original raw EXEC CICS text preserved
+    verbatim - none were silently dropped.
+  - The generated skeleton compiles cleanly with `scala-cli compile`
+    (confirmed, exit 0, no errors) - a real, well-formed Scala 3 trait, not
+    just plausible-looking text.
+
+TRIAGE: HONEST. The roadmap's coverage-honesty claim for CICS command
+classification holds precisely for both "known classification, no
+dedicated codegen bucket" (GETMAIN) and "genuinely unrecognized verb"
+(STARTBR/READNEXT/ENDBR/DELAY) cases - nothing vanished, the inventory
+comment correctly reports each command's own classified name (or UNKNOWN),
+and the output is real, compiling Scala 3, exactly as documented.

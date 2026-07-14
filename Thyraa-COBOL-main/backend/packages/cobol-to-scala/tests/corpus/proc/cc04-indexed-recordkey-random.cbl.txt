@@ -1,0 +1,87 @@
+      * cc04: INDEXED file organization with RECORD KEY (not
+      * RELATIVE KEY) in RANDOM access mode. Rounds 25-26's random-
+      * access machinery was built and verified only against
+      * RELATIVE files (RELATIVE KEY clause) - this probes whether
+      * INDEXED organization's own RECORD KEY clause is recognized
+      * at all for keyed READ/WRITE.
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. CC04IDXR.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT IDX-FILE ASSIGN TO "IDXFILE.DAT"
+               ORGANIZATION IS INDEXED
+               ACCESS MODE IS RANDOM
+               RECORD KEY IS REC-ID
+               FILE STATUS IS WS-STATUS.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  IDX-FILE.
+       01  IDX-REC.
+           05  REC-ID    PIC 9(3).
+           05  REC-VAL   PIC X(5).
+       WORKING-STORAGE SECTION.
+       01  WS-STATUS     PIC X(2).
+       PROCEDURE DIVISION.
+       MAIN-LOGIC.
+           OPEN OUTPUT IDX-FILE.
+      * Write out of key order: 30, 10, 20.
+           MOVE 30 TO REC-ID.
+           MOVE "THIRTY" TO REC-VAL.
+           WRITE IDX-REC
+               INVALID KEY DISPLAY "W30 INVALID"
+               NOT INVALID KEY DISPLAY "W30 OK"
+           END-WRITE.
+           MOVE 10 TO REC-ID.
+           MOVE "TEN  " TO REC-VAL.
+           WRITE IDX-REC
+               INVALID KEY DISPLAY "W10 INVALID"
+               NOT INVALID KEY DISPLAY "W10 OK"
+           END-WRITE.
+           MOVE 20 TO REC-ID.
+           MOVE "TWENTY" TO REC-VAL.
+           WRITE IDX-REC
+               INVALID KEY DISPLAY "W20 INVALID"
+               NOT INVALID KEY DISPLAY "W20 OK"
+           END-WRITE.
+           CLOSE IDX-FILE.
+
+      * Random READ by RECORD KEY, in a DIFFERENT order than
+      * written, to prove real key-based lookup (not "whatever
+      * happens to be at that sequential slot").
+           OPEN I-O IDX-FILE.
+           MOVE 10 TO REC-ID.
+           READ IDX-FILE
+               INVALID KEY
+                   DISPLAY "R10 INVALID ST=" WS-STATUS
+               NOT INVALID KEY
+                   DISPLAY "R10 ID=" REC-ID " VAL=" REC-VAL
+           END-READ.
+
+           MOVE 30 TO REC-ID.
+           READ IDX-FILE
+               INVALID KEY
+                   DISPLAY "R30 INVALID ST=" WS-STATUS
+               NOT INVALID KEY
+                   DISPLAY "R30 ID=" REC-ID " VAL=" REC-VAL
+           END-READ.
+
+           MOVE 20 TO REC-ID.
+           READ IDX-FILE
+               INVALID KEY
+                   DISPLAY "R20 INVALID ST=" WS-STATUS
+               NOT INVALID KEY
+                   DISPLAY "R20 ID=" REC-ID " VAL=" REC-VAL
+           END-READ.
+
+      * A key that was never written at all - must be invalid.
+           MOVE 99 TO REC-ID.
+           READ IDX-FILE
+               INVALID KEY
+                   DISPLAY "R99 INVALID ST=" WS-STATUS
+               NOT INVALID KEY
+                   DISPLAY "R99 ID=" REC-ID " VAL=" REC-VAL
+           END-READ.
+
+           CLOSE IDX-FILE.
+           STOP RUN.

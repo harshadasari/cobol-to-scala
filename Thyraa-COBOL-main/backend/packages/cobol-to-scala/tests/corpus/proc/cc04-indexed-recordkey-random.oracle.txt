@@ -1,0 +1,68 @@
+# cobc COMPILE ERROR (exit 1) - TOOLCHAIN LIMITATION, not a source error
+#
+# This sandbox's installed GnuCOBOL build has the indexed-file handler
+# compiled out entirely (confirmed via `cobc --info`: "indexed file handler :
+# disabled" - no VBISAM/D-ISAM/BDB library linked in; `dpkg -l` confirms no
+# such package is installed either). Any program using
+# `ORGANIZATION IS INDEXED` fails to compile here, regardless of whether the
+# program itself is valid COBOL:
+#
+#   error [-Werror]: compiler is not configured to support ORGANIZATION
+#   INDEXED; FD IDX-FILE
+#
+# So a true byte-for-byte cobc-oracle comparison is NOT obtainable in this
+# environment for this probe (see docs/toolchain-status.md - it documents
+# cobc/scala-cli as installed and working, but does not mention ISAM
+# support, and this round's investigation found it is in fact absent).
+#
+# Renamed to *.cbl.txt (not *.cbl) specifically so tests/oracle/oracle.test.js
+# own `walkCblFiles()` sweep (which requires every discovered *.cbl under
+# tests/corpus/ to both compile AND run cleanly under cobc, with no
+# toolchain-unavailability escape hatch for a single file - unlike the
+# tests/corpus/sql/ directory, which is deliberately excluded wholesale from
+# that same sweep for the analogous EXEC-SQL-not-compilable-by-plain-cobc
+# reason) does not pick this file up and hard-fail on a toolchain gap that
+# has nothing to do with the actual finding below.
+#
+# THE ACTUAL FINDING (independent of the cobc-oracle gap above): this
+# generator's own OWN generated Scala, for this exact program, throws an
+# unhandled java.lang.NullPointerException at runtime (via convertToScala()
+# + scala-cli run) - a genuine crash-level DISHONEST bug, confirmed purely
+# by running the engine's own output, with no cobc comparison needed to see
+# it is broken:
+#
+#   Exception in thread "main" java.lang.NullPointerException: Cannot invoke
+#   "java.io.PrintWriter.println(String)" because the return value of
+#   "com.example.cobol.Cc04idxr$.idxFileWriter()" is null
+#   	at com.example.cobol.Cc04idxr$.mainLogic(Main.scala:985)
+#   	at com.example.cobol.Cc04idxr$._step0$1(Main.scala:1067)
+#   	at com.example.cobol.Cc04idxr$.run(Main.scala:1068)
+#   	at com.example.cobol.run.main(Main.scala:1065)
+#
+# Root cause (traced in generator/file-io-gen.js and generator/
+# expression-gen.js, parser/index.js): parser/index.js's
+# parseEnvironmentDivision only ever recognizes a `RELATIVE KEY IS <field>`
+# clause (round-26 root cause 3's own new `fileControl.relativeKey`) - it has
+# no branch at all for `RECORD KEY IS <field>` (the clause INDEXED files use
+# instead of RELATIVE KEY), so RELATIVE_KEY_REGISTRY never gets an entry for
+# any INDEXED file no matter what its RECORD KEY clause says.
+# generator/file-io-gen.js's generateOpen decides whether to build the
+# keyed, indexable `bufVar` buffer (vs. the old plain PrintWriter) purely
+# from `accessModeFor(fileName)` (RANDOM/DYNAMIC) - so OPEN OUTPUT of this
+# RANDOM-access INDEXED file DOES build an (empty) bufVar and does NOT
+# create idxFileWriter. But generator/expression-gen.js's
+# generateWriteStatement instead gates on `isKeyedAccess(fileName,
+# statement)`, which ALSO requires `relativeKeyVarFor(fileName)` to be
+# non-null - false here (RECORD KEY was never captured) - so WRITE takes the
+# OLD, non-keyed codegen branch that assumes a `idxFileWriter` PrintWriter
+# was created by OPEN. It wasn't (OPEN took the keyed/bufVar branch), so
+# `idxFileWriter` is still null when the first WRITE statement runs -
+# guaranteed NullPointerException for ANY INDEXED file opened
+# RANDOM/DYNAMIC and then WRITTEN to, which is the overwhelmingly common
+# real-world access pattern for an indexed file (RANDOM/DYNAMIC access is
+# the whole point of choosing ORGANIZATION IS INDEXED over a plain
+# sequential file). No `???`/TODO marker anywhere warns of this - it
+# compiles cleanly and only fails at runtime, on the very first WRITE.
+#
+# See cc04-indexed-recordkey-random.cbl.txt for the probe source (renamed
+# from .cbl per the note above) and the round-27 report for full detail.

@@ -1,0 +1,43 @@
+# cobc COMPILE ERROR (exit 1) - EXPECTED, not a toolchain gap this time
+#
+# error: unknown statement 'EXEC'
+#
+# Plain GnuCOBOL cannot compile EXEC SQL at all without a database
+# precompiler (ocesql/DB2 coprocessor) - the SAME reason
+# tests/oracle/oracle.test.js already excludes the whole tests/corpus/sql/
+# directory from its cobc-oracle sweep (see that file's own comment). Renamed
+# to *.cbl.txt (not *.cbl) for the identical reason cc04's note explains -
+# so oracle.test.js's walkCblFiles() sweep doesn't pick this file up and
+# hard-fail on a cobc limitation unrelated to this probe's actual target.
+#
+# THE ACTUAL FINDING: this probes whether docs/CAPABILITY_AUDIT_AND_ROADMAP.md's
+# claim - "EXEC SQL (parsed + compile-verified Doobie generation, not yet
+# wired into the main generator)" - is still accurate for the MAIN
+# convertToScala() entry point (tests/sql.test.js only ever exercises the
+# SEPARATE generator/sql-gen.js pipeline directly, never convertToScala()
+# itself with an EXEC-SQL-bearing program).
+#
+# CONFIRMED STILL ACCURATE - HONEST decline, not drifted:
+# convertToScala() does NOT throw and does NOT silently drop the statement.
+# The EXEC SQL block is tokenized as a generic `{type: 'EXEC', execType:
+# 'SQL', content: ...}` node (parser/procedure-parser.js's
+# parseExecStatement - genuinely generic, handles CICS the same way) and,
+# since generator/scala-generator.js/method-gen.js/expression-gen.js have no
+# case at all for statement type 'EXEC' (confirmed by reading
+# generateMethodBody's switch and generateExpression's switch - neither
+# mentions 'EXEC'), it falls all the way through to generateExpression's own
+# default branch, producing a visible, grep-able, still-compiling marker:
+#
+#   () /* ??? TODO: unsupported statement type (EXEC) - not yet implemented */
+#
+# Compiled and ran cleanly with scala-cli (exit 0):
+#   BEFORE-SQL
+#   AFTER-SQL NAME=
+#
+# (WS-CUSTNAME stays at its default blank value, since the SELECT INTO never
+# actually ran - exactly the "compiles and runs to completion, but the SQL
+# operation itself never happened" shape the roadmap doc's own wording
+# implies, not a crash and not a silently-wrong-looking success.)
+#
+# TRIAGE: HONEST. The roadmap's claim holds precisely at the main-generator
+# entry point, not just in the standalone sql-gen.js/tests/sql.test.js path.

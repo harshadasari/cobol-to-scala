@@ -192,7 +192,15 @@ describe('round-26 finding 2 (bb10): RANDOM-access READ indexes bufVar directly 
 
   test('READ addresses bufVar directly by (wsRkey).toInt, not the sequential iterator', () => {
     assert.match(scala, /if someFileBuf == null \|\| someFileBuf\.isEmpty then/);
-    assert.match(scala, /else if \(wsRkey\)\.toInt >= 1 && \(wsRkey\)\.toInt <= someFileBuf\.length then/);
+    // round-27 finding 4 (cc01) added a `someFileOcc(...)` occupied-slot
+    // check alongside the range check, so a never-written "gap" slot
+    // (auto-extended by an earlier out-of-order-key WRITE, but never
+    // actually written to) correctly falls through to the "23" branch
+    // below instead of decoding blank placeholder bytes as real data -
+    // see tests/round27-fixes.test.js and tests/oracle/README.md's
+    // round-27 entry for the full write-up. Still verifies READ addresses
+    // bufVar directly by the RELATIVE KEY value, round-26's own point here.
+    assert.match(scala, /else if \(wsRkey\)\.toInt >= 1 && \(wsRkey\)\.toInt <= someFileBuf\.length && someFileOcc\(\(wsRkey\)\.toInt - 1\) then/);
     assert.match(scala, /val _record = someFileBuf\(\(wsRkey\)\.toInt - 1\)/);
   });
 
@@ -250,7 +258,14 @@ describe('round-26 finding 2 (bb13): RANDOM-access REWRITE/WRITE auto-extend the
 
   test('WRITE (OUTPUT mode, RANDOM access) auto-extends the buffer for a positive key, rejects a non-positive one', () => {
     assert.match(scala, /if \(wsRkey\)\.toInt >= 1 then/);
-    assert.match(scala, /while someFileBuf\.length < \(wsRkey\)\.toInt do someFileBuf\.append\(""\)/);
+    // round-27 finding 4 (cc01)/finding 3 (cc02) added a parallel
+    // `someFileOcc` occupied-slot tracking array (each auto-extended slot
+    // starts unoccupied) alongside the buffer, so a later WRITE/READ can
+    // tell a genuinely-written slot apart from a never-written "gap" one -
+    // see tests/round27-fixes.test.js and tests/oracle/README.md's round-27
+    // entry. Still verifies the buffer itself auto-extends for a positive
+    // key, round-26's own point here.
+    assert.match(scala, /while someFileBuf\.length < \(wsRkey\)\.toInt do \{ someFileBuf\.append\(""\); someFileOcc\.append\(false\) \}/);
     assert.match(scala, /wsStatus = "24"/);
   });
 

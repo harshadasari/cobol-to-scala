@@ -2468,6 +2468,19 @@ function parseDeleteStatement(ctx) {
     stmt.invalidKey = parseStatementBlock(ctx, ['NOT', 'END-DELETE']);
   }
 
+  // round-27 finding 2: `NOT INVALID KEY` companion clause - DELETE never
+  // parsed this at all before this round (unlike READ, and unlike REWRITE/
+  // WRITE/START since round-26) - its own trailing tokens were left
+  // unconsumed and silently misparsed as the start of the NEXT statement in
+  // the same paragraph (cc06's own repro: a real, unrelated DISPLAY right
+  // after the DELETE lost its own output entirely, corrupted by the leftover
+  // `NOT INVALID KEY DISPLAY ...` tokens being reparsed as garbage).
+  if (ctx.matchValue('NOT')) {
+    ctx.matchValue('INVALID');
+    ctx.matchValue('KEY');
+    stmt.notInvalidKey = parseStatementBlock(ctx, ['END-DELETE']);
+  }
+
   ctx.matchValue('END-DELETE');
 
   return stmt;

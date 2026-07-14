@@ -36,6 +36,7 @@ import {
   setDeclarativeHandlers as setDeclarativeHandlersExpr,
   setRelativeKeyRegistry as setRelativeKeyRegistryExpr,
   setAccessModeRegistry as setAccessModeRegistryExpr,
+  setIndexedOrganizationFiles as setIndexedOrganizationFilesExpr,
   setCallProgramRegistry,
   resetCallRetSeq,
   defaultZeroValueForScalaType,
@@ -71,6 +72,7 @@ import {
   setFileStatusRegistry as setFileStatusRegistryFileIO,
   setDeclarativeHandlers as setDeclarativeHandlersFileIO,
   setAccessModeRegistry as setAccessModeRegistryFileIO,
+  setIndexedOrganizationFiles as setIndexedOrganizationFilesFileIO,
 } from './file-io-gen.js';
 import { generateSql, generateDoobieImports, generateTransactorSetup } from './sql-gen.js';
 
@@ -3329,6 +3331,16 @@ export function generateScala(ast, options = {}) {
   // defaulted, with zero effect on its own codegen.
   const relativeKeyRegistry = new Map();
   const accessModeRegistry = new Map();
+  // round-27 finding 8: FD file names (upper) whose FILE-CONTROL entry
+  // declared `ORGANIZATION IS INDEXED` - fed to expression-gen.js (READ/
+  // WRITE/REWRITE/DELETE/START) and file-io-gen.js (OPEN), each keeping its
+  // own copy like every other per-file registry above, so a RANDOM/DYNAMIC-
+  // access INDEXED file (this generator implements no real RECORD-KEY-
+  // addressed semantics for - see isIndexedRandomAccess, expression-gen.js)
+  // degrades to a visible decline everywhere instead of crashing. Empty (and
+  // so a pure no-op) for every pre-round-27 corpus program, none of which
+  // declare ORGANIZATION IS INDEXED at all.
+  const indexedOrganizationFiles = new Set();
   for (const fc of getFileControls(ast)) {
     const fname = fc.name || fc.fileName;
     if (!fname) continue;
@@ -3340,12 +3352,17 @@ export function generateScala(ast, options = {}) {
       relativeKeyRegistry.set(fnameUpper, toCamelCase(fc.relativeKey));
     }
     accessModeRegistry.set(fnameUpper, String(fc.access || 'SEQUENTIAL').toUpperCase());
+    if (String(fc.organization || '').toUpperCase() === 'INDEXED') {
+      indexedOrganizationFiles.add(fnameUpper);
+    }
   }
   setFileStatusRegistryExpr(fileStatusRegistry);
   setFileStatusRegistryFileIO(fileStatusRegistry);
   setRelativeKeyRegistryExpr(relativeKeyRegistry);
   setAccessModeRegistryExpr(accessModeRegistry);
   setAccessModeRegistryFileIO(accessModeRegistry);
+  setIndexedOrganizationFilesExpr(indexedOrganizationFiles);
+  setIndexedOrganizationFilesFileIO(indexedOrganizationFiles);
 
   // DECLARATIVES `USE AFTER STANDARD ERROR PROCEDURE` handler methods +
   // registries (round-10 finding 1, registry-population ordering fixed by

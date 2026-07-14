@@ -1,0 +1,56 @@
+cc08 finding notes (JCL <-> COBOL file-I/O correlation)
+========================================================
+
+Companion files: cc08-jcl-cobol-correlation.jcl (JCL job, PGM=CC08COB, DD
+names INFILE/OUTFILE mapped to DSNs PROD.CUSTOMER.MASTER/
+PROD.CUSTOMER.REPORT) and cc08-jcl-cobol-correlation.cbl (the COBOL program
+itself, SELECT ... ASSIGN TO INFILE / OUTFILE - the ordinary mainframe
+convention of a COBOL SELECT's ASSIGN clause naming the JCL DD it will be
+run under). The .cbl program's own oracle-vs-generated-Scala comparison
+(see cc08-jcl-cobol-correlation.oracle.txt) matches byte-for-byte (a
+trivial DISPLAY-only probe - the file I/O is declared but never opened, so
+this is testing the JCL/COBOL correlation question specifically, not
+general file-I/O correctness, which cc01-cc06 already cover).
+
+QUESTION PROBED: does this engine's JCL parser (parser/jcl-parser.js) ever
+correlate a JCL DD name / dataset (DSN) with the SAME-named COBOL program's
+own FILE-CONTROL SELECT/ASSIGN clause - i.e. does converting CC08COB's
+COBOL source to Scala ever resolve "INFILE" against the JCL's own
+PROD.CUSTOMER.MASTER DSN (for a real filesystem path, a log message, or
+anything else), or are the two parsers/pipelines totally independent?
+
+FINDING: totally independent - confirmed by direct inspection, not just
+absence of a code reference:
+
+  - parser/jcl-parser.js has ZERO imports of, or references to, anything
+    COBOL-specific (no `SELECT`/`ASSIGN`/`fileControl`/`FILE-CONTROL`
+    string anywhere in the file - confirmed by grep) - `parseJcl()` only
+    ever sees the .jcl text; `buildDatasetFlow()` only ever correlates DD
+    entries by DSN, purely within the JCL model itself (parser/
+    jcl-parser.js:605-656).
+  - Running `parseJcl()` on cc08's own .jcl produces the expected
+    structured step/DD/DSN model (STEP1 -> PGM=CC08COB, DD INFILE ->
+    DSN=PROD.CUSTOMER.MASTER, DD OUTFILE -> DSN=PROD.CUSTOMER.REPORT) -
+    entirely on its own, no COBOL source involved at all.
+  - Running `convertToScala()` on cc08's own .cbl produces a generated
+    Scala program whose file-path variables are LITERALLY the ASSIGN
+    clause's own token text, unresolved and un-cross-referenced against
+    anything:
+        val inFilePath: String = "INFILE"
+        val outFilePath: String = "OUTFILE"
+    Not "PROD.CUSTOMER.MASTER" (the JCL's real dataset), not any kind of
+    DD-name-to-DSN indirection - just the bare ASSIGN-clause token, exactly
+    as if the JCL file did not exist. index.js/generator/scala-generator.js
+    also have zero imports of jcl-parser.js (confirmed by grep) - there is
+    no code path by which one could reach the other even if a caller
+    wanted it to.
+
+TRIAGE: HONEST, not a new bug - this is NOT a violated claim.
+docs/CAPABILITY_AUDIT_AND_ROADMAP.md's own JCL row already documents JCL as
+a "Structural parse: steps, DD, PROC expansion, referbacks, dataset lineage
+JSON" with the flow-diagram/pipeline-scaffolding piece explicitly marked
+OPEN - it never claims JCL DD/DSN information is (or will be) cross-
+referenced into the generated Scala's own file I/O. This probe simply
+confirms that documented architectural boundary holds exactly as described
+- two independent parsers/pipelines, correctly and honestly represented in
+the docs, not a silent gap the docs paper over.

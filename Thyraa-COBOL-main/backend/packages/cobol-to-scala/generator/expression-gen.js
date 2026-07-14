@@ -216,6 +216,49 @@ export function getTableRegistry() {
 }
 
 /**
+ * round-23 finding (l12/l04): the set of camelCase identifiers that are
+ * currently RECURSIVE-LINKAGE-aliased local getter/setter `def` pairs
+ * (generateRecursiveEntryMethod, generator/scala-generator.js) rather than
+ * ordinary `var`s - installed once per generateEntryMethod call (empty for
+ * every non-recursive program, or a program's own recursive path never
+ * reached), consulted only by renderAssignment (below) to decide whether a
+ * write to this name must be an explicit `<camel>_=(value)` method CALL
+ * instead of a bare `<camel> = value` assignment.
+ *
+ * Root cause this exists to work around: Scala's assignment-operator
+ * desugaring (`x = y` -> `x_=(y)`) only fires for a `def x`/`def x_=` pair
+ * that are MEMBERS of an enclosing template (a class/object/trait) - even
+ * an unqualified reference to such a pair, relying on an implicit `this`,
+ * desugars correctly. A LOCAL `def x`/`def x_=` pair declared directly
+ * inside a method body (exactly what generateRecursiveEntryMethod emits -
+ * these getter/setter defs are local to entry()'s own call, not members of
+ * any object) is NOT a template member, so the compiler never looks for a
+ * `x_=` companion at all: `x = y` there is parsed as a doomed attempt to
+ * reassign the (immutable, val-like) local def `x` itself, a hard
+ * `Reassignment to val x` compile error - confirmed with a minimal
+ * standalone scala-cli snippet, and confirmed to reproduce byte-for-byte in
+ * the real generated Scala for l12-recur-selfwrite.cbl (a single
+ * self-recursive program doing `SUBTRACT 1 FROM LS-N`, a direct write to
+ * its own LINKAGE parameter - the getter/setter LOCAL-def convention
+ * round-21 finding 2 introduced was never actually exercised with a real
+ * write anywhere in this campaign until l12/l04). The explicit method-call
+ * form `x_=(y)` compiles and runs correctly for a local def pair (also
+ * confirmed with a minimal snippet) - it needs no template-member lookup at
+ * all, it's an ordinary method call - so renderAssignment emits THAT form
+ * whenever the target name is in this set, instead of teaching Scala's
+ * assignment sugar to do something it fundamentally does not do for locals.
+ */
+let RECURSIVE_LEAF_NAMES = new Set();
+
+export function setRecursiveLeafNames(names) {
+  RECURSIVE_LEAF_NAMES = names instanceof Set ? names : new Set(names || []);
+}
+
+export function getRecursiveLeafNames() {
+  return RECURSIVE_LEAF_NAMES;
+}
+
+/**
  * Resolve a bare (unqualified) uppercased group name - as read directly off
  * a MOVE/ADD CORRESPONDING source/target or a RELEASE/RETURN FROM/INTO
  * reference, none of which carry OF/IN qualification in the Phase 2 corpus -
@@ -766,6 +809,26 @@ function refModNumericPlaceholder(contextLabel) {
 }
 
 /**
+ * round-23 finding (l12/l04): the single shared "write a plain camelCase
+ * Scala identifier" primitive - every call site that used to build a bare
+ * `${camel} = ${valueExpr}` string directly (renderAssignment below, plus
+ * generateCall's recursive-target closure-building branch and its
+ * ordinary-target writeback branches, generator/expression-gen.js) now goes
+ * through this instead, so all of them automatically pick up
+ * RECURSIVE_LEAF_NAMES' own `<camel>_=(value)` explicit-setter-call
+ * detour (see that Set's own doc comment above for the full Scala-
+ * assignment-sugar-doesn't-work-for-locals root cause) with zero risk of a
+ * missed spot - a single centralized decision instead of duplicating the
+ * `RECURSIVE_LEAF_NAMES.has(...)` check at every one of those sites.
+ */
+function assignExpr(camel, valueExpr) {
+  if (RECURSIVE_LEAF_NAMES.has(camel)) {
+    return `${camel}_=(${valueExpr})`;
+  }
+  return `${camel} = ${valueExpr}`;
+}
+
+/**
  * Render an assignment to a (possibly subscripted) target as a Scala
  * statement. WORKING-STORAGE OCCURS tables are represented as flat
  * `var name: Vector[...]` fields (one Vector layer per occurs-bearing
@@ -777,7 +840,7 @@ function refModNumericPlaceholder(contextLabel) {
 function renderAssignment(targetRef, valueExpr) {
   if (!targetRef) return `/* no assignment target */ = ${valueExpr}`;
   if (typeof targetRef === 'string') {
-    return `${toCamelCase(targetRef)} = ${valueExpr}`;
+    return assignExpr(toCamelCase(targetRef), valueExpr);
   }
 
   if (targetRef.refMod) {
@@ -798,7 +861,13 @@ function renderAssignment(targetRef, valueExpr) {
   const camel = targetCamelFor(targetRef);
   const subscripts = Array.isArray(targetRef.subscripts) ? targetRef.subscripts : [];
   if (subscripts.length === 0) {
-    return `${camel} = ${valueExpr}`;
+    // round-23 (l12/l04): a RECURSIVE-LINKAGE-aliased leaf (see
+    // RECURSIVE_LEAF_NAMES's own doc comment above) is always a plain
+    // scalar - flattenGroupLeaves never produces a subscriptable/OCCURS
+    // leaf - so this unsubscripted branch is the only one that can ever
+    // need the explicit setter-call form; the subscripted `.updated(...)`
+    // branch below is unreachable for such a name and is left untouched.
+    return assignExpr(camel, valueExpr);
   }
 
   const idxs = subscripts.map(subscriptIndexExpr);
@@ -5423,7 +5492,31 @@ export function flattenGroupLeaves(groupKey, groupRegistry = GROUP_REGISTRY, tab
 
   const leaves = [];
   for (const c of children) {
-    if (c.isFiller) return null;
+    // round-23 finding (l11): a FILLER child has no COBOL-level name to
+    // expose as an accessor, but buildFieldRegistry (scala-generator.js)
+    // already gives it its own hidden `_fillerN` flat var + registered
+    // field info (groupRegistry's own entry for it: `{ camel:
+    // c._fillerCamel, info: c._fillerInfo, isFiller: true }` - the exact
+    // same shape scatterGroupFromString already reads/writes through
+    // unconditionally, which is WHY that function - unlike this one,
+    // before this fix - never needed to bail on a FILLER child at all: it
+    // just treats `_fillerN` like any other named leaf). Since that
+    // synthetic identifier is already there and never referenced from
+    // anywhere a real COBOL name could collide with it, it flattens into
+    // this leaf list exactly like a named field - giving it the SAME
+    // per-call-activation getter/setter closure every other leaf gets
+    // (generateRecursiveEntryMethod/generateCall's RECURSIVE-target
+    // branch) instead of falling through to the clobbering-prone ordinary
+    // shared-module-var convention (the exact pre-round-21/22 bug,
+    // reproduced for a FILLER-bearing GROUP LINKAGE parameter specifically -
+    // see l11-recgrp-filler.cbl's own header comment). An OCCURS-bearing
+    // child (checked below) is the one shape that genuinely has no single
+    // flat-var leaf to alias at all, and still bails to `null`.
+    if (c.isFiller) {
+      if (!c.camel || !c.info) return null;
+      leaves.push({ camel: c.camel, scalaType: c.info.scalaType });
+      continue;
+    }
     if (c.nameUpper && tableRegistry.has(c.nameUpper)) return null;
     if (c.groupKey) {
       const nested = flattenGroupLeaves(c.groupKey, groupRegistry, tableRegistry);
@@ -7201,7 +7294,14 @@ function generateCall(statement, indent = 0) {
       if (isPlainRefVar) {
         const camel = toCamelCase(name);
         const scalaType = leafShapes[0]?.scalaType || target.paramTypes?.[i] || 'String';
-        const setter = mode === 'REFERENCE' ? `(v: ${scalaType}) => ${camel} = v` : `(_: ${scalaType}) => ()`;
+        // round-23 (l12/l04): this closure's own caller-side variable may
+        // ITSELF be a recursive-LINKAGE-aliased leaf (a RECURSIVE program
+        // CALLing itself/a sibling, passing its own LINKAGE item BY
+        // REFERENCE - l12/l04's own exact shape) - assignExpr routes through
+        // the same explicit `<camel>_=(v)` setter-call detour renderAssignment
+        // uses, instead of a bare `${camel} = v` that would hit the identical
+        // "Reassignment to val" compile error for such a name.
+        const setter = mode === 'REFERENCE' ? `(v: ${scalaType}) => ${assignExpr(camel, 'v')}` : `(_: ${scalaType}) => ()`;
         closureArgs.push(`() => ${camel}, ${setter}`);
         return;
       }
@@ -7210,7 +7310,7 @@ function generateCall(statement, indent = 0) {
         const callerLeaves = flattenGroupLeaves(resolveGroupKey(String(name).toUpperCase()));
         if (callerLeaves && callerLeaves.length === leafShapes.length) {
           callerLeaves.forEach(leaf => {
-            const setter = mode === 'REFERENCE' ? `(v: ${leaf.scalaType}) => ${leaf.camel} = v` : `(_: ${leaf.scalaType}) => ()`;
+            const setter = mode === 'REFERENCE' ? `(v: ${leaf.scalaType}) => ${assignExpr(leaf.camel, 'v')}` : `(_: ${leaf.scalaType}) => ()`;
             closureArgs.push(`() => ${leaf.camel}, ${setter}`);
           });
           return;
@@ -7280,7 +7380,13 @@ function generateCall(statement, indent = 0) {
   // see the paramCount===1 group branch and the multi-param `_callRet`
   // path below, both of which evaluate the call exactly once first).
   const renderWriteback = (writer, sourceExpr) => {
-    if (writer.kind === 'scalar') return [`${indentStr}${writer.camel} = ${sourceExpr}`];
+    // round-23 (l12/l04): the CALLER here may itself be running inside a
+    // RECURSIVE program's own entry() (e.g. a RECURSIVE program CALLing an
+    // ordinary, non-recursive sibling and passing its own LINKAGE item BY
+    // REFERENCE) - assignExpr routes writer.camel through the same
+    // `<camel>_=(value)` detour as every other write site for this exact
+    // reason.
+    if (writer.kind === 'scalar') return [`${indentStr}${assignExpr(writer.camel, sourceExpr)}`];
     if (writer.kind === 'scalar-subscripted') return [`${indentStr}${renderAssignment(writer.ref, sourceExpr)}`];
     if (writer.kind === 'refmod-unsupported') {
       return [
@@ -7305,7 +7411,7 @@ function generateCall(statement, indent = 0) {
   if (target.paramCount === 1) {
     const w = refWriters.find(Boolean);
     if (!w) return `${indentStr}${callExpr}`;
-    if (w.kind === 'scalar') return `${indentStr}${w.camel} = ${callExpr}`;
+    if (w.kind === 'scalar') return `${indentStr}${assignExpr(w.camel, callExpr)}`;
     const retName = nextCallRetName();
     return [`${indentStr}val ${retName} = ${callExpr}`, ...renderWriteback(w, retName)].join('\n');
   }

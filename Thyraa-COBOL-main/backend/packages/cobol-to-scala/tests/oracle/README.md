@@ -1227,6 +1227,96 @@ afterward).
 See `tests/round22-fixes.test.js` for focused, toolchain-independent unit
 tests of all 4 findings above.
 
+### Round-23 adversarial-refutation findings (l01-l13) and their fixes
+
+A round-23 refuter found 4 more dishonest divergences, all tracing back to the
+RECURSIVE-program/group-LINKAGE machinery rounds 21-22 introduced
+(`generateRecursiveEntryMethod` and friends, `generator/scala-generator.js`):
+the getter/setter LOCAL-def convention that whole mechanism rests on turned
+out to have never actually been exercised with a real write anywhere in this
+campaign (every prior RECURSIVE-with-writeback program only ever computed a
+NEW value into a separate WORKING-STORAGE variable and passed THAT onward -
+none assigned directly to the LINKAGE parameter identifier itself within the
+same activation), and both of round-22 finding 1's own documented
+`flattenGroupLeaves` bail-out cases (an OCCURS child, a FILLER child) turned
+out to have two DIFFERENT failure modes once actually probed - one a silent
+infinite recursion, the other a silent reproduction of the exact clobbering
+bug round-21/22 already fixed twice before. All 4 are now fixed at their
+root cause; every promoted program hard-passes `oracleCompare()` except
+`l10`, a **deliberate** `t.todo(...)` entry (see below - the same
+"honest, out-of-scope decline" shape as `r1303c`/round-13 finding 1, not a
+regression).
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | **Root cause of l12/l04's compile failure**: `generateRecursiveEntryMethod`'s own doc comment claimed Scala's assignment-operator desugaring (`x = y` -> `x_=(y)`) would let ordinary generated code read/write a RECURSIVE program's LINKAGE-aliased local `def <camel>: T` / `def <camel>_=(v: T): Unit` pair transparently, "with zero changes needed to how expression-gen.js reads/writes an ordinary identifier." Never true: independently re-verified against the ACTUAL generated Scala for l12 (a minimal single-self-recursive-program repro, `SUBTRACT 1 FROM LS-N` - a direct write to its own LINKAGE parameter) with scala-cli, confirming a hard `Reassignment to val lsN` compile error, then bisected with standalone scala-cli snippets down to the precise Scala semantics: assignment-sugar desugaring only fires for a `def x`/`def x_=` pair that are MEMBERS of an enclosing template (a class/object/trait) - even an *unqualified* reference to such a pair (relying on an implicit `this`) desugars correctly (confirmed with a minimal object-member snippet) - but a **local** `def x`/`def x_=` pair declared directly inside a method body (exactly what `generateRecursiveEntryMethod` emits - these getter/setter defs are local to `entry()`'s own call, never members of any object) is not a template member, so the compiler never looks for an `x_=` companion at all: `x = y` there is parsed as a doomed attempt to reassign the (immutable, val-like) local def `x` itself. A genuine Scala language limitation, not a narrower generation bug (bad nesting/naming collision/incorrect def syntax) - confirmed by isolating a single-level-nested local def pair with no other change and reproducing the identical error | Centralized, not per-statement-type: the explicit method-call form `x_=(y)` compiles and runs correctly for a local def pair (confirmed with its own minimal snippet - it needs no template-member lookup at all, it's an ordinary method call), so every write site was changed to emit that form instead of teaching Scala to do something it fundamentally does not do for locals. New `RECURSIVE_LEAF_NAMES` (`generator/expression-gen.js`) is the set of camelCase identifiers currently aliased as local getter/setter def pairs inside the CURRENT program's own `entry()` - installed (and reset to empty in a `finally`) around each `generateRecursiveEntryMethod` call site (`generateEntryMethod`, `generator/scala-generator.js`), populated from the exact same `paramLeafShapes.flat()` list that call site already builds. New `assignExpr(camel, valueExpr)` is the single shared "write a plain camelCase Scala identifier" primitive - checks `RECURSIVE_LEAF_NAMES` and emits `<camel>_=(value)` instead of `<camel> = value` when the name is aliased. `renderAssignment` (the shared low-level assignment-rendering helper every statement generator - MOVE/ADD/SUBTRACT/COMPUTE/STRING/UNSTRING/ACCEPT/INITIALIZE/SET, etc. - already funnels through, per rounds 16-19's own precedent) now calls `assignExpr` instead of building `${camel} = ${valueExpr}` directly, in both its string-target and plain-scalar branches - a single, centralized fix rather than touching every statement type individually. Three MORE bare-assignment string-building call sites, all in `generateCall`'s own CALL-boundary closure/writeback construction (not statements `renderAssignment` ever sees), needed the identical treatment since a RECURSIVE program's own LINKAGE-aliased variable can ALSO be the operand of a CALL it makes (to itself, a sibling, or an ordinary non-recursive callee) - `generateCall`'s RECURSIVE-target closure-building branch (both the plain-scalar and the per-leaf GROUP-child cases) and its ordinary-target `renderWriteback`/single-writer-scalar branches all now route their setter-lambda-body/writeback text through `assignExpr` too. Verified against installed GnuCOBOL and re-compiled with scala-cli (l12): `ENTER N=03/02/01/00`, `EXIT N=00` x4, `MAIN N AFTER=00` - byte-for-byte matching cobc; l04 (a 3-program mutual-recursion cycle - A calls B calls C calls A - that also layers the writeback-aliasing check k04 deliberately skipped, each unwinding level reading its own `WS-NEXT` mutation back through its own `LS-N`) matches cobc exactly too (`A ENTER N=003` ... `MAIN N AFTER=677`); confirmed zero regressions on every pre-existing RECURSIVE corpus program's own read-only/computed-writeback LINKAGE references (j10, k01, k04, k12, all re-verified `oracleCompare()`-clean end to end with scala-cli) | l12, l04 |
+| 2 | A RECURSIVE program's GROUP LINKAGE parameter containing an OCCURS-bearing child (`flattenGroupLeaves`'s first documented bail-out case) falls back to the ordinary (non-recursive-safe) `generateEntryMethod` convention, per round-22 finding 1's own doc comment - but that fallback's own group-parameter SCATTER (the code that copies the incoming CALL argument into the callee's own flat vars) was ALREADY a silent no-op (`() // TODO: ... - value left unchanged`) whenever `scatterGroupFromString` itself also bails (l10: `LS-ITEMS`, the OCCURS table, makes `scatterGroupFromString` bail for the WHOLE group, not just that one child - `if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) return null`). For an ordinary non-recursive callee this is a harmless (if not byte-accurate) "compiles and runs to completion" decline, since it only ever runs once per CALL - but l10's own `LS-DEPTH` (the program's OWN recursion loop-guard field) lives in the SAME group as the un-scatterable `LS-ITEMS`, so it too is silently never updated across the recursive CALL boundary: it stays frozen at its module-var default (0) forever, and `IF LS-DEPTH < 3 THEN CALL ...` becomes permanently true - genuine infinite recursion, confirmed reproducible as a real `StackOverflowError` (directly contradicting `tests/oracle/README.md`'s own README - see the Known Gaps update below - which only ever documented this fallback's non-recursive "compiles and runs to completion, but... not byte-accurate" behavior, never a hang) | **Honest, VISIBLE decline that terminates, not full correctness** (matching round-13 finding 1's own explicitly-out-of-scope precedent for this exact shape - true byte-level marshalling of an OCCURS-bearing GROUP across a CALL boundary stays out of scope, for the recursive case exactly as much as the non-recursive one). `generateEntryMethod`'s group-scatter fallback (`generator/scala-generator.js`) now branches on `isRecursiveProgram(ast)`: an ORDINARY (non-recursive) callee keeps the EXACT pre-existing silent no-op (never loops, so nothing to fix there - unaffected, zero regression risk for round-13's own `r1303c`), but a RECURSIVE program's own entry() now `throw`s a `NotImplementedError` with a full explanation instead, so EVERY activation (including the very first, outermost CALL) fails fast and loud, before ever reaching whatever recursive CALL this unresolvable parameter would otherwise have silently fed forever - a hang/resource-exhaustion crash (StackOverflowError, after however many thousand frames the JVM allows, with a stack trace that gives no hint WHY) is strictly worse than an immediate, clearly-labeled decline. Verified against installed GnuCOBOL and scala-cli (l10): before the fix, `scala-cli run` crashes with a genuine `StackOverflowError` (confirmed reproducible); after the fix, it fails immediately with `scala.NotImplementedError: CALL ... USING LS-DEPTH-GRP: group parameter scatter not supported for this shape ... on a RECURSIVE program - declining honestly here instead of silently leaving this program's own loop-guard field frozen at its default forever (genuine infinite recursion)` - a clean, immediate, explained failure instead of a resource-exhaustion hang. **Deliberately left as a `t.todo(...)` entry, not promoted to a hard pass** - l10 exercises a documented, intentional gap (the same reasoning as every other "Known gaps" entry in this file): a program exercising this gap is EXPECTED to fail `oracleCompare()` (real cobc's own output shows the fully-correct 3-level `ENTER/EXIT DEPTH=`/`I1=`/`I2=` trace, which this decline does not attempt to reproduce), and forcing a byte-exact match here was never the goal - only replacing a silent hang with a visible, honest failure was. Confirmed zero regressions on every pre-existing non-recursive group-with-OCCURS CALL corpus program (the `isRecursiveProgram(ast)` branch is false for all of them, so they hit the exact same code path as before, byte for byte) | l10 |
+| 3 | A RECURSIVE program's GROUP LINKAGE parameter containing a FILLER child (`flattenGroupLeaves`'s SECOND documented bail-out case) falls back to the same ordinary convention as finding 2 above - but unlike the OCCURS case, `scatterGroupFromString` does NOT bail for a FILLER child (it already reads/writes a FILLER's own hidden `_fillerN` var, populated by `buildFieldRegistry`, exactly like any other named leaf - `flattenGroupLeaves`'s FILLER bail-out, unlike `scatterGroupFromString`'s, was never actually load-bearing). So l11's own CALL-argument scatter DOES correctly copy per-call values into `lsDepth`/`_fillerN`/`lsTag` on every activation - but since it's still the ORDINARY (non-recursive-safe) convention, that scatter target is a SHARED module-level var, not a per-activation alias: the deepest recursive activation's own writeback silently clobbers the outermost frame's own value, EXACTLY the pre-round-21 scalar clobbering bug and the pre-round-22 GROUP clobbering bug, reproduced a third time for a FILLER-bearing GROUP specifically (l11's own oracle: the outermost frame must read back `EXIT DEPTH=01 TAG=TOP` even after two deeper activations both correctly show `EXIT DEPTH=03 TAG=SUB` - the pre-fix generated Scala showed `DEPTH=03 TAG=SUB` for all three, including the outermost) | **Real fix, extending the exact same per-activation closure-aliasing mechanism, not a new decline** - unlike l10's OCCURS case (which has no single flat-var leaf to alias at all for the un-flattenable child), a FILLER child's underlying storage is a completely ordinary flat var (`_fillerN`) that just happens to have no COBOL-level name; `buildFieldRegistry` already gives it exactly the same `{ camel, info }` shape as any named sibling in `groupRegistry`'s own per-child entries (only its `isFiller: true` tag distinguishes it) - `scatterGroupFromString`'s own indifference to that tag is WHY it never needed to bail here in the first place. `flattenGroupLeaves` (`generator/expression-gen.js`) now does the same: a FILLER child (`c.isFiller`) is flattened into its own leaf using its existing hidden `_fillerN` camel/info instead of bailing to `null` for the WHOLE group, giving it the SAME per-call-activation getter/setter closure pair every other leaf gets (`generateRecursiveEntryMethod`/`generateCall`'s RECURSIVE-target branch, unchanged otherwise) - a synthetic internal identifier that's never exposed to any COBOL-level reference (since none can name it), scoped per-call exactly like every other leaf. An OCCURS-bearing child (l10's own shape) is unaffected - it still bails to `null`, the genuinely-unsupported residual case with no single flat-var leaf to alias at all. Verified against installed GnuCOBOL and scala-cli (l11): `ENTER DEPTH=01/02/03 TAG=TOP/SUB/SUB WS-N=01/02/03`, `EXIT DEPTH=03/03/01 TAG=SUB/SUB/TOP WS-N=03/03/03` - byte-for-byte matching cobc (the outermost activation's own `LS-DEPTH`/`LS-TAG` correctly survive both deeper activations' own writes, while `WS-N`, genuine shared WORKING-STORAGE, legitimately keeps counting up across all three, exactly like j10/k01 already established); confirmed zero regressions on k01 (the non-FILLER GROUP LINKAGE case this extends) | l11 |
+
+9 further round-23 probes were valid, confirmed unaffected by all three
+production fixes above (finding 2's own fix only changes behavior for the
+one genuinely-broken shape it targets - an ORDINARY, non-recursive callee's
+group-scatter fallback is byte-for-byte unchanged): `l01` (a RECURSIVE
+program's GROUP LINKAGE parameter with a NESTED sub-group - `LS-DEPTH-GRP`
+containing elementary `LS-DEPTH` AND a nested `LS-INNER-GRP` with its own
+two elementary children - no OCCURS/FILLER anywhere in it, `flattenGroupLeaves`'s
+own recursion into a nested `c.groupKey` child, untested by k01's own flat
+two-child group; re-verified with scala-cli: matches cobc exactly, confirming
+the nested-group leaf flattening produces correct independent per-activation
+values one level deeper than k01 already established, not silently
+reused/clobbered storage for the nested sub-group's own children), `l02`
+(the identical qualified multi-target `GO TO t1 OF s1, t2 OF s2 DEPENDING ON
+WS-SEL` shape round-22 finding 2 fixed for a LINKAGE selector (k02), here
+with an ORDINARY WORKING-STORAGE selector instead, in a program with no
+CALL/LINKAGE/GOBACK at all - confirms the comma-consuming parser fix isn't
+somehow dependent on the selector being a LINKAGE parameter, and that
+`WS-SEL` itself is never misinterpreted as a spurious paragraph name;
+re-verified with scala-cli: matches cobc exactly), `l03` (a copybook
+pseudo-text (`==...==`) REPLACING pair with NO quoted literal on either side
+- a multi-word clause substituted in for a single placeholder token, COBOL's
+ordinary "parameterize a PICTURE/VALUE clause via copybook" idiom, distinct
+from k03/j05's own narrower identifier-prefix substitution use of pseudo-text
+- existing REPLACING/COPY machinery, re-verified with scala-cli AND its own
+`.copybooks.json` fixture: matches cobc exactly), `l05` (a dynamic
+`CALL <data-name>` whose data-name's runtime VALUE happens to match a sibling
+PROGRAM-ID this same source defines - the exact "coincidental match" scenario
+round-7 finding 1c's own Known Gap text explicitly calls out as untried;
+confirmed this generator's existing decline (the same "external subprogram
+not available for conversion" TODO-marker path a genuinely-unresolvable
+dynamic CALL already takes, since resolving a data-name's runtime value
+against a sibling PROGRAM-ID is explicitly out of scope) is a genuinely
+HONEST one - a visible, distinguishable `AFTER X=007` (the argument
+correctly left unchanged, since the CALL was skipped) rather than a silently
+wrong "looks like it worked" result mimicking `L05SUB`'s own real mutation -
+an EXPECTED `oracleCompare()` mismatch against cobc's own `AFTER X=107`, not
+a new regression; still an honest, already-documented decline, exactly as
+before this round), `l06`/`l13` (a `PERFORM ... VARYING ... AFTER` whose
+INNER index's own UNTIL bound depends on the OUTER index's live,
+per-iteration value - a triangular/staggered iteration space, `l13` nesting
+a THIRD such dependent index one level deeper still - distinct from every
+prior multi-AFTER PERFORM corpus program's fixed, mutually-independent inner
+bounds; re-verified with scala-cli: both match cobc exactly, confirming the
+inner UNTIL condition is correctly re-evaluated against the outer variable's
+current value on every outer iteration, never a value snapshotted once
+up front), `l07` (an out-of-line, call/return-semantics PERFORM issued FROM
+inside a DECLARATIVES handler INTO an ordinary paragraph physically declared
+OUTSIDE the DECLARATIVES range - distinct from every prior DECLARATIVES
+corpus program, none of which PERFORM out of their own handler body at all;
+re-verified with scala-cli: matches cobc exactly, confirming control
+correctly returns to the statement right after the PERFORM once the outside
+paragraph finishes), `l08` (two level-88 condition-names attached directly to
+a REDEFINES item itself, not the base item being redefined - existing
+REDEFINES/condition-name machinery, re-verified with scala-cli: matches cobc
+exactly), `l09` (EVALUATE with a THRU range over an ALPHANUMERIC subject - a
+lexicographic/collating-sequence bound check rather than the arithmetic one
+every prior EVALUATE-THRU corpus program exercises - re-verified with
+scala-cli: matches cobc exactly).
+
+See `tests/round23-fixes.test.js` for focused, toolchain-independent unit
+tests of all 3 production-code findings above (finding 2's own decline is
+exercised there too, asserting the `NotImplementedError` marker text rather
+than a full run, since l10 is a deliberate `t.todo(...)`, not a hard pass).
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -1530,6 +1620,32 @@ tests of all 4 findings above.
   `odoDisplayValueExpr`'s DISPLAY/WRITE use - see round-10/11's table-aware
   concatenation) into the CALL BY REFERENCE marshalling channel specifically,
   if a future pass has time.
+
+  **Round-23 update**: the "compiles and runs to completion" behavior
+  described above is still exactly accurate for an ORDINARY (non-recursive)
+  callee - unaffected by this round. But a **RECURSIVE** program (can CALL
+  itself while an outer activation is still on the Scala call stack) whose
+  OWN GROUP LINKAGE parameter has this same unresolvable shape is a
+  genuinely different, worse failure mode: round-22 finding 1's own
+  getter/setter closure-aliasing convention can't apply either (no single
+  flat-var leaf exists for an OCCURS-bearing child to alias), so it falls
+  back to this SAME silent-no-op scatter - but since the callee can silently
+  re-CALL itself using this exact parameter as its own loop-guard, "the
+  callee sees a default (empty) value instead of the caller's actual...
+  contents" is no longer merely "not byte-accurate": the guard field is
+  NEVER updated across the recursive CALL boundary at all, so it stays
+  frozen at its default forever, and genuine infinite recursion (a real
+  `StackOverflowError`, confirmed reproducible - `l10-recgrp-occurs.cbl`)
+  results, not just a wrong-but-terminating answer. **Fixed** (see the
+  round-23 table above, finding 2): a RECURSIVE program's own entry() now
+  `throw`s a `NotImplementedError` from this exact fallback instead of
+  silently no-op'ing, so every activation fails fast and loud instead of
+  hanging. `l10` IS promoted into `tests/corpus/proc/` (deliberately, unlike
+  `r1303c` above) specifically to regression-test that this decline
+  terminates - it is intentionally left as a `t.todo(...)` entry, not a hard
+  pass, since real cobc's own output for this shape is fully correct
+  (matching k01's own 3-level trace) and this fix does not attempt that
+  level of correctness, only removing the hang.
 
 - **REDEFINES of a group-with-OCCURS by another group-with-OCCURS, round-13
   finding 5** - `todoStubRedefinesLines` (`generator/scala-generator.js`) now

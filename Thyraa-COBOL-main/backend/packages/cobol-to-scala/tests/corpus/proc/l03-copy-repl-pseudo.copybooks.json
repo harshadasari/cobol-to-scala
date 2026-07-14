@@ -1,0 +1,3 @@
+{
+  "LCPY03": "       01 L03-REC.\n          05 L03-FLD PICTYPE.\n          05 L03-TAG PIC X(3) VALUE \"TAG\".\n"
+}

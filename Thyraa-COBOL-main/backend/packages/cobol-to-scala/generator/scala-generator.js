@@ -49,6 +49,7 @@ import {
   getGroupRegistry,
   getGroupKeyRegistry,
   getTableRegistry,
+  setRecursiveLeafNames,
 } from './expression-gen.js';
 import {
   generateMethod,
@@ -3599,8 +3600,24 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
     usingNames, fieldRegistry, getGroupRegistry(), getGroupKeyRegistry(), getTableRegistry()
   );
   if (isRecursiveProgram(ast) && paramInfos.length > 0 && paramLeafShapes !== null) {
-    return generateRecursiveEntryMethod(paramInfos, paramLeafShapes, units, ambiguousNames, indent);
+    // round-23 (l12/l04): install this program's own recursive-LINKAGE leaf
+    // names so renderAssignment (generator/expression-gen.js) knows every
+    // one of these camelCase identifiers is a LOCAL getter/setter `def` pair
+    // inside entry() (see generateRecursiveEntryMethod's own doc comment)
+    // rather than an ordinary module `var`, and must be written via an
+    // explicit `<camel>_=(value)` method call instead of a bare `<camel> =
+    // value` assignment - reset to empty right after generating this
+    // program's entry() so a LATER, non-recursive (or differently-shaped)
+    // program in the same multi-PROGRAM-ID source never inherits a stale
+    // name from this one.
+    setRecursiveLeafNames(new Set(paramLeafShapes.flat().map(leaf => leaf.camel)));
+    try {
+      return generateRecursiveEntryMethod(paramInfos, paramLeafShapes, units, ambiguousNames, indent);
+    } finally {
+      setRecursiveLeafNames(new Set());
+    }
   }
+  setRecursiveLeafNames(new Set());
 
   // round-12 finding 3: every parameter gets a default (its type's own
   // zero/spaces value, matching real COBOL's un-passed-LINKAGE-item
@@ -3634,10 +3651,53 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
     }
     const scattered = scatterGroupFromString(p.groupKey, `_arg${i}`, indent + 1);
     if (scattered == null) {
-      lines.push(
-        `${bi}() // TODO: CALL ... USING ${p.groupKey}: group parameter scatter not supported for this ` +
-          'shape (an OCCURS child, or a child with no registered field info) - value left unchanged'
-      );
+      // round-23 finding (l10): this fallback is reached for ANY program
+      // (recursive or not) whose GROUP LINKAGE parameter can't be
+      // flattened/scattered (an OCCURS child, a FILLER child, or a child
+      // with no registered field info - flattenGroupLeaves/
+      // scatterGroupFromString's own shared bail-out). For an ORDINARY
+      // (non-recursive) callee, a silent no-op here is the SAME honest,
+      // already-accepted decline round-13 finding 1 uses on the CALL
+      // argument-construction side for this identical shape (see
+      // generateCall's own `isNamedGroup` branch, above in this file's
+      // doc comments) - the callee just keeps whatever default/prior value
+      // its module-level var already had, "compiles and runs to
+      // completion" (see tests/oracle/README.md's known gaps) but not
+      // byte-accurate; since a non-recursive callee only ever runs once
+      // per CALL, this can never loop.
+      //
+      // A RECURSIVE program is different: it can CALL itself using this
+      // SAME unresolvable-shape parameter as its own loop-guard (l10:
+      // `LS-DEPTH-GRP` contains both the elementary `LS-DEPTH` guard field
+      // AND an OCCURS table sibling that's the actual reason the whole
+      // group can't be flattened) - a silent no-op here means the guard
+      // field is NEVER updated across the recursive CALL boundary, stays
+      // frozen at its start-of-program default forever, and a
+      // `IF LS-DEPTH < 3 THEN CALL ...`-shaped termination condition
+      // becomes permanently true: genuine infinite recursion
+      // (StackOverflowError - confirmed reproducible), not just a wrong
+      // answer. A hang/crash-by-resource-exhaustion is strictly worse than
+      // an immediate, clearly-labeled decline, so a RECURSIVE program's
+      // own entry() throws here instead of silently no-op'ing - every
+      // activation (including the very first, outermost CALL) fails fast
+      // and loud, before ever reaching whatever recursive CALL this
+      // unresolvable parameter would otherwise have silently fed forever.
+      // True marshalling of this shape is still out of scope (same as the
+      // non-recursive case above) - this is a visible, compiling decline,
+      // not an attempt at correctness.
+      if (isRecursiveProgram(ast)) {
+        lines.push(
+          `${bi}throw new NotImplementedError("CALL ... USING ${p.groupKey}: group parameter scatter not supported ` +
+            'for this shape (an OCCURS child, or a child with no registered field info) on a RECURSIVE program - ' +
+            'declining honestly here instead of silently leaving this program\'s own loop-guard field frozen at ' +
+            'its default forever (genuine infinite recursion) - see tests/oracle/README.md known gaps")'
+        );
+      } else {
+        lines.push(
+          `${bi}() // TODO: CALL ... USING ${p.groupKey}: group parameter scatter not supported for this ` +
+            'shape (an OCCURS child, or a child with no registered field info) - value left unchanged'
+        );
+      }
       return;
     }
     lines.push(...scattered);

@@ -259,6 +259,58 @@ export function getRecursiveLeafNames() {
 }
 
 /**
+ * round-29 fix (ee09/ee10 - EXIT SECTION/EXIT PARAGRAPH's cascading-return
+ * bug in a RECURSIVE program's own nested-local-def convention): true only
+ * while scala-generator.js's generateRecursiveEntryMethod is building a
+ * RECURSIVE program's own CALL entry point - and everything generated while
+ * that one call is on the JS call stack: the ordinary paragraphs
+ * generateProgramFlowLinesNested renders (method-gen.js), any PERFORM ...
+ * THRU wrapper reachable from entry() (generatePerformThruMethod - reused
+ * verbatim for the ordinary convention's own ALWAYS-generated shared
+ * top-level wrapper too, see that function's own doc comment, so this flag
+ * is what tells the two calls apart), and any DECLARATIVES handler
+ * generateDeclarativeHandlerDefsNested renders. False at every other time.
+ *
+ * generateExit (below) and method-gen.js's generateMethodBody/
+ * renderNestedFallthroughDefs consult this to decide EXIT SECTION/EXIT
+ * PARAGRAPH's translation. Root cause: for an ORDINARY (non-recursive)
+ * program, every paragraph is its own genuinely separate top-level method,
+ * so a bare `return` there really does mean "stop just this one paragraph" -
+ * correct, and left completely unchanged (this flag is false there). But
+ * round-21's RECURSIVE nested-local-def convention chains paragraph
+ * fall-through by appending a call to the NEXT paragraph inside the END of
+ * the CURRENT paragraph's own def body (not sequential top-level calls) -
+ * so a bare `return` fired partway through one such nested def doesn't just
+ * skip the rest of THIS paragraph, it also skips that appended next-
+ * paragraph call (since it's textually part of the same def), and
+ * transitively every paragraph chained after it that way, cascading all the
+ * way to the true end of the RECURSIVE program's own flow - potentially
+ * aborting an entire recursive sub-call early. See
+ * generateProgramFlowLinesNested's own doc comment (method-gen.js) for the
+ * full fix: EXIT PARAGRAPH becomes a `scala.util.boundary`/`break()` wrapped
+ * around just the current paragraph's own original statements (so the
+ * appended next-paragraph call, sitting OUTSIDE that boundary, still runs
+ * afterward - correct, since EXIT PARAGRAPH must still fall through to
+ * whatever naturally follows); EXIT SECTION becomes a `throw
+ * CobolExitSectionSignal` instead (a paragraph can have OTHER paragraphs
+ * chained after it within the SAME section, which a single boundary local to
+ * one def cannot reach across - a dynamically-scoped exception can, since it
+ * unwinds however many nested paragraph calls are actually on the stack
+ * until caught by the nearest enclosing try/catch, which
+ * renderNestedFallthroughDefs installs at every point that "enters" a new
+ * SECTION).
+ */
+let IN_RECURSIVE_NESTED_FLOW = false;
+
+export function setRecursiveNestedFlowMode(v) {
+  IN_RECURSIVE_NESTED_FLOW = !!v;
+}
+
+export function isRecursiveNestedFlowMode() {
+  return IN_RECURSIVE_NESTED_FLOW;
+}
+
+/**
  * Resolve a bare (unqualified) uppercased group name - as read directly off
  * a MOVE/ADD CORRESPONDING source/target or a RELEASE/RETURN FROM/INTO
  * reference, none of which carry OF/IN qualification in the Phase 2 corpus -
@@ -349,6 +401,92 @@ function relativeKeyVarFor(fileName) {
 
 function accessModeFor(fileName) {
   return ACCESS_MODE_REGISTRY.get(String(fileName || '').toUpperCase()) || 'SEQUENTIAL';
+}
+
+/**
+ * round-29 finding 5 (MOST SERIOUS - see tests/oracle/README.md's round-29
+ * entry): FD file name (upper) -> its own FD record's total byte width,
+ * populated ONLY for a FILE-CONTROL entry that declared `ORGANIZATION IS
+ * RELATIVE` with a determinable record length. See file-io-gen.js's
+ * identical copy (consulted by generateOpen/generateClose there) for the
+ * full rationale - real COBOL RELATIVE-file storage is FIXED-LENGTH BYTE
+ * RECORDS, not newline-delimited text, so a raw 0x0A byte inside a binary-
+ * encoded field's own value must never be treated as a record delimiter.
+ * Consulted here by generateWriteStatement (a plain SEQUENTIAL-access
+ * WRITE must write exactly `recordLength` raw bytes with NO trailing
+ * newline instead of `println`) and by the auto-extend gap-fill logic
+ * shared by generateKeyedWriteStatement/generateKeyedRewriteStatement/
+ * generateKeyedDeleteStatement (a skipped/deleted slot's own placeholder
+ * must be exactly `recordLength` characters wide - an all-NUL, 0x00-filled
+ * string - not the plain `""` empty-string placeholder the pre-fix,
+ * newline-delimited model used, since every entry in the buffer this
+ * registry gates must stay a uniform `recordLength` characters for the
+ * raw-byte CLOSE flush (file-io-gen.js) to reconstruct record boundaries
+ * correctly with no delimiter at all).
+ */
+let RELATIVE_RECORD_LENGTH_REGISTRY = new Map();
+
+export function setRelativeRecordLengthRegistry(registry) {
+  RELATIVE_RECORD_LENGTH_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+function relativeRecordLengthFor(fileName) {
+  return RELATIVE_RECORD_LENGTH_REGISTRY.get(String(fileName || '').toUpperCase()) || null;
+}
+
+/**
+ * round-29 finding 5: the Scala expression for a full-width "never actually
+ * written" gap-fill placeholder for a RELATIVE file with a known
+ * `recordLength` - an all-NUL (0x00) string of exactly that many
+ * characters, matching file-io-gen.js's own identical literal (its
+ * pushBufferLoadLines' occVar-reload check tests a reloaded chunk against
+ * this SAME literal to recognize a gap after a close/reopen round trip).
+ */
+function relativeGapFillLiteral(recordLength) {
+  return `("\\u0000" * ${recordLength})`;
+}
+
+/**
+ * round-29 finding 5: the gap-fill placeholder expression for a `bufVar`
+ * slot the auto-extend loop (generateKeyedWriteStatement/
+ * generateKeyedRewriteStatement/generateKeyedDeleteStatement, all three
+ * below) creates purely to keep the buffer index-addressable - `""` for
+ * every file this round's fix doesn't touch (its own pre-existing,
+ * newline-delimited-model placeholder), or a full-`recordLength`-wide
+ * all-NUL string for a RELATIVE file with a known fixed record width (see
+ * relativeRecordLengthFor's own doc comment for why a placeholder must stay
+ * exactly `recordLength` characters wide under that model).
+ */
+function gapFillExpr(fileName) {
+  const recLen = relativeRecordLengthFor(fileName);
+  return recLen ? relativeGapFillLiteral(recLen) : '""';
+}
+
+/**
+ * round-29 finding 5: the record-text expression shared by a KEYED WRITE's
+ * `finalTextExpr` (generateWriteStatement's isKeyedAccess branch) and
+ * REWRITE's own `recordExpr` (generateRewriteStatement) - both ultimately
+ * store their result into `bufVar` for a later CLOSE-time flush (see
+ * file-io-gen.js's generateClose), which for a RELATIVE file with a known
+ * fixed record width now writes RAW bytes with NO delimiter between
+ * records at all - every `bufVar` entry MUST therefore stay exactly
+ * `recordLength` characters wide, so the pre-existing `.stripTrailing()`
+ * shortcut (safe under the old newline-delimited model, but one that
+ * silently SHRINKS a record whenever its own last field happens to end in
+ * whitespace) would misalign every later record's own position under the
+ * fixed-width model. A 'bytes' mode plan is already exactly right
+ * regardless of this fix (case-class-gen.js's own `format()` always
+ * returns a fixed-size `Array[Byte]`) - only the plain (all-DISPLAY-field)
+ * content path needs the substitution, and only for a RELATIVE file with a
+ * DETERMINED record length; every other file keeps the exact pre-existing
+ * `.stripTrailing()` behavior unchanged.
+ */
+function plainRecordTextExpr(fileName, plan) {
+  if (plan.mode === 'bytes') {
+    return `new String(${plan.className}.format(${plan.className}(${plan.ctorArgs})), java.nio.charset.StandardCharsets.ISO_8859_1)`;
+  }
+  const recLen = relativeRecordLengthFor(fileName);
+  return recLen ? `CobolFmt.fitLeft(${plan.expr}, ${recLen})` : `(${plan.expr}).stripTrailing()`;
 }
 
 /**
@@ -1256,9 +1394,91 @@ export function generateCobolFmtHelper() {
     '  // the shortest round-tripping decimal text (matching cobc\'s own',
     '  // representation for every value both were checked against), so this',
     '  // only has to additionally strip a trailing ".0".',
-    '  def floatDisplay(v: Double): String =',
-    '    val s = v.toString',
-    '    if s.endsWith(".0") then s.dropRight(2) else s',
+    '  //',
+    '  // round-29 finding 4 (ee07): a scientific-notation magnitude (e.g. a',
+    '  // COMP-1 value of 1.0E30) exposed a SECOND gap this same function must',
+    '  // also handle - `s.endsWith(".0")` only ever matched a WHOLE, non-',
+    '  // scientific value (its own doc comment above never anticipated an',
+    '  // exponent), so a value whose own Scala .toString is "1.0E30" fell',
+    '  // through untouched, keeping cobc-incompatible ".0" AND missing the',
+    '  // explicit "+" cobc\'s own exponent format always carries for a non-',
+    '  // negative exponent - verified against installed GnuCOBOL (ee07\'s own',
+    '  // oracle): 1.0E30 -> "1E+30", -1.0E30 -> "-1E+30", while a NEGATIVE',
+    '  // exponent already carries its own "-" and needs no extra sign (ee01\'s',
+    '  // oracle: 1.6688933612840628E-7f\'s own Float.toString, "1.6688934E-7",',
+    '  // is already correct as-is). `formatFloatText` below normalizes BOTH',
+    '  // pieces of a scientific-notation string (mantissa\'s trailing ".0",',
+    '  // exponent\'s missing "+") while leaving the ordinary non-scientific',
+    '  // case (no "E" at all) exactly as before.',
+    '  private def formatFloatText(s: String): String =',
+    '    val eIdx = s.indexOf(\'E\')',
+    '    if eIdx >= 0 then',
+    '      val rawMantissa = s.substring(0, eIdx)',
+    '      val mantissa = if rawMantissa.endsWith(".0") then rawMantissa.dropRight(2) else rawMantissa',
+    '      val rawExp = s.substring(eIdx + 1)',
+    '      val exp = if rawExp.startsWith("-") || rawExp.startsWith("+") then rawExp else "+" + rawExp',
+    '      mantissa + "E" + exp',
+    '    else if s.endsWith(".0") then s.dropRight(2)',
+    '    else s',
+    '',
+    '  // round-29 finding 5 investigation (ee06): DIVIDE/COMPUTE of two',
+    '  // COMP-2 values whose true IEEE-754 double quotient is not exactly',
+    '  // decimal-representable (e.g. 12.5 / 3.25) exposed a THIRD gap in',
+    '  // this function - `v.toString` gives the shortest STRING that still',
+    '  // round-trips back to the exact same 64-bit double (Java/Scala\'s own',
+    '  // convention, up to 17 significant digits), but cobc\'s own COMP-2',
+    '  // DISPLAY caps at 16 significant digits and TRUNCATES (does not',
+    '  // round) any further ones - compiler-verified against installed',
+    '  // GnuCOBOL with several non-terminating quotients: 100.0/3.0 ->',
+    '  // "33.33333333333333" (not Scala\'s own 17-digit',
+    '  // "33.333333333333336"), 1.0/7.0 -> "0.1428571428571428" (not',
+    '  // "0.14285714285714285"), 12.5/3.25 -> "3.846153846153846" (not',
+    '  // "3.8461538461538463") - every case truncates the 17th significant',
+    '  // digit away entirely rather than rounding the 16th one up, confirmed',
+    '  // by 100.0/3.0\'s own last kept digit staying "3" (Scala\'s 17th digit',
+    '  // there is "6", which would round the 16th digit UP to "4" if this',
+    '  // were genuine rounding, not truncation). `BigDecimal(v).round(...,',
+    '  // RoundingMode.DOWN)` is an exact match: DOWN always truncates toward',
+    '  // zero at the given precision, never rounds. A value that already fits',
+    '  // in 16 significant digits (every whole/short value round-7 originally',
+    '  // verified this function against, and every special magnitude round-29',
+    '  // finding 4 added - 0.0, 1.0E30, -1.0E30) is a complete no-op here -',
+    '  // this ONLY changes a Double whose OWN shortest round-trip text needs',
+    '  // more than 16 significant digits, i.e. exactly the previously-',
+    '  // unexercised case ee06 uncovered. COMP-1 (Float) never needs this at',
+    '  // all - a 32-bit float\'s own maximum meaningful precision (~9',
+    '  // significant digits) never approaches this 16-digit cap - so',
+    '  // floatDisplaySingle below intentionally does NOT call this.',
+    '  //',
+    '  // Defensive guard: `BigDecimal(v)` throws for NaN/+-Infinity (neither',
+    '  // has any decimal representation at all) - COBOL arithmetic has no',
+    '  // portable notion of either (a genuine divide-by-zero is normally',
+    '  // caught by ON SIZE ERROR before a NaN/Infinity value could ever reach',
+    '  // a DISPLAY at all), but this must not CRASH the whole program over an',
+    '  // edge case no corpus program is known to exercise either way - `v` is',
+    '  // returned unchanged (its own `.toString`, "NaN"/"Infinity", is at',
+    '  // least a visible, non-crashing marker) rather than let the exception',
+    '  // escape.',
+    '  private def truncateSignificantDigits(v: Double, maxDigits: Int): Double =',
+    '    if v.isNaN || v.isInfinite then v',
+    '    else BigDecimal(v).round(new java.math.MathContext(maxDigits, java.math.RoundingMode.DOWN)).toDouble',
+    '',
+    '  def floatDisplay(v: Double): String = formatFloatText(truncateSignificantDigits(v, 16).toString)',
+    '',
+    '  // round-29 finding 4 (ee07/ee04): COMP-1\'s own genuine 32-bit Float -',
+    '  // calling floatDisplay(v: Double) with an actual Float value forced an',
+    '  // implicit Float->Double WIDENING before this function ever saw it,',
+    '  // introducing REAL extra (wrong) precision digits into the string (a',
+    '  // widened 32-bit bit pattern is only an approximation of the original',
+    '  // decimal value at 64-bit precision) - e.g. 1.0E30f widened to Double',
+    '  // stringifies as "1.0000000150474662E30" instead of the true 32-bit',
+    '  // shortest-round-trip text "1.0E30" (verified against installed',
+    '  // GnuCOBOL, ee07\'s oracle: cobc\'s own COMP-1 DISPLAY shows "1E+30", not',
+    '  // "1.0000000150474662E+30"). Operating on a genuine `Float` all the way',
+    '  // through - `v.toString` on an actual Float (never widened) - produces',
+    '  // the shortest round-tripping decimal text for the TRUE 32-bit value,',
+    '  // exactly like floatDisplay already does for a genuine Double.',
+    '  def floatDisplaySingle(v: Float): String = formatFloatText(v.toString)',
     '',
     '  // Fixed-width alphanumeric MOVE alignment: default is truncate-right/',
     '  // pad-right with spaces; JUSTIFIED RIGHT truncates-left/pads-left.',
@@ -5786,7 +6006,18 @@ function renderDisplayOperand(ref) {
   // path below renders an all-zero-width (i.e. empty) numeric string. See
   // CobolFmt.floatDisplay's own doc comment for the plain-decimal-text
   // format cobc actually uses for these.
-  if (info && (info.scalaType === 'Float' || info.scalaType === 'Double')) {
+  //
+  // round-29 finding 4: COMP-1's own genuine Float MUST go through the
+  // Float-specific `floatDisplaySingle` overload, not `floatDisplay(v:
+  // Double)` - passing a Float there would implicitly widen it to Double
+  // before formatting, introducing spurious extra precision digits (see
+  // floatDisplaySingle's own doc comment). Dispatching on `info.scalaType`
+  // (not just "any floating type") is exactly what keeps COMP-2's own
+  // existing Double path (`floatDisplay`) unaffected.
+  if (info && info.scalaType === 'Float') {
+    return `CobolFmt.floatDisplaySingle(${expr})`;
+  }
+  if (info && info.scalaType === 'Double') {
     return `CobolFmt.floatDisplay(${expr})`;
   }
   if (info && info.dataType === 'numeric') {
@@ -7060,12 +7291,28 @@ function generateReadStatement(statement, indent = 0) {
   // above, whichever of the three branches applies) in this outer guard - via
   // a uniform 2-space re-indent - means every one of the three shapes gets
   // the identical swallow behavior without duplicating any of them.
+  //
+  // Round-29 regression fix: `lines` isn't guaranteed to hold one physical
+  // line per array element. When this READ's own NOT AT END/AT END clause
+  // contains a nested statement whose codegen itself returns a *joined*
+  // multi-line string (e.g. another READ - which recurses into this very
+  // function and returns its own already-`\n`-joined, already-fully-wrapped
+  // block; t02-multi-file-open.cbl's IN-FILE-A NOT AT END clause READing
+  // IN-FILE-B is exactly this shape), that whole block sits in `lines` as a
+  // SINGLE element containing embedded '\n's. The old `lines.map(l => \`
+  // ${l}\`)` only ever prepends its 2 spaces once per array element - i.e.
+  // once to that element's first physical line - leaving every other
+  // physical line folded up inside the same string untouched, one
+  // indentation level short of everything around it. Splitting every
+  // element on '\n' first, so the 2-space bump lands on every physical
+  // line (not just once per array element), fixes that at any nesting
+  // depth.
   return [
     `${indentStr}if ${startInvalidVar} then`,
     `${indentStr}  ${hasCurrentVar} = false`,
     ...(statusVar ? [`${indentStr}  ${assignExpr(statusVar, '"46"')}`] : []),
     `${indentStr}else`,
-    ...lines.map(l => `  ${l}`),
+    ...lines.flatMap(l => l.split('\n')).map(l => `  ${l}`),
   ].join('\n');
 }
 
@@ -7275,7 +7522,7 @@ function generateKeyedWriteStatement(statement, fileName, finalTextExpr, statusV
 
   const lines = [];
   lines.push(`${indentStr}if ${relKey} >= 1 then`);
-  lines.push(`${bi}while ${bufVar}.length < ${relKey} do { ${bufVar}.append(""); ${occVar}.append(false) }`);
+  lines.push(`${bi}while ${bufVar}.length < ${relKey} do { ${bufVar}.append(${gapFillExpr(fileName)}); ${occVar}.append(false) }`);
   lines.push(`${bi}if ${occVar}(${relKey} - 1) then`);
   if (statusVar) lines.push(`${bi2}${assignExpr(statusVar, '"22"')}`);
   // round-28 finding 2: see this function's own doc comment update below -
@@ -7371,10 +7618,34 @@ function generateWriteStatement(statement, indent = 0) {
   // every SEQUENTIAL-access file (the pre-round-26 default, and every
   // pre-existing corpus program).
   if (isKeyedAccess(fileName, statement)) {
-    const finalTextExpr = plan.mode === 'bytes'
-      ? `new String(${plan.className}.format(${plan.className}(${plan.ctorArgs})), java.nio.charset.StandardCharsets.ISO_8859_1)`
-      : `(${plan.expr}).stripTrailing()`;
+    const finalTextExpr = plainRecordTextExpr(fileName, plan);
     return generateKeyedWriteStatement(statement, fileName, finalTextExpr, statusVar, indent);
+  }
+
+  // round-29 finding 5 (MOST SERIOUS - see tests/oracle/README.md's round-29
+  // entry): a plain SEQUENTIAL-access WRITE to a RELATIVE-organization file
+  // with a known FIXED record byte width must write EXACTLY `recordLength`
+  // raw bytes with NO trailing newline at all - real RELATIVE-file storage
+  // is fixed-length byte records, not newline-delimited text, so appending
+  // `\n` after every record (the pre-fix model, shared with genuine LINE
+  // SEQUENTIAL files below) is indistinguishable on the next OPEN/READ from
+  // an embedded 0x0A byte that happens to be part of a binary-encoded
+  // field's own value (ee06: COMP-2 3.25 encodes to bytes ending in `...
+  // 00 0A 40` - host-native/little-endian - genuinely containing a 0x0A
+  // byte at a real data position). No ADVANCING check is needed here (real
+  // COBOL never combines ADVANCING - a LINE SEQUENTIAL/printer-file
+  // convention - with RELATIVE organization; no corpus program does either).
+  if (relativeRecordLengthFor(fileName)) {
+    // plainRecordTextExpr already produces the exact fixed-width text this
+    // branch needs (`CobolFmt.fitLeft(..., recordLength)` for a plain
+    // DISPLAY-field record, or the already-fixed-size byte-level format()
+    // text for a 'bytes'-mode one) - deliberately does NOT stripTrailing: a
+    // fixed-length record's trailing bytes (spaces, NULs, or otherwise) are
+    // real stored content, not insignificant whitespace to trim.
+    const rawTextExpr = plainRecordTextExpr(fileName, plan);
+    return statusVar
+      ? `${indentStr}{ ${writerVar}.print(${rawTextExpr});${statusSuffix} }`
+      : `${indentStr}${writerVar}.print(${rawTextExpr})`;
   }
 
   // round-10 finding 3: a record containing a non-DISPLAY (packed/binary/
@@ -7477,7 +7748,7 @@ function generateKeyedRewriteStatement(statement, fileName, finalTextExpr, statu
   // too (not just in WRITE's own auto-extend loop) so the two stay the same
   // length - a REWRITE past the file's current end (bb13's own auto-extend
   // case) is exactly as real a "genuinely written" record as a WRITE is.
-  lines.push(`${bi}while ${bufVar}.length < ${relKey} do { ${bufVar}.append(""); ${occVar}.append(false) }`);
+  lines.push(`${bi}while ${bufVar}.length < ${relKey} do { ${bufVar}.append(${gapFillExpr(fileName)}); ${occVar}.append(false) }`);
   lines.push(`${bi}${bufVar}(${relKey} - 1) = ${finalTextExpr}`);
   lines.push(`${bi}${occVar}(${relKey} - 1) = true`);
   lines.push(`${bi}${posVar} = ${relKey}`);
@@ -7537,13 +7808,14 @@ function generateRewriteStatement(statement, indent = 0) {
     );
   }
 
-  let recordExpr;
-  if (plan.mode === 'bytes') {
-    const bytesExpr = `${plan.className}.format(${plan.className}(${plan.ctorArgs}))`;
-    recordExpr = `new String(${bytesExpr}, java.nio.charset.StandardCharsets.ISO_8859_1)`;
-  } else {
-    recordExpr = `(${plan.expr}).stripTrailing()`;
-  }
+  // round-29 finding 5: see plainRecordTextExpr's own doc comment - a
+  // REWRITE's result always lands in `bufVar` (whether via the plain
+  // SEQUENTIAL-access path just below or generateKeyedRewriteStatement),
+  // which for a RELATIVE file with a known fixed record width is flushed
+  // back to disk as raw, undelimited bytes (file-io-gen.js's generateClose)
+  // - every entry MUST stay exactly `recordLength` characters wide, so this
+  // must NOT stripTrailing for such a file.
+  const recordExpr = plainRecordTextExpr(fileName, plan);
 
   // round-26 root cause 3: RANDOM/DYNAMIC access - see
   // generateKeyedRewriteStatement's own doc comment above.
@@ -7613,8 +7885,8 @@ function generateKeyedDeleteStatement(statement, fileName, statusVar, indent) {
 
   const lines = [];
   lines.push(`${indentStr}if ${relKey} >= 1 then`);
-  lines.push(`${bi}while ${bufVar}.length < ${relKey} do { ${bufVar}.append(""); ${occVar}.append(false) }`);
-  lines.push(`${bi}${bufVar}(${relKey} - 1) = ""`);
+  lines.push(`${bi}while ${bufVar}.length < ${relKey} do { ${bufVar}.append(${gapFillExpr(fileName)}); ${occVar}.append(false) }`);
+  lines.push(`${bi}${bufVar}(${relKey} - 1) = ${gapFillExpr(fileName)}`);
   lines.push(`${bi}${occVar}(${relKey} - 1) = false`);
   lines.push(`${bi}${posVar} = ${relKey}`);
   lines.push(`${bi}${hasCurrentVar} = false`);
@@ -8411,8 +8683,30 @@ function generateCall(statement, indent = 0) {
  * marking exactly which target(s) are affected, so this is grep-able as a
  * known gap rather than invisible.
  */
+/**
+ * round-29 REGRESSION fix (dd05-goto-depending-recursive.cbl): while
+ * isRecursiveNestedFlowMode() is true, every nested paragraph def
+ * method-gen.js's renderNestedFallthroughDefs renders for the whole-program
+ * flow list now takes a `_chain: Boolean = false` parameter gating its own
+ * appended fall-through tail call (see that function's own doc comment). A
+ * GO TO transfers control to its target PERMANENTLY - unlike an out-of-line
+ * PERFORM, which runs its target and returns - so real COBOL fall-through
+ * resumes from wherever GO TO actually landed, exactly like natural
+ * top-to-bottom flow would from that same point. Passing `_chain = true`
+ * here (never for the ordinary, non-recursive convention's own flat
+ * top-level methods, which take no such parameter at all - false there) is
+ * what makes that happen; an ordinary out-of-line PERFORM's own call site
+ * (generatePerformFromAST/generatePerform) is untouched and still calls with
+ * no args (`_chain` defaults `false`), so it still can never re-trigger
+ * fall-through (ee10 stays fixed).
+ */
+function goToChainArg() {
+  return isRecursiveNestedFlowMode() ? '_chain = true' : '';
+}
+
 function generateGoTo(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
+  const chainArg = goToChainArg();
   const targets = statement.targets && statement.targets.length > 0 ? statement.targets : [statement.target];
   // round-21 finding 3: index-aligned with `targets` (see GoToStatement's
   // own doc comment, parser/ast.js, and parseGoToStatement's own comment,
@@ -8434,14 +8728,14 @@ function generateGoTo(statement, indent = 0) {
     : '';
 
   if (!statement.dependingOn) {
-    return `${indentStr}return ${paragraphMethodName(targets[0], targetSections[0])}() // GO TO${escapeNote(targets[0])}`;
+    return `${indentStr}return ${paragraphMethodName(targets[0], targetSections[0])}(${chainArg}) // GO TO${escapeNote(targets[0])}`;
   }
 
   const dependingOn = convertArithmeticExpression(statement.dependingOn);
   const lines = [`${indentStr}${dependingOn} match`];
 
   targets.forEach((target, idx) => {
-    lines.push(`${indentStr}  case ${idx + 1} => return ${paragraphMethodName(target, targetSections[idx])}()${escapeNote(target)}`);
+    lines.push(`${indentStr}  case ${idx + 1} => return ${paragraphMethodName(target, targetSections[idx])}(${chainArg})${escapeNote(target)}`);
   });
 
   lines.push(`${indentStr}  case _ => ()`);
@@ -8504,6 +8798,15 @@ function generateExit(statement, indent = 0) {
       // cover - see generatePerform's 'simple' branch.
       return `${indentStr}scala.util.boundary.break() // EXIT PERFORM`;
     case 'SECTION':
+      // round-29 fix (ee09): see isRecursiveNestedFlowMode's own doc comment
+      // above for why a bare `return` is wrong specifically for a RECURSIVE
+      // program's own nested-local-def paragraphs (cascades past the whole
+      // rest of this SECTION, and every paragraph chained after it, instead
+      // of stopping at the section's own end) - the ordinary (non-recursive)
+      // convention is untouched, `return` there is still exactly correct.
+      if (isRecursiveNestedFlowMode()) {
+        return `${indentStr}throw CobolExitSectionSignal // EXIT SECTION`;
+      }
       return `${indentStr}return // EXIT SECTION`;
     default:
       // EXIT PARAGRAPH: every paragraph is its own Scala method (see
@@ -8515,6 +8818,19 @@ function generateExit(statement, indent = 0) {
       // is not a paragraph boundary). The pre-fix behavior emitted a no-op
       // comment, so nothing after an EXIT PARAGRAPH was ever actually
       // skipped (round-3 finding 2).
+      //
+      // round-29 fix (ee09/ee10 trio): for a RECURSIVE program's own nested
+      // paragraph def, a bare `return` also incorrectly skips the very NEXT
+      // paragraph's fall-through call (appended inside THIS same def's own
+      // body - see isRecursiveNestedFlowMode's doc comment) - wrong, EXIT
+      // PARAGRAPH must still fall through normally. renderNestedFallthroughDefs
+      // (method-gen.js) wraps this paragraph's own original statements in a
+      // `scala.util.boundary { ... }` whenever this flag is set, so `break()`
+      // here stops only at the boundary's own end, leaving the appended
+      // fall-through call (outside the boundary) to run right afterward.
+      if (isRecursiveNestedFlowMode()) {
+        return `${indentStr}scala.util.boundary.break() // EXIT PARAGRAPH`;
+      }
       return `${indentStr}return // EXIT PARAGRAPH`;
   }
 }

@@ -17,7 +17,7 @@ import {
   encodeFieldExpr,
 } from './case-class-gen.js';
 import { getPicPattern, scalaBaseType, occursCount, hasOccurs, itemByteLength, syncPadBytes, elementaryByteLength } from './layout.js';
-import { packedDecode, binaryDecode } from './codecs.js';
+import { packedDecode, binaryDecode, floatDecode, doubleDecode } from './codecs.js';
 import { generateAllEnums, groupLevel88sByParent } from './enum-gen.js';
 import {
   generateExpression,
@@ -37,6 +37,7 @@ import {
   setRelativeKeyRegistry as setRelativeKeyRegistryExpr,
   setAccessModeRegistry as setAccessModeRegistryExpr,
   setIndexedOrganizationFiles as setIndexedOrganizationFilesExpr,
+  setRelativeRecordLengthRegistry as setRelativeRecordLengthRegistryExpr,
   setCallProgramRegistry,
   resetCallRetSeq,
   defaultZeroValueForScalaType,
@@ -53,6 +54,7 @@ import {
   getGroupKeyRegistry,
   getTableRegistry,
   setRecursiveLeafNames,
+  setRecursiveNestedFlowMode,
 } from './expression-gen.js';
 import {
   generateMethod,
@@ -74,6 +76,7 @@ import {
   setDeclarativeHandlers as setDeclarativeHandlersFileIO,
   setAccessModeRegistry as setAccessModeRegistryFileIO,
   setIndexedOrganizationFiles as setIndexedOrganizationFilesFileIO,
+  setRelativeRecordLengthRegistry as setRelativeRecordLengthRegistryFileIO,
 } from './file-io-gen.js';
 import { generateSql, generateDoobieImports, generateTransactorSetup } from './sql-gen.js';
 
@@ -506,6 +509,35 @@ function getFileSectionRecordItems(ast) {
 }
 
 /**
+ * The raw per-FD/SD `files` array itself (not flattened to records like
+ * getFileSectionRecordItems above) - round-29 finding 5 needs each FD's own
+ * file NAME alongside its record(s) to build relativeRecordLengthRegistry
+ * (an FD file name -> record byte width map), which getFileSectionRecordItems'
+ * flattened record list alone can't provide.
+ */
+function getFileSectionFiles(ast) {
+  return ast.dataItems?.fileSection?.files || ast.data?.fileSection?.files || [];
+}
+
+/**
+ * round-29 finding 5 safety guard: true when `item` (or any child/descendant
+ * of it, at any nesting depth) declares an OCCURS ... DEPENDING ON clause -
+ * consulted before treating an FD record as having a "determinable, uniform
+ * fixed byte width" for relativeRecordLengthRegistry (see that registry's
+ * own doc comment at its build site for the full rationale: an ODO record's
+ * real WRITE writes a variable-length concatenation driven by the live
+ * counter, round-10 finding 4's odoDisplayValueExpr, not always the maximum
+ * occursCount/itemByteLength assumes for byte-level LAYOUT purposes
+ * elsewhere).
+ */
+function hasOccursDependingOn(item) {
+  if (!item) return false;
+  if (item.occurs && item.occurs.dependingOn) return true;
+  const children = Array.isArray(item.children) ? item.children : [];
+  return children.some(child => !isLevel(child, 88) && hasOccursDependingOn(child));
+}
+
+/**
  * Collect every 01-level item in the LINKAGE SECTION, regardless of parser
  * output shape (mirrors getWorkingStorageItems). round-7 finding 1: a called
  * subprogram's PROCEDURE DIVISION references its LINKAGE SECTION items
@@ -805,6 +837,51 @@ function ownValueStorageText(item, width) {
  * itself rejects - rather than letting a RangeError escape and abort the
  * whole conversion over one VALUE-inheriting child's unlucky byte content.
  */
+/**
+ * True for COMP-1 (single-precision)/COMP-2 (double-precision) USAGE -
+ * shared by defaultElementaryValueWithInheritance's group-VALUE-inheritance
+ * fix (findings 1/2, round-29) and redefinesAccessorLines' elementary-
+ * REDEFINES byte-reinterpretation fix (finding 3, round-29) below, so both
+ * fixes recognize exactly the same set of USAGE spellings.
+ */
+function isFloatUsage(usage) {
+  const u = String(usage || '').toUpperCase();
+  return u === 'COMP-1' || u === 'COMPUTATIONAL-1' || u === 'COMP-2' || u === 'COMPUTATIONAL-2';
+}
+
+/**
+ * round-29 findings 1/2: cobc's actual byte-reinterpretation for a COMP-1
+ * (Float)/COMP-2 (Double) child inheriting its initial value from an
+ * enclosing group's own VALUE clause - the exact same "group VALUE literal
+ * text is laid down as raw bytes, then read back through the child's own
+ * USAGE-declared storage format" convention nonDisplayInheritedNumericText
+ * above already established for COMP-3/COMP/BINARY children (round-9
+ * finding 3), just decoding through the real IEEE-754 floatDecode/
+ * doubleDecode codecs (round-28) instead of packedDecode/binaryDecode -
+ * before this fix, `isNonDisplay` (below) simply didn't list COMP-1/COMP-2
+ * at all, so a group-VALUE-inheriting COMP-1/COMP-2 child fell all the way
+ * through to the final `!/^\d+$/.test(inheritedSlice)` plain-digit-text
+ * branch, which (for ee01/ee02's own non-digit slice bytes) failed that test
+ * and silently defaulted to 0.0 instead of decoding the real bytes.
+ *
+ * `inheritedSlice` here is always exactly this item's own declared byte
+ * width (4 for COMP-1, 8 for COMP-2 - see buildFieldRegistry's walk(),
+ * `itemWidthSingle`/`itemByteLength`), so floatDecode/doubleDecode's own
+ * exact-length check always succeeds in practice; the try/catch is
+ * defensive only, mirroring nonDisplayInheritedNumericText's own null-
+ * on-failure contract so a caller can safely fall back to
+ * defaultElementaryValue's ordinary zero default.
+ */
+function floatInheritedNumericText(inheritedSlice, scalaType) {
+  const bytes = Uint8Array.from(inheritedSlice, ch => ch.charCodeAt(0) & 0xff);
+  try {
+    const decoded = scalaType === 'Float' ? floatDecode(bytes) : doubleDecode(bytes);
+    return String(decoded);
+  } catch {
+    return null;
+  }
+}
+
 function nonDisplayInheritedNumericText(inheritedSlice, digits, usage) {
   const bytes = Uint8Array.from(inheritedSlice, ch => ch.charCodeAt(0) & 0xff);
   const isPacked = usage === 'COMP-3' || usage === 'COMPUTATIONAL-3' || usage === 'PACKED-DECIMAL';
@@ -854,6 +931,20 @@ function defaultElementaryValueWithInheritance(item, scalaType, inheritedSlice, 
   const decDigits = pic?.decimalDigits || 0;
 
   const usage = (item.usage || 'DISPLAY').toUpperCase();
+
+  // round-29 findings 1/2: COMP-1 (Float)/COMP-2 (Double) children get their
+  // OWN byte-reinterpretation branch, ahead of the ordinary `isNonDisplay`
+  // digit-slicing model below - a Float/Double scalaType has no PICTURE
+  // digit count to slice at all (`nonDisplayInheritedNumericText`'s
+  // `digits`-based model is meaningless here), so this must decode the raw
+  // IEEE-754 bytes directly via floatDecode/doubleDecode rather than fall
+  // into (and be silently swallowed by) either digit-slicing path below.
+  if (isFloatUsage(usage)) {
+    const literalText = floatInheritedNumericText(inheritedSlice, scalaType);
+    if (literalText == null) return defaultElementaryValue(item, scalaType);
+    return defaultElementaryValue({ ...item, value: { type: 'numeric', value: literalText } }, scalaType);
+  }
+
   const isNonDisplay = usage === 'COMP-3' || usage === 'COMPUTATIONAL-3' || usage === 'PACKED-DECIMAL' ||
     usage === 'COMP' || usage === 'COMP-4' || usage === 'COMP-5' || usage === 'BINARY' ||
     usage === 'COMPUTATIONAL' || usage === 'COMPUTATIONAL-4' || usage === 'COMPUTATIONAL-5';
@@ -1164,8 +1255,72 @@ function redefinesAccessorLines(item, registry, siblingList, tableRegistry, targ
   const realChildren = (item.children || []).filter(c => !isLevel(c, 88));
 
   if (realChildren.length === 0) {
-    // Elementary REDEFINES: direct alias onto the target's storage.
     const camel = toCamelCase(item.name);
+
+    // round-29 finding 3: an elementary REDEFINES pairing a COMP-1/COMP-2
+    // (Float/Double) item with a DIFFERENTLY-represented item sharing the
+    // same storage (e.g. a COMP binary int, as in ee04) needs REAL byte
+    // reinterpretation, not the bare Scala-level alias below - that alias
+    // just assigns the target's own CURRENT VALUE straight across
+    // (`targetCamel`, typed as `targetInfo.scalaType`) as if it already WERE
+    // the redefining item's own type, silently producing the wrong number
+    // (or failing to compile at all) instead of decoding the shared
+    // storage's actual bytes as the redefining item's own real type. Route
+    // through the same classifyCodec/encodeFieldExpr/decodeFieldExpr
+    // machinery flattenRedefinesLeavesBytes/byteLeafOp (round-16) already
+    // use for a byte-accurate GROUP REDEFINES: encode the TARGET's current
+    // value to its own real byte representation, then decode those exact
+    // same bytes as the REDEFINING item's own real type - both
+    // floatEncode/floatDecode/doubleEncode/doubleDecode (round-28) and
+    // binaryEncode/binaryDecode/packedEncode/packedDecode operate on a real
+    // Array[Byte] directly (no ISO-8859-1 String round trip needed here,
+    // unlike byteLeafOp's flat-character-view use of them - there is no
+    // String-typed flat view backing an elementary REDEFINES' own typed
+    // Scala var). Only attempted when the two sides' byte widths actually
+    // match (always true for a legal COBOL elementary REDEFINES, which
+    // shares the same physical storage) and at least one side is COMP-1/
+    // COMP-2 - every other elementary-REDEFINES shape keeps the pre-
+    // existing plain alias below unchanged.
+    const itemUsage = (item.usage || 'DISPLAY').toUpperCase();
+    const targetAstItem = (siblingList || []).find(i => !isLevel(i, 88) && (i.name || '').toUpperCase() === targetUpper);
+    const targetUsage = targetAstItem ? (targetAstItem.usage || 'DISPLAY').toUpperCase() : '';
+    const itemBaseType = scalaBaseType(item);
+
+    if (targetAstItem && itemBaseType !== targetInfo.scalaType && (isFloatUsage(itemUsage) || isFloatUsage(targetUsage))) {
+      const itemWidth = elementaryByteLength(item);
+      const targetWidth = elementaryByteLength(targetAstItem);
+      if (itemWidth > 0 && targetWidth > 0 && itemWidth === targetWidth) {
+        const itemCodec = { ...classifyCodec(item, {}), type: itemBaseType, length: itemWidth };
+        const targetCodec = { ...classifyCodec(targetAstItem, {}), type: targetInfo.scalaType, length: targetWidth };
+        const targetAsBytes = encodeFieldExpr(targetCodec, targetCamel);
+        const itemAsBytes = encodeFieldExpr(itemCodec, 'v');
+        lines.push(`  def ${camel}: ${itemBaseType} = ${decodeFieldExpr(itemCodec, targetAsBytes)}`);
+        lines.push(`  def ${camel}_=(v: ${itemBaseType}): Unit = ${targetCamel} = ${decodeFieldExpr(targetCodec, itemAsBytes)}`);
+        const itemPic = item.pic && typeof item.pic === 'object' ? item.pic : null;
+        registry.set((item.name || '').toUpperCase(), {
+          camel,
+          scalaType: itemBaseType,
+          dataType: itemBaseType === 'String' ? 'alphanumeric' : 'numeric',
+          integerDigits: itemPic?.integerDigits || 0,
+          decimalDigits: itemPic?.decimalDigits || 0,
+          signed: !!(itemPic && itemPic.signed),
+          editPattern: null,
+          occursDepth: 0,
+          picLength: itemWidth,
+          justified: false,
+          blankWhenZero: false,
+        });
+        return lines;
+      }
+      // Byte-width mismatch between the two sides - not a shape this fix
+      // attempts to byte-reinterpret; fall through to the plain alias below
+      // exactly like the pre-fix behavior (rare/invalid-COBOL edge case, no
+      // corpus program exercises it).
+    }
+
+    // Elementary REDEFINES: direct alias onto the target's storage (same
+    // representation on both sides, or a shape not covered by the byte-
+    // reinterpretation branch above).
     lines.push(`  def ${camel}: ${targetInfo.scalaType} = ${targetCamel}`);
     lines.push(`  def ${camel}_=(v: ${targetInfo.scalaType}): Unit = ${targetCamel} = v`);
     registry.set((item.name || '').toUpperCase(), { ...targetInfo, camel });
@@ -3342,6 +3497,32 @@ export function generateScala(ast, options = {}) {
   // so a pure no-op) for every pre-round-27 corpus program, none of which
   // declare ORGANIZATION IS INDEXED at all.
   const indexedOrganizationFiles = new Set();
+  // round-29 finding 5 (MOST SERIOUS - see tests/oracle/README.md's round-29
+  // entry): FD file name (upper) -> its own FD record's total byte width,
+  // populated ONLY for a FILE-CONTROL entry that declared `ORGANIZATION IS
+  // RELATIVE` with a determinable record length (computed via layout.js's
+  // own itemByteLength - the SAME byte-accurate machinery already used
+  // elsewhere in this file for SYNC-aware group/record sizing). Real COBOL
+  // RELATIVE (and INDEXED) files are FIXED-LENGTH BYTE RECORD storage, not
+  // newline-delimited text - this generator's pre-existing OPEN/READ/WRITE/
+  // CLOSE storage model (`scala.io.Source...getLines()`/`PrintWriter.
+  // println`, one text "line" per record) is exactly correct for a genuine
+  // LINE SEQUENTIAL file but silently CORRUPTS/SPLITS a RELATIVE-file
+  // record whenever its own bytes happen to contain a raw 0x0A byte inside
+  // a binary-encoded field (COMP-1/COMP-2/COMP-3/BINARY) - an entirely
+  // ordinary, valid occurrence for such a field, not an error condition.
+  // Fed to both expression-gen.js (WRITE/REWRITE/DELETE's auto-extend
+  // gap-fill and plain-WRITE codegen) and file-io-gen.js (OPEN/CLOSE), each
+  // keeping its own copy like every other per-file registry here - a file
+  // with no entry (every LINE SEQUENTIAL/plain-SEQUENTIAL file, and any
+  // RELATIVE file whose own record byte width couldn't be determined) is
+  // completely unaffected, keeping the pre-existing text-line model exactly
+  // as before.
+  const relativeRecordLengthRegistry = new Map();
+  const fdFilesByName = new Map();
+  for (const f of getFileSectionFiles(ast)) {
+    if (f?.name) fdFilesByName.set(String(f.name).toUpperCase(), f);
+  }
   for (const fc of getFileControls(ast)) {
     const fname = fc.name || fc.fileName;
     if (!fname) continue;
@@ -3356,6 +3537,27 @@ export function generateScala(ast, options = {}) {
     if (String(fc.organization || '').toUpperCase() === 'INDEXED') {
       indexedOrganizationFiles.add(fnameUpper);
     }
+    if (String(fc.organization || '').toUpperCase() === 'RELATIVE') {
+      const fdFile = fdFilesByName.get(fnameUpper);
+      const record = fdFile && Array.isArray(fdFile.records) ? fdFile.records[0] : null;
+      // round-29 finding 5 safety guard: itemByteLength's own occursCount
+      // helper (layout.js) always uses an OCCURS ... DEPENDING ON item's
+      // MAXIMUM count (so BYTE-LEVEL LAYOUT offsets stay fixed) - but this
+      // registry's own contract is stronger: EVERY record actually written
+      // to this file must be genuinely, uniformly `recLen` bytes wide, and
+      // an ODO record's own real WRITE (odoDisplayValueExpr, round-10
+      // finding 4) deliberately writes a VARIABLE-length concatenation
+      // driven by the field's own LIVE counter value, not always the
+      // maximum. Treating such a record as "fixed length" here would
+      // silently misalign fixedWidthLoadLines' own byte-chunking the
+      // instant a real ODO record's live count differs from the max (dd11/
+      // ee12's own shape) - a regression this round must not introduce.
+      // `hasOccursDependingOn` declines (recLen treated as 0, keeping the
+      // pre-existing line-delimited model) for any such record, at any
+      // nesting depth.
+      const recLen = record && !hasOccursDependingOn(record) ? itemByteLength(record) : 0;
+      if (recLen > 0) relativeRecordLengthRegistry.set(fnameUpper, recLen);
+    }
   }
   setFileStatusRegistryExpr(fileStatusRegistry);
   setFileStatusRegistryFileIO(fileStatusRegistry);
@@ -3364,6 +3566,8 @@ export function generateScala(ast, options = {}) {
   setAccessModeRegistryFileIO(accessModeRegistry);
   setIndexedOrganizationFilesExpr(indexedOrganizationFiles);
   setIndexedOrganizationFilesFileIO(indexedOrganizationFiles);
+  setRelativeRecordLengthRegistryExpr(relativeRecordLengthRegistry);
+  setRelativeRecordLengthRegistryFileIO(relativeRecordLengthRegistry);
 
   // DECLARATIVES `USE AFTER STANDARD ERROR PROCEDURE` handler methods +
   // registries (round-10 finding 1, registry-population ordering fixed by
@@ -3454,6 +3658,28 @@ export function generateScala(ast, options = {}) {
 
   // Generate main object
   sections.push(`object ${objectName}:`);
+
+  // round-29 fix (ee09 - EXIT SECTION's cascading-return bug in a RECURSIVE
+  // program's own nested-local-def convention): a dynamically-scoped signal
+  // for EXIT SECTION - see isRecursiveNestedFlowMode's own doc comment
+  // (generator/expression-gen.js) and generateProgramFlowLinesNested's
+  // (generator/method-gen.js) for the full mechanism this is thrown/caught
+  // by. A plain object extending RuntimeException (not a case class - no
+  // payload is ever needed, every catch site only cares THAT one fired, not
+  // which SECTION - dynamic try/catch nesting, which mirrors the real Scala
+  // call stack, already ensures it's always caught at the correct enclosing
+  // SECTION regardless), with stack-trace capture disabled (the 4-arg
+  // RuntimeException constructor) since this is pure control flow, never
+  // surfaced as a real error - exactly the same no-stack-trace idiom
+  // scala.util.boundary's own internal Break signal uses. Emitted
+  // unconditionally for every RECURSIVE program (regardless of whether it
+  // actually uses EXIT SECTION) to keep this emission point simple - an
+  // unused private object costs nothing at runtime and this codebase's
+  // scala-cli invocation does not treat unused-member warnings as errors.
+  if (isRecursiveProgram(ast)) {
+    sections.push('');
+    sections.push('  private object CobolExitSectionSignal extends RuntimeException(null, null, false, false)');
+  }
 
   // File constants
   const fileConstants = generateFileConstants(ast, 1);
@@ -3694,10 +3920,18 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
     // program in the same multi-PROGRAM-ID source never inherits a stale
     // name from this one.
     setRecursiveLeafNames(new Set(paramLeafShapes.flat().map(leaf => leaf.camel)));
+    // round-29 fix (ee09/ee10 trio): true for exactly the duration of this
+    // call - see isRecursiveNestedFlowMode's own doc comment
+    // (expression-gen.js) for what it gates (EXIT SECTION/EXIT PARAGRAPH's
+    // translation inside generateProgramFlowLinesNested's own nested-def
+    // paragraphs, any PERFORM ... THRU wrapper reachable from entry(), and
+    // any DECLARATIVES handler nested inside entry() - method-gen.js).
+    setRecursiveNestedFlowMode(true);
     try {
       return generateRecursiveEntryMethod(paramInfos, paramLeafShapes, units, ambiguousNames, indent, declaratives);
     } finally {
       setRecursiveLeafNames(new Set());
+      setRecursiveNestedFlowMode(false);
     }
   }
   setRecursiveLeafNames(new Set());

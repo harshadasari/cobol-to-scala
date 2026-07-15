@@ -97,8 +97,18 @@ describe('round-25 finding 1 (o01/o02/o03): OPEN I-O initializes the read iterat
 `;
   const scala = scalaOf(src);
 
-  test('OPEN I-O loads the file into a position-tracked in-memory buffer and adapts iteratorVar over it', () => {
-    assert.match(scala, /someFileBuf = scala\.collection\.mutable\.ArrayBuffer\.from\(/);
+  // round-29 finding 5 update: SOME-REC (`05 REC-ID PIC 9(3). 05 REC-VAL PIC
+  // X(5).` = 8 bytes) now has a determinable fixed record length, and
+  // SOME-FILE declares ORGANIZATION IS RELATIVE - so OPEN I-O now loads the
+  // buffer via the new fixed-WIDTH byte-chunking model (fixedWidthLoadLines,
+  // file-io-gen.js) instead of `getLines()` (see tests/oracle/README.md's
+  // round-29 entry, finding 5 - a 0x0A byte inside a binary-encoded field's
+  // own value must never be treated as a record delimiter). `someFilePos`/
+  // `someFileIterator`'s own shape is completely unchanged either way - only
+  // how `someFileBuf` itself gets populated differs.
+  test('OPEN I-O loads the file into a position-tracked in-memory buffer (fixed-width byte chunks) and adapts iteratorVar over it', () => {
+    assert.match(scala, /val _someFileRelBytes = java\.nio\.file\.Files\.readAllBytes\(someFileFile\.toPath\)/);
+    assert.match(scala, /someFileBuf = scala\.collection\.mutable\.ArrayBuffer\.tabulate\(_someFileRelCount\)/);
     assert.match(scala, /someFilePos = 0/);
     assert.match(scala, /someFileIterator = new Iterator\[String\]/);
     assert.match(scala, /def hasNext: Boolean = someFilePos < someFileBuf\.length/);
@@ -126,15 +136,30 @@ describe('round-25 finding 1 (o01/o02/o03): OPEN I-O initializes the read iterat
     assert.doesNotMatch(scala, /\/\/ DELETE record from/);
   });
 
-  test('CLOSE flushes the I-O buffer back to disk before closing the other (unused) handles', () => {
-    assert.match(scala, /if someFileBuf != null then \{ val _w = new java\.io\.PrintWriter\(new java\.io\.OutputStreamWriter\(new java\.io\.FileOutputStream\(someFileFile\), java\.nio\.charset\.StandardCharsets\.ISO_8859_1\)\); try someFileBuf\.foreach\(_w\.println\) finally _w\.close\(\); someFileBuf = null \}/);
+  // round-29 finding 5 update: SOME-FILE has a determinable fixed record
+  // length (see the previous test's own note), so CLOSE now flushes the
+  // buffer back to disk as RAW, undelimited bytes (a plain
+  // `java.io.FileOutputStream`/`.write(...)`) instead of a
+  // `PrintWriter`/`.println` per record - the old model appended a `\n`
+  // after every record, indistinguishable on the next OPEN from an embedded
+  // 0x0A byte inside a binary-encoded field's own value (see this file's
+  // ee06 counterpart in tests/oracle/README.md's round-29 entry).
+  test('CLOSE flushes the I-O buffer back to disk (raw, undelimited fixed-width bytes) before closing the other (unused) handles', () => {
+    assert.match(scala, /if someFileBuf != null then \{ val _fos = new java\.io\.FileOutputStream\(someFileFile\); try someFileBuf\.foreach\(r => _fos\.write\(r\.getBytes\(java\.nio\.charset\.StandardCharsets\.ISO_8859_1\)\)\) finally _fos\.close\(\); someFileBuf = null \}/);
   });
 
+  // round-29 finding 5 update: a plain OPEN INPUT of a RELATIVE-organization
+  // file with a determinable record length ALSO now uses the fixed-width
+  // byte-chunking model (not just I-O/RANDOM/DYNAMIC access) - `getLines()`
+  // is exactly the newline-delimited-text bug this round fixes, so it is no
+  // longer used for ANY access mode of such a file. `someFileIterator`
+  // itself stays an opaque `Iterator[String]` either way - no downstream
+  // READ codegen needed any change at all.
   test('regression guard: OPEN INPUT/OUTPUT are completely unaffected (no buffer/position codegen in their own branches)', () => {
     const inputOnlySrc = src.replace('OPEN I-O SOME-FILE.', 'OPEN INPUT SOME-FILE.').replace(/\n\s*MOVE "ZZZZZ".*\n\s*REWRITE SOME-REC\.\n\s*DELETE SOME-FILE\./, '');
     const inputScala = scalaOf(inputOnlySrc);
-    assert.match(inputScala, /someFileIterator = someFileReader\.getLines\(\)/);
-    assert.doesNotMatch(inputScala, /ArrayBuffer\.from/);
+    assert.match(inputScala, /someFileChunks\.iterator/);
+    assert.doesNotMatch(inputScala, /someFileReader\.getLines\(\)/);
   });
 });
 

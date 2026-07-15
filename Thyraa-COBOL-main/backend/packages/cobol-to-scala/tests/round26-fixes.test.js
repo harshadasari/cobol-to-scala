@@ -103,8 +103,15 @@ describe('round-26 finding 1 (bb02/bb04): REWRITE with no valid prior READ sets 
     assert.match(scala, /someFileHasCurrent = false/);
   });
 
-  test('regression guard: OPEN I-O still loads the buffer exactly as round-25 built it', () => {
-    assert.match(scala, /someFileBuf = scala\.collection\.mutable\.ArrayBuffer\.from\(/);
+  // round-29 finding 5 update: SOME-REC has a determinable fixed record
+  // length and SOME-FILE is ORGANIZATION IS RELATIVE, so OPEN I-O now loads
+  // the buffer via the fixed-width byte-chunking model (fixedWidthLoadLines,
+  // file-io-gen.js), not `getLines()`/`ArrayBuffer.from` - see
+  // tests/round25-fixes.test.js's own identically-updated assertion and
+  // tests/oracle/README.md's round-29 entry (finding 5) for the full
+  // rationale.
+  test('regression guard: OPEN I-O still loads the buffer, now via the fixed-width byte-chunking model round-29 built', () => {
+    assert.match(scala, /someFileBuf = scala\.collection\.mutable\.ArrayBuffer\.tabulate\(_someFileRelCount\)/);
   });
 });
 
@@ -186,8 +193,11 @@ describe('round-26 finding 2 (bb10): RANDOM-access READ indexes bufVar directly 
 `;
   const scala = scalaOf(src);
 
+  // round-29 finding 5 update: see this file's earlier identically-updated
+  // assertion - SOME-FILE's determinable record length now routes this
+  // buffer load through the fixed-width byte-chunking model too.
   test('OPEN INPUT of a RANDOM-access file builds the SAME indexable buffer I-O uses (not a plain forward-only iterator)', () => {
-    assert.match(scala, /someFileBuf = scala\.collection\.mutable\.ArrayBuffer\.from\(/);
+    assert.match(scala, /someFileBuf = scala\.collection\.mutable\.ArrayBuffer\.tabulate\(_someFileRelCount\)/);
   });
 
   test('READ addresses bufVar directly by (wsRkey).toInt, not the sequential iterator', () => {
@@ -265,7 +275,15 @@ describe('round-26 finding 2 (bb13): RANDOM-access REWRITE/WRITE auto-extend the
     // see tests/round27-fixes.test.js and tests/oracle/README.md's round-27
     // entry. Still verifies the buffer itself auto-extends for a positive
     // key, round-26's own point here.
-    assert.match(scala, /while someFileBuf\.length < \(wsRkey\)\.toInt do \{ someFileBuf\.append\(""\); someFileOcc\.append\(false\) \}/);
+    // round-29 finding 5 update: SOME-REC has a determinable fixed record
+    // width (8 bytes: REC-ID PIC 9(3) + REC-VAL PIC X(5)) - the auto-extend
+    // gap-fill placeholder is now a full-width all-NUL string (not the bare
+    // `""` the pre-fix, newline-delimited model used), so every `bufVar`
+    // entry stays exactly `recordLength` characters wide for CLOSE's own
+    // raw, undelimited byte flush - see tests/oracle/README.md's round-29
+    // entry (finding 5) and tests/round27-fixes.test.js's own identically-
+    // updated gap-fill assertions.
+    assert.match(scala, /while someFileBuf\.length < \(wsRkey\)\.toInt do \{ someFileBuf\.append\(\("\\u0000" \* 8\)\); someFileOcc\.append\(false\) \}/);
     assert.match(scala, /wsStatus = "24"/);
   });
 
@@ -274,10 +292,21 @@ describe('round-26 finding 2 (bb13): RANDOM-access REWRITE/WRITE auto-extend the
     assert.match(scala, /"REWRITE-INVALID-KEY"/);
   });
 
-  test('regression guard: a SEQUENTIAL-access file\'s WRITE is completely unaffected (plain println, no keyed branch)', () => {
+  // round-29 finding 5 update: a SEQUENTIAL-access WRITE is still routed
+  // through `someFileWriter` (not the keyed `bufVar` auto-extend branch) -
+  // round-26's own point here is unchanged - but SOME-REC's determinable 8-
+  // byte fixed record length now ALSO applies to this plain WRITE: it
+  // writes the record via `.print(...)` with NO trailing newline (real
+  // RELATIVE-file storage is fixed-length byte records, not newline-
+  // delimited text - the old `println` unconditionally appended `\n` after
+  // every record, indistinguishable on the next OPEN from an embedded 0x0A
+  // byte inside a binary-encoded field's own value) - see tests/oracle/
+  // README.md's round-29 entry (finding 5).
+  test('regression guard: a SEQUENTIAL-access file\'s WRITE still uses someFileWriter directly (no keyed branch), now via fixed-width .print with no newline', () => {
     const seqSrc = src.replace('ACCESS MODE IS RANDOM', 'ACCESS MODE IS SEQUENTIAL');
     const seqScala = scalaOf(seqSrc);
-    assert.match(seqScala, /someFileWriter\.println/);
+    assert.match(seqScala, /someFileWriter\.print\(CobolFmt\.fitLeft\(/);
+    assert.doesNotMatch(seqScala, /someFileWriter\.println/);
     assert.doesNotMatch(seqScala, /while someFileBuf\.length < /);
   });
 });

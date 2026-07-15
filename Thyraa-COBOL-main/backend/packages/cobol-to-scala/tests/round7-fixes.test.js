@@ -269,9 +269,17 @@ test('Finding 2: DISPLAY of a COMP-1/COMP-2 field routes through CobolFmt.floatD
   const code = scalaOf(source);
   assert.match(code, /var wsF1: Float = 3\.5f/);
   assert.match(code, /var wsF2: Double = 2\.25d/);
-  assert.match(code, /println\(CobolFmt\.floatDisplay\(wsF1\)\)/);
+  // round-29 finding 4/6 update: COMP-1 (Float) now gets its own genuine-
+  // Float `floatDisplaySingle` path instead of `floatDisplay(v: Double)` -
+  // calling the Double overload with an actual Float forces an implicit
+  // widening BEFORE formatting, introducing spurious extra precision digits
+  // for a value whose true 32-bit shortest-round-trip text needs them (see
+  // tests/oracle/README.md's round-29 entry, finding 4 - ee07). COMP-2
+  // (Double) keeps the pre-existing `floatDisplay` dispatch unchanged.
+  assert.match(code, /println\(CobolFmt\.floatDisplaySingle\(wsF1\)\)/);
   assert.match(code, /println\(CobolFmt\.floatDisplay\(wsF2\)\)/);
   assert.match(code, /def floatDisplay\(v: Double\): String =/);
+  assert.match(code, /def floatDisplaySingle\(v: Float\): String =/);
 });
 
 test('Finding 3: a COMPUTE storing into a Float target casts with .toFloat instead of leaving a bare BigDecimal expression', () => {

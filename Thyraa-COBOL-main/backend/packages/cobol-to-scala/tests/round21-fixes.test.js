@@ -256,7 +256,11 @@ describe('round-21 finding 2: a RECURSIVE program\'s own LINKAGE SECTION paramet
     const scala = scalaOf(j10Shape);
     const entryMatch = scala.match(/def entry\(_get0[\s\S]*?\nend T21recsub/);
     assert.ok(entryMatch, 'expected to find the RECURSIVE program\'s own entry() method body');
-    assert.match(entryMatch[0], /def mainPara\(\): Unit =/);
+    // round-29 REGRESSION fix (dd05-goto-depending-recursive.cbl): every
+    // nested paragraph def in this convention now takes a `_chain: Boolean =
+    // false` parameter (method-gen.js's renderNestedFallthroughDefs - see its
+    // own doc comment) instead of a bare `(): Unit =` signature.
+    assert.match(entryMatch[0], /def mainPara\(_chain: Boolean = false\): Unit =/);
   });
 
   test('regression guard: an ORDINARY (non-recursive) multi-program CALL chain keeps the pre-existing value-in/tuple-out convention entirely (u01-style)', () => {

@@ -194,6 +194,12 @@ const STATEMENT_KEYWORDS = new Set([
   'GO', 'STOP', 'GOBACK', 'EXIT', 'CONTINUE', 'NEXT', 'INITIALIZE',
   'SET', 'ACCEPT', 'DISPLAY', 'EXEC', 'RETURN', 'SEARCH', 'SORT',
   'MERGE', 'RELEASE', 'GENERATE', 'INITIATE', 'TERMINATE',
+  // round-29 fix (ee13): ALTER (see parseAlterStatement's own doc comment)
+  // must be recognized as a genuine statement-start boundary here too, or
+  // an UnknownStatement scan for some OTHER unrecognized verb earlier in
+  // the same paragraph could run right past an ALTER clause and swallow it
+  // as more of its own bogus operand tokens instead of stopping at it.
+  'ALTER',
 ]);
 
 /**
@@ -2993,9 +2999,62 @@ function parseStatement(ctx) {
     case 'ACCEPT': return parseAcceptStatement(ctx);
     case 'DISPLAY': return parseDisplayStatement(ctx);
     case 'EXEC': return parseExecStatement(ctx);
+    case 'ALTER': return parseAlterStatement(ctx);
     default:
       return null;
   }
+}
+
+/**
+ * round-29 fix (ee13): parse `ALTER <para-1> TO [PROCEED TO] <target-1>
+ * [, <para-2> TO [PROCEED TO] <target-2>] ... .` as its own recognized
+ * statement, consuming every one of its own tokens up to the REAL
+ * terminating period - a plain no-op UnknownStatement (same as any other
+ * out-of-scope construct, see generateExpression's own default-case doc
+ * comment, generator/expression-gen.js), NOT an attempt at real ALTER
+ * semantics (retargeting a GO TO statement's own destination at runtime) -
+ * ALTER is a rare, deprecated COBOL feature this campaign's own roadmap
+ * already lists as low-priority/out of scope, and implementing that
+ * runtime behavior would be a disproportionately large feature for it.
+ *
+ * Root cause this fixes: before this dedicated case existed, ALTER (an
+ * IDENTIFIER token to this lexer - it registers no keyword for it) fell
+ * through parseStatement's default case to parseUnknownStatement's generic
+ * verb-scan, which stops the instant it sees anything matching
+ * isParagraphName (an IDENTIFIER immediately followed by a PERIOD) - and
+ * the clause's own FINAL target procedure-name is always immediately
+ * followed by the period that ends the WHOLE ALTER statement, so the
+ * generic scan always stopped exactly one token early, leaving that final
+ * target name unconsumed. Control then returned to the ENCLOSING
+ * per-paragraph loop, which found the identical "IDENTIFIER then PERIOD"
+ * shape sitting right there and concluded a brand new paragraph (named
+ * after the ALTER clause's own target) had just started - silently
+ * hijacking every statement that actually belonged to the CURRENT
+ * paragraph into that phantom one instead (a hard scala-cli duplicate-method
+ * compile error, not a clean decline - see tests/oracle/README.md's own
+ * round-29 entry). Understanding just enough of ALTER's own grammar to
+ * always reach its REAL terminating period - rather than guessing at a
+ * boundary the way the generic scan must - closes the gap entirely.
+ */
+function parseAlterStatement(ctx) {
+  ctx.advance(); // ALTER
+
+  const clauses = [];
+  while (!ctx.isAtEnd() && !ctx.check(TokenType.PERIOD)) {
+    const from = ctx.advance().value;
+    ctx.matchValue('TO');
+    ctx.matchValue('PROCEED');
+    ctx.matchValue('TO');
+    if (ctx.isAtEnd() || ctx.check(TokenType.PERIOD)) break;
+    const to = ctx.advance().value;
+    clauses.push({ from, to });
+    if (!ctx.match(TokenType.COMMA)) break;
+  }
+
+  return new UnknownStatement({
+    keyword: 'ALTER',
+    tokens: clauses.flatMap((c) => [c.from, 'TO', c.to]),
+  });
 }
 
 /**

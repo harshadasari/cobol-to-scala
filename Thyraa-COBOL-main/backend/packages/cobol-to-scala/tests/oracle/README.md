@@ -1534,6 +1534,209 @@ findings share.
 See `tests/round28-fixes.test.js` for focused, toolchain-independent unit
 tests of all 4 findings above.
 
+### Round-29 adversarial-refutation findings (ee09/ee10/ee13 - RECURSIVE-nested-def EXIT trio, PERFORM-vs-fallthrough, ALTER parse corruption)
+
+A round-29 refuter left 14 new probes (ee01-ee14); this section covers the 3
+assigned to this fix agent - ee09, ee10, ee13 (the other 11, including
+ee01-ee08/ee11/ee12/ee14 - COMP-1/COMP-2 float-codec findings and EXIT
+PERFORM's own already-correct `scala.util.boundary` precedent - are a
+separate workstream's own findings, not touched here). Findings 1 and 2 are
+the FIFTH and SIXTH instances of the recurring "feature collides with the
+RECURSIVE-program nested-local-def convention" bug class (after round-25's
+qualified-PERFORM-THRU fix and its own predecessor, round-27 finding 5's
+SORT/MERGE fix, and round-28 finding 1's DECLARATIVES fix) - `generateExit`'s
+SECTION/default(PARAGRAPH) cases and `renderNestedFallthroughDefs`'s baked-in
+auto-fallthrough had never been audited against that convention either.
+Finding 3 is a different class entirely - a genuinely unrecognized verb
+(ALTER, confirmed nowhere in this parser/generator at all) corrupting the
+surrounding parse, the same class of bug round-21's own GO-TO-OF-SECTION fix
+closed for a different construct.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | EXIT SECTION (and, latently, EXIT PARAGRAPH) inside a RECURSIVE program's own nested-local-def paragraph (`generateProgramFlowLinesNested`/`renderNestedFallthroughDefs`, `generator/method-gen.js`) cascaded WAY too far. Root cause: for an ORDINARY (non-recursive) program every paragraph is its own separate top-level method, so `generateExit`'s bare `return` (`generator/expression-gen.js`) correctly stops just that one paragraph. But round-21's RECURSIVE convention nests every paragraph as a local `def` *inside* `entry()` and chains fall-through by appending a call to the NEXT paragraph at the END of the CURRENT paragraph's own def body (not sequential top-level calls) - so a bare `return` fired partway through one such nested def also skips that appended next-paragraph call (it's textually part of the SAME def), and transitively every paragraph chained after it, cascading all the way to the true end of the RECURSIVE program's own flow (ee09: a `return` fired at LS-DEPTH=1 silently skipped the rest of SECTION-A, all of SECTION-B, and the entire next recursive sub-call, with zero error or indication) | `isRecursiveNestedFlowMode()` (new flag, `generator/expression-gen.js` - installed/reset by `scala-generator.js`'s `generateEntryMethod` for exactly the duration of its `generateRecursiveEntryMethod` call, alongside the existing `setRecursiveLeafNames`) lets `generateExit`/`generateMethodBody`'s own EXIT dispatch tell the two conventions apart. EXIT PARAGRAPH becomes `scala.util.boundary.break()` - `renderNestedFallthroughDefs` wraps ONLY a paragraph's own original statements in `scala.util.boundary { ... }` (gated on `paragraphsContainExitOfType(paragraphs, 'PARAGRAPH')`, so a paragraph list using neither EXIT kind renders byte-identical to before), leaving the appended fall-through call OUTSIDE the boundary so it still runs after a `break()` - correct, since EXIT PARAGRAPH must still fall through normally, exactly mirroring EXIT PERFORM's own pre-existing, already-correct `scala.util.boundary` precedent (ee14, confirmed unaffected). EXIT SECTION becomes `throw CobolExitSectionSignal` instead (a new no-stack-trace `RuntimeException` object, emitted once per RECURSIVE program's own `object` body) - a paragraph can have OTHER paragraphs chained after it within the SAME section, which a single boundary local to one def cannot reach across, but a dynamically-scoped exception can: every cross-SECTION fall-through call `renderNestedFallthroughDefs` emits (and the one-off call that "enters" `paragraphs[0]`, `renderSectionAwareEntryCall`) is wrapped in `try { ... } catch { case CobolExitSectionSignal => <resume at the SECTION after the one that was entered, or do nothing if there is none> }` whenever the paragraph list actually contains an EXIT SECTION anywhere (`findNextSectionHead`/`paragraphsContainExitOfType`). Verified against installed GnuCOBOL and scala-cli (ee09): `A1 DEPTH=00`/`A1-TAIL DEPTH=00`/`A2 DEPTH=00`/`B1 DEPTH=00`/`A1 DEPTH=01`/`B1 DEPTH=01`/`A1 DEPTH=02`/`A1-TAIL DEPTH=02`/`A2 DEPTH=02`/`B1 DEPTH=02`/`EXIT DEPTH=02`/`EXIT DEPTH=02`/`EXIT DEPTH=00` - matching cobc byte-for-byte (LS-DEPTH=1's own EXIT SECTION correctly skips A1-TAIL/A2, lands at SECTION-B, and the recursive sub-call still completes); confirmed zero regressions on every pre-existing RECURSIVE-program corpus program (j01-j12, k01-k13, m07, dd02, etc., all re-verified `oracleCompare()`-clean, since `paragraphsContainExitOfType` returns false - so every new boundary/try-catch is skipped entirely - for any unit list with no EXIT SECTION/PARAGRAPH at all) | ee09 |
+| 2 | A bare out-of-line `PERFORM <paragraph>` to a paragraph inside a RECURSIVE program incorrectly cascaded into whatever paragraph comes "after" it in program order, even when reached via an explicit, deliberate PERFORM (not natural fall-through) - `PERFORM COMMON-PARA OF SECTION-ONE` (ee10: two different SECTIONs each declaring their own bare-named `COMMON-PARA`, disambiguated via qualified PERFORM) incorrectly ALSO ran SECTION-TWO's own same-named `COMMON-PARA`, producing spurious duplicate output. Root cause: `generateProgramFlowLinesNested`'s single nested-def-per-paragraph convention serves BOTH "the whole program's own natural top-to-bottom fall-through" AND "an out-of-line call to this one paragraph" at once (unlike the ordinary convention, where `generateAllMethods`' flat top-level methods have NO auto-chain baked in at all - fall-through is modeled ONLY by the separate `_stepN` wrapper `renderNestedFallthroughSteps` builds for the whole-program entry point) - so the auto-chained fall-through `renderNestedFallthroughDefs` baked into `sectionOneCommonPara`'s own def body ALSO fired the moment the qualified PERFORM called it directly | Ported the ordinary convention's own flat-method/`_stepN`-wrapper split into the RECURSIVE nested-def convention: `generateProgramFlowLinesNested` now renders every paragraph as a FLAT nested def via `renderNestedFallthroughDefs(units, indent, nameFor, noFallthroughAfter, true)` - the new trailing `true` (`suppressAllFallthrough`) unconditionally disables auto-chaining for this call, so an out-of-line PERFORM/GO TO resolving to one of these defs (via `nameFor`, unchanged) is a genuine call-and-return, never an auto-cascade. The program's own NATURAL fall-through is instead modeled by a SEPARATE new `_stepN` wrapper chain, `renderNestedProgramFlowSteps` (`generator/method-gen.js`) - mirroring `renderNestedFallthroughSteps` exactly, but calling each paragraph's own FLAT nested sibling def instead of an already-generated top-level method - which also carries finding 1's own EXIT SECTION try/catch (per-step now, since the flat defs no longer chain into each other at all, each `_stepN` is the ONLY call site for its own paragraph). `generatePerformThruMethod`/`generateDeclarativeHandlerDefsNested` (bounded THRU ranges / one DECLARATIVES SECTION's own paragraphs) are UNCHANGED - still body-duplicating with embedded fall-through, exactly like the ordinary convention's own equivalent THRU-range wrapper already is; only the WHOLE-PROGRAM flow (where an explicit qualified PERFORM and natural fall-through can target the exact same def) needed the split. Verified against installed GnuCOBOL and scala-cli (ee10): `ENTER DEPTH=00`/`IN-SECTION-ONE DEPTH=00`/`IN-SECTION-TWO DEPTH=00`/`ENTER DEPTH=01`/`IN-SECTION-ONE DEPTH=01`/`IN-SECTION-TWO DEPTH=01`/`ENTER DEPTH=02`/`IN-SECTION-ONE DEPTH=02`/`IN-SECTION-TWO DEPTH=02`/`EXIT DEPTH=02`/`EXIT DEPTH=02`/`EXIT DEPTH=00` - matching cobc byte-for-byte (each qualified PERFORM now runs its OWN target exactly once, no duplicate SECTION-TWO output); confirmed zero regressions on every pre-existing RECURSIVE-program corpus program (the `_stepN` indirection is purely structural - functionally a no-op restructuring for any program with no ambiguous cross-section PERFORM target - all re-verified `oracleCompare()`-clean) | ee10 |
+| 3 | ALTER (`ALTER <para> TO [PROCEED TO] <target>.`) is confirmed nowhere in this parser/generator at all - not even a documented `???` stub - and an unrecognized ALTER clause didn't just fail to do anything, it actively CORRUPTED the surrounding parse: `parseStatement`'s default case fell through to `parseUnknownStatement`'s generic verb-scan, which stops the instant it sees anything matching `isParagraphName` (an IDENTIFIER immediately followed by a PERIOD) - and the clause's own FINAL target procedure-name (`TARGET-TWO` in `ALTER JUMP-PARA TO PROCEED TO TARGET-TWO.`) is always immediately followed by the period ending the WHOLE ALTER statement, so the generic scan always stopped exactly one token early. The ENCLOSING per-paragraph loop then found that identical "IDENTIFIER then PERIOD" shape and concluded a brand new paragraph (named after the ALTER clause's own target) had started there - silently hijacking every statement that actually belonged to the CURRENT paragraph (MAIN-PARA's own trailing `PERFORM`/`DISPLAY`/`STOP RUN`) into a phantom, duplicate `TARGET-TWO` paragraph instead - a hard scala-cli duplicate-method compile error, not a clean decline | New `parseAlterStatement` (`parser/procedure-parser.js`), dispatched from `parseStatement`'s switch via a new `case 'ALTER'` (and `'ALTER'` added to `STATEMENT_KEYWORDS`, so an UnknownStatement scan for some OTHER unrecognized verb correctly stops AT an ALTER clause too, rather than swallowing it). Understands just enough of ALTER's own grammar - `<para> TO [PROCEED TO] <target> [, <para> TO [PROCEED TO] <target>]*` - to always consume every one of its own tokens up through the REAL terminating period, never guessing at a boundary the way the generic scan must. Deliberately implements NO real ALTER semantics (retargeting a GO TO's own destination at runtime) - ALTER is a rare, deprecated COBOL feature this campaign's own roadmap already lists as low-priority/out of scope, and real runtime semantics would be a disproportionately large feature for it; the clause is parsed into a plain `UnknownStatement` (`keyword: 'ALTER'`), degrading to the SAME visible, compiling `() /* ??? TODO: unsupported statement type (UNKNOWN) */` no-op every other out-of-scope construct already uses (`generateExpression`'s own default case, `generator/expression-gen.js`) - a compiling, honest decline, never a crash or corruption. Verified against installed GnuCOBOL and scala-cli (ee13): parse no longer corrupts (confirmed via direct AST inspection - MAIN-PARA keeps its own full statement list, no phantom paragraph, exactly 4 real paragraphs afterward) and the generated Scala now compiles and runs cleanly (`BEFORE-ALTER`/`IN-TARGET-ONE`/`AFTER-PERFORM` - JUMP-PARA's own un-retargeted `GO TO TARGET-ONE` still fires, since real ALTER semantics are intentionally not implemented); this is a KNOWN, DOCUMENTED semantic mismatch against cobc's own `IN-TARGET-TWO`-only oracle (registers as `t.todo('Phase 2 work queue - ...')`, not a failure - see the Known Gaps entry below), not a regression, and matches this finding's own explicit brief (fix the parse corruption only, do not implement real ALTER retargeting) | ee13 |
+
+See `tests/round29-fixes.test.js` for focused, toolchain-independent unit
+tests of these 3 findings (a parallel workstream's own COMP-1/COMP-2
+float-codec findings, over the same round, may add further `describe`
+blocks to that same file - not duplicated here).
+
+### Round-29 adversarial-refutation findings (ee01/ee02/ee04/ee06/ee07 - COMP-1/COMP-2 IEEE-754 float codec gaps)
+
+This section covers the 5 COMP-1/COMP-2 (IEEE-754 float) findings assigned to
+this fix agent (ee01, ee02, ee04, ee06, ee07) - a parallel workstream's own
+RECURSIVE-nested-def/ALTER findings (ee09, ee10, ee13) are covered in the
+table above, not touched here (the round-29 refuter's other probes, ee03/
+ee05/ee08/ee11/ee12/ee14, are further float/RECURSIVE probes not assigned to
+either fix agent this round - not investigated here). Findings 1/2/4 close a
+recurring gap shape this campaign has now hit four times: a byte-level
+codec/display convention gets built for COMP-3/BINARY (or COMP-1/COMP-2 in a
+DIFFERENT context) and simply never gets audited against COMP-1/COMP-2's own
+narrower `isFloatUsage`/`scalaType` special-casing until a refuter's probe
+combines the two for the first time (`isNonDisplay` omitting COMP-1/COMP-2
+entirely - round-9's own convention for COMP-3/BINARY; the elementary
+REDEFINES alias never reinterpreting bytes at all; `floatDisplay(v: Double)`
+silently widening a Float before ever formatting it). Finding 5 (ee06) is the
+single most serious finding of this round - not a narrow float-codec gap at
+all, but a genuine, foundational architecture bug in this generator's
+RELATIVE-file storage model, general to ANY binary-encoded field (not just
+COMP-1/COMP-2), which ee06 merely happens to be the first program in this
+corpus's history to expose.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1/2 | `defaultElementaryValueWithInheritance`'s `isNonDisplay` check (`generator/scala-generator.js`, round-9 finding 3) - which routes a group-VALUE-inheriting child's own byte slice through real byte-reinterpretation instead of plain-digit-text parsing - listed COMP-3/COMP/COMP-4/COMP-5/BINARY but omitted COMP-1/COMP-2 entirely, so a COMP-1/COMP-2 child inheriting its initial value from an enclosing group's own VALUE clause fell all the way through to the final `!/^\d+$/.test(inheritedSlice)` plain-digit-text branch, which fails for arbitrary raw bytes and silently defaults to `0.0f`/`0.0` instead of decoding the sliced bytes as a real IEEE-754 float/double (ee01: `01 WS-GRP VALUE "AB1234CD". 05 WS-PREFIX PIC XX. 05 WS-FLOAT COMP-1. 05 WS-SUFFIX PIC XX.` - the raw bytes `"1234"` landing under WS-FLOAT's own 4-byte span silently became `0.0` instead of the real float32 bit pattern those 4 bytes encode; ee02 is the identical gap for an 8-byte COMP-2 child) | New `isFloatUsage`/`floatInheritedNumericText` helpers (`generator/scala-generator.js`) - `isFloatUsage` is a small shared USAGE-spelling check (COMP-1/COMPUTATIONAL-1/COMP-2/COMPUTATIONAL-2), consulted by `defaultElementaryValueWithInheritance` BEFORE the pre-existing `isNonDisplay` digit-slicing branch (a Float/Double scalaType has no PICTURE digit count to slice at all, so the digit-slicing model is meaningless for it and must not be reached). `floatInheritedNumericText` decodes `inheritedSlice`'s raw bytes via round-28's real `CobolCodecs.floatDecode`/`doubleDecode` (`generator/codecs.js`, imported alongside the pre-existing `packedDecode`/`binaryDecode`) and hands the decoded JS number's own string form to the ordinary `defaultElementaryValue` as a synthetic numeric VALUE clause - reusing every existing Float/Double literal-formatting rule (the `f`/`d` suffix) instead of re-deriving it. Verified against installed GnuCOBOL and scala-cli: ee01 (`FLOAT=1.6688934E-7`) and ee02 (`DBL=6.821320051701325E-38`) both match cobc byte-for-byte; confirmed zero regressions on every pre-existing group-VALUE-inheritance corpus program (w03/d02/d06, all COMP-3/COMP/COMP-5 children, none of which are COMP-1/COMP-2 - `isFloatUsage` is false for all of them, so the pre-existing `isNonDisplay` branch is reached exactly as before) | ee01, ee02 |
+| 3 | **Silent wrong-value bug.** The "elementary REDEFINES: direct alias" codegen path (`redefinesAccessorLines`, `generator/scala-generator.js` ~line 1166) unconditionally aliased the redefining item directly to the target's own CURRENT VALUE (`def wsFloat: Float = wsInt`) with ZERO byte reinterpretation - correct only when both sides of the REDEFINES share an identical Scala representation, but silently WRONG (or a hard compile error, since `Float`/`Int` don't even implicitly convert) the instant a COMP-1/COMP-2 item redefines a differently-represented one (ee04: `01 WS-INT PIC S9(9) COMP VALUE 1078530011. 01 WS-FLOAT REDEFINES WS-INT COMP-1.` - real cobc reinterprets WS-INT's own big-endian binary-int bytes as a host-native little-endian IEEE-754 float, `-5.5641903E+16`, not any kind of numeric conversion of 78530011 itself) | When an elementary REDEFINES pairs two items with DIFFERENT Scala types AND at least one side is COMP-1/COMP-2 (`isFloatUsage`, shared with findings 1/2 above), and both sides' own byte widths match (`elementaryByteLength`), the accessor now routes through real byte encode/decode instead of a bare alias: `classifyCodec`/`encodeFieldExpr`/`decodeFieldExpr` (`case-class-gen.js`, already used elsewhere for byte-accurate FD records) encode the TARGET's current value to its own real byte representation (`CobolCodecs.binaryEncode` for a binary int, `CobolCodecs.floatEncode` for a COMP-1), then decode those EXACT SAME bytes as the REDEFINING item's own real type (`CobolCodecs.floatDecode`/`binaryDecode` respectively) - both directions operate on a genuine `Array[Byte]` directly (no ISO-8859-1 String round trip needed here, unlike `byteLeafOp`'s own flat-character-view use of the identical codecs for a byte-accurate GROUP REDEFINES, round-16 - there is no String-typed flat view backing an elementary REDEFINES' own typed Scala var). A byte-width MISMATCH between the two sides (rare/invalid COBOL) falls back to the pre-existing plain alias unchanged, exactly like every other elementary-REDEFINES shape neither side of which is COMP-1/COMP-2. Verified against installed GnuCOBOL and scala-cli (ee04): `INT=+078530011`/`FLOAT=-5.5641903E+16`/`FLOAT2=3.5`/`INT2=+000024640` (WS-INT's own VALUE, truncated to its declared 9 digits, decodes as a real IEEE-754 float when viewed through WS-FLOAT; `MOVE 3.5 TO WS-FLOAT` then re-encodes back to WS-INT's own binary-int bytes, decoding as `24640`) - matching cobc byte-for-byte; confirmed zero regressions on every pre-existing elementary-REDEFINES corpus program (none of which pair a COMP-1/COMP-2 side with a differently-typed one, so the new branch's own guard condition is never even reached for them - the pre-existing plain-alias code is untouched, only reached via an explicit fallback path) | ee04 |
+| 4 | `CobolFmt.floatDisplay(v: Double)` (round-7 findings 2/3) was called for EVERY floating-point DISPLAY regardless of whether the field was actually COMP-1 (Float) or COMP-2 (Double) - passing an actual `Float` there forces Scala's own automatic Float->Double WIDENING before the function ever sees it, and a widened 32-bit bit pattern is only an approximation of the original decimal value at full 64-bit precision, introducing REAL extra (wrong) precision digits into the formatted string (ee07: `1.0E30f` widened to Double stringifies as `"1.0000000150474662E30"` instead of the true 32-bit shortest-round-trip text `"1.0E30"` cobc's own COMP-1 DISPLAY actually shows) | New `CobolFmt.floatDisplaySingle(v: Float)` (embedded runtime, `generator/expression-gen.js`) operates on a genuine `Float` all the way through - `v.toString` on an ACTUAL (never-widened) Float produces the shortest round-tripping decimal text for the TRUE 32-bit value, sharing the same `formatFloatText` scientific-notation normalizer (trailing-`.0` mantissa stripping, missing `"+"` exponent-sign insertion - itself a NEW fix this round needed too, since neither `.0`-stripping nor exponent-sign rules had ever been exercised against a large/scientific-notation magnitude before ee07's `1.0E30`/`-1.0E30`) `floatDisplay` (COMP-2's own path) already used. `renderDisplayOperand` (`generator/expression-gen.js`) now dispatches on the field's own actual `info.scalaType` - `'Float'` routes to the new `floatDisplaySingle`, `'Double'` keeps the pre-existing `floatDisplay` - rather than "any floating type uses floatDisplay". Verified against installed GnuCOBOL and scala-cli (ee07): `REC1 ID=001 F=0`/`REC2 ID=002 F=1E+30`/`REC3 ID=003 F=-1E+30` - matching cobc byte-for-byte (zero, and both a very large positive and negative COMP-1 magnitude, all round-trip through a RELATIVE file - see finding 5 below for why ee07 was DELIBERATELY chosen not to contain an embedded 0x0A byte in its own IEEE-754 bit pattern, isolating this display-formatting fix from that separate file-corruption bug); confirmed zero regressions on every pre-existing COMP-1/COMP-2 DISPLAY corpus program (u02/u02b/dd10, all re-verified `oracleCompare()`-clean - u02/u02b's own COMP-1 values are small/exact enough that the pre-fix widening bug happened to not manifest, which is exactly why this gap went undetected until ee07's extreme magnitudes) | ee07 |
+| 5 | **THE MOST SERIOUS FINDING - genuine architectural bug, not scoped to floats.** RELATIVE-file record storage (round-25's in-memory `bufVar: ArrayBuffer[String]` model) was built entirely on `scala.io.Source.fromFile(...).getLines()` for reading and `PrintWriter.println`/`.print(...); .print("\n")` for writing - ONE text "line" (`\n`-delimited) per logical record. Real COBOL RELATIVE (and INDEXED) files are FIXED-LENGTH BYTE RECORDS, not newline-delimited text - a raw 0x0A byte inside ANY binary-encoded field's own value (COMP-1/COMP-2/COMP-3/BINARY, or a packed/zoned field whose byte pattern happens to produce one) is a completely ordinary, valid occurrence, but the newline-delimited reader has no way to tell it apart from a genuine record boundary, silently SPLITTING one logical record's own bytes into two "lines" and corrupting every subsequent record's read position (ee06: COMP-2 3.25 encodes, host-native/little-endian, to bytes ending in `...00 0A 40` - a real 0x0A data byte at a real position, not a delimiter) | **Real, general architectural fix** (not a narrower interim workaround - investigated and judged tractable given the existing buffer-model code structure): a new `relativeRecordLengthRegistry` (FD file name -> its own record's total byte width, computed via `layout.js`'s `itemByteLength` over the FD's own 01 record - `scala-generator.js`, fed to independent copies in both `expression-gen.js` and `file-io-gen.js`, mirroring every other per-file registry this generator already threads through both modules) is populated ONLY for a FILE-CONTROL entry that declared `ORGANIZATION IS RELATIVE` with a determinable record length - gating this fix so a genuine LINE SEQUENTIAL file (correctly newline-delimited COBOL text) is completely unaffected, and so this is a pure ADDITION alongside the pre-existing code path, not a wholesale rewrite of it. When a file has an entry: (a) `file-io-gen.js`'s new `fixedWidthLoadLines` helper (used by both `pushBufferLoadLines`, the shared I-O/RANDOM/DYNAMIC buffer-load routine, AND the plain, non-random OPEN INPUT branch - so a SEQUENTIAL-access RELATIVE file, ee06/ee07's own shape, gets the fix too, not just RANDOM/DYNAMIC access) reads the WHOLE file as raw bytes (`java.nio.file.Files.readAllBytes`) and slices it into exactly-`recordLength`-character chunks with NO delimiter involved at all - `iteratorVar`/`bufVar` stay the exact same opaque `Iterator[String]`/`ArrayBuffer[String]` types either way, so EVERY downstream READ/keyed-READ/REWRITE/DELETE/START code path needed ZERO changes at all; (b) `generateClose`'s buffer flush now writes raw, concatenated bytes via a plain `FileOutputStream`/`.write(...)` with NO delimiter between records, instead of `bufVar.foreach(_w.println)`; (c) a plain (non-keyed) WRITE to such a file (`generateWriteStatement`) writes the EXACT fixed-width record via `.print(...)` with NO trailing newline at all, using `CobolFmt.fitLeft(text, recordLength)` (deliberately NOT `.stripTrailing()`, which would silently shrink a record whenever its own last field happens to end in whitespace - a fixed-length record's trailing bytes are real stored content, not insignificant whitespace); (d) the SAME fixed-width text-building (`plainRecordTextExpr`, shared by a KEYED WRITE's `finalTextExpr` and REWRITE's own `recordExpr`) and (e) the auto-extend gap-fill placeholder used by `generateKeyedWriteStatement`/`generateKeyedRewriteStatement`/`generateKeyedDeleteStatement` (a never-actually-written slot, previously the bare empty string `""`) is now a full-`recordLength`-width ALL-NUL placeholder (`gapFillExpr`/`relativeGapFillLiteral`) instead, so every `bufVar` entry stays uniformly `recordLength` characters wide for the raw, undelimited CLOSE-time flush to reconstruct record boundaries correctly - `pushBufferLoadLines`' own occVar-reload heuristic (a slot loaded from disk is "occupied" unless it looks like a gap) is adapted in lockstep, testing a reloaded chunk against this SAME all-NUL literal instead of the pre-fix `_.nonEmpty` check (which can no longer usefully distinguish anything once every chunk is forced to a uniform width). ADVANCING (a LINE-SEQUENTIAL/printer-file-only convention) is never combined with RELATIVE organization in real COBOL, so no ADVANCING-model interaction needed any handling at all. Verified against installed GnuCOBOL and scala-cli (ee06): `ADD=15.75`/`SUB=9.25`/`MUL=40.625`/`DIV=3.846153846153846` (a RELATIVE file with a COMP-2 field whose own IEEE-754 bytes genuinely contain 0x0A now reads back correctly across ADD/SUBTRACT/MULTIPLY/DIVIDE, not just the COMPUTE round-28 finding 3 already covered) - matching cobc byte-for-byte, INCLUDING an unrelated, previously-undiscovered COMP-2 DISPLAY precision gap this same investigation surfaced (see finding 4's own table entry, `truncateSignificantDigits` - DIVIDE's own `12.5 / 3.25` quotient is not exactly decimal-representable, and cobc's real COMP-2 DISPLAY caps at 16 significant digits, TRUNCATING rather than rounding any further ones, unlike Scala's own 17-digit shortest-round-trip `Double.toString`); confirmed zero regressions on every one of the 34 pre-existing RELATIVE-organization corpus programs (bb01-bb14, cc01-cc11, dd06-dd12, o01-o03, ee05/ee08/ee12, all re-verified `oracleCompare()`-clean, since none of their own record data happens to contain an embedded 0x0A byte - the exact reason this bug went undetected for 4 rounds of RELATIVE-file work) - see `tests/round25-fixes.test.js`/`tests/round26-fixes.test.js`/`tests/round27-fixes.test.js`'s own updated assertions (their literal generated-code shape legitimately changed for a determinable-record-length RELATIVE file; their own underlying runtime behavior, independently re-verified via `oracleCompare()`, did not) | ee06 |
+
+See `tests/round29-fixes.test.js` (the same file findings 1/2/3 above use -
+this workstream's own `describe` blocks are appended after them, clearly
+marked) for focused, toolchain-independent unit tests of all 5 findings
+above.
+
+**Known, narrower residual gap left by finding 5's own fix**: a
+RANDOM/DYNAMIC-access RELATIVE file's auto-extend gap-fill placeholder is
+now a full-width all-NUL string rather than a plain `""` - this is
+completely internal bookkeeping (never itself exposed as a real record's
+own DISPLAY output, since a gap slot is only ever addressed by a
+subsequent WRITE/REWRITE that overwrites it, or a READ that correctly
+declines with FILE STATUS "23"/"24" before ever decoding the placeholder's
+own bytes as field data - round-27 findings 3/4's own `occVar` guard,
+unaffected by this round). A RELATIVE file whose own record byte width
+could NOT be determined at all - either `itemByteLength` itself declines
+(some shape it can't lay out at all), OR (a real bug caught and fixed
+DURING this round's own testing, not merely a theoretical concern) the
+FD record contains an OCCURS ... DEPENDING ON child anywhere: `itemByteLength`
+itself still returns a nonzero value there (its own occursCount helper
+deliberately uses the MAXIMUM count so BYTE-LEVEL LAYOUT offsets stay
+fixed), but a real ODO record's own WRITE (`odoDisplayValueExpr`, round-10
+finding 4) writes a VARIABLE-length concatenation driven by the field's own
+LIVE counter, not always the maximum - treating such a record as uniformly
+"fixed length" here would have silently misaligned the new fixed-width
+byte-chunking model the instant a live count differed from the max (caught
+via dd11/ee12, both of which combine OCCURS DEPENDING ON with RELATIVE
+organization - confirmed regressed during this round's own manual
+verification, before the new `hasOccursDependingOn` guard, `generator/
+scala-generator.js`, was added to explicitly exclude any such record from
+`relativeRecordLengthRegistry` at any nesting depth). Either way, a file
+this fix declines to cover keeps the exact pre-existing (still line-
+delimited, still theoretically vulnerable to an embedded-0x0A byte)
+behavior, silently, exactly as before this round - re-verified `oracleCompare()`-clean
+for dd11/ee12 with the guard in place. No corpus program (old or new)
+exercises the remaining (non-ODO, `itemByteLength`-declines) narrower
+residual gap.
+
+### Round-29 post-merge regression fixes (t02 indentation, dd05 GO TO cascade)
+
+The two round-29 fix agents above ran **concurrently against the same
+working tree**. A fresh, complete full-suite verification run AFTER both
+finished (before this note's own fixes) found the whole-program `todo`
+count at 32, not the 31 the two agents' own tables above would predict
+(28 pre-round-29 baseline + 3 legitimate new declines, ee03/ee05/ee13) -
+`dd05-goto-depending-recursive.cbl` had silently flipped from a clean,
+byte-for-byte oracle match (confirmed passing as of round 28) to a
+mismatching `t.todo(...)`, and `tests/corpus/proc/t02-multi-file-open.cbl`
+(a round-6 corpus program) now produced a hard `scala-cli` compile error
+when run through `convertToScala()` directly - both fixed here, at root
+cause, without reverting either agent's own real fix:
+
+- **t02 (indentation - `generator/expression-gen.js`'s `generateReadStatement`)**:
+  round-27 finding 7's "wrap the entire plain-READ body in an outer `if
+  <startInvalidVar> then <swallow> else <original body>`" mechanism
+  re-indents the original (pre-wrap) body by prepending exactly `"  "` to
+  each element of its own `lines` array - correct as long as every element
+  is a single physical line. t02's own `READ IN-FILE-A` has a `NOT AT END`
+  clause that itself contains a nested `READ IN-FILE-B` (also plain/
+  sequential, so it ALSO gets this same round-27 wrap) - and that nested
+  READ's own fully-wrapped, already-multi-line (`\n`-joined) output is
+  pushed onto the OUTER read's `lines` array as a single array element.
+  Prepending `"  "` to that element only shifted its FIRST physical line;
+  every other physical line folded up inside stayed exactly as indented as
+  before, one level short of everything around it once embedded a second
+  time - producing a Scala 3 significant-whitespace violation (an `if`'s
+  own true-branch body at the SAME indentation as the `if` line itself).
+  Fixed by splitting every element on `\n` before the indent bump
+  (`lines.flatMap(l => l.split('\n')).map(l => \`  ${l}\`)`), so the extra
+  2 spaces land on every physical line, not just once per array element,
+  at any nesting depth. This bug's own root cause (`lines.map(l => ...)`)
+  predates round 29 - it already existed, unnoticed, in the round-28
+  commit (t02 was already an `oracleCompare()` `t.todo(...)` at the
+  round-28 baseline, not a clean pass, for this exact reason, though the
+  task briefing that flagged it described it as round-29-introduced) -
+  fixing it now still closes a real, previously-undetected corpus gap and
+  correctly reduces the `todo` count by one, regardless of which round's
+  commit first introduced it. Verified via direct `scala-cli` compile
+  through `convertToScala()`'s real t02 source: compiles cleanly and
+  matches `t02-multi-file-open.oracle.txt` byte-for-byte (`MERGED-COUNT=02`
+  / `OUT=[AAAAA11111]` / `OUT=[BBBBB22222]`).
+- **dd05 (GO TO cascade - `generator/method-gen.js`'s
+  `generateProgramFlowLinesNested`/`renderNestedFallthroughDefs`,
+  `generator/expression-gen.js`'s `generateGoTo`)**: a genuine, round-29-
+  introduced regression, caused by finding 2's (ee10) own fix above. That
+  fix split the RECURSIVE nested-def convention's single per-paragraph def
+  (which used to bake BOTH "callable out-of-line PERFORM/GO TO target" AND
+  "the program's own natural fall-through" into the SAME def body) into a
+  flat, fall-through-free def (for PERFORM/GO TO call sites) plus a
+  SEPARATE `_stepN` wrapper chain (modeling natural fall-through by calling
+  each paragraph's flat def as one opaque unit, then unconditionally
+  deciding whether to call the next step). That split conflated two
+  genuinely different COBOL semantics that the pre-round-29 single-def
+  convention had never needed to distinguish: an out-of-line **PERFORM**
+  runs its target and returns to the performer (must never auto-cascade -
+  ee10's own concern), but **GO TO** transfers control to its target
+  *permanently*, and real paragraph-to-paragraph fall-through correctly
+  resumes from wherever GO TO actually landed - exactly like natural
+  top-to-bottom flow would from that same point. dd05's `MAIN-PARA` ends
+  `GO TO PATH-ZERO, PATH-ONE, PATH-TWO DEPENDING ON WS-SEL` followed by a
+  fallback `DISPLAY` (so the GO TO is deliberately NOT the paragraph's own
+  last statement - COBOL falls through to that DISPLAY, then off the
+  paragraph's end, only when WS-SEL is out of range). The `_stepN` wrapper
+  called `MAIN-PARA`'s flat def as one opaque unit and, seeing its own last
+  statement wasn't an unconditional transfer, unconditionally called the
+  next step afterward too - with no way to tell "the flat def returned
+  because one of its DEPENDING ON arms already fired `return pathTwo()`
+  partway through" apart from "the flat def genuinely fell through to its
+  own end" (both look identical from outside a plain function call) -
+  spuriously re-invoking `PATH-ZERO` after `WRAP-UP`'s own natural
+  completion, on EVERY activation, real cobc never does. Fixed by removing
+  the `_stepN` split entirely and instead giving every paragraph in the
+  RECURSIVE whole-program flow list a `_chain: Boolean = false` parameter
+  (`renderNestedFallthroughDefs`'s new `gated` mode) that gates its own
+  appended fall-through tail call: an out-of-line PERFORM/qualified GO TO
+  OF SECTION still calls with no args (`_chain` defaults `false`, so it
+  still can never re-trigger fall-through - ee10 stays fixed), while GO
+  TO's own target call (`generateGoTo`) now explicitly passes `_chain =
+  true`, and the program's true entry point enters `units[0]` the same way
+  (`renderSectionAwareEntryCall`'s new `chained` flag). A `return` embedded
+  partway through a paragraph's own body (from an unconditional GO TO, or a
+  fired DEPENDING ON arm) is lexically inside that SAME def again (no
+  separate wrapper), so it correctly short-circuits that def's own appended
+  fall-through call too - restoring the exact single-def short-circuiting
+  the pre-round-29 convention relied on, but now WITH ee10's fix intact.
+  ee09's EXIT SECTION/EXIT PARAGRAPH machinery (`needsSectionCatch`/
+  `needsParagraphBoundary`, `paragraphsContainExitOfType`) is preserved
+  unchanged, just re-homed onto this same per-def `_chain` gating instead
+  of the removed `_stepN` chain. Verified against installed GnuCOBOL and
+  scala-cli (dd05): `ENTER N=02`/`PATH-TWO N=02`/`ENTER N=01`/`PATH-ONE
+  N=01`/`EXIT N=01`/`EXIT N=02` - matching cobc byte-for-byte (no more
+  spurious `PATH-ZERO` lines); re-verified `oracleCompare()`-clean on
+  ee09/ee10/ee14 (the RECURSIVE EXIT SECTION/PARAGRAPH and out-of-line
+  PERFORM/qualified-GO-TO corpus programs this same convention also
+  covers) and every pre-existing RECURSIVE-program corpus program
+  (`tests/round21-fixes.test.js` through `tests/round29-fixes.test.js`'s
+  own focused unit tests, updated only where they asserted the removed
+  `_stepN`/bare-`(): Unit =` literal shape - their underlying behavioral
+  assertions are unchanged).
+
+Net effect on the whole-suite `todo` count: 32 (post-merge, pre-this-fix)
+&rarr; 30 (28 pre-round-29 baseline, minus t02's now-fixed pre-existing
+gap, plus ee03/ee05/ee13's 3 legitimate new round-29 declines) - see
+`tests/round29-fixes.test.js` for the updated focused unit-test assertions
+these two fixes required.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -2008,3 +2211,26 @@ tests of all 4 findings above.
   hard-fail on a toolchain gap unrelated to the actual (now-fixed) finding.
   Revisit only if a future sandbox's GnuCOBOL build is reconfigured with
   indexed-file support enabled, making real verification possible.
+
+- **ALTER's own real runtime semantics (retargeting a GO TO statement's own
+  destination), round-29 finding 3** - only the PARSE-CORRUPTION bug is fixed
+  (see the round-29 table above, `ee13`): `ALTER <para> TO [PROCEED TO]
+  <target>.` now parses correctly and degrades to a visible, compiling
+  no-op (`UnknownStatement`) instead of corrupting the surrounding paragraph
+  structure. The actual behavior - every subsequent `GO TO` inside the named
+  paragraph should be retargeted to the new destination at runtime - is NOT
+  implemented at all: `ee13`'s own generated Scala still runs `JUMP-PARA`'s
+  original, un-retargeted `GO TO TARGET-ONE`, producing `IN-TARGET-ONE`/
+  `AFTER-PERFORM` where cobc's own oracle shows only `IN-TARGET-TWO` (`ee13`
+  registers as a `t.todo(...)` in the Phase 2 suite for exactly this reason,
+  not a failure). This is a deliberate scoping decision, not an oversight:
+  ALTER is a rare, deprecated COBOL feature (most modern style guides forbid
+  it outright) this campaign's own roadmap already lists as low-priority: OPEN
+  - not implemented, low priority (rare, deprecated) - and real semantics
+  would require modeling a mutable "current GO TO target" per altered
+  paragraph (the paragraph's own `GO TO` would need to read that mutable
+  target at the point it fires, rather than being compiled to a fixed
+  `return <target>()` the way every other GO TO is - a structural change to
+  how `generateGoTo` translates a GO TO inside any paragraph ALTER ever
+  names), disproportionate for a construct this rare. Revisit only if a
+  future program genuinely needs real ALTER semantics.

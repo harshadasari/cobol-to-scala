@@ -97,13 +97,18 @@ describe('round-27 finding 1 (cc05): RANDOM-access DELETE addresses the record d
 `;
   const scala = scalaOf(src);
 
+  // round-29 finding 5 update: SOME-REC (shared RELATIVE_FILE_HEADER fixture)
+  // has a determinable fixed record width (8 bytes), so the auto-extend
+  // gap-fill placeholder is now a full-width all-NUL string, not the bare
+  // `""` the pre-fix, newline-delimited model used - see tests/oracle/
+  // README.md's round-29 entry (finding 5).
   test('DELETE resolves via generateKeyedDeleteStatement (a positive-key guard), not the old hasCurrentVar-gated guard', () => {
     assert.match(scala, /if \(wsRkey\)\.toInt >= 1 then/);
-    assert.match(scala, /while someFileBuf\.length < \(wsRkey\)\.toInt do \{ someFileBuf\.append\(""\); someFileOcc\.append\(false\) \}/);
+    assert.match(scala, /while someFileBuf\.length < \(wsRkey\)\.toInt do \{ someFileBuf\.append\(\("\\u0000" \* 8\)\); someFileOcc\.append\(false\) \}/);
   });
 
-  test('the target slot is marked as a gap (blanked, occVar false), not removed/shifted', () => {
-    assert.match(scala, /someFileBuf\(\(wsRkey\)\.toInt - 1\) = ""/);
+  test('the target slot is marked as a gap (blanked - a full-width all-NUL placeholder, occVar false), not removed/shifted', () => {
+    assert.match(scala, /someFileBuf\(\(wsRkey\)\.toInt - 1\) = \("\\u0000" \* 8\)/);
     assert.match(scala, /someFileOcc\(\(wsRkey\)\.toInt - 1\) = false/);
     assert.doesNotMatch(scala, /someFileBuf\.remove\(\(wsRkey\)\.toInt - 1\)/);
   });
@@ -239,8 +244,15 @@ describe('round-27 finding 4 (cc01): a gap slot (auto-extended, never written) r
     assert.match(scala, /"GAP"/);
   });
 
-  test('OPEN builds occVar alongside bufVar (a slot reloaded from disk is occupied unless its own line is empty)', () => {
-    assert.match(scala, /someFileOcc = scala\.collection\.mutable\.ArrayBuffer\.from\(someFileBuf\.map\(_\.nonEmpty\)\)/);
+  // round-29 finding 5 update: SOME-REC's determinable fixed record width
+  // (8 bytes) routes this buffer load through the fixed-width byte-chunking
+  // model, whose own occVar-reload heuristic tests each chunk against a
+  // full-width all-NUL placeholder (every real chunk is always exactly 8
+  // characters, so the bare `""`/`_.nonEmpty` check the pre-fix, newline-
+  // delimited model used can no longer occur at all) - see tests/oracle/
+  // README.md's round-29 entry (finding 5).
+  test('OPEN builds occVar alongside bufVar (a slot reloaded from disk is occupied unless its own chunk is the full-width all-NUL placeholder)', () => {
+    assert.match(scala, /someFileOcc = scala\.collection\.mutable\.ArrayBuffer\.from\(someFileBuf\.map\(_ != "\\u0000" \* 8\)\)/);
   });
 });
 
@@ -300,9 +312,13 @@ describe('round-27 finding 5 (cc10): a RECURSIVE program\'s nested-def paragraph
     const entryIdx = scala.indexOf('def entry(_get0');
     assert.ok(entryIdx > -1, 'expected a RECURSIVE program entry() method with LINKAGE getter/setter closures');
     const entryBody = scala.slice(entryIdx);
-    const fillSortMatch = entryBody.match(/def fillSort\(\): Unit =\s*\n([\s\S]*?)\n(\s*)def showSort/);
+    // round-29 REGRESSION fix: every nested def in this RECURSIVE entry body
+    // now takes a `_chain: Boolean = false` parameter (method-gen.js's
+    // renderNestedFallthroughDefs - see its own doc comment) gating the
+    // auto-chain tail call instead of a bare `(): Unit =` signature.
+    const fillSortMatch = entryBody.match(/def fillSort\(_chain: Boolean = false\): Unit =\s*\n([\s\S]*?)\n(\s*)def showSort/);
     assert.ok(fillSortMatch, 'expected a nested def fillSort followed eventually by def showSort inside the RECURSIVE entry body');
-    assert.doesNotMatch(fillSortMatch[1], /showSort\(\)\s*\/\/ implicit fall-through/);
+    assert.doesNotMatch(fillSortMatch[1], /showSort\(_chain = true\)\s*\/\/ implicit fall-through/);
   });
 
   test('SORT\'s own machinery still calls showSort() for real, after the sort itself', () => {

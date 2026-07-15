@@ -9,6 +9,7 @@ import {
   convertCondition,
   setAmbiguousParagraphNamesForPerform as setAmbiguousParagraphNamesForPerformExpr,
   assignExpr,
+  isRecursiveNestedFlowMode,
 } from './expression-gen.js';
 
 /**
@@ -121,13 +122,32 @@ function generateMethodBody(statements, indent = 1) {
           // boundary-wrapped bodies below - never the whole method (round-3
           // finding 1).
           lines.push('  '.repeat(indent) + 'scala.util.boundary.break() // EXIT PERFORM');
+        } else if (String(stmt.exitType).toUpperCase() === 'SECTION') {
+          // round-29 fix (ee09): see isRecursiveNestedFlowMode's own doc
+          // comment (expression-gen.js) and generateProgramFlowLinesNested's
+          // (below) for why a RECURSIVE program's own nested-def paragraph
+          // needs `throw CobolExitSectionSignal` here instead of a bare
+          // `return` - the ordinary (non-recursive) convention is unaffected.
+          lines.push(
+            '  '.repeat(indent) +
+            (isRecursiveNestedFlowMode() ? 'throw CobolExitSectionSignal // EXIT SECTION' : 'return // EXIT SECTION')
+          );
         } else {
           // EXIT PARAGRAPH: every paragraph is its own Scala method, so
           // `return` skips only the rest of *this* paragraph (round-3
           // finding 2 - the pre-fix `()` no-op skipped nothing). Still
           // compiles even when EXIT is the only statement in its paragraph -
           // a common THRU-range-endpoint idiom (e.g. "1900-EXIT-PARA. EXIT.").
-          lines.push('  '.repeat(indent) + 'return // EXIT PARAGRAPH');
+          //
+          // round-29 fix (ee09/ee10 trio): a RECURSIVE program's own
+          // nested-def paragraph instead needs `scala.util.boundary.break()`
+          // here - see isRecursiveNestedFlowMode's own doc comment
+          // (expression-gen.js) and renderNestedFallthroughDefs' (below) for
+          // why a bare `return` is wrong there specifically.
+          lines.push(
+            '  '.repeat(indent) +
+            (isRecursiveNestedFlowMode() ? 'scala.util.boundary.break() // EXIT PARAGRAPH' : 'return // EXIT PARAGRAPH')
+          );
         }
         break;
 
@@ -791,7 +811,7 @@ export function generatePerformThruMethod(fromParagraph, toParagraph, units, amb
   const defIndent = indent + 1;
   const lines = [`${indentStr}def ${methodName}(): Unit =`];
   lines.push(...renderNestedFallthroughDefs(rangeUnits, defIndent, nameFor));
-  lines.push(`${'  '.repeat(defIndent)}${nameFor(rangeUnits[0])}()`);
+  lines.push(renderSectionAwareEntryCall(rangeUnits, '  '.repeat(defIndent), nameFor));
   if (isBackward) {
     lines.push(
       `${'  '.repeat(defIndent)}sys.exit(0) // round-9 finding 5: backward PERFORM ... THRU falls off the ` +
@@ -861,14 +881,184 @@ export function generatePerformThruMethod(fromParagraph, toParagraph, units, amb
  * paragraph's flat method the identical way if it ever were, an equally-
  * unmodeled edge case shared by both conventions, not one this fix changes).
  */
-function renderNestedFallthroughDefs(paragraphs, defIndent, nameFor, noFallthroughAfter = null) {
+/**
+ * round-29 fix (ee09/ee10 trio): true if any paragraph in `paragraphs`
+ * contains an EXIT statement of the given kind (`'PARAGRAPH'`/`'SECTION'`),
+ * at ANY nesting depth (collectStatementsDeep - an EXIT is very often nested
+ * inside an IF, exactly like ee09's own repro). Used to gate
+ * renderNestedFallthroughDefs' own EXIT-SECTION/EXIT-PARAGRAPH-specific
+ * wrapping so a paragraph list that never uses either (the overwhelming
+ * majority of the existing corpus, recursive or not) renders byte-identical
+ * Scala to before this fix - only a paragraph list that actually contains
+ * one pays for the extra `scala.util.boundary`/`try`-`catch` scaffolding.
+ */
+function paragraphsContainExitOfType(paragraphs, wantedUpper) {
+  return (paragraphs || []).some((p) => {
+    let found = false;
+    collectStatementsDeep(p.statements, (stmt) => {
+      if (found || normalizeStatementType(stmt.type) !== 'EXIT') return;
+      if (String(stmt.exitType || 'PARAGRAPH').toUpperCase() === wantedUpper) found = true;
+    });
+    return found;
+  });
+}
+
+/**
+ * round-29 fix (ee09): the first unit in `paragraphs`, scanning forward from
+ * (but not including) `fromIndex`, whose own `sectionName` differs from
+ * `paragraphs[fromIndex]`'s - i.e. "the head of whatever SECTION comes right
+ * after the one `paragraphs[fromIndex]` belongs to." `null` if every
+ * remaining unit shares the same section (there is no "next section" to
+ * resume into - see renderSectionAwareEntryCall's own doc comment for what
+ * that means for EXIT SECTION). Two units with no enclosing SECTION at all
+ * both read as the same (`null`) section, exactly like the rest of this
+ * file already treats a section-less paragraph's `sectionName`.
+ */
+function findNextSectionHead(paragraphs, fromIndex) {
+  const sectionName = paragraphs[fromIndex]?.sectionName || null;
+  for (let j = fromIndex + 1; j < paragraphs.length; j++) {
+    if ((paragraphs[j].sectionName || null) !== sectionName) return paragraphs[j];
+  }
+  return null;
+}
+
+/**
+ * round-29 fix (ee09): render the call that invokes `paragraphs[0]` - i.e.
+ * the one call site, in both generateProgramFlowLinesNested and
+ * generatePerformThruMethod, that "enters" the whole paragraph list from
+ * OUTSIDE renderNestedFallthroughDefs' own appended fall-through calls (so
+ * renderNestedFallthroughDefs never sees or wraps it). Needs the identical
+ * `try { ... } catch { case CobolExitSectionSignal => ... }` treatment a
+ * cross-SECTION fall-through transition gets (see renderNestedFallthroughDefs'
+ * own doc comment) whenever `paragraphs` actually contains an EXIT SECTION
+ * anywhere: an EXIT SECTION fired directly inside `paragraphs[0]` itself (ee09's
+ * own shape - PARA-A1, the very first paragraph) has no OTHER call site to be
+ * caught at, since this one is emitted directly by the caller, not via
+ * another paragraph's own appended tail. The catch body resumes at the next
+ * SECTION's own head (findNextSectionHead), or does nothing if `paragraphs[0]`'s
+ * SECTION is the last one in this list - matching "EXIT SECTION with nothing
+ * left afterward" behaving exactly like normal completion.
+ */
+/**
+ * round-29 REGRESSION fix (dd05-goto-depending-recursive.cbl): `chained`
+ * (default `false`, matching every pre-existing caller - generatePerformThruMethod
+ * and generateDeclarativeHandlerDefsNested, neither of which changes at all)
+ * - when `true` (only ever passed by generateProgramFlowLinesNested, for the
+ * program's OWN true entry point), passes `_chain = true` to `paragraphs[0]`'s
+ * own def, gated exactly like renderNestedFallthroughDefs' own doc comment
+ * describes: the program's natural top-to-bottom fall-through must actually
+ * cascade past `paragraphs[0]` (and, transitively, whatever comes after each
+ * later paragraph GO TO sends control to), which the `_chain` parameter's
+ * whole purpose is to allow - see renderNestedFallthroughDefs' own doc
+ * comment for the full mechanism.
+ */
+function renderSectionAwareEntryCall(paragraphs, indentStr, nameFor, chained = false) {
+  const name = nameFor(paragraphs[0]);
+  const recursive = isRecursiveNestedFlowMode();
+  const chainArg = recursive && chained ? '_chain = true' : '';
+  const callExpr = `${name}(${chainArg})`;
+  if (!recursive || !paragraphsContainExitOfType(paragraphs, 'SECTION')) {
+    return `${indentStr}${callExpr}`;
+  }
+  const after = findNextSectionHead(paragraphs, 0);
+  const afterCall = after ? `${nameFor(after)}(${chainArg})` : '()';
+  return [
+    `${indentStr}try // round-29 fix: entering paragraphs[0]'s own SECTION - see renderSectionAwareEntryCall's doc comment`,
+    `${indentStr}  ${callExpr}`,
+    `${indentStr}catch`,
+    `${indentStr}  case CobolExitSectionSignal => ${afterCall}`,
+  ].join('\n');
+}
+
+/**
+ * round-29 REGRESSION fix (dd05-goto-depending-recursive.cbl): `gated`
+ * (default `false` - every pre-existing caller: generatePerformThruMethod's
+ * own THRU-range copy and generateDeclarativeHandlerDefsNested's own
+ * DECLARATIVES copy, neither of which changes behavior at all) selects how
+ * the auto-chain tail call below behaves, ONLY while
+ * isRecursiveNestedFlowMode() is true (false for every OTHER caller - the
+ * ordinary convention's shared top-level PERFORM ... THRU wrapper
+ * generateAllMethods always builds - so nothing changes there regardless of
+ * `gated`):
+ *
+ *  - `gated: false` (THRU ranges/DECLARATIVES): the tail call, when not
+ *    suppressed, runs UNCONDITIONALLY whenever `continues` - exactly the
+ *    pre-round-29 behavior these two isolated, body-duplicated contexts
+ *    always had (a THRU range's/DECLARATIVES SECTION's own internal
+ *    fall-through is never ambiguous about "how was I entered" the way the
+ *    WHOLE PROGRAM's shared paragraph list is - see below).
+ *  - `gated: true` (generateProgramFlowLinesNested's OWN whole-program
+ *    paragraph list only): each def additionally takes a `_chain: Boolean =
+ *    false` parameter, and the tail call only fires `if _chain then ...`.
+ *    This is the actual regression fix: an out-of-line PERFORM/qualified GO
+ *    TO OF SECTION (ee10's own repro) still calls a paragraph's def with NO
+ *    args - `_chain` defaults `false`, so it still can never re-trigger
+ *    fall-through, exactly like ee10's fix intended. But GO TO's target call
+ *    (expression-gen.js's generateGoTo, see its own round-29 fix) now passes
+ *    `_chain = true` explicitly - real COBOL GO TO transfers control
+ *    permanently to its target and lets NORMAL paragraph-to-paragraph
+ *    fall-through resume from there, unlike PERFORM (which runs its target
+ *    and returns) - so GO TO's target correctly keeps cascading into
+ *    whatever naturally follows it. dd05-goto-depending-recursive.cbl is
+ *    exactly this shape: MAIN-PARA's `GO TO PATH-ZERO, PATH-ONE, PATH-TWO
+ *    DEPENDING ON WS-SEL` sends control to PATH-TWO, which (not ending in its
+ *    own unconditional transfer) must fall through into WRAP-UP afterward -
+ *    `_chain = true`, threaded all the way from MAIN-PARA's own entry call
+ *    (renderSectionAwareEntryCall's `chained` flag) through the GO TO,
+ *    through PATH-TWO's own tail call, makes that happen. The single-def
+ *    `return` a fired GO TO produces still short-circuits THIS SAME def's own
+ *    appended tail call exactly like the pre-round-29 convention relied on
+ *    (both live in the same lexical function again, unlike the round-29
+ *    `_stepN` split this replaces) - so MAIN-PARA's own fallback tail
+ *    (reached only when WS-SEL matched none of the DEPENDING ON targets)
+ *    fires only on that one genuinely-falls-through branch, never on a branch
+ *    where GO TO already fired.
+ */
+function renderNestedFallthroughDefs(paragraphs, defIndent, nameFor, noFallthroughAfter = null, gated = false) {
   const defIndentStr = '  '.repeat(defIndent);
   const lines = [];
 
+  // round-29 fix (ee09/ee10 trio): see isRecursiveNestedFlowMode's own doc
+  // comment (expression-gen.js) for the cascading-return bug this whole
+  // block exists to fix, ONLY for a RECURSIVE program's own nested-def
+  // convention (isRecursiveNestedFlowMode() is false for every OTHER caller
+  // of this function - the ordinary convention's shared top-level PERFORM
+  // ... THRU wrapper generateAllMethods always builds - so this changes
+  // nothing there). Gated per-list on whether `paragraphs` actually contains
+  // the relevant EXIT kind at all, so a paragraph list using neither (the
+  // overwhelming majority) renders byte-identical to before this fix.
+  const recursive = isRecursiveNestedFlowMode();
+  const needsParagraphBoundary = recursive && paragraphsContainExitOfType(paragraphs, 'PARAGRAPH');
+  const needsSectionCatch = recursive && paragraphsContainExitOfType(paragraphs, 'SECTION');
+  // See this function's own doc comment above - every def in a recursive
+  // paragraph list gets the SAME `_chain` parameter regardless of `gated`
+  // (a THRU-range/DECLARATIVES copy just always ignores it and chains
+  // unconditionally), so a GO TO compiled once but reachable, via ordinary
+  // Scala lexical shadowing, from either copy of a same-named paragraph
+  // (e.g. one inside a THRU range AND the whole-program list) can always
+  // pass `_chain = true` without an arity mismatch.
+  const chainParam = recursive ? '_chain: Boolean = false' : '';
+  const chainArg = recursive ? '_chain = true' : '';
+
   paragraphs.forEach((para, i) => {
     const name = nameFor(para);
-    lines.push(`${defIndentStr}def ${name}(): Unit =`);
-    lines.push(generateMethodBody(para.statements, defIndent + 1));
+    lines.push(`${defIndentStr}def ${name}(${chainParam}): Unit =`);
+    if (needsParagraphBoundary) {
+      // EXIT PARAGRAPH here becomes `scala.util.boundary.break()`
+      // (expression-gen.js's generateExit / this file's own generateMethodBody
+      // EXIT case) - wrapping ONLY this paragraph's own original statements
+      // (not the fall-through call appended below, which sits OUTSIDE this
+      // boundary) means break() stops exactly at the end of THIS paragraph,
+      // same as a correctly-scoped `return` would for the ordinary
+      // convention's own separate top-level method, while still letting the
+      // appended fall-through call run afterward - EXIT PARAGRAPH must still
+      // fall through normally, unlike EXIT SECTION below.
+      lines.push(`${defIndentStr}  scala.util.boundary {`);
+      lines.push(generateMethodBody(para.statements, defIndent + 2));
+      lines.push(`${defIndentStr}  }`);
+    } else {
+      lines.push(generateMethodBody(para.statements, defIndent + 1));
+    }
 
     const isLast = i === paragraphs.length - 1;
     // round-27 finding 5: a paragraph that is the "through" endpoint of a
@@ -876,11 +1066,46 @@ function renderNestedFallthroughDefs(paragraphs, defIndent, nameFor, noFallthrou
     // an explicit THRU - see collectSortMergeThroughEndpoints) must never
     // auto-chain into whatever paragraph physically follows it, even when it
     // doesn't itself end in an unconditional transfer - see this function's
-    // own doc comment update below for why.
-    const suppressed = noFallthroughAfter && noFallthroughAfter.has(String(para.name || '').toUpperCase());
-    if (!isLast && !suppressed && !statementEndsInUnconditionalTransfer(para.statements)) {
-      const nextName = nameFor(paragraphs[i + 1]);
-      lines.push(`${'  '.repeat(defIndent + 1)}${nextName}() // implicit fall-through`);
+    // own doc comment update below for why. This is a HARD suppression
+    // (unaffected by `gated`/`_chain`): SORT/MERGE's own call site
+    // (expression-gen.js's procedureCallExpr) always invokes such a paragraph
+    // like an ordinary out-of-line PERFORM (never passing `_chain = true`),
+    // so it would never auto-chain anyway - kept explicit rather than relying
+    // on that indirectly, exactly as round-27 originally required.
+    const hardSuppressed = noFallthroughAfter && noFallthroughAfter.has(String(para.name || '').toUpperCase());
+    if (!isLast && !hardSuppressed && !statementEndsInUnconditionalTransfer(para.statements)) {
+      const nextPara = paragraphs[i + 1];
+      const nextName = nameFor(nextPara);
+      // round-29 fix: gated mode wraps the whole tail (both branches below)
+      // in `if _chain then` - one indent level deeper than the ungated
+      // (THRU/DECLARATIVES) tail, which runs unconditionally at `defIndent+1`
+      // exactly as before this fix.
+      const tailIndent = defIndent + 1 + (gated ? 1 : 0);
+      const bi = '  '.repeat(defIndent + 1);
+      const ti = '  '.repeat(tailIndent);
+      if (gated) lines.push(`${bi}if _chain then`);
+      // round-29 fix (ee09): a fall-through call that crosses INTO a
+      // different SECTION than the current paragraph's own is exactly where
+      // an EXIT SECTION fired anywhere within that NEXT section (however many
+      // nested paragraph calls deep - a dynamically-scoped `throw` unwinds
+      // through all of them) needs to be caught: `CobolExitSectionSignal`
+      // propagates up past however many of that section's own paragraphs
+      // already ran, stopping exactly here, then resumes at whatever SECTION
+      // comes after THAT one (findNextSectionHead) - or does nothing if it
+      // was the program's last SECTION. A same-section fall-through (the
+      // common case) needs no wrapping at all: nothing here could ever catch
+      // an EXIT SECTION meant for THIS section anyway (it must keep
+      // propagating up to wherever THIS section was itself entered).
+      if (needsSectionCatch && (para.sectionName || null) !== (nextPara.sectionName || null)) {
+        const after = findNextSectionHead(paragraphs, i + 1);
+        const afterCall = after ? `${nameFor(after)}(${chainArg})` : '()';
+        lines.push(`${ti}try // implicit fall-through into a new SECTION`);
+        lines.push(`${ti}  ${nextName}(${chainArg})`);
+        lines.push(`${ti}catch`);
+        lines.push(`${ti}  case CobolExitSectionSignal => ${afterCall}`);
+      } else {
+        lines.push(`${ti}${nextName}(${chainArg}) // implicit fall-through`);
+      }
     }
   });
 
@@ -1047,9 +1272,26 @@ export function generateProgramFlowLinesNested(units, indent, ambiguousNames) {
   const nameFor = (u) => resolveParagraphMethodName(u.name, u.sectionName, ambiguousNames);
   // round-27 finding 5: see renderNestedFallthroughDefs' own doc comment - a
   // SORT/MERGE INPUT/OUTPUT PROCEDURE paragraph must never auto-chain into
-  // whatever paragraph physically follows it.
+  // whatever paragraph physically follows it (a HARD suppression, unrelated
+  // to the `gated`/`_chain` mechanism just below).
+  //
+  // round-29 REGRESSION fix (dd05-goto-depending-recursive.cbl): pass
+  // `gated: true` - see renderNestedFallthroughDefs' own doc comment for the
+  // full mechanism this replaces (round-29's original ee10 fix introduced a
+  // SEPARATE `_stepN` wrapper chain here, calling each paragraph's flat def
+  // as one opaque unit with NO way to tell "returned because its own GO TO
+  // fired" apart from "genuinely fell through to its own end" - which
+  // spuriously re-cascaded a GO TO's target paragraph's fall-through back
+  // into whatever the GO TO's OWN paragraph would otherwise have continued
+  // into). `gated: true` keeps ee10 fixed (an explicit out-of-line PERFORM/
+  // qualified GO TO OF SECTION still calls with no `_chain` arg, defaulting
+  // `false`, so it still can never re-trigger fall-through) while restoring
+  // correct GO TO semantics (its target call - expression-gen.js's
+  // generateGoTo - explicitly passes `_chain = true`, so real fall-through
+  // resumes from wherever GO TO actually sent control, exactly like real
+  // COBOL and exactly like the pre-round-29 single-def convention did).
   const noFallthroughAfter = collectSortMergeThroughEndpoints(units);
-  const lines = renderNestedFallthroughDefs(units, indent, nameFor, noFallthroughAfter);
+  const lines = renderNestedFallthroughDefs(units, indent, nameFor, noFallthroughAfter, true);
 
   // round-25 root cause 3: a `PERFORM x THRU y` range reachable from this
   // RECURSIVE program's own entry point needs its OWN nested-local
@@ -1081,7 +1323,15 @@ export function generateProgramFlowLinesNested(units, indent, ambiguousNames) {
     lines.push(generatePerformThruMethod(thru.from, thru.to, units, ambiguousNames, indent, thru.fromSection, thru.toSection));
   }
 
-  lines.push(`${'  '.repeat(indent)}${nameFor(units[0])}()`);
+  // round-29 REGRESSION fix: enter the program's own true entry point -
+  // units[0] - with `_chain = true` (renderSectionAwareEntryCall's `chained`
+  // flag), so the program's natural top-to-bottom fall-through (and any GO
+  // TO's own further cascade) actually happens, exactly like the pre-round-29
+  // single-def convention's unconditional chain did, while an explicit
+  // out-of-line PERFORM/GO TO OF SECTION targeting some OTHER paragraph
+  // elsewhere (never through this one call site) still defaults `_chain` to
+  // `false` and never re-triggers it (ee10 stays fixed).
+  lines.push(renderSectionAwareEntryCall(units, '  '.repeat(indent), nameFor, true));
   return lines;
 }
 
@@ -1160,7 +1410,22 @@ export function generateDeclarativeHandlerDefsNested(declaratives, indent) {
 
     if (!decl.paragraphs || decl.paragraphs.length === 0) {
       lines.push(`${indentStr}def ${methodName}(): Unit =`);
-      lines.push(generateMethodBody(decl.statements, indent + 1));
+      // round-29 fix: this flat (no nested paragraphs) DECLARATIVES body is
+      // never reached via renderNestedFallthroughDefs' own EXIT PARAGRAPH
+      // boundary-wrapping below (there's no paragraph LIST here to gate on) -
+      // an EXIT PARAGRAPH inside it would otherwise emit a bare
+      // `scala.util.boundary.break()` (isRecursiveNestedFlowMode() is true
+      // for the whole of this function, see its own call site) with no
+      // enclosing boundary at all, a hard compile error. Defensively wrap
+      // whenever this body actually contains one, exactly like a real
+      // paragraph's own body would.
+      if (isRecursiveNestedFlowMode() && paragraphsContainExitOfType([decl], 'PARAGRAPH')) {
+        lines.push(`${indentStr}  scala.util.boundary {`);
+        lines.push(generateMethodBody(decl.statements, indent + 2));
+        lines.push(`${indentStr}  }`);
+      } else {
+        lines.push(generateMethodBody(decl.statements, indent + 1));
+      }
       continue;
     }
 
@@ -1170,7 +1435,7 @@ export function generateDeclarativeHandlerDefsNested(declaratives, indent) {
     const paragraphUnits = leading ? [leading, ...decl.paragraphs] : decl.paragraphs;
     lines.push(`${indentStr}def ${methodName}(): Unit =`);
     lines.push(...renderNestedFallthroughDefs(paragraphUnits, defIndent, nameFor));
-    lines.push(`${'  '.repeat(defIndent)}${nameFor(paragraphUnits[0])}()`);
+    lines.push(renderSectionAwareEntryCall(paragraphUnits, '  '.repeat(defIndent), nameFor));
   }
   return lines;
 }

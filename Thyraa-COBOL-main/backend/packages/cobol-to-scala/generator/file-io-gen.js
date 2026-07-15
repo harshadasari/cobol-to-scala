@@ -218,6 +218,83 @@ function accessModeFor(fileName) {
 }
 
 /**
+ * round-29 finding 5 (MOST SERIOUS - see tests/oracle/README.md's round-29
+ * entry): FD file name (upper) -> its own FD record's total byte width,
+ * populated ONLY for a FILE-CONTROL entry that declared `ORGANIZATION IS
+ * RELATIVE` with a determinable record length (scala-generator.js's own
+ * copy, built from layout.js's `itemByteLength` over the FD's own 01
+ * record). Real COBOL RELATIVE (and INDEXED) files are FIXED-LENGTH BYTE
+ * RECORD storage - unlike this generator's pre-existing storage model,
+ * built entirely on `scala.io.Source...getLines()`/`PrintWriter.println`
+ * (one text "line" per record, `\n`-delimited), which is exactly correct
+ * for a genuine LINE SEQUENTIAL file but silently CORRUPTS/SPLITS any
+ * RELATIVE-file record whose own bytes happen to contain a raw 0x0A byte
+ * inside a binary-encoded field (COMP-1/COMP-2/COMP-3/BINARY, or a zoned/
+ * packed field whose value happens to produce one) - an entirely ordinary,
+ * valid occurrence for such a field's bytes, not an error condition, but
+ * one a newline-delimited reader has no way to distinguish from a genuine
+ * record boundary (verified against installed GnuCOBOL - ee06: a COMP-2
+ * value of 3.25 encodes, host-native/little-endian, to bytes ending in
+ * `00 00 00 00 00 00 0A 40` - the 7th byte IS 0x0A - `getLines()` split
+ * that single 11-byte record's own bytes into two separate "lines",
+ * corrupting every subsequent record's read position too).
+ *
+ * When a file's name has an entry here, OPEN/CLOSE (this module) and
+ * WRITE/REWRITE/DELETE's own auto-extend gap-fill (expression-gen.js's own
+ * identical copy of this registry) read/write it as RAW FIXED-WIDTH byte
+ * chunks with NO delimiter between records, instead of getLines()/
+ * println. A file with no entry here (every LINE SEQUENTIAL/plain-
+ * SEQUENTIAL file - correctly newline-delimited COBOL text - and any
+ * RELATIVE file whose own record byte width couldn't be determined) is
+ * completely unaffected, keeping the pre-existing text-line model exactly
+ * as before - this is a pure ADDITION gated on this registry, not a
+ * rewrite of the existing code path.
+ */
+let RELATIVE_RECORD_LENGTH_REGISTRY = new Map();
+
+export function setRelativeRecordLengthRegistry(registry) {
+  RELATIVE_RECORD_LENGTH_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+function relativeRecordLengthFor(fileName) {
+  return RELATIVE_RECORD_LENGTH_REGISTRY.get(String(fileName || '').toUpperCase()) || null;
+}
+
+/**
+ * round-29 finding 5: the fixed-width-chunk-buffer-building Scala expression
+ * shared by every "load this RELATIVE file's on-disk content into an
+ * in-memory buffer" call site below (`pushBufferLoadLines`'s buffer branch,
+ * and OPEN INPUT's plain/non-random branch) - reads the WHOLE file as raw
+ * bytes (ISO-8859-1: the same lossless 1:1 byte<->char identity mapping
+ * this generator's text-line reading already used elsewhere), then slices
+ * it into exactly `recordLength`-character chunks with NO delimiter
+ * involved at all - a raw 0x0A byte inside a chunk is just an ordinary
+ * character at that position, never mistaken for a boundary. A trailing
+ * PARTIAL chunk (fewer than `recordLength` bytes left over - a truncated/
+ * malformed file, or many real COBOL RELATIVE files that legitimately pad
+ * their last block) is silently dropped via the integer-division record
+ * count, rather than surfacing a short, corrupt "record".
+ */
+function fixedWidthLoadLines(bi, fileVarExpr, targetArrayExpr, recordLength, varPrefix) {
+  const lines = [];
+  // `varPrefix` (this file's own camelCase name) keeps these locals unique
+  // per file - two RELATIVE files both OPENed with this fixed-width model
+  // in the same enclosing Scala scope (e.g. two OPENs in the same method)
+  // would otherwise emit colliding `val _relBytes = ...` declarations.
+  const bytesVar = `_${varPrefix}RelBytes`;
+  const textVar = `_${varPrefix}RelText`;
+  const countVar = `_${varPrefix}RelCount`;
+  lines.push(`${bi}val ${bytesVar} = java.nio.file.Files.readAllBytes(${fileVarExpr}.toPath)`);
+  lines.push(`${bi}val ${textVar} = new String(${bytesVar}, java.nio.charset.StandardCharsets.ISO_8859_1)`);
+  lines.push(`${bi}val ${countVar} = ${textVar}.length / ${recordLength}`);
+  lines.push(
+    `${bi}${targetArrayExpr} = scala.collection.mutable.ArrayBuffer.tabulate(${countVar})(` +
+    `i => ${textVar}.substring(i * ${recordLength}, (i + 1) * ${recordLength}))`
+  );
+  return lines;
+}
+
+/**
  * round-27 finding 8: FD file name (upper) -> true when its FILE-CONTROL
  * entry declared `ORGANIZATION IS INDEXED` - see expression-gen.js's own
  * identical copy (isIndexedRandomAccess) for the full rationale. This module
@@ -370,18 +447,39 @@ export function generateOpen(statement, indent = 0) {
     // I-O). Shared by the I-O case (every access mode) and, new this round,
     // the INPUT/OUTPUT cases whenever access mode is RANDOM/DYNAMIC.
     function pushBufferLoadLines() {
-      const srcVar = `_${toCamelCase(fileName)}Src`;
+      const recLen = relativeRecordLengthFor(fileName);
       openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
-      openLines.push(`${bi}val ${srcVar} = scala.io.Source.fromFile(${fileVar})(scala.io.Codec.ISO8859)`);
-      openLines.push(`${bi}${bufVar} = scala.collection.mutable.ArrayBuffer.from(${srcVar}.getLines())`);
-      // round-27 findings 3/4: a slot reloaded from disk is "occupied" unless
-      // its own on-disk line is the exact empty string - the literal filler
-      // WRITE/REWRITE's own auto-extend loop uses for a never-actually-written
-      // gap slot (see toOccVarName's own doc comment) - so a gap a program
-      // creates, closes, and reopens (cc01's own shape) still reads back as a
-      // gap, not as a legitimate (blank) record.
-      openLines.push(`${bi}${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_.nonEmpty))`);
-      openLines.push(`${bi}${srcVar}.close()`);
+      if (recLen) {
+        // round-29 finding 5: RELATIVE-organization file with a known FIXED
+        // record byte width - read raw bytes and chunk by that exact width
+        // instead of `getLines()` (see relativeRecordLengthFor's own doc
+        // comment for why: a 0x0A byte inside a binary-encoded field's own
+        // storage is an ordinary data byte here, never a record delimiter).
+        openLines.push(...fixedWidthLoadLines(bi, fileVar, bufVar, recLen, toCamelCase(fileName)));
+        // round-27 findings 3/4 (adapted for round-29's fixed-width model):
+        // a slot reloaded from disk is "occupied" unless its own chunk is
+        // EXACTLY the all-NUL (0x00) gap-fill placeholder WRITE/REWRITE/
+        // DELETE's own auto-extend logic now uses for a never-actually-
+        // written gap slot (see expression-gen.js's identical
+        // relativeRecordLengthFor/gap-fill literal, all-NUL bytes)
+        // instead of the plain `""` the pre-fixed-width model used - every
+        // real chunk here is always exactly `recLen` characters wide, so an
+        // empty string can no longer occur at all once loaded through
+        // fixedWidthLoadLines.
+        openLines.push(`${bi}${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_ != "\\u0000" * ${recLen}))`);
+      } else {
+        const srcVar = `_${toCamelCase(fileName)}Src`;
+        openLines.push(`${bi}val ${srcVar} = scala.io.Source.fromFile(${fileVar})(scala.io.Codec.ISO8859)`);
+        openLines.push(`${bi}${bufVar} = scala.collection.mutable.ArrayBuffer.from(${srcVar}.getLines())`);
+        // round-27 findings 3/4: a slot reloaded from disk is "occupied" unless
+        // its own on-disk line is the exact empty string - the literal filler
+        // WRITE/REWRITE's own auto-extend loop uses for a never-actually-written
+        // gap slot (see toOccVarName's own doc comment) - so a gap a program
+        // creates, closes, and reopens (cc01's own shape) still reads back as a
+        // gap, not as a legitimate (blank) record.
+        openLines.push(`${bi}${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_.nonEmpty))`);
+        openLines.push(`${bi}${srcVar}.close()`);
+      }
       openLines.push(`${bi}${posVar} = 0`);
       openLines.push(`${bi}${hasCurrentVar} = false`);
       openLines.push(`${bi}${iteratorVar} = new Iterator[String] {`);
@@ -402,14 +500,29 @@ export function generateOpen(statement, indent = 0) {
           break;
         }
         openLines.push(`${bi}${fileVar} = new java.io.File(${toCamelCase(fileName)}Path)`);
-        // round-10 finding 3 companion: ISO-8859-1 is a lossless 1:1
-        // byte<->char identity mapping (unlike the JVM's UTF-8-by-default
-        // charset, which rejects/mangles arbitrary non-ASCII byte values) -
-        // required so a record containing packed/binary bytes round-trips
-        // through this text-line reader exactly, and a no-op for every
-        // plain-ASCII (DISPLAY-only) record already in the corpus.
-        openLines.push(`${bi}${readerVar} = scala.io.Source.fromFile(${fileVar})(scala.io.Codec.ISO8859)`);
-        openLines.push(`${bi}${iteratorVar} = ${readerVar}.getLines()`);
+        // round-29 finding 5: a plain SEQUENTIAL-access RELATIVE file with a
+        // known FIXED record byte width reads raw fixed-width byte chunks
+        // instead of `getLines()` too - see relativeRecordLengthFor's own
+        // doc comment (a 0x0A byte inside a binary-encoded field is just an
+        // ordinary data byte, never a record delimiter, for such a file).
+        // `iteratorVar` stays an opaque `Iterator[String]` either way, so no
+        // READ codegen anywhere needs to know or care which branch built it.
+        {
+          const recLen = relativeRecordLengthFor(fileName);
+          if (recLen) {
+            openLines.push(...fixedWidthLoadLines(bi, fileVar, `val ${toCamelCase(fileName)}Chunks`, recLen, toCamelCase(fileName)));
+            openLines.push(`${bi}${iteratorVar} = ${toCamelCase(fileName)}Chunks.iterator`);
+          } else {
+            // round-10 finding 3 companion: ISO-8859-1 is a lossless 1:1
+            // byte<->char identity mapping (unlike the JVM's UTF-8-by-default
+            // charset, which rejects/mangles arbitrary non-ASCII byte values) -
+            // required so a record containing packed/binary bytes round-trips
+            // through this text-line reader exactly, and a no-op for every
+            // plain-ASCII (DISPLAY-only) record already in the corpus.
+            openLines.push(`${bi}${readerVar} = scala.io.Source.fromFile(${fileVar})(scala.io.Codec.ISO8859)`);
+            openLines.push(`${bi}${iteratorVar} = ${readerVar}.getLines()`);
+          }
+        }
         break;
 
       case 'OUTPUT':
@@ -561,11 +674,33 @@ export function generateClose(statement, indent = 0) {
     // opened I-O in this run leaves bufVar at its null default
     // (generateFileHandleDeclarations), so this is a harmless no-op for
     // every pre-existing (non-I-O) corpus program.
-    lines.push(
-      `${indentStr}if ${bufVar} != null then { val _w = new java.io.PrintWriter(new java.io.OutputStreamWriter(` +
-      `new java.io.FileOutputStream(${fileVar}), java.nio.charset.StandardCharsets.ISO_8859_1)); ` +
-      `try ${bufVar}.foreach(_w.println) finally _w.close(); ${bufVar} = null }`
-    );
+    //
+    // round-29 finding 5: for a RELATIVE-organization file with a known
+    // FIXED record byte width, flush the buffer back out as RAW
+    // concatenated bytes with NO delimiter between records at all (each
+    // entry is already exactly `recLen` characters wide - see
+    // fixedWidthLoadLines/the auto-extend gap-fill literal) instead of
+    // `bufVar.foreach(_w.println)` - the pre-fix model appended a `\n`
+    // after EVERY record, which a 0x0A byte inside a binary-encoded
+    // field's own value is indistinguishable from on the next OPEN/READ.
+    // Every other file (no entry in relativeRecordLengthFor) keeps the
+    // exact pre-existing newline-per-record flush unchanged.
+    {
+      const recLen = relativeRecordLengthFor(fileName);
+      if (recLen) {
+        lines.push(
+          `${indentStr}if ${bufVar} != null then { val _fos = new java.io.FileOutputStream(${fileVar}); ` +
+          `try ${bufVar}.foreach(r => _fos.write(r.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1))) ` +
+          `finally _fos.close(); ${bufVar} = null }`
+        );
+      } else {
+        lines.push(
+          `${indentStr}if ${bufVar} != null then { val _w = new java.io.PrintWriter(new java.io.OutputStreamWriter(` +
+          `new java.io.FileOutputStream(${fileVar}), java.nio.charset.StandardCharsets.ISO_8859_1)); ` +
+          `try ${bufVar}.foreach(_w.println) finally _w.close(); ${bufVar} = null }`
+        );
+      }
+    }
 
     // Only whichever handle OPEN actually assigned for this file is
     // non-null; guard each close so CLOSE-ing a file that was never opened
@@ -888,4 +1023,5 @@ export default {
   setDeclarativeHandlers,
   setAccessModeRegistry,
   setIndexedOrganizationFiles,
+  setRelativeRecordLengthRegistry,
 };

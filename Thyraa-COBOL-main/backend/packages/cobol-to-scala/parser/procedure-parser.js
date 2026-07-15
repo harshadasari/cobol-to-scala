@@ -2328,7 +2328,29 @@ function parseReadStatement(ctx) {
     stmt.atEnd = parseStatementBlock(ctx, ['NOT', 'END-READ']);
   }
 
-  if (ctx.matchValue('NOT')) {
+  // round-31 finding 3 (gg15): READ's grammar has TWO independent "NOT ..."
+  // clauses - NOT AT END and NOT INVALID KEY - and this used to be two
+  // separate, UNCONDITIONAL `if (ctx.matchValue('NOT'))` checks in sequence
+  // (this one first). `matchValue('NOT')` consumes the NOT token the moment
+  // it sees one, with no lookahead at all - so a `READ ... NOT INVALID KEY
+  // ...` with NEITHER a preceding `AT END` NOR `INVALID KEY` clause (legal
+  // COBOL; every pre-existing corpus program instead pairs INVALID KEY with
+  // NOT INVALID KEY together, cc06's own idiom, which never reaches this
+  // ambiguity) had its NOT token greedily consumed HERE. `ctx.matchValue('AT')`
+  // then fails (the next token is INVALID, not AT), `ctx.matchValue('END')`
+  // fails too, and `parseStatementBlock` runs anyway from that wrong
+  // position - swallowing "INVALID KEY <body>" as if it were a NOT-AT-END
+  // block, leaving the second `if (ctx.matchValue('NOT'))` below with no NOT
+  // token left to find, so the genuine NOT INVALID KEY clause and its
+  // imperative statements vanish entirely (no crash, no marker - gg15's own
+  // repro). Fix: look ahead (peek(1), without consuming NOT) to confirm the
+  // NEXT token is actually AT before treating this as NOT AT END at all -
+  // only then is the NOT token consumed. A `NOT INVALID KEY` (next token
+  // INVALID, not AT) now falls through untouched to the INVALID KEY / NOT
+  // INVALID KEY checks below, exactly where it belongs, whether or not an
+  // AT END/INVALID KEY clause precedes it.
+  if (ctx.checkValue('NOT') && ctx.peek(1)?.value?.toUpperCase() === 'AT') {
+    ctx.advance(); // consume NOT
     ctx.matchValue('AT');
     ctx.matchValue('END');
     stmt.notAtEnd = parseStatementBlock(ctx, ['END-READ']);

@@ -259,7 +259,14 @@ describe('round-30 finding 2 (ff13): occVar reload preserves in-memory state ins
   const scala = scalaOf(src);
 
   test('the content-based occVar rebuild is now gated behind a runtime `if occVar == null` check', () => {
-    assert.match(scala, /if relFileOcc == null then\s+relFileOcc = scala\.collection\.mutable\.ArrayBuffer\.from\(relFileBuf\.map\(_ != "\\u0000" \* \d+\)\)/);
+    // round-31 finding 1 (gg01) added a second disjunct - a length mismatch
+    // between the persisted occVar and the freshly-reloaded bufVar also
+    // triggers a rebuild, since a different logical file sharing the same
+    // physical path may have rewritten the file's actual on-disk shape out
+    // from under this one's own cached occVar - see tests/round31-fixes.test.js
+    // and tests/oracle/README.md's round-31 entry. Still gated behind a
+    // runtime check (not an unconditional rebuild), round-30's own point here.
+    assert.match(scala, /if relFileOcc == null \|\| relFileOcc\.length != relFileBuf\.length then\s+relFileOcc = scala\.collection\.mutable\.ArrayBuffer\.from\(relFileBuf\.map\(_ != "\\u0000" \* \d+\)\)/);
   });
 
   test('CLOSE still never nulls occVar itself (only the record buffer) - the precondition the fix depends on', () => {

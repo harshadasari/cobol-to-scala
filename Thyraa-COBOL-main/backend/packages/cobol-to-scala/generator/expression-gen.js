@@ -7553,7 +7553,39 @@ function writeRecordPlan(recordName, fileName) {
     // `allowTables` false, so it still declines exactly as before this round
     // for that same combination (no corpus program exercises it).
     const allowTables = !!relativeRecordLengthFor(fileName);
-    if (containsNonDisplay || (containsSignedDisplay && !containsTable)) {
+    // round-31 finding 2 (gg05): round-30 finding 3's own `&& !containsTable`
+    // exclusion meant a record combining a SIGNED DISPLAY field with an
+    // UNRELATED OCCURS table (even a plain, non-ODO, fixed-size table of
+    // ordinary DISPLAY elements - REC-ITEM PIC S9(3)V99 OCCURS 3 TIMES,
+    // gg05's own shape) fell straight through to the OLD text-mode paths
+    // below, reproducing round-30 finding 3's own `zonedDecode: non-digit
+    // data` crash for the exact combination that fix was meant to close.
+    // Investigated whether the byte-level case-class codec path
+    // (writeByteLevelLines/groupChildConstructorExpr, this same file) can
+    // actually handle a table here at all: it already can, in full -
+    // case-class-gen.js's generateCaseClass has ALWAYS built a proper
+    // `Vector[...]` field with real per-element zonedEncode/zonedDecode
+    // calls (classifyCodec's `signed` flag is read per-element, from each
+    // table element's own PIC clause, exactly like a non-table elementary
+    // field) for a plain (non-group) OCCURS table of DISPLAY elements,
+    // signed or not - round-30 finding 1's `allowTables` parameter on
+    // groupChildConstructorExpr already contributes such a table's flat
+    // Vector var straight through as a constructor argument. So this is not
+    // a "byte-level path can't handle tables" gap at all for THIS shape - it
+    // is simply that writeRecordPlan's own gating condition never tried,
+    // because `!containsTable` was written before `allowTables` existed.
+    // Dropping that exclusion here (checking `containsSignedDisplay` alone,
+    // matching `containsNonDisplay`'s condition just above) lets a
+    // signed-DISPLAY + table record reach the SAME `allowTables`-gated
+    // ctorArgs call finding 1 already established: still byte mode ONLY for
+    // a RELATIVE-organization file with a determinable maximum record byte
+    // width (the one shape finding 1's own direct cobc probe verified pads
+    // to maximum) - a LINE SEQUENTIAL file (or any other organization) keeps
+    // `allowTables` false, so `ctorArgs` comes back null for that narrower
+    // shape and this combination falls through to the pre-existing
+    // text-mode path below, exactly as before this round (no corpus program
+    // exercises that combination).
+    if (containsNonDisplay || containsSignedDisplay) {
       const ctorArgs = groupChildConstructorExpr(groupKey, allowTables);
       if (ctorArgs != null) {
         return { mode: 'bytes', className: toPascalCase(nameUpper), ctorArgs };
@@ -7568,9 +7600,11 @@ function writeRecordPlan(recordName, fileName) {
         return { mode: 'bytes-unsupported' };
       }
       // else: an all-DISPLAY group where groupChildConstructorExpr still
-      // declined (a FILLER/ambiguous-nested-group child) - fall through to
-      // the pre-existing text-mode path below, unchanged from before this
-      // round for that narrower shape.
+      // declined (a FILLER/ambiguous-nested-group child, or a table child
+      // with allowTables false - a non-RELATIVE file's own signed-DISPLAY +
+      // table combination, round-31 finding 2's own untouched boundary) -
+      // fall through to the pre-existing text-mode path below, unchanged
+      // from before this round for that narrower shape.
     }
 
     const odoExpr = odoDisplayValueExpr(groupKey);

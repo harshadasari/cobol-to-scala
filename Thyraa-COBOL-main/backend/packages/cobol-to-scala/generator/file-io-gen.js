@@ -490,7 +490,32 @@ export function generateOpen(statement, indent = 0) {
         // this generated Scala program never itself launched is out of
         // scope - no corpus program does this, and this single-process
         // simulation model has no concept of "another run" to begin with.)
-        openLines.push(`${bi}if ${occVar} == null then`);
+        // round-31 finding 1 (gg01): round-30's own reasoning above ("nothing
+        // else could have changed the file's bytes in between") silently
+        // assumed this file's own occVar is the ONLY actor touching its
+        // physical path - but this engine builds a SEPARATE bufVar/occVar
+        // per logical file NAME (per SELECT/FD), while cobc allows two
+        // DIFFERENT logical files (two different SELECT/FD entries) to be
+        // ASSIGNed to the SAME physical path. If a DIFFERENT logical file
+        // (gg01's FILE-B) opens OUTPUT and rewrites that shared path with
+        // different content/size while THIS logical file (FILE-A) is
+        // closed, FILE-A's own persisted occVar is stale the moment it
+        // reopens - it reflects a shape some other actor already
+        // overwrote, not the file's genuine current shape - so trusting it
+        // unconditionally (round-30's `== null` check alone) can index it
+        // out of bounds against the freshly-reloaded bufVar (correctly
+        // sized to the NEW on-disk content) or silently misreport
+        // occupied/gap slots that no longer correspond to anything real.
+        // The freshly-reloaded bufVar's own record count is always
+        // trustworthy (it comes straight off disk, right above) - comparing
+        // it against the persisted occVar's own length is exactly the
+        // signal that tells "this is genuinely the same file this occVar
+        // was tracking" (lengths match - keep round-30's reuse, the common
+        // case) apart from "some other actor changed this file's physical
+        // shape since we last saw it" (lengths differ - occVar can no
+        // longer be trusted at all, so rebuild from content exactly as if
+        // this were a true first open).
+        openLines.push(`${bi}if ${occVar} == null || ${occVar}.length != ${bufVar}.length then`);
         openLines.push(`${bi}  ${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_ != "\\u0000" * ${recLen}))`);
       } else {
         const srcVar = `_${toCamelCase(fileName)}Src`;
@@ -508,7 +533,13 @@ export function generateOpen(statement, indent = 0) {
         // genuinely null (this file's first open in this run); a later
         // reopen keeps the already-accurate in-memory answer instead of
         // re-deriving an ambiguous one from a genuinely-blank record's bytes.
-        openLines.push(`${bi}if ${occVar} == null then`);
+        //
+        // round-31 finding 1: same cross-logical-file staleness guard as the
+        // recLen branch above, for consistency - a stale occVar whose OWN
+        // length no longer matches the freshly-reloaded bufVar (a different
+        // logical file sharing this physical path rewrote it while this one
+        // was closed) is rebuilt from content instead of trusted verbatim.
+        openLines.push(`${bi}if ${occVar} == null || ${occVar}.length != ${bufVar}.length then`);
         openLines.push(`${bi}  ${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_.nonEmpty))`);
         openLines.push(`${bi}${srcVar}.close()`);
       }

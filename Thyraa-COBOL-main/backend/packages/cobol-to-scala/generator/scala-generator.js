@@ -519,23 +519,6 @@ function getFileSectionFiles(ast) {
   return ast.dataItems?.fileSection?.files || ast.data?.fileSection?.files || [];
 }
 
-/**
- * round-29 finding 5 safety guard: true when `item` (or any child/descendant
- * of it, at any nesting depth) declares an OCCURS ... DEPENDING ON clause -
- * consulted before treating an FD record as having a "determinable, uniform
- * fixed byte width" for relativeRecordLengthRegistry (see that registry's
- * own doc comment at its build site for the full rationale: an ODO record's
- * real WRITE writes a variable-length concatenation driven by the live
- * counter, round-10 finding 4's odoDisplayValueExpr, not always the maximum
- * occursCount/itemByteLength assumes for byte-level LAYOUT purposes
- * elsewhere).
- */
-function hasOccursDependingOn(item) {
-  if (!item) return false;
-  if (item.occurs && item.occurs.dependingOn) return true;
-  const children = Array.isArray(item.children) ? item.children : [];
-  return children.some(child => !isLevel(child, 88) && hasOccursDependingOn(child));
-}
 
 /**
  * Collect every 01-level item in the LINKAGE SECTION, regardless of parser
@@ -3540,22 +3523,50 @@ export function generateScala(ast, options = {}) {
     if (String(fc.organization || '').toUpperCase() === 'RELATIVE') {
       const fdFile = fdFilesByName.get(fnameUpper);
       const record = fdFile && Array.isArray(fdFile.records) ? fdFile.records[0] : null;
-      // round-29 finding 5 safety guard: itemByteLength's own occursCount
+      // round-29 finding 5 ORIGINALLY guarded this registry with
+      // `!hasOccursDependingOn(record)` - itemByteLength's own occursCount
       // helper (layout.js) always uses an OCCURS ... DEPENDING ON item's
-      // MAXIMUM count (so BYTE-LEVEL LAYOUT offsets stay fixed) - but this
-      // registry's own contract is stronger: EVERY record actually written
-      // to this file must be genuinely, uniformly `recLen` bytes wide, and
-      // an ODO record's own real WRITE (odoDisplayValueExpr, round-10
-      // finding 4) deliberately writes a VARIABLE-length concatenation
-      // driven by the field's own LIVE counter value, not always the
-      // maximum. Treating such a record as "fixed length" here would
-      // silently misalign fixedWidthLoadLines' own byte-chunking the
-      // instant a real ODO record's live count differs from the max (dd11/
-      // ee12's own shape) - a regression this round must not introduce.
-      // `hasOccursDependingOn` declines (recLen treated as 0, keeping the
-      // pre-existing line-delimited model) for any such record, at any
-      // nesting depth.
-      const recLen = record && !hasOccursDependingOn(record) ? itemByteLength(record) : 0;
+      // MAXIMUM count (so BYTE-LEVEL LAYOUT offsets stay fixed), but round-29
+      // reasoned an ODO record's own real WRITE (odoDisplayValueExpr, round-10
+      // finding 4) writes a VARIABLE-length concatenation driven by the
+      // field's own LIVE counter value, not always the maximum - so treating
+      // such a record as "fixed length" here would misalign
+      // fixedWidthLoadLines' own byte-chunking whenever a live count
+      // differed from the max, and declined (recLen treated as 0, keeping
+      // the OLD line-delimited model) for any such record instead.
+      //
+      // round-30 finding 1 (ff01): that reasoning left EVERY ODO-bearing
+      // RELATIVE record on the OLD, line-delimited reader/writer - including
+      // one that ALSO has an unrelated binary/float field elsewhere in the
+      // SAME record, reintroducing round-29's own embedded-0x0A-byte
+      // corruption bug for exactly that combination. Investigated (and
+      // compiler-verified) against installed GnuCOBOL what a real ODO
+      // record's own on-disk RELATIVE-file representation actually does: a
+      // direct probe (two records, live counts 2 and 3 of a 1-to-3 OCCURS
+      // DEPENDING ON table) showed cobc's own per-slot byte layout is a
+      // fixed MAXIMUM width regardless of the live count - the record's own
+      // trailing (beyond-live-count) table elements are genuinely present on
+      // disk (as leftover/whatever bytes were last stored there, e.g.
+      // literal spaces for a never-yet-written element), not omitted or
+      // length-prefixed the way round-29 assumed. So the ORIGINAL "ODO
+      // records don't have a determinable fixed width" premise was true only
+      // for this engine's own OLD write path (odoDisplayValueExpr's
+      // variable-length text) - the record's real MAXIMUM byte width
+      // (itemByteLength, unchanged - occursCount already computes this) is
+      // exactly the right, determinable `recLen` for cobc's own fixed-slot
+      // format too. `writeRecordPlan`'s own `plainRecordTextExpr` call already
+      // pads a variable-length ODO text-mode WRITE up to `recLen` via
+      // `CobolFmt.fitLeft` whenever this registry has an entry (pre-existing
+      // code, unconditionally reused - no changes needed there), so simply
+      // removing the `hasOccursDependingOn` guard here is enough to pad
+      // every ODO-only (no non-DISPLAY sibling) RELATIVE record to cobc's own
+      // real max-width slot size automatically. A record that ALSO contains
+      // a non-DISPLAY sibling field (ff01's own shape) additionally needs
+      // `groupChildConstructorExpr`'s own new `allowTables` parameter
+      // (expression-gen.js) to round-trip through the byte-accurate
+      // case-class codec instead of declining outright - see that function's
+      // own doc comment.
+      const recLen = record ? itemByteLength(record) : 0;
       if (recLen > 0) relativeRecordLengthRegistry.set(fnameUpper, recLen);
     }
   }

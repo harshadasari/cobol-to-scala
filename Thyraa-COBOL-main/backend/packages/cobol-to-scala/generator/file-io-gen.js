@@ -466,7 +466,32 @@ export function generateOpen(statement, indent = 0) {
         // real chunk here is always exactly `recLen` characters wide, so an
         // empty string can no longer occur at all once loaded through
         // fixedWidthLoadLines.
-        openLines.push(`${bi}${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_ != "\\u0000" * ${recLen}))`);
+        //
+        // round-30 finding 2 (ff13): this content-based heuristic is
+        // FUNDAMENTALLY ambiguous for a genuinely-written all-zero-byte
+        // record (e.g. a COMP-1 field holding 0.0F encodes to 4 zero bytes) -
+        // indistinguishable, from content alone, from a slot that was never
+        // written at all. Rebuilding `occVar` from disk content EVERY time
+        // this file is opened discards a perfectly accurate answer this
+        // SAME running program may already have in memory from an EARLIER
+        // open/close cycle in this same run (occVar is never nulled by
+        // CLOSE - only bufVar is, see generateClose) - only rebuild from
+        // content when `occVar` is genuinely null (this file's occupied-slot
+        // state has never been established in this run before: its very
+        // first OPEN, whether that is OPEN OUTPUT of a brand new file or
+        // OPEN INPUT/I-O of a file this program did not itself just create).
+        // Once occVar exists, a later close+reopen of the SAME file within
+        // the SAME run cannot have had its on-disk bytes changed by anything
+        // other than this program's own WRITE/REWRITE/DELETE - all of which
+        // already keep occVar exactly in sync - so reusing it verbatim is
+        // not a heuristic at all, it is the literal ground truth, sidestepping
+        // the content-based ambiguity entirely rather than guessing around
+        // it. (A file genuinely modified between runs by some OTHER process
+        // this generated Scala program never itself launched is out of
+        // scope - no corpus program does this, and this single-process
+        // simulation model has no concept of "another run" to begin with.)
+        openLines.push(`${bi}if ${occVar} == null then`);
+        openLines.push(`${bi}  ${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_ != "\\u0000" * ${recLen}))`);
       } else {
         const srcVar = `_${toCamelCase(fileName)}Src`;
         openLines.push(`${bi}val ${srcVar} = scala.io.Source.fromFile(${fileVar})(scala.io.Codec.ISO8859)`);
@@ -477,7 +502,14 @@ export function generateOpen(statement, indent = 0) {
         // gap slot (see toOccVarName's own doc comment) - so a gap a program
         // creates, closes, and reopens (cc01's own shape) still reads back as a
         // gap, not as a legitimate (blank) record.
-        openLines.push(`${bi}${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_.nonEmpty))`);
+        //
+        // round-30 finding 2: same reload-preservation fix as the recLen
+        // branch just above - only rebuild from content when occVar is
+        // genuinely null (this file's first open in this run); a later
+        // reopen keeps the already-accurate in-memory answer instead of
+        // re-deriving an ambiguous one from a genuinely-blank record's bytes.
+        openLines.push(`${bi}if ${occVar} == null then`);
+        openLines.push(`${bi}  ${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_.nonEmpty))`);
         openLines.push(`${bi}${srcVar}.close()`);
       }
       openLines.push(`${bi}${posVar} = 0`);

@@ -3055,6 +3055,24 @@ function renderVariableMoveSource(source, info) {
         : sourceInfo?.scalaType === 'String'
           ? `CobolFmt.numval(${rawExpr})`
           : `BigDecimal(${rawExpr})`;
+    // round-30 (ff09 companion gap): a COMP-1/COMP-2 (Float/Double) MOVE
+    // target has no PIC clause at all, so intDigits/decDigits above are just
+    // this function's own `18`/`0` fallback defaults, not a real declared
+    // digit width - CobolFmt.truncNumeric's digit-truncation is meaningless
+    // for it (COMP-1/COMP-2 are genuine binary floating point) and silently
+    // discarded the ENTIRE fractional part before this fix (decDigits=0
+    // truncated `12.25` to `12`, then the final `.toInt` fallback below
+    // dropped it to an Int besides - `MOVE IN-VAL TO SORT-KEY-F`, ff09,
+    // silently became integer 30/-12/7/0/99 instead of the real
+    // 30.5/-12.25/7.0/-0.12/99.75). storeNumericByInfo (COMPUTE/ADD/
+    // SUBTRACT/etc, round-7 findings 2/3) already carries this exact
+    // Float/Double special case - renderVariableMoveSource (the separate,
+    // MOVE-only code path) had simply never been audited against it, the
+    // same recurring "a numeric convention gets built and never re-checked
+    // against COMP-1/COMP-2" gap shape round-29's own entry already
+    // documented four instances of.
+    if (info.scalaType === 'Float') return `(${asBD}).toFloat`;
+    if (info.scalaType === 'Double') return `(${asBD}).toDouble`;
     const truncated = `CobolFmt.truncNumeric(${asBD}, ${intDigits}, ${decDigits})`;
     if (info.scalaType === 'BigDecimal') return truncated;
     if (info.scalaType === 'Long') return `${truncated}.toLong`;
@@ -5641,6 +5659,72 @@ function groupContainsNonDisplay(groupKey) {
 }
 
 /**
+ * round-30 finding 3: true when `groupKey`'s own children (recursing into
+ * nested groups, exactly like groupContainsNonDisplay above) include an
+ * OCCURS table anywhere (fixed-size OR OCCURS ... DEPENDING ON - both are
+ * TABLE_REGISTRY entries, and both are shapes groupChildConstructorExpr can
+ * never safely turn into a byte-mode case-class constructor arg: a case
+ * class's own format() always writes a table at its fixed MAX width, wrong
+ * for an ODO table's live/variable length, and the concatenation-order
+ * text-mode path (odoDisplayValueExpr) already correctly handles a table's
+ * own repeated-element rendering that byte mode has no equivalent for).
+ * Drives writeRecordPlan's mode selection alongside groupContainsNonDisplay:
+ * a table anywhere in the group means byte mode must not even be attempted,
+ * exactly like before this round (see writeRecordPlan's own updated doc
+ * comment for the full decision table).
+ */
+function groupContainsTable(groupKey) {
+  const children = GROUP_REGISTRY.get(groupKey);
+  if (!children || children.length === 0) return false;
+  for (const c of children) {
+    if (c.isRedefines) continue;
+    if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) return true;
+    if (c.groupKey && groupContainsTable(c.groupKey)) return true;
+  }
+  return false;
+}
+
+/**
+ * round-30-regression-fix (over-triggering scope narrow): true when
+ * `groupKey`'s own children (recursing into nested groups, exactly like
+ * groupContainsNonDisplay/groupContainsTable above) include at least one
+ * SIGNED numeric DISPLAY field anywhere - `info.signed` (set from the PIC
+ * clause's own `S`, or an explicit SIGN IS clause) on a plain DISPLAY
+ * elementary child. This is the ONLY shape where groupDisplayValueExpr's
+ * text convention (a literal '+'/'-' marker byte) genuinely disagrees with
+ * cobc's real on-disk representation (default trailing zoned-overpunch,
+ * folded into the last digit's own zone nibble - no extra byte, no literal
+ * sign character at all) and with this same record's generated `.parse()`
+ * (CobolCodecs.zonedDecode) on the READ side - see writeRecordPlan's mode
+ * decision below and case-class-gen.js's zonedDecode/zonedEncode. An
+ * UNSIGNED DISPLAY numeric field's on-disk bytes ARE just its plain digit
+ * text (real cobc never overpunches an unsigned field), so
+ * groupDisplayValueExpr's plain-digit-text rendering is already byte-
+ * identical to zonedDecode's expectations for it - routing an
+ * all-unsigned-DISPLAY (or pure-alphanumeric) group through the byte-level
+ * case-class codec path instead is unnecessary AND was the actual
+ * regression this function fixes: `groupContainsTable(groupKey) === false`
+ * is true for the overwhelming majority of ordinary FD records (any group
+ * with no OCCURS table at all, signed or not), so gating byte mode on
+ * `!containsTable` alone (round-30 finding 3's original condition) forced
+ * EVERY plain unsigned-DISPLAY (and pure-alphanumeric) record without a
+ * table onto the byte-level path too - observed breaking round10-fixes.test.js
+ * (Finding 3b regression guard), round26-fixes.test.js (bb13), and
+ * round29-fixes.test.js (ee06), all of which have an ordinary UNSIGNED
+ * DISPLAY numeric field (or no numeric field at all) and no OCCURS table.
+ */
+function groupContainsSignedDisplay(groupKey) {
+  const children = GROUP_REGISTRY.get(groupKey);
+  if (!children || children.length === 0) return false;
+  for (const c of children) {
+    if (c.isRedefines) continue;
+    if (c.groupKey && groupContainsSignedDisplay(c.groupKey)) return true;
+    if (!c.groupKey && c.info && c.info.signed) return true;
+  }
+  return false;
+}
+
+/**
  * Builds the `<Child1>, <Child2>, ...` constructor-argument list needed to
  * instantiate this group's own generated case class from its CURRENT flat-var
  * values (`<ClassName>(<args>)`), for writeByteLevelLines's `.format(...)`
@@ -5650,19 +5734,38 @@ function groupContainsNonDisplay(groupKey) {
  * a nested group child recurses into its own constructor call
  * (`<NestedClassName>(<nested-args>)`).
  *
+ * `allowTables` (round-30 finding 1, default false - every pre-existing call
+ * site's behavior is unchanged): when true, an OCCURS table child
+ * (TABLE_REGISTRY) is treated exactly like any other plain elementary child -
+ * its own flat Vector var (`c.camel`) is contributed directly, unchanged,
+ * as the constructor argument. This is safe whenever it's used: the flat var
+ * backing a table (fixed-size OR OCCURS ... DEPENDING ON alike) is ALWAYS a
+ * full MAXIMUM-size Vector (e.g. `Vector.fill(3)(...)`, updated in place via
+ * `.updated(i, ...)` per subscripted MOVE - never resized) - the exact same
+ * Vector shape/width the generated case class's own table field already
+ * expects, so passing it straight through needs no special-casing at all.
+ * Before this round, EVERY caller left `allowTables` at its default `false`
+ * (the parameter didn't exist) - `writeRecordPlan` only turns it `true` for a
+ * RELATIVE-organization file with a determinable MAXIMUM record byte width
+ * (`relativeRecordLengthFor` - see that function's own doc comment), because
+ * that is the ONE case a direct GnuCOBOL probe (see scala-generator.js's
+ * relativeRecordLengthRegistry build site) confirmed pads an ODO table's own
+ * on-disk storage to its declared MAXIMUM width regardless of the table's
+ * live/current count - exactly what unconditionally serializing the full
+ * flat Vector already does. A LINE SEQUENTIAL file (or any other org this
+ * hasn't been verified for) keeps `allowTables` false, so it still declines
+ * (returns `null` below) exactly as before this round - the pre-existing,
+ * oracle-verified text-mode path (odoDisplayValueExpr, writeRecordPlan's own
+ * fallback) still handles those.
+ *
  * Returns `null` (not a guessed/wrong constructor call) for any shape this
  * can't safely build - a FILLER child (no established flat-var <-> case-class
  * constructor-slot correspondence, same restriction generateGroupMove's own
- * differing-layout path already documents), an OCCURS table child (fixed or
- * ODO - a case class's own `format()` always writes the table at its FIXED
- * max width, which is exactly wrong for an ODO table's variable-length WRITE;
- * combining COMP-3/binary fields with an OCCURS table in the same record is
- * consequently left as an honest, visible TODO rather than a silently wrong
- * byte layout - see writeRecordPlan), a nested group whose case-class name is
- * ambiguous across two different records, or a child with no registry info
- * at all.
+ * differing-layout path already documents), an OCCURS table child when
+ * `allowTables` is false, a nested group whose case-class name is ambiguous
+ * across two different records, or a child with no registry info at all.
  */
-function groupChildConstructorExpr(groupKey) {
+function groupChildConstructorExpr(groupKey, allowTables = false) {
   const children = GROUP_REGISTRY.get(groupKey);
   if (!children || children.length === 0) return null;
 
@@ -5674,11 +5777,11 @@ function groupChildConstructorExpr(groupKey) {
     // must not contribute a constructor argument for it either.
     if (c.isRedefines) continue;
     if (c.isFiller) return null;
-    if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper)) return null;
+    if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper) && !allowTables) return null;
     if (c.groupKey) {
       const nestedClassName = toPascalCase(c.nameUpper);
       if (AMBIGUOUS_GROUP_CLASS_NAMES.has(nestedClassName)) return null;
-      const nestedArgs = groupChildConstructorExpr(c.groupKey);
+      const nestedArgs = groupChildConstructorExpr(c.groupKey, allowTables);
       if (nestedArgs == null) return null;
       parts.push(`${nestedClassName}(${nestedArgs})`);
       continue;
@@ -7377,7 +7480,7 @@ function writeFromLiteralPlan(literal, recordName) {
   return { mode: 'text', expr: renderLiteralForTarget(literal, syntheticInfo) };
 }
 
-function writeRecordPlan(recordName) {
+function writeRecordPlan(recordName, fileName) {
   const info = lookupField(recordName);
   if (info) {
     const camel = info.camel;
@@ -7392,13 +7495,84 @@ function writeRecordPlan(recordName) {
   const groupKey = resolveGroupKey(nameUpper);
   const isGroup = GROUP_REGISTRY.has(groupKey) && !AMBIGUOUS_GROUP_CLASS_NAMES.has(toPascalCase(nameUpper));
 
-  if (isGroup && groupContainsNonDisplay(groupKey)) {
-    const ctorArgs = groupChildConstructorExpr(groupKey);
-    if (ctorArgs == null) return { mode: 'bytes-unsupported' };
-    return { mode: 'bytes', className: toPascalCase(nameUpper), ctorArgs };
-  }
-
   if (isGroup) {
+    const containsTable = groupContainsTable(groupKey);
+    const containsNonDisplay = groupContainsNonDisplay(groupKey);
+    // round-30-regression-fix: see groupContainsSignedDisplay's own doc
+    // comment - this is the ONLY all-DISPLAY shape where byte mode is
+    // actually required (the field's default trailing-overpunch on-disk
+    // representation differs from its plain digit text). An all-unsigned
+    // (or pure-alphanumeric) group with no OCCURS table keeps the original,
+    // pre-round-30 text-concatenation + stripTrailing() WRITE path below
+    // instead - its plain-digit-text rendering is already byte-identical to
+    // what a real cobc WRITE of an unsigned DISPLAY field (or plain
+    // alphanumeric text) produces, so no byte-level codec detour is needed.
+    const containsSignedDisplay = groupContainsSignedDisplay(groupKey);
+
+    // round-30 finding 3: a plain, all-DISPLAY group with NO OCCURS table
+    // anywhere that has at least one SIGNED DISPLAY field (ff09/ff14's own
+    // shape - e.g. `01 FF-REC. 05 FF-ID PIC 9(2). 05 FF-VAL PIC S9(3)V99.`)
+    // used to fall straight through to the text-mode paths below
+    // (groupDisplayValueExpr, since groupContainsNonDisplay was false) - but
+    // readDestination's own 'group' READ path (below, shared by every FD
+    // group whose children are all plain elementary fields, DISPLAY or not)
+    // ALWAYS decodes back through this exact same record's real generated
+    // `.parse()` (CobolCodecs.zonedDecode for a signed DISPLAY child among
+    // others - see case-class-gen.js). Writing groupDisplayValueExpr's OWN
+    // separate text convention instead - a literal '+'/'-' marker BYTE
+    // prepended before the unsigned digit text (round-9 finding 2, built for
+    // the CALL BY REFERENCE marshalling channel, not file I/O) - is one byte
+    // too wide for the field's real declared PICTURE width and uses an
+    // encoding zonedDecode was never built to read back, corrupting every
+    // byte position after it and crashing on the very next signed DISPLAY
+    // field read back (`zonedDecode: non-digit data in ...`). Attempting the
+    // SAME byte-accurate case-class codec (.format()/.parse()) WRITE and
+    // READ both already use whenever a non-DISPLAY field forces it keeps
+    // the two sides symmetric for the signed-DISPLAY case too. An
+    // UNSIGNED-only (or pure-alphanumeric) all-DISPLAY group - the
+    // overwhelming majority of ordinary FD records - is unaffected: its
+    // plain digit text already round-trips correctly through zonedDecode
+    // with no overpunch involved at all, so it stays on the original
+    // text-mode path below exactly as before round-30.
+    //
+    // round-30 finding 1 (ff01): an OCCURS table anywhere (fixed or ODO)
+    // still blocks byte mode by default (groupChildConstructorExpr's own
+    // `allowTables` defaults false) - EXCEPT for a RELATIVE-organization
+    // file with a determinable MAXIMUM record byte width
+    // (relativeRecordLengthFor - see scala-generator.js's
+    // relativeRecordLengthRegistry doc comment for the direct GnuCOBOL probe
+    // that confirmed cobc's own on-disk RELATIVE-file format pads an ODO
+    // table to its declared maximum width regardless of live count, exactly
+    // like an ordinary fixed-size table already does) - allowing byte mode
+    // there too is what actually fixes ff01 (a COMP-2 field sharing a record
+    // with an ODO table): the pre-round-30 code declined the WHOLE record as
+    // 'bytes-unsupported' (a silent WRITE no-op) the instant ANY non-DISPLAY
+    // field combined with ANY table, without regard for whether the file's
+    // own organization actually made a fixed-width byte layout safe. A
+    // LINE SEQUENTIAL file (relativeRecordLengthFor null) keeps
+    // `allowTables` false, so it still declines exactly as before this round
+    // for that same combination (no corpus program exercises it).
+    const allowTables = !!relativeRecordLengthFor(fileName);
+    if (containsNonDisplay || (containsSignedDisplay && !containsTable)) {
+      const ctorArgs = groupChildConstructorExpr(groupKey, allowTables);
+      if (ctorArgs != null) {
+        return { mode: 'bytes', className: toPascalCase(nameUpper), ctorArgs };
+      }
+      if (containsNonDisplay) {
+        // A non-DISPLAY field's true byte layout has no honest plain-text
+        // representation at all (round-10 finding 3) - decline visibly
+        // (FILLER/ambiguous-nested-group/etc got in the way of the
+        // constructor call) rather than silently fall through to
+        // groupDisplayValueExpr's ASCII-digit-text convention, which would
+        // write bytes no real cobc WRITE of this record could ever produce.
+        return { mode: 'bytes-unsupported' };
+      }
+      // else: an all-DISPLAY group where groupChildConstructorExpr still
+      // declined (a FILLER/ambiguous-nested-group child) - fall through to
+      // the pre-existing text-mode path below, unchanged from before this
+      // round for that narrower shape.
+    }
+
     const odoExpr = odoDisplayValueExpr(groupKey);
     if (odoExpr) return { mode: 'text', expr: `(${odoExpr})` };
     const groupExpr = groupDisplayValueExpr(groupKey);
@@ -7596,7 +7770,7 @@ function generateWriteStatement(statement, indent = 0) {
     ? writeFromLiteralPlan(statement.from, recordName)
     : null;
   const sourceName = statement.from ? (statement.from.name || statement.from) : recordName;
-  const plan = literalPlan || writeRecordPlan(sourceName);
+  const plan = literalPlan || writeRecordPlan(sourceName, fileName);
   // round-6 finding 2/3 companion: this generator never models a WRITE
   // failure path, so a registered FILE STATUS field always goes to "00"
   // (successful write) here - see FILE_STATUS_REGISTRY's doc comment.
@@ -7799,7 +7973,7 @@ function generateRewriteStatement(statement, indent = 0) {
     ? writeFromLiteralPlan(statement.from, recordNameRaw)
     : null;
   const sourceName = statement.from ? (statement.from.name || statement.from) : recordNameRaw;
-  const plan = literalPlan || writeRecordPlan(sourceName);
+  const plan = literalPlan || writeRecordPlan(sourceName, fileName);
 
   if (plan.mode === 'bytes-unsupported') {
     return (

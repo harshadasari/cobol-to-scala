@@ -532,19 +532,33 @@ describe('round-29 finding 7 (ee06): RELATIVE-file storage reads/writes raw fixe
     assert.doesNotMatch(lineSeqScala, /readAllBytes/);
   });
 
-  // round-29 finding 5 safety-guard regression test: caught (and fixed) DURING
-  // this round's own testing - itemByteLength's own occursCount helper always
-  // uses an OCCURS ... DEPENDING ON item's MAXIMUM count (so BYTE-LEVEL LAYOUT
-  // offsets stay fixed), so a naive "does itemByteLength return > 0" check
-  // would have wrongly treated an ODO record as having a determinable UNIFORM
-  // fixed width - but a real ODO record's own WRITE (odoDisplayValueExpr,
-  // round-10 finding 4) writes a VARIABLE-length concatenation driven by the
-  // field's own LIVE counter, not always the maximum, which would silently
-  // misalign the new fixed-width byte-chunking model (dd11/ee12's own shape -
-  // both combine OCCURS DEPENDING ON with RELATIVE organization) the instant a
-  // live count differs from the max. `hasOccursDependingOn` (scala-generator.js)
-  // guards against this at any nesting depth.
-  test('regression: a RELATIVE-organization file whose FD record contains an OCCURS ... DEPENDING ON child keeps the pre-existing getLines()/println text-line model (NOT the fixed-width one)', () => {
+  // round-29 finding 5 safety-guard regression test: originally caught (and
+  // fixed) DURING round-29's own testing - itemByteLength's own occursCount
+  // helper always uses an OCCURS ... DEPENDING ON item's MAXIMUM count (so
+  // BYTE-LEVEL LAYOUT offsets stay fixed), so a naive "does itemByteLength
+  // return > 0" check would have wrongly treated an ODO record as having a
+  // determinable UNIFORM fixed width before round-29 could actually pad a
+  // live-count-driven WRITE up to that width - round-29 sidestepped the gap
+  // by declining (via `hasOccursDependingOn`) rather than risk misaligning
+  // the fixed-width byte-chunking model (dd11/ee12's own shape - both
+  // combine OCCURS DEPENDING ON with RELATIVE organization).
+  //
+  // round-30 finding 1 (ff01) closed that gap for real: a direct GnuCOBOL
+  // probe confirmed cobc's own on-disk RELATIVE-file format pads an ODO
+  // table's un-lived tail to its declared MAXIMUM width regardless of live
+  // count - so `hasOccursDependingOn`'s guard on
+  // `relativeRecordLengthRegistry` (scala-generator.js) was removed
+  // entirely, and `writeRecordPlan`'s own pre-existing `CobolFmt.fitLeft`
+  // padding (already unconditionally applied whenever this registry has an
+  // entry) now pads every ODO RELATIVE record - WITH or WITHOUT an unrelated
+  // non-DISPLAY sibling field - up to cobc's own real maximum-width slot,
+  // matching cobc byte-for-byte. This ODO-only (no non-DISPLAY sibling)
+  // shape now correctly uses the SAME fixed-width byte-chunk model as any
+  // other RELATIVE record, not the old line-delimited one - see
+  // tests/round30-fixes.test.js's own finding-1 coverage (including the
+  // still-unaffected LINE SEQUENTIAL ODO regression case) and
+  // tests/oracle/README.md's round-30 write-up for the full verification.
+  test('round-30 finding 1: a RELATIVE-organization file whose FD record contains an OCCURS ... DEPENDING ON child now ALSO uses the fixed-width byte-chunk model (padded to its declared maximum width), matching cobc\'s own real on-disk layout', () => {
     const odoSrc = `       IDENTIFICATION DIVISION.
        PROGRAM-ID. EE06ODOGUARD.
        ENVIRONMENT DIVISION.
@@ -571,7 +585,8 @@ describe('round-29 finding 7 (ee06): RELATIVE-file storage reads/writes raw fixe
            CLOSE ODO-FILE.
 `;
     const odoScala = scalaOf(odoSrc);
-    assert.match(odoScala, /odoFileIterator = odoFileReader\.getLines\(\)/);
-    assert.doesNotMatch(odoScala, /readAllBytes/);
+    assert.match(odoScala, /odoFileIterator = odoFileChunks\.iterator/);
+    assert.match(odoScala, /Files\.readAllBytes/);
+    assert.doesNotMatch(odoScala, /odoFileReader\.getLines\(\)/);
   });
 });

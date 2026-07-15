@@ -221,6 +221,78 @@ object CobolCodecs:
       result
 
   // ==========================================================================
+  // Floating point (COMP-1 / COMP-2)
+  //
+  // round-28 finding 3: real IEEE-754 binary float (COMP-1, 4 bytes)/double
+  // (COMP-2, 8 bytes) encode/decode - see generator/codecs.js's identical
+  // section for the full rationale (no byte-level codec existed for these
+  // USAGEs at all before this round; case-class-gen.js's legacyEncodeExpr/
+  // legacyDecodeExpr text-truncation shortcut silently corrupted precision on
+  // an actual file-record round trip).
+  //
+  // Byte ORDER is HOST-NATIVE (little-endian on x86_64), exactly like COMP-5
+  // (see binaryEncode/binaryDecode above) - NOT the big-endian default
+  // COMP/COMP-4/BINARY use. Compiler-verified directly against installed
+  // GnuCOBOL: a COMP-1 field holding 3.5 wrote bytes `00 00 60 40` and a
+  // COMP-2 field holding 2.25 wrote `00 00 00 00 00 00 02 40` - each the exact
+  // byte-reverse of the standard big-endian IEEE-754 bit pattern
+  // (0x40600000/0x4002000000000000) - confirmed again with -7.125 (COMP-1)
+  // and 100.5 (COMP-2), so this is host-native byte order, not a coincidence
+  // of the specific test value.
+  // ==========================================================================
+
+  /**
+   * Encode a Float as COMP-1 bytes (IEEE-754 single precision, 4 bytes,
+   * host-native/little-endian byte order - see this section's own doc comment).
+   */
+  def floatEncode(value: Float): Array[Byte] =
+    val bits = java.lang.Float.floatToIntBits(value)
+    Array(
+      (bits & 0xff).toByte,
+      ((bits >> 8) & 0xff).toByte,
+      ((bits >> 16) & 0xff).toByte,
+      ((bits >> 24) & 0xff).toByte
+    )
+
+  /**
+   * Decode COMP-1 bytes (IEEE-754 single precision, 4 bytes, host-native/
+   * little-endian byte order) to a Float.
+   */
+  def floatDecode(bytes: Array[Byte]): Float =
+    require(bytes.length == 4, s"floatDecode: expected 4 bytes (COMP-1), got ${bytes.length}")
+    val bits =
+      (bytes(0) & 0xff) | ((bytes(1) & 0xff) << 8) | ((bytes(2) & 0xff) << 16) | ((bytes(3) & 0xff) << 24)
+    java.lang.Float.intBitsToFloat(bits)
+
+  /**
+   * Encode a Double as COMP-2 bytes (IEEE-754 double precision, 8 bytes,
+   * host-native/little-endian byte order - see this section's own doc comment).
+   */
+  def doubleEncode(value: Double): Array[Byte] =
+    val bits = java.lang.Double.doubleToLongBits(value)
+    val bytes = new Array[Byte](8)
+    var i = 0
+    while i < 8 do
+      bytes(i) = ((bits >> (8 * i)) & 0xffL).toByte
+      i += 1
+    end while
+    bytes
+
+  /**
+   * Decode COMP-2 bytes (IEEE-754 double precision, 8 bytes, host-native/
+   * little-endian byte order) to a Double.
+   */
+  def doubleDecode(bytes: Array[Byte]): Double =
+    require(bytes.length == 8, s"doubleDecode: expected 8 bytes (COMP-2), got ${bytes.length}")
+    var bits = 0L
+    var i = 0
+    while i < 8 do
+      bits = bits | ((bytes(i) & 0xffL) << (8 * i))
+      i += 1
+    end while
+    java.lang.Double.longBitsToDouble(bits)
+
+  // ==========================================================================
   // Zoned Decimal (DISPLAY numeric) with sign overpunch
   //
   // One byte per digit. Unsigned fields (and non-sign digit positions of

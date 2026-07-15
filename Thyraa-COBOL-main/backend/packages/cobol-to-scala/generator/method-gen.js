@@ -1086,6 +1086,96 @@ export function generateProgramFlowLinesNested(units, indent, ambiguousNames) {
 }
 
 /**
+ * round-28 finding 1: a RECURSIVE program's own DECLARATIVES `USE AFTER
+ * STANDARD ERROR PROCEDURE` handler method(s) need the EXACT SAME nested-
+ * local-def treatment generateProgramFlowLinesNested already gives every
+ * ORDINARY paragraph reachable from entry() - see that function's own doc
+ * comment (and generateRecursiveEntryMethod's, scala-generator.js) for why a
+ * RECURSIVE program cannot use shared module-level state for its own LINKAGE
+ * SECTION parameter(s).
+ *
+ * Before this fix, scala-generator.js's generateDeclarativeSupport /
+ * generateDeclarativeMethodBodies ALWAYS compiled a DECLARATIVES handler as a
+ * flat TOP-LEVEL method (round-10's original, non-recursive-aware
+ * convention) that reads/writes whatever module-level `var` a LINKAGE item
+ * resolves to for a non-recursive program. For a RECURSIVE program that
+ * module-level var is never actually assigned by any real activation (every
+ * ordinary paragraph, nested inside entry() via generateProgramFlowLinesNested,
+ * closes over that ONE call's own getter/setter closures instead - see
+ * generateRecursiveEntryMethod) - so the flat top-level handler method, called
+ * by its own bare name from file-io-gen.js's/expression-gen.js's
+ * declarativeHandlerFor dispatch (`${handlerMethod}()`), always read the
+ * LINKAGE item's stale, never-updated default value instead of the CURRENT
+ * activation's real one (dd02: `HANDLER-FIRED AT DEPTH=02` expected, but the
+ * flat method could only ever see LS-DEPTH's default `00`).
+ *
+ * Fixed by generating a SECOND, nested-local counterpart per ERROR-kind
+ * DECLARATIVES SECTION directly inside entry()'s own body (called from
+ * generateRecursiveEntryMethod, alongside the nested ordinary-paragraph defs
+ * and PERFORM-THRU wrapper defs) - named IDENTICALLY to the flat top-level
+ * method (`toMethodName(decl.name)`, matching collectDeclarativeHandlers'
+ * own registered name exactly), so Scala's ordinary lexical shadowing rules
+ * resolve every `${handlerMethod}()` call made from within one of THIS
+ * activation's own nested paragraph defs to THIS nested version - closing
+ * over the same per-call getter/setter closures every other nested paragraph
+ * def already does - instead of escaping out to the stale, module-shared flat
+ * one. The pre-existing flat top-level method (still generated exactly as
+ * before, by generateDeclarativeMethodBodies - see its own doc comment) is
+ * simply unreachable dead code for a RECURSIVE program, exactly like the flat
+ * top-level per-paragraph methods generateAllMethods already unconditionally
+ * emits (harmless, never called once entry() exists, per
+ * generateRecursiveEntryMethod's existing convention).
+ *
+ * Only a `USE AFTER [STANDARD] ERROR PROCEDURE` SECTION (useClause.kind ===
+ * 'ERROR') gets nested here - the only kind declarativeHandlerFor ever
+ * dispatches to at all (see collectDeclarativeHandlers); an UNSUPPORTED USE
+ * form (e.g. USE FOR DEBUGGING) is never invoked from anywhere, recursive or
+ * not, so it has no nested nested-scope staleness bug to fix and is left
+ * exactly as generateDeclarativeMethodBodies already handles it (flat-only,
+ * with its own visible TODO comment).
+ *
+ * A DECLARATIVES SECTION with its own nested paragraph(s) (dd02's
+ * MISSING-FILE-ERR SECTION / MISSING-FILE-HANDLER paragraph shape) is nested
+ * body-duplicating too (renderNestedFallthroughDefs, reused verbatim - same
+ * helper generateProgramFlowLinesNested itself uses), with the outer
+ * SECTION-named def calling straight into its own nested paragraph def(s) -
+ * mirroring generateSectionMethod's flat-method structure, but body-
+ * duplicating instead of calling out to a shared top-level method, exactly
+ * like generateProgramFlowLinesNested itself does for the whole program's own
+ * ordinary paragraphs. Paragraph names inside one DECLARATIVES SECTION are
+ * inherently collision-free here (COBOL requires paragraph names be unique
+ * within their own section, and these nested defs are scoped inside their own
+ * SECTION's own outer def, not spilled flat into entry()'s own top-level
+ * scope) - so plain `toMethodName` (not the whole-program collision-aware
+ * resolveParagraphMethodName) is enough.
+ */
+export function generateDeclarativeHandlerDefsNested(declaratives, indent) {
+  const lines = [];
+  for (const decl of declaratives || []) {
+    const useClause = decl.useClause;
+    if (!useClause || useClause.kind !== 'ERROR') continue;
+
+    const indentStr = '  '.repeat(indent);
+    const methodName = toMethodName(decl.name);
+
+    if (!decl.paragraphs || decl.paragraphs.length === 0) {
+      lines.push(`${indentStr}def ${methodName}(): Unit =`);
+      lines.push(generateMethodBody(decl.statements, indent + 1));
+      continue;
+    }
+
+    const defIndent = indent + 1;
+    const nameFor = (p) => toMethodName(p.name);
+    const leading = sectionLeadingUnit(decl);
+    const paragraphUnits = leading ? [leading, ...decl.paragraphs] : decl.paragraphs;
+    lines.push(`${indentStr}def ${methodName}(): Unit =`);
+    lines.push(...renderNestedFallthroughDefs(paragraphUnits, defIndent, nameFor));
+    lines.push(`${'  '.repeat(defIndent)}${nameFor(paragraphUnits[0])}()`);
+  }
+  return lines;
+}
+
+/**
  * Statement-node fields that carry a NESTED, ordinary (non-WhenClause-
  * wrapped) statement array - shared by every AST statement class that can
  * itself hold an imperative-statement block (see parser/ast.js): inline
@@ -1397,6 +1487,7 @@ export default {
   generateSectionMethod,
   generateProgramFlowLines,
   generateProgramFlowLinesNested,
+  generateDeclarativeHandlerDefsNested,
   generateAllMethods,
   collectAmbiguousParagraphNames,
   resolveParagraphMethodName,

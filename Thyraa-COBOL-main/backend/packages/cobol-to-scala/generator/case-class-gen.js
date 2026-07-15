@@ -645,7 +645,10 @@ export function decodeFieldExpr(field, bytesExpr) {
         : `new String(${bytesExpr}, java.nio.charset.StandardCharsets.ISO_8859_1)`;
 
     default:
-      return legacyDecodeExpr(field.type, bytesExpr);
+      // 'legacy' - COMP-1/COMP-2 (Float/Double), the only codecKind
+      // classifyCodec ever assigns here (isFloatUsage) - see
+      // legacyFloatDecodeExpr's own doc comment (round-28 finding 3).
+      return legacyFloatDecodeExpr(field.type, bytesExpr);
   }
 }
 
@@ -683,13 +686,49 @@ export function encodeFieldExpr(field, valueExpr) {
         : `${valueExpr}.padTo(${field.length}, ' ').take(${field.length}).getBytes(java.nio.charset.StandardCharsets.ISO_8859_1)`;
 
     default:
-      return legacyEncodeExpr(field.type, field, valueExpr);
+      // 'legacy' - see decodeFieldExpr's identical comment just above.
+      return legacyFloatEncodeExpr(field.type, field, valueExpr);
   }
 }
 
 /**
- * Unchanged pre-Phase-1 display-string decode, kept only for COMP-1/COMP-2
- * (Float/Double), which have no byte-level codec yet.
+ * round-28 finding 3: real IEEE-754 byte codec for COMP-1 (Float)/COMP-2
+ * (Double) - the ONLY two scalaTypes classifyCodec's 'legacy' codecKind is
+ * ever assigned for (isFloatUsage). Before this fix, decodeFieldExpr/
+ * encodeFieldExpr's `default` branch called legacyDecodeExpr/legacyEncodeExpr
+ * unconditionally for 'legacy' - a TEXT-TRUNCATING shortcut
+ * (`value.toString.reverse.padTo(len,'0').reverse.take(len)`) that silently
+ * corrupted precision the moment a COMP-1/COMP-2 field went through an
+ * actual file-record WRITE/REWRITE/READ round trip (dd10: -7.125 became the
+ * 4 ASCII bytes "-7.1", which re-parsed as -7.099999904632568 - a genuine
+ * data-corruption bug, not merely a cosmetic one, since it had simply never
+ * been exercised by any prior corpus program combining COMP-1/COMP-2 with
+ * real file I/O). Routed through CobolCodecs.floatEncode/floatDecode/
+ * doubleEncode/doubleDecode (generator/codecs.js's JS-reference / runtime/
+ * CobolCodecs.scala's Scala counterpart) instead - real 4-byte/8-byte
+ * IEEE-754 bit patterns, host-native (little-endian) byte order, compiler-
+ * verified against installed GnuCOBOL (see CobolCodecs.scala's own doc
+ * comment on this section for the exact hex dump this was checked against).
+ * Falls back to legacyDecodeExpr/legacyEncodeExpr for any OTHER scalaType
+ * (defensive only - classifyCodec never actually assigns 'legacy' for
+ * anything but Float/Double, so this branch is unreachable in practice).
+ */
+function legacyFloatDecodeExpr(scalaType, bytesExpr) {
+  if (scalaType === 'Float') return `CobolCodecs.floatDecode(${bytesExpr})`;
+  if (scalaType === 'Double') return `CobolCodecs.doubleDecode(${bytesExpr})`;
+  return legacyDecodeExpr(scalaType, bytesExpr);
+}
+
+function legacyFloatEncodeExpr(scalaType, field, valueExpr) {
+  if (scalaType === 'Float') return `CobolCodecs.floatEncode(${valueExpr})`;
+  if (scalaType === 'Double') return `CobolCodecs.doubleEncode(${valueExpr})`;
+  return legacyEncodeExpr(scalaType, field, valueExpr);
+}
+
+/**
+ * Unchanged pre-Phase-1 display-string decode, kept only as the defensive
+ * fallback above (dead code in practice - see legacyFloatDecodeExpr's own
+ * doc comment) and, historically, for COMP-1/COMP-2 before this round.
  */
 function legacyDecodeExpr(scalaType, bytesExpr) {
   const slice = `new String(${bytesExpr}).trim`;
@@ -710,7 +749,10 @@ function legacyDecodeExpr(scalaType, bytesExpr) {
 }
 
 /**
- * Unchanged pre-Phase-1 display-string encode, kept only for COMP-1/COMP-2.
+ * Unchanged pre-Phase-1 display-string encode. Round-28 finding 3: its own
+ * Float/Double branch is dead code in practice now - legacyFloatEncodeExpr
+ * (above) intercepts both before ever reaching here - kept only as the same
+ * defensive fallback legacyFloatEncodeExpr itself falls back to.
  */
 function legacyEncodeExpr(scalaType, field, valueExpr) {
   switch (scalaType) {

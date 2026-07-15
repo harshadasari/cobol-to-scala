@@ -63,6 +63,7 @@ import {
   collectAmbiguousParagraphNames,
   generateProgramFlowLines,
   generateProgramFlowLinesNested,
+  generateDeclarativeHandlerDefsNested,
 } from './method-gen.js';
 import {
   generateFileIO,
@@ -3660,7 +3661,7 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
     };
   });
 
-  const { topLevelParagraphs, sections } = splitProcedureDivision(ast);
+  const { topLevelParagraphs, sections, declaratives } = splitProcedureDivision(ast);
   const units = flattenProcedureUnits(topLevelParagraphs, sections);
   const ambiguousNames = collectAmbiguousParagraphNames(topLevelParagraphs, sections);
 
@@ -3694,7 +3695,7 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
     // name from this one.
     setRecursiveLeafNames(new Set(paramLeafShapes.flat().map(leaf => leaf.camel)));
     try {
-      return generateRecursiveEntryMethod(paramInfos, paramLeafShapes, units, ambiguousNames, indent);
+      return generateRecursiveEntryMethod(paramInfos, paramLeafShapes, units, ambiguousNames, indent, declaratives);
     } finally {
       setRecursiveLeafNames(new Set());
     }
@@ -3893,7 +3894,7 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
  * activation's own live alias, with zero changes needed anywhere else in the
  * generator.
  */
-function generateRecursiveEntryMethod(paramInfos, paramLeafShapes, units, ambiguousNames, indent = 1) {
+function generateRecursiveEntryMethod(paramInfos, paramLeafShapes, units, ambiguousNames, indent = 1, declaratives = []) {
   const indentStr = '  '.repeat(indent);
   const bi = '  '.repeat(indent + 1);
 
@@ -3920,6 +3921,19 @@ function generateRecursiveEntryMethod(paramInfos, paramLeafShapes, units, ambigu
     lines.push(`${bi}def ${leaf.camel}: ${leaf.scalaType} = _get${i}()`);
     lines.push(`${bi}def ${leaf.camel}_=(v: ${leaf.scalaType}): Unit = _set${i}(v)`);
   });
+  // round-28 finding 1: nest each DECLARATIVES USE AFTER ERROR PROCEDURE
+  // handler's own body directly inside entry(), identically named to the
+  // registered handler method (toMethodName(decl.name)) - see
+  // generateDeclarativeHandlerDefsNested's own doc comment (method-gen.js)
+  // for the full staleness bug this closes: without this, a call to
+  // `${handlerMethod}()` made from within one of this program's own nested
+  // paragraph defs (file-io-gen.js's/expression-gen.js's declarativeHandlerFor
+  // dispatch) would escape out to the flat, top-level, module-shared-var
+  // version instead of resolving - via ordinary Scala lexical shadowing - to
+  // THIS activation's own nested version, which closes over the same
+  // per-call getter/setter closures every other nested paragraph def already
+  // does.
+  lines.push(...generateDeclarativeHandlerDefsNested(declaratives, indent + 1));
   lines.push(...generateProgramFlowLinesNested(units, indent + 1, ambiguousNames));
 
   return lines.join('\n');

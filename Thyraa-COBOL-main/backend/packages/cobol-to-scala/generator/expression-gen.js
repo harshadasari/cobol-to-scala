@@ -5518,11 +5518,25 @@ function odoDisplayValueExpr(groupKey) {
       if (!tableInfo || !c.info || isNonDisplayUsage(c.info.usage)) return null;
       const info = c.info;
       const countExpr = tableInfo.dependingOn ? `(${tableInfo.dependingOn}).toInt` : `${tableInfo.times}`;
-      const asBDExpr = info.scalaType === 'BigDecimal' ? `${c.camel}(i)` : `BigDecimal(${c.camel}(i))`;
-      const digitsText = `CobolFmt.digitsOf(${asBDExpr}, ${info.integerDigits || 0}, ${info.decimalDigits || 0})`;
-      const elemExpr = info.signed
-        ? `((if ${asBDExpr} < BigDecimal(0) then "-" else "+") + ${digitsText})`
-        : digitsText;
+      // round-28 finding 4: dispatch on the table element's ACTUAL declared
+      // type, exactly like the ordinary (non-table) elementary child branch
+      // just below already does (info.scalaType === 'String' vs numeric) -
+      // this used to unconditionally build `CobolFmt.digitsOf(BigDecimal(...))`
+      // for EVERY element regardless of PIC clause, a hard
+      // NumberFormatException the instant an alphanumeric (PIC X(n)) table
+      // element (dd11: REC-ITEM PIC X(3)) was written - "AAA" can't parse as
+      // a BigDecimal.
+      let elemExpr;
+      if (info.scalaType === 'String') {
+        const width = info.picLength || 0;
+        elemExpr = width > 0 ? `CobolFmt.fitLeft(${c.camel}(i), ${width})` : `${c.camel}(i)`;
+      } else {
+        const asBDExpr = info.scalaType === 'BigDecimal' ? `${c.camel}(i)` : `BigDecimal(${c.camel}(i))`;
+        const digitsText = `CobolFmt.digitsOf(${asBDExpr}, ${info.integerDigits || 0}, ${info.decimalDigits || 0})`;
+        elemExpr = info.signed
+          ? `((if ${asBDExpr} < BigDecimal(0) then "-" else "+") + ${digitsText})`
+          : digitsText;
+      }
       parts.push(`(0 until ${countExpr}).map(i => ${elemExpr}).mkString`);
       continue;
     }
@@ -6837,6 +6851,17 @@ function generateKeyedReadStatement(statement, fileName, dest, statusVar, indent
   lines.push(`${indentStr}else`);
   const invalidBodyStart = lines.length;
   if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"23"')}`);
+  // round-28 finding 2: a registered DECLARATIVES handler for this file (or
+  // its INPUT mode generically) fires on this keyed READ failure, exactly
+  // like a plain (non-keyed) READ's own end-of-file path already does
+  // (generateReadStatement below) and OPEN's own failure path does
+  // (file-io-gen.js's generateOpen) - dd09's own "not-found gap" probe (ST=23)
+  // - round-26/27 wired declarativeHandlerFor into OPEN, a bare READ's EOF
+  // path, and REWRITE/DELETE's own SEQUENTIAL-access failure path, but never
+  // audited the keyed (RANDOM/DYNAMIC) READ/WRITE/REWRITE/DELETE/START
+  // codegen paths at all - this closes that gap for READ.
+  const readHandler = declarativeHandlerFor(fileName, 'INPUT');
+  if (readHandler) lines.push(`${bi}${readHandler}()`);
   if (Array.isArray(statement.invalidKey)) {
     for (const stmt of statement.invalidKey) {
       lines.push(generateExpression(stmt, indent + 1));
@@ -7229,6 +7254,17 @@ function writeRecordPlan(recordName) {
  * loop itself now grows `occVar` in lockstep with `bufVar` (both start every
  * OPEN at the same length - see generateOpen, file-io-gen.js), so indexing
  * either one at `relKey - 1` after the loop is always in-bounds.
+ *
+ * round-28 finding 2: BOTH failure branches (duplicate key -> "22", boundary
+ * violation -> "24") now also invoke this file's registered DECLARATIVES
+ * handler (declarativeHandlerFor), exactly like OPEN's own failure path
+ * (file-io-gen.js's generateOpen), a bare (non-keyed) READ's end-of-file path,
+ * and REWRITE/DELETE's own SEQUENTIAL-access failure path already do - dd09's
+ * own probe (a real `USE AFTER STANDARD ERROR PROCEDURE ON <file>` handler,
+ * no INVALID KEY clause on the triggering WRITE) confirmed real cobc invokes
+ * the registered handler for a KEYED WRITE failure exactly as readily as any
+ * other qualifying I/O failure - round-26/27 built the RANDOM/DYNAMIC-access
+ * codegen itself but never wired this dispatch into it at all.
  */
 function generateKeyedWriteStatement(statement, fileName, finalTextExpr, statusVar, indent) {
   const indentStr = '  '.repeat(indent);
@@ -7242,6 +7278,12 @@ function generateKeyedWriteStatement(statement, fileName, finalTextExpr, statusV
   lines.push(`${bi}while ${bufVar}.length < ${relKey} do { ${bufVar}.append(""); ${occVar}.append(false) }`);
   lines.push(`${bi}if ${occVar}(${relKey} - 1) then`);
   if (statusVar) lines.push(`${bi2}${assignExpr(statusVar, '"22"')}`);
+  // round-28 finding 2: see this function's own doc comment update below -
+  // a registered DECLARATIVES handler fires on EVERY qualifying keyed WRITE
+  // failure, not just OPEN/plain-READ/REWRITE/DELETE's SEQUENTIAL-access one
+  // (dd09's own duplicate-key probe, ST=22).
+  const dupHandler = declarativeHandlerFor(fileName, 'I-O');
+  if (dupHandler) lines.push(`${bi2}${dupHandler}()`);
   const dupInvalidStart = lines.length;
   if (Array.isArray(statement.invalidKey)) {
     for (const stmt of statement.invalidKey) {
@@ -7266,6 +7308,10 @@ function generateKeyedWriteStatement(statement, fileName, finalTextExpr, statusV
   lines.push(`${indentStr}else`);
   const invalidStart = lines.length;
   if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"24"')}`);
+  // round-28 finding 2: see generateKeyedWriteStatement's own doc comment
+  // update above (dd09's own boundary-violation probe, ST=24).
+  const boundaryHandler = declarativeHandlerFor(fileName, 'I-O');
+  if (boundaryHandler) lines.push(`${bi}${boundaryHandler}()`);
   if (Array.isArray(statement.invalidKey)) {
     for (const stmt of statement.invalidKey) {
       lines.push(generateExpression(stmt, indent + 1));
@@ -7446,6 +7492,13 @@ function generateKeyedRewriteStatement(statement, fileName, finalTextExpr, statu
   lines.push(`${indentStr}else`);
   const invalidStart = lines.length;
   if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"24"')}`);
+  // round-28 finding 2: see generateKeyedWriteStatement's own doc comment for
+  // the full rationale - a registered DECLARATIVES handler must fire on this
+  // keyed REWRITE's own boundary-violation failure too, exactly like the
+  // SEQUENTIAL-access REWRITE failure path (generateRewriteStatement below)
+  // already does.
+  const boundaryHandler = declarativeHandlerFor(fileName, 'I-O');
+  if (boundaryHandler) lines.push(`${bi}${boundaryHandler}()`);
   if (Array.isArray(statement.invalidKey)) {
     for (const stmt of statement.invalidKey) {
       lines.push(generateExpression(stmt, indent + 1));
@@ -7575,6 +7628,13 @@ function generateKeyedDeleteStatement(statement, fileName, statusVar, indent) {
   lines.push(`${indentStr}else`);
   const invalidStart = lines.length;
   if (statusVar) lines.push(`${bi}${assignExpr(statusVar, '"24"')}`);
+  // round-28 finding 2: see generateKeyedWriteStatement's own doc comment for
+  // the full rationale - a registered DECLARATIVES handler must fire on this
+  // keyed DELETE's own boundary-violation failure too, exactly like the
+  // SEQUENTIAL-access DELETE failure path (generateDeleteStatement below)
+  // already does.
+  const boundaryHandler = declarativeHandlerFor(fileName, 'I-O');
+  if (boundaryHandler) lines.push(`${bi}${boundaryHandler}()`);
   if (Array.isArray(statement.invalidKey)) {
     for (const stmt of statement.invalidKey) {
       lines.push(generateExpression(stmt, indent + 1));
@@ -7766,6 +7826,11 @@ function generateStartStatement(statement, indent = 0) {
   // position "undefined" - a subsequent plain sequential READ NEXT/PREVIOUS
   // (generateReadStatement's own non-keyed path) must consult this flag.
   lines.push(`${bi}${startInvalidVar} = true`);
+  // round-28 finding 2: see generateKeyedWriteStatement's own doc comment for
+  // the full rationale - a registered DECLARATIVES handler must fire on a
+  // failed START too, exactly like every other keyed I/O failure now does.
+  const startHandler = declarativeHandlerFor(fileNameRaw, 'INPUT');
+  if (startHandler) lines.push(`${bi}${startHandler}()`);
   if (Array.isArray(statement.invalidKey)) {
     for (const stmt of statement.invalidKey) {
       lines.push(generateExpression(stmt, indent + 1));

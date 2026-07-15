@@ -270,6 +270,77 @@ export function binaryDecode(bytes, options = {}) {
 }
 
 // ============================================================================
+// Floating point (COMP-1 / COMP-2)
+//
+// round-28 finding 3: real IEEE-754 binary float (COMP-1, 4 bytes)/double
+// (COMP-2, 8 bytes) encode/decode - added because NO byte-level codec existed
+// for these USAGEs at all before this round (case-class-gen.js's
+// classifyCodec labeled them 'legacy' and fell back to a text-truncation
+// shortcut - `value.toString.reverse.padTo(len,'0').reverse.take(len)` - which
+// silently corrupted precision the instant a COMP-1/COMP-2 field went through
+// an actual file-record WRITE/REWRITE/READ round trip: e.g. -7.125 became the
+// 4 ASCII bytes "-7.1", which then re-parsed as -7.099999904632568).
+//
+// Byte ORDER, like COMP-5 (see binaryEncode/binaryDecode's own doc comment
+// above), is HOST-NATIVE - little-endian on the x86_64 GnuCOBOL build this was
+// compiler-verified against - NOT the big-endian default COMP/COMP-4/BINARY
+// use. Verified directly against installed GnuCOBOL (not just "compiles and
+// runs"): a tiny COBOL program (FD record with a COMP-1 and a COMP-2 field,
+// written via WRITE to a RELATIVE file, then hex-dumped) wrote 3.5 as
+// COMP-1 bytes `00 00 60 40` and 2.25 as COMP-2 bytes `00 00 00 00 00 00 02
+// 40` - each the EXACT reverse of the standard (big-endian) IEEE-754 bit
+// pattern Java's Float.floatToIntBits(3.5f) (0x40600000) and
+// Double.doubleToLongBits(2.25) (0x4002000000000000) produce. -7.125 (COMP-1
+// `00 00 e4 c0`, reverse of 0xC0E40000) and 100.5 (COMP-2 `00 00 00 00 00 20
+// 59 40`, reverse of 0x4059200000000000) confirm the same reversed-big-endian
+// (i.e. little-endian) pattern holds for negative values and doubles alike.
+// ============================================================================
+
+/**
+ * Encode a JS `number` as COMP-1 (IEEE-754 single precision, 4 bytes,
+ * host-native/little-endian byte order - see this section's own doc comment).
+ */
+export function floatEncode(value) {
+  const buf = new ArrayBuffer(4);
+  new DataView(buf).setFloat32(0, value, /* littleEndian */ true);
+  return new Uint8Array(buf);
+}
+
+/**
+ * Decode COMP-1 (IEEE-754 single precision, 4 bytes, host-native/
+ * little-endian byte order) bytes to a JS `number`.
+ */
+export function floatDecode(bytes) {
+  if (bytes.length !== 4) {
+    throw new RangeError(`floatDecode: expected 4 bytes (COMP-1), got ${bytes.length}`);
+  }
+  const view = new DataView(new Uint8Array(bytes).buffer);
+  return view.getFloat32(0, /* littleEndian */ true);
+}
+
+/**
+ * Encode a JS `number` as COMP-2 (IEEE-754 double precision, 8 bytes,
+ * host-native/little-endian byte order - see this section's own doc comment).
+ */
+export function doubleEncode(value) {
+  const buf = new ArrayBuffer(8);
+  new DataView(buf).setFloat64(0, value, /* littleEndian */ true);
+  return new Uint8Array(buf);
+}
+
+/**
+ * Decode COMP-2 (IEEE-754 double precision, 8 bytes, host-native/
+ * little-endian byte order) bytes to a JS `number`.
+ */
+export function doubleDecode(bytes) {
+  if (bytes.length !== 8) {
+    throw new RangeError(`doubleDecode: expected 8 bytes (COMP-2), got ${bytes.length}`);
+  }
+  const view = new DataView(new Uint8Array(bytes).buffer);
+  return view.getFloat64(0, /* littleEndian */ true);
+}
+
+// ============================================================================
 // Zoned Decimal (DISPLAY numeric) with sign overpunch
 //
 // One byte per digit. Unsigned fields (and non-sign digit positions of
@@ -576,6 +647,10 @@ export default {
   binaryByteLength,
   binaryEncode,
   binaryDecode,
+  floatEncode,
+  floatDecode,
+  doubleEncode,
+  doubleDecode,
   zonedEncode,
   zonedDecode,
   ebcdicByteToChar,

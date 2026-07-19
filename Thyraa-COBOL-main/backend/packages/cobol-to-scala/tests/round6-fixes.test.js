@@ -188,7 +188,14 @@ test('Finding 4: STRING ON OVERFLOW/NOT ON OVERFLOW branches are generated and g
 
 test('Finding 5: the STRING copy loop is bounds-checked against the target width instead of an unguarded setCharAt', () => {
   const code = scalaOf(STRING_OVERFLOW_SOURCE);
-  assert.match(code, /if _pos >= 0 && _pos < 6 then _sb\.setCharAt\(_pos, _seg\d+\(_i\)\) else _overflow = true/);
+  // round-33 finding 3 (ii09): each segment's copy loop now also tracks its
+  // own actual written-character count (`_writtenN`), since real cobc's
+  // WITH POINTER value after an overflow reflects only the characters
+  // genuinely written into the bounded target, not the full source segment's
+  // own length - see tests/round33-fixes.test.js and tests/oracle/README.md's
+  // round-33 entry. Still bounds-checked against the target width, round-6's
+  // own point here - just no longer a single bare setCharAt on the true branch.
+  assert.match(code, /if _pos >= 0 && _pos < 6 then \{ _sb\.setCharAt\(_pos, _seg\d+\(_i\)\); _written\d+ \+= 1 \} else _overflow = true/);
   assert.doesNotMatch(code, /_sb\.setCharAt\(_ptr - 1 \+ _i, _seg\d+\(_i\)\)/);
 });
 

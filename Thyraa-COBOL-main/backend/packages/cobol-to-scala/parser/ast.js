@@ -151,6 +151,15 @@ export class FileDescription extends ASTNode {
     // corpus program) - drives WRITE's own AT END-OF-PAGE/NOT AT END-OF-PAGE
     // clause (see generator/expression-gen.js's generateWriteStatement).
     this.linageLines = options.linageLines || null;
+    // round-33 finding 1 (ii01): `WITH FOOTING AT <m>` - a plain integer
+    // literal only (mirroring linageLines' own scope), the line number
+    // (measured from the running per-page line counter) at which the
+    // footing area begins. Real cobc fires AT END-OF-PAGE once the counter
+    // reaches (linageLines - linageFootingLines), not linageLines itself -
+    // see generator/expression-gen.js's linageEopLines. `null` (no FOOTING
+    // clause at all) keeps the pre-existing bare-LINAGE comparison against
+    // linageLines unchanged.
+    this.linageFootingLines = options.linageFootingLines || null;
   }
 }
 

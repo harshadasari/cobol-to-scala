@@ -3506,13 +3506,19 @@ export function generateScala(ast, options = {}) {
   // round-32 finding 1 (hh01): FD file name (upper) -> its own `LINAGE IS
   // <n> LINES` page size - see expression-gen.js's own LINAGE_REGISTRY doc
   // comment for the full rationale (drives WRITE's AT END-OF-PAGE/NOT AT
-  // END-OF-PAGE clause).
+  // END-OF-PAGE clause). round-33 finding 1 (ii01): each entry is now
+  // `{ pageSize, footingLines }` (footingLines `null` when no `WITH
+  // FOOTING AT` clause was present) rather than a bare integer, so
+  // linageEopLines can compute the footing-aware AT END-OF-PAGE threshold.
   const linageRegistry = new Map();
   const fdFilesByName = new Map();
   for (const f of getFileSectionFiles(ast)) {
     if (f?.name) fdFilesByName.set(String(f.name).toUpperCase(), f);
     if (f?.name && Number.isInteger(f.linageLines) && f.linageLines > 0) {
-      linageRegistry.set(String(f.name).toUpperCase(), f.linageLines);
+      const footingLines = Number.isInteger(f.linageFootingLines) && f.linageFootingLines > 0
+        ? f.linageFootingLines
+        : null;
+      linageRegistry.set(String(f.name).toUpperCase(), { pageSize: f.linageLines, footingLines });
     }
   }
   for (const fc of getFileControls(ast)) {

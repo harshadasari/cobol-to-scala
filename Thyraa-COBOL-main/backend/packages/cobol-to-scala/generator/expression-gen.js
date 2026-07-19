@@ -4717,11 +4717,25 @@ export function generateString(statement, indent = 0) {
 
   (statement.sources || []).forEach((source, i) => {
     const segVar = `_seg${i}`;
+    const writtenVar = `_written${i}`;
     lines.push(`${bi}val ${segVar} = ${stringSourceSegmentExpr(source)}`);
+    // round-33 finding 3 (ii09): real cobc leaves WITH POINTER positioned
+    // exactly where writing actually stopped - the position right after the
+    // last character genuinely stored into the bounded target - not past
+    // the entire source segment's own length regardless of truncation. This
+    // per-segment counter (`_writtenN`) counts only the characters that
+    // actually pass the same bounds check the overflow-detection loop
+    // already performs (each stored character increments it, each
+    // out-of-bounds one instead sets `_overflow` exactly as before), and
+    // `_ptr` below advances by that count instead of unconditionally by
+    // `segVar.length` - a pure correction of the pointer's own final value;
+    // the overflow condition itself and the truncated target content were
+    // already correct before this fix.
+    lines.push(`${bi}var ${writtenVar} = 0`);
     lines.push(
-      `${bi}for _i <- ${segVar}.indices do { val _pos = _ptr - 1 + _i; if _pos >= 0 && _pos < ${width} then _sb.setCharAt(_pos, ${segVar}(_i)) else _overflow = true }`
+      `${bi}for _i <- ${segVar}.indices do { val _pos = _ptr - 1 + _i; if _pos >= 0 && _pos < ${width} then { _sb.setCharAt(_pos, ${segVar}(_i)); ${writtenVar} += 1 } else _overflow = true }`
     );
-    lines.push(`${bi}_ptr = _ptr + ${segVar}.length`);
+    lines.push(`${bi}_ptr = _ptr + ${writtenVar}`);
   });
 
   lines.push(`${bi}${renderAssignment(statement.into, '_sb.toString')}`);
@@ -7802,6 +7816,30 @@ function writeRecordPlan(recordName, fileName) {
     if (odoExpr) return { mode: 'text', expr: `(${odoExpr})` };
     const groupExpr = groupDisplayValueExpr(groupKey);
     if (groupExpr) return { mode: 'text', expr: `(${groupExpr})` };
+
+    // round-33 finding 2 (ii06): every representation this function knows how
+    // to build for a GROUP record has now been tried and declined
+    // (groupChildConstructorExpr's byte-mode path, odoDisplayValueExpr,
+    // groupDisplayValueExpr) - unlike an elementary record (the `info`
+    // branch at the very top of this function, which always has a genuine
+    // flat Scala var), a GROUP record has NO flat var of its own at all; it
+    // exists purely as nested case-class/group structure. Falling through to
+    // the bare `toCamelCase(recordName)` fallback below for a group would
+    // reference an identifier that was never declared anywhere (a hard Scala
+    // "Not found: <name>" COMPILE error, not a runtime decline) - ii06's own
+    // shape (`REC-ROW OCCURS 2 TIMES` where each row ITSELF contains another
+    // OCCURS table, `ROW-ITEM ... OCCURS 3 TIMES`) hits exactly this:
+    // groupChildConstructorExprIndexed deliberately declines a table nested
+    // inside a table-of-groups row (a real, narrower, documented limitation -
+    // not implemented here either), and since the record has no non-DISPLAY
+    // field, `odoDisplayValueExpr`/`groupDisplayValueExpr` are reached next -
+    // both also decline (a table-of-groups top-level child bails out of
+    // both, since neither was ever taught the table-of-groups shape round-32
+    // added only to groupChildConstructorExpr) - leaving nothing but this
+    // dead end. Decline visibly (a genuinely honest, compiling `???`/TODO
+    // marker - see 'bytes-unsupported' above) instead of guessing at an
+    // identifier that doesn't exist.
+    return { mode: 'text-unsupported' };
   }
 
   return { mode: 'text', expr: toCamelCase(recordName) };
@@ -7983,8 +8021,9 @@ function generateKeyedWriteStatement(statement, fileName, finalTextExpr, statusV
  * WRITE with no AT END-OF-PAGE at all is unaffected either way).
  */
 function linageEopLines(fileName, statement, indent) {
-  const linageLines = linageLinesFor(fileName);
-  if (!linageLines) return null;
+  const linage = linageLinesFor(fileName);
+  if (!linage) return null;
+  const { pageSize, footingLines } = linage;
   const hasEop = (Array.isArray(statement.atEndOfPage) && statement.atEndOfPage.length > 0) ||
     (Array.isArray(statement.notAtEndOfPage) && statement.notAtEndOfPage.length > 0);
   if (!hasEop) return null;
@@ -7992,15 +8031,31 @@ function linageEopLines(fileName, statement, indent) {
   const indentStr = '  '.repeat(indent);
   const bi = `${indentStr}  `;
   const ctr = toLinageCounterVarName(fileName);
+  // round-33 finding 1 (ii01): with a `WITH FOOTING AT <m>` clause present,
+  // real cobc fires AT END-OF-PAGE once the running line counter reaches
+  // (pageSize - footingLines) - the page is considered "full" the instant
+  // only the footing area remains - and keeps firing on every subsequent
+  // WRITE until the counter actually reaches the full pageSize, at which
+  // point (and ONLY at which point) the counter resets for a fresh page.
+  // Compiler-verified against installed GnuCOBOL (ii01: `LINAGE IS 5 LINES
+  // WITH FOOTING AT 3`, 8 successive WRITEs) - NOTEOP/EOP/EOP/EOP/EOP/
+  // NOTEOP/EOP/EOP, i.e. AT END-OF-PAGE fires from counter==2 (5-3) through
+  // counter==5 (the full page, where the reset happens), then the cycle
+  // repeats. With no FOOTING clause at all (footingLines null), the
+  // threshold degenerates to pageSize itself - the reset and the EOP
+  // condition then fire on the exact same WRITE, reproducing round 32's own
+  // pre-existing bare-LINAGE behavior byte-for-byte (a pure addition).
+  const threshold = footingLines != null ? pageSize - footingLines : pageSize;
   const lines = [];
   lines.push(`${indentStr}${ctr} += 1`);
-  lines.push(`${indentStr}if ${ctr} >= ${linageLines} then`);
-  lines.push(`${bi}${ctr} = 0`);
+  lines.push(`${indentStr}if ${ctr} >= ${threshold} then`);
   const eop = statement.atEndOfPage || [];
   lines.push(eop.length > 0 ? eop.map(s => generateExpression(s, indent + 1)).join('\n') : `${bi}()`);
   lines.push(`${indentStr}else`);
   const notEop = statement.notAtEndOfPage || [];
   lines.push(notEop.length > 0 ? notEop.map(s => generateExpression(s, indent + 1)).join('\n') : `${bi}()`);
+  lines.push(`${indentStr}if ${ctr} >= ${pageSize} then`);
+  lines.push(`${bi}${ctr} = 0`);
   return lines.join('\n');
 }
 
@@ -8052,6 +8107,19 @@ function generateWriteStatement(statement, indent = 0) {
     return (
       `${indentStr}() // TODO: WRITE ${sourceName}: a byte-level (non-DISPLAY-child) record with a FILLER/OCCURS ` +
       'child is not supported (see tests/oracle/README.md known gaps); record not written'
+    );
+  }
+  // round-33 finding 2 (ii06): see writeRecordPlan's own doc comment - a
+  // GROUP record with no flat var of its own (built entirely from nested
+  // group/table structure) that none of the byte-mode/ODO/group-display text
+  // paths could represent (e.g. a table-of-groups row that itself contains
+  // ANOTHER nested OCCURS table) declines visibly here instead of the
+  // pre-fix crash (a bare reference to an undeclared flat var).
+  if (plan.mode === 'text-unsupported') {
+    return (
+      `${indentStr}() // TODO: WRITE ${sourceName}: a group record built entirely from nested group/table structure ` +
+      '(no flat var of its own) with a shape this generator cannot represent (e.g. a table-of-groups row that itself ' +
+      'contains another nested OCCURS table) is not supported (see tests/oracle/README.md known gaps); record not written'
     );
   }
 
@@ -8248,6 +8316,15 @@ function generateRewriteStatement(statement, indent = 0) {
     return (
       `${indentStr}() // TODO: REWRITE ${sourceName}: a byte-level (non-DISPLAY-child) record with a FILLER/OCCURS ` +
       'child is not supported (see tests/oracle/README.md known gaps); record not rewritten'
+    );
+  }
+  // round-33 finding 2 (ii06): see writeRecordPlan's own doc comment/the
+  // identical guard in generateWriteStatement above.
+  if (plan.mode === 'text-unsupported') {
+    return (
+      `${indentStr}() // TODO: REWRITE ${sourceName}: a group record built entirely from nested group/table structure ` +
+      '(no flat var of its own) with a shape this generator cannot represent (e.g. a table-of-groups row that itself ' +
+      'contains another nested OCCURS table) is not supported (see tests/oracle/README.md known gaps); record not rewritten'
     );
   }
 

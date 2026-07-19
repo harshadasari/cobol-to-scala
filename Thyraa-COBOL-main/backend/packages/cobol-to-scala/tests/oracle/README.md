@@ -1840,6 +1840,45 @@ passing, 0 failing, 29 todo - unchanged from round 31's own baseline,
 confirming none of this round's 5 fixes introduced a new decline or left
 any prior gap unresolved.
 
+### Round-33 adversarial-refutation findings (ii01/ii06/ii09) and their fixes
+
+A round-33 refuter (again briefed to keep pressure-testing prior rounds' own
+fixes, given rounds 22-32 all found real bugs this same way) left 13 new
+probes (ii01-ii13, 10 already passing/honest); this section covers the 3
+that were failing.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 3 | **STRING's own `WITH POINTER` value, after an `ON OVERFLOW` truncation, silently advanced by the ENTIRE source segment's own length rather than the number of characters actually written into the bounded target.** `generateString`'s (`generator/expression-gen.js`) per-character bounds-check loop already correctly detects overflow and stores only the characters that fit (`_overflow = true` for anything past the target's own width) - both the overflow condition and the truncated target content were already correct - but the very next line unconditionally advanced `_ptr` by `<segVar>.length`, the FULL source segment's own length, with no regard for whether every character of it actually fit. Real cobc leaves the pointer positioned exactly where writing stopped (right after the last character genuinely stored) - confirmed a GENERAL bug (`generateString` is called identically regardless of which paragraph-rendering convention wraps it), not something specific to ii09's own RECURSIVE-paragraph repro (chosen by the refuter only to probe whether the recursive nested-local-def convention interacted with it - it doesn't) | Added a per-segment written-character counter (`_writtenN`), incremented in lockstep with the pre-existing bounds check exactly when a character is actually stored (`_sb.setCharAt(...); _writtenN += 1`, the `else _overflow = true` branch left untouched) - `_ptr` now advances by `_writtenN` instead of the segment's raw `.length`. A segment that never overflows has `_writtenN == <segVar>.length` at runtime (every character passes the bounds check), so this is behaviorally identical to before this fix for any non-overflowing STRING - a pure correction of the truncated case only. Verified against installed GnuCOBOL and scala-cli (ii09): `TARGET=[HELLO]`/`PTR=06` (position right after the 5th stored character), matching cobc exactly - the pre-fix generated code produced `PTR=11` (1 + the full 10-character source length) instead | ii09 |
+| 2 | **A table-within-a-table-of-groups RELATIVE-file record crashed at Scala COMPILE time with a bare undeclared-identifier reference, not a decline.** Round-32's `groupChildConstructorExprIndexed` (`generator/expression-gen.js`) correctly and deliberately declines (returns `null`) a table-of-groups row that ITSELF contains another nested OCCURS table (ii06: `REC-ROW OCCURS 2 TIMES` containing `ROW-ITEM ... OCCURS 3 TIMES`, a genuine, documented, narrower limitation - not itself a bug) - but `writeRecordPlan`'s own fallback chain didn't stop there. Since this record has no non-DISPLAY field either (all signed/plain DISPLAY), `writeRecordPlan` next tried `odoDisplayValueExpr`/`groupDisplayValueExpr` (the older ODO/group text-mode paths) - both ALSO decline this exact shape (each bails to `null` the moment a table-of-groups top-level child is seen; neither was ever taught the table-of-groups shape round-32 added only to `groupChildConstructorExpr`) - leaving `writeRecordPlan` to fall all the way through to its final, UNCONDITIONAL fallback, `return { mode: 'text', expr: toCamelCase(recordName) }`, which blindly references a flat Scala variable (`relRec`) that is NEVER declared for a record built entirely out of nested group/table structure (such a record has no single flat text var at all - only its own case class). This produced a hard `Not found: relRec` Scala COMPILE error, not a visible, honest decline | Added a guard immediately before that final unconditional fallback: when `isGroup` is true and none of the byte-mode/ODO/group-display paths above could represent this record's own shape, `writeRecordPlan` now returns a new `{ mode: 'text-unsupported' }` plan instead of guessing at an identifier that doesn't exist - `generateWriteStatement` and `generateRewriteStatement` (the only two callers) both check for it right alongside the pre-existing `bytes-unsupported` check and emit an equally honest, visible, compiling `// TODO: ... a group record built entirely from nested group/table structure ... is not supported ...` marker (record simply not written/rewritten), matching how this codebase already declines every other unsupported shape. The two-level-deep table-of-groups-containing-a-table shape itself is deliberately NOT newly implemented (still a real, narrower, out-of-scope limitation per round 32's own reasoning) - only the crash-to-decline conversion is new. Verified against installed GnuCOBOL and scala-cli (ii06): the generated Scala now compiles cleanly and runs to completion (registering as an honest `t.todo(...)` in `oracleCompare()`, since the WRITE itself is correctly declined rather than corrupting anything) instead of failing to compile at all; confirmed zero regressions on the pre-existing round-32 table-of-groups WRITE path (a table-of-groups row with no further nested table still gets its real `Vector.tabulate(...)` constructor call, untouched) and on the pre-existing non-DISPLAY/FILLER `bytes-unsupported` decline (still reached, and still distinct from the new `text-unsupported` message, for that separate shape) | ii06 |
+| 1 | **LINAGE's fuller clause grammar (`WITH FOOTING AT <m>`) was silently discarded, so a FOOTING-driven AT END-OF-PAGE timing was indistinguishable from a bare `LINAGE IS <n> LINES`.** Round 32 implemented `LINAGE IS <n> LINES` (a bare integer page size) but `parseFileDescription` (`parser/data-division-parser.js`) let any `WITH FOOTING AT`/`LINES AT TOP`/`LINES AT BOTTOM` sub-clause tokens fall through to the generic per-token catch-all, uncaptured - so `LINAGE IS 5 LINES WITH FOOTING AT 3` behaved identically to a bare `LINAGE IS 5 LINES` in the generated Scala. A direct cobc probe (ii01, alongside a companion `LINES AT TOP`/`LINES AT BOTTOM` probe, ii02, already passing) confirmed FOOTING alone changes AT END-OF-PAGE's own real timing: with `LINAGE IS 5 LINES WITH FOOTING AT 3`, cobc's own oracle output across 8 successive WRITEs is `NOTEOP/EOP/EOP/EOP/EOP/NOTEOP/EOP/EOP` - AT END-OF-PAGE fires from the moment the running line counter reaches (pageSize - footingLines) = 2, and KEEPS firing on every subsequent WRITE (not just once), until the counter actually reaches the full pageSize (5), at which point (and only then) it resets for a fresh page - a materially different shape from round 32's bare-LINAGE model, which resets the counter the INSTANT the threshold is reached (so EOP only ever fires on exactly one WRITE per page) | Parsed `WITH FOOTING AT <m>` (a plain integer literal, mirroring how the bare LINAGE integer is already parsed) into a new `fd.linageFootingLines` AST field, threaded through `LINAGE_REGISTRY` (now `{ pageSize, footingLines }` per file instead of a bare integer) into `linageEopLines` (`generator/expression-gen.js`): the AT END-OF-PAGE condition now compares the counter against `footingLines != null ? pageSize - footingLines : pageSize`, and the counter-reset check is a SEPARATE, unconditional `if <ctr> >= <pageSize> then <ctr> = 0` immediately after (previously the reset was nested inside the same `if` as the EOP condition, which is exactly why bare LINAGE degenerates back to firing/resetting on the identical single WRITE - the two conditions collapse to the same value when `footingLines` is absent). `LINES AT TOP <p>`/`LINES AT BOTTOM <q>` are now parsed too (consumed by name, not left to the untargeted catch-all) but deliberately not captured anywhere - ii02's own direct cobc probe already confirmed neither affects AT END-OF-PAGE timing, so harmlessly discarding their integer operand is correct, not a gap. Verified against installed GnuCOBOL and scala-cli (ii01): `NOTEOP/EOP/EOP/EOP/EOP/NOTEOP/EOP/EOP` across 8 WRITEs, matching cobc byte-for-byte; confirmed zero regressions on hh01's own bare-LINAGE corpus program (no FOOTING clause at all - the threshold degenerates to `pageSize` exactly as before this round, and the reset still happens on the same WRITE as the EOP condition, reproducing round 32's own `NOTEOP/EOP/NOTEOP/EOP` output unchanged) | ii01 |
+
+See `tests/round33-fixes.test.js` for focused, toolchain-independent unit
+tests of all 3 findings above, including regression coverage confirming a
+bare LINAGE (no FOOTING clause) keeps round 32's own exact fire/reset-on-
+the-same-WRITE behavior, that `LINES AT TOP`/`LINES AT BOTTOM` parse
+harmlessly without corrupting the surrounding FD clause, that a plain
+(non-doubly-nested) table of groups still gets its real round-32
+`Vector.tabulate` WRITE untouched, that a genuinely non-DISPLAY/FILLER
+record still reaches the pre-existing `bytes-unsupported` decline (not the
+new `text-unsupported` one), and that a non-overflowing STRING's pointer
+arithmetic is unchanged from before this round.
+
+Net effect on the whole-suite `todo` count: findings 1 and 3 are genuine,
+oracle-verified corrections to already-promoted corpus programs (ii01,
+ii09), not new declines. Finding 2 (ii06) converts a hard Scala COMPILE
+FAILURE into an honest, visible `t.todo(...)` decline - ii06 could not
+compile at all before this round's fix (so it could not previously
+contribute to any todo count), and after the fix it compiles and runs to
+completion, registering as exactly one new, correctly-attributed
+`t.todo(...)` entry (the two-level table-of-groups-containing-a-table shape
+remains a real, narrower, deliberately out-of-scope limitation, exactly as
+round 32 already established for the one-level case) - see the exact
+reconciled full-suite counts recorded after this round's own verification
+pass below. The round-33 refuter's other 10 probes (ii02-ii05, ii07-ii08,
+ii10-ii13) were already passing/honest at hand-off and needed no further
+work this round.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
@@ -2337,3 +2376,25 @@ any prior gap unresolved.
   how `generateGoTo` translates a GO TO inside any paragraph ALTER ever
   names), disproportionate for a construct this rare. Revisit only if a
   future program genuinely needs real ALTER semantics.
+
+- **A table-within-a-table-of-groups (two independent OCCURS dimensions) in
+  a RELATIVE-file record, round-33 finding 2's own explicitly-acknowledged
+  boundary** - `groupChildConstructorExprIndexed` (`generator/
+  expression-gen.js`) still bails out (`return null`) the moment a
+  table-of-groups row's OWN child is itself another OCCURS table (ii06:
+  `REC-ROW OCCURS 2 TIMES` containing `ROW-ITEM ... OCCURS 3 TIMES`) - round
+  33 only fixed the resulting Scala COMPILE crash (see the round-33 table
+  above), converting `writeRecordPlan`'s previous bare undeclared-identifier
+  reference into a visible, compiling `// TODO: ... a group record built
+  entirely from nested group/table structure ... is not supported ...`
+  marker; the WRITE is honestly skipped (record not written), not
+  byte-accurately produced. `ii06` IS promoted into `tests/corpus/proc/`
+  (deliberately, unlike most other documented gaps here) since it is now an
+  honest `t.todo(...)` under the existing Phase 2 match-or-todo convention,
+  not a hard failure or compile error that would need special-casing to
+  avoid misrepresenting a known limitation as a regression - exactly like
+  `o14` (round-25) or `d12` (round-15) already do for their own respective
+  gaps. Revisit by threading a SECOND, independent index dimension through
+  `groupChildConstructorExprIndexed`'s own recursion (distinct from the
+  outer table-of-groups' `indexVar` it already carries) if a future program
+  needs this specific two-level nesting.

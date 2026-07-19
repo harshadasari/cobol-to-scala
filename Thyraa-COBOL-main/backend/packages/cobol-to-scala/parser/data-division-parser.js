@@ -1062,11 +1062,16 @@ function parseFileDescription(ctx) {
     // (see generator/expression-gen.js's generateWriteStatement). Only a
     // plain integer literal is captured (`fd.linageLines`) - a data-name
     // (`LINAGE IS WS-PAGE-SIZE LINES`) is left unset, same as before this
-    // fix, and any `WITH FOOTING AT`/`LINES AT TOP`/`LINES AT BOTTOM`
-    // sub-clause tokens fall through to the generic catch-all `ctx.advance()`
-    // below untouched (consumed one token at a time, same as any other
-    // not-yet-modeled FD clause already was before this fix - not a new
-    // parsing risk).
+    // fix.
+    // round-33 finding 1 (ii01): the fuller clause grammar - `WITH FOOTING
+    // AT <m>` - is now captured too (`fd.linageFootingLines`, a plain
+    // integer literal only, mirroring linageLines' own scope), since real
+    // cobc's AT END-OF-PAGE timing depends on it (see LINAGE_REGISTRY's own
+    // doc comment in expression-gen.js). `LINES AT TOP <p>`/`LINES AT BOTTOM
+    // <q>` are parsed too (consumed here, not left to the generic catch-all)
+    // but deliberately NOT captured anywhere - a direct cobc probe (round-33)
+    // confirmed neither affects AT END-OF-PAGE timing at all, so harmlessly
+    // discarding their integer operand is correct, not a gap.
     if (ctx.matchValue('LINAGE')) {
       ctx.matchValue('IS');
       if (ctx.check(TokenType.NUMERIC_LITERAL)) {
@@ -1075,6 +1080,44 @@ function parseFileDescription(ctx) {
         ctx.advance(); // data-name-driven LINAGE: not supported, not captured
       }
       ctx.matchValue('LINES');
+      // Fuller clause grammar, any order, each optional:
+      //   WITH FOOTING AT <m>
+      //   LINES AT TOP <p>
+      //   LINES AT BOTTOM <q>
+      while (true) {
+        if (ctx.checkValue('WITH') && ctx.peek(1)?.value?.toUpperCase() === 'FOOTING') {
+          ctx.advance(); // WITH
+          ctx.advance(); // FOOTING
+          ctx.matchValue('AT');
+          if (ctx.check(TokenType.NUMERIC_LITERAL)) {
+            fd.linageFootingLines = parseInt(ctx.advance().value, 10);
+          } else if (ctx.check(TokenType.IDENTIFIER)) {
+            ctx.advance(); // data-name-driven FOOTING: not supported, not captured
+          }
+          continue;
+        }
+        if (ctx.checkValue('FOOTING')) {
+          // bare `FOOTING AT <m>` (no leading WITH) - same handling
+          ctx.advance();
+          ctx.matchValue('AT');
+          if (ctx.check(TokenType.NUMERIC_LITERAL)) {
+            fd.linageFootingLines = parseInt(ctx.advance().value, 10);
+          } else if (ctx.check(TokenType.IDENTIFIER)) {
+            ctx.advance();
+          }
+          continue;
+        }
+        if (ctx.checkValue('LINES') && ctx.peek(1)?.value?.toUpperCase() === 'AT') {
+          ctx.advance(); // LINES
+          ctx.advance(); // AT
+          ctx.matchValue('TOP', 'BOTTOM');
+          if (ctx.check(TokenType.NUMERIC_LITERAL) || ctx.check(TokenType.IDENTIFIER)) {
+            ctx.advance(); // discarded - confirmed not to affect AT END-OF-PAGE timing
+          }
+          continue;
+        }
+        break;
+      }
       continue;
     }
 

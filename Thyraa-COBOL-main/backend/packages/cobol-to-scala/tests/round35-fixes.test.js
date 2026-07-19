@@ -193,26 +193,49 @@ describe('round-35 finding 2 (kk07): BY CONTENT writes are visible within the sa
 
   test('BY CONTENT (LK-DEPTH, the 3rd LINKAGE leaf) gets its own isolated call-site-local snapshot var instead - a real getter/setter pair over that local, not a no-op setter', () => {
     const scala = scalaOf(readCorpus('kk07-call-content-ref-recursive.cbl'));
-    // the top-level MAIN-PARA call site's own snapshot vars (WS-CONTENT-ARG
-    // is USING-position 0, WS-DEPTH is USING-position 2 - BY REFERENCE
-    // WS-REF-ARG at position 1 needs no snapshot, it's a live alias)
-    assert.match(scala, /var _call0Snapshot0: Int = wsContentArg/);
-    assert.match(scala, /var _call2Snapshot0: Int = wsDepth/);
+    // round-36 finding 1 (ll01): the snapshot var name now also carries a
+    // call-site id (`_call<siteId>_<i>Snapshot<j>`), unique across the WHOLE
+    // generated method - not just `_call<i>Snapshot<j>` (round-35's own
+    // shape, unique only within one CALL node's own argument list) - since
+    // round-35's naming collided when two textually distinct CALL statements
+    // to a RECURSIVE program landed in the SAME method scope (ll01's own
+    // finding). The top-level MAIN-PARA call site's own snapshot vars
+    // (WS-CONTENT-ARG is USING-position 0, WS-DEPTH is USING-position 2 - BY
+    // REFERENCE WS-REF-ARG at position 1 needs no snapshot, it's a live
+    // alias) get call-site id 0 (the first CALL statement generateScala
+    // encounters).
+    assert.match(scala, /var _call0_0Snapshot0: Int = wsContentArg/);
+    assert.match(scala, /var _call0_2Snapshot0: Int = wsDepth/);
     assert.match(
       scala,
-      /Kk07sub\.entry\(\(\) => _call0Snapshot0, \(v: Int\) => _call0Snapshot0 = v, \(\) => wsRefArg, \(v: Int\) => wsRefArg = v, \(\) => _call2Snapshot0, \(v: Int\) => _call2Snapshot0 = v\)/
+      /Kk07sub\.entry\(\(\) => _call0_0Snapshot0, \(v: Int\) => _call0_0Snapshot0 = v, \(\) => wsRefArg, \(v: Int\) => wsRefArg = v, \(\) => _call0_2Snapshot0, \(v: Int\) => _call0_2Snapshot0 = v\)/
     );
     // the RECURSIVE self-call inside KK07SUB's own body gets the identical
     // treatment - LK-CONTENT/LK-DEPTH (BY CONTENT) each get a fresh local
     // snapshot var seeded from THIS activation's own current value; LK-REF
     // (BY REFERENCE) stays a live alias, routed through its own `_=` setter
     // call (round-23's own detour) since lkRef is itself a recursive-LINKAGE
-    // leaf.
-    assert.match(scala, /var _call0Snapshot0: Int = lkContent/);
-    assert.match(scala, /var _call2Snapshot0: Int = lkDepth/);
+    // leaf. The call-site counter resets per PROGRAM-ID (generateScala() is
+    // invoked once per program - see generateMultiProgramScala), so
+    // KK07SUB's own generateScala() pass starts its own numbering fresh at 0
+    // regardless of KK07MAIN's call above: this same source-level CALL
+    // statement is rendered twice within KK07SUB's own pass (once in the
+    // plain top-level `subMain()` def, once nested inside `entry()`'s own
+    // `subMain(_chain)` def - see generateRecursiveEntryMethod), picking up
+    // two DIFFERENT call-site ids (0, then 1) - each still self-consistent
+    // and collision-free (KK07MAIN's own id-0 vars live in a completely
+    // separate `object Kk07main`, so reusing id 0 here is harmless).
+    assert.match(scala, /var _call0_0Snapshot0: Int = lkContent/);
+    assert.match(scala, /var _call0_2Snapshot0: Int = lkDepth/);
     assert.match(
       scala,
-      /Kk07sub\.entry\(\(\) => _call0Snapshot0, \(v: Int\) => _call0Snapshot0 = v, \(\) => lkRef, \(v: Int\) => lkRef_=\(v\), \(\) => _call2Snapshot0, \(v: Int\) => _call2Snapshot0 = v\)/
+      /Kk07sub\.entry\(\(\) => _call0_0Snapshot0, \(v: Int\) => _call0_0Snapshot0 = v, \(\) => lkRef, \(v: Int\) => lkRef = v, \(\) => _call0_2Snapshot0, \(v: Int\) => _call0_2Snapshot0 = v\)/
+    );
+    assert.match(scala, /var _call1_0Snapshot0: Int = lkContent/);
+    assert.match(scala, /var _call1_2Snapshot0: Int = lkDepth/);
+    assert.match(
+      scala,
+      /Kk07sub\.entry\(\(\) => _call1_0Snapshot0, \(v: Int\) => _call1_0Snapshot0 = v, \(\) => lkRef, \(v: Int\) => lkRef_=\(v\), \(\) => _call1_2Snapshot0, \(v: Int\) => _call1_2Snapshot0 = v\)/
     );
   });
 });

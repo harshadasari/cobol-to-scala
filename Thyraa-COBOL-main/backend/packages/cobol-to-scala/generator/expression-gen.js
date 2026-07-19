@@ -674,6 +674,39 @@ function nextCallRetName() {
   return `_callRet${CALL_RET_SEQ++}`;
 }
 
+// Round-36 finding 1 (ll01): the EXACT same duplicate-declaration bug class
+// resetCallRetSeq/nextCallRetName was introduced to fix (see the doc comment
+// above) also existed in generateCall's `target.recursive` branch's own
+// BY CONTENT/VALUE snapshot-var naming (round-35 finding 2): `snapshotVar(i, j)`
+// named its local `var` purely from `i`/`j` - the USING-argument's position
+// and leaf index *within that one CALL node* - which is unique only relative
+// to a single CALL statement's own argument list, not across the whole
+// generated method body. Two textually distinct CALL statements to the same
+// RECURSIVE program, both passing BY CONTENT as their first argument, land in
+// the SAME Scala method scope (e.g. two CALLs in one paragraph) and both try
+// to declare `var _call0Snapshot0` - a hard "already defined" compile error,
+// exactly like the pre-round-12 `_callRet` bug. Fixed the identical way:
+// every CALL statement that reaches the `target.recursive` branch asks for
+// its own never-repeated call-site id via nextCallSiteId() (module-level
+// counter, reset once per generateScala() call alongside CALL_RET_SEQ - see
+// resetCallSiteSeq below), threaded into the snapshot var's own name
+// alongside the pre-existing `i`/`j` (still needed to distinguish multiple
+// BY CONTENT/VALUE arguments *within* the same call). A single call site
+// executed repeatedly at runtime (e.g. inside a PERFORM VARYING loop, ll14)
+// is unaffected - nextCallSiteId() is called once per *source-level*
+// generateCall invocation, not once per runtime execution, so the loop body
+// still declares exactly one `var` and simply overwrites it each iteration,
+// matching real cobc's own per-activation-local BY CONTENT semantics.
+let CALL_SITE_SEQ = 0;
+
+export function resetCallSiteSeq() {
+  CALL_SITE_SEQ = 0;
+}
+
+function nextCallSiteId() {
+  return CALL_SITE_SEQ++;
+}
+
 /**
  * The COBOL default-initialization ("no VALUE clause") literal for a bare
  * Scala type - numeric zero, or empty/blank text - with no item context
@@ -2446,10 +2479,39 @@ function generateFunctionCall(fc) {
  *     now guaranteed BigDecimal, with no separate wrap needed afterward
  *     (mirrors toBigDecimalOperand's own operator-recursion approach above:
  *     coerce the leaves, never the already-composed expression text).
- *   - everything else (MOD, ABS, SQRT, INTEGER, ...): generateFunctionCall
- *     renders these as plain Int/Long/Double Scala expressions, so they still
- *     need the same wrap-if-not-already-BigDecimal fallback as any other
- *     shape this function doesn't specifically recognize.
+ *   - MOD: round-36 finding 2's own verification (ll07) disproved this
+ *     doc comment's original assumption that MOD's rendering is always a
+ *     plain Int/Long/Double expression safe for the generic wrap-if-not-
+ *     already-BigDecimal fallback below - `FUNCTION MOD`'s own two operands
+ *     can themselves be arbitrary arithmetic expressions (as of round-36
+ *     finding 2's parseFunctionArgument fix, no longer truncated to a bare
+ *     leading term), including a nested `FUNCTION NUMVAL(...)` call, which
+ *     is ALREADY BigDecimal-typed - `COMPUTE X = FUNCTION
+ *     MOD(FUNCTION NUMVAL(A) * 10, FUNCTION NUMVAL(B)) + 5.25` renders
+ *     generateFunctionCall's MOD formula as a BigDecimal-typed expression
+ *     whose own text does NOT start with the literal `BigDecimal(` prefix
+ *     the generic fallback's textual check below looks for - so it got
+ *     wrapped a second time (`BigDecimal(<already-BigDecimal-expr>)`), a
+ *     hard "no overload of BigDecimal.apply accepts a BigDecimal" Scala
+ *     COMPILE error, previously masked because no prior corpus program
+ *     combined a top-level `FUNCTION MOD` with BigDecimal-typed operands in
+ *     a COMPUTE (every pre-existing MOD-using corpus program's own operands
+ *     are plain Int literals/fields - k09, bb10, v11, p15, r11/r11b -
+ *     `BigDecimal(Int-typed-expr)` has a real `apply(i: Int)` overload, so
+ *     the pre-existing fallback never crashed for any of them). Fixed the
+ *     same way MAX/MIN already are: a dedicated case that coerces MOD's OWN
+ *     two operands through toBigDecimalOperand itself (guaranteed
+ *     BigDecimal, regardless of what they render as under
+ *     convertArithmeticExpression) and returns the resulting formula
+ *     directly - no separate wrap-guess needed afterward, since the operands
+ *     (and therefore the whole `%`/`+` formula) are provably BigDecimal
+ *     already.
+ *   - everything else (ABS, SQRT, INTEGER, ...): not implemented at all by
+ *     generateFunctionCall (falls to its own `???` default case) - not
+ *     exercised by any corpus program, so the generic wrap-if-not-already-
+ *     BigDecimal fallback below is unreachable for them in practice; left
+ *     unchanged as a defensive fallback for any future FUNCTION this file
+ *     learns to render as a genuinely non-BigDecimal Scala expression.
  */
 function functionCallToBigDecimalOperand(fc) {
   const name = String(fc?.name || '').toUpperCase();
@@ -2462,6 +2524,13 @@ function functionCallToBigDecimalOperand(fc) {
     const args = fc?.arguments || [];
     const method = name === 'MAX' ? 'max' : 'min';
     return `List(${args.map(toBigDecimalOperand).join(', ')}).${method}`;
+  }
+
+  if (name === 'MOD') {
+    const args = fc?.arguments || [];
+    const a = toBigDecimalOperand(args[0]);
+    const b = toBigDecimalOperand(args[1]);
+    return `(((${a}) % (${b}) + (${b})) % (${b}))`;
   }
 
   const rendered = generateFunctionCall(fc);
@@ -2485,6 +2554,29 @@ function toBigDecimalOperand(node) {
     const info = lookupFieldForRef(node);
     const expr = convertIdentifier(node);
     return info?.scalaType === 'BigDecimal' ? expr : `BigDecimal(${expr})`;
+  }
+
+  // Round-36 finding 2 (ll07/ll15): a bare (unwrapped) FunctionCall node can
+  // now appear directly as an ArithmeticExpression's own `.left`/`.right`
+  // (see parseFunctionArgument's own doc comment, parser/procedure-parser.js
+  // - its own precedence chain builds ArithmeticExpression parents directly
+  // around whatever parseOperand returned, unlike parseArithmeticExpression's
+  // parsePrimary, which always wraps a FUNCTION call in an
+  // `ArithmeticExpression({ functionCall })` shell first). Before this case
+  // existed, such a node fell through to the generic fallback below, which
+  // renders it via convertArithmeticExpression (correctly dispatching
+  // `expr.type === 'FunctionCall'` to generateFunctionCall) and then
+  // wrap-guesses off the rendered TEXT - exactly the same
+  // already-BigDecimal-double-wrap bug functionCallToBigDecimalOperand's own
+  // doc comment describes, just one level up (e.g. `FUNCTION
+  // NUMVAL(WS-STR)` as the left operand of `FUNCTION MOD(FUNCTION
+  // NUMVAL(WS-STR) * 10, ...)`. Dispatching through
+  // functionCallToBigDecimalOperand directly - the same function
+  // convertArithmeticExpression's own top-level `expr.type === 'FunctionCall'`
+  // case effectively mirrors for the non-BigDecimal-guaranteed rendering -
+  // fixes it the same principled way as the MOD/MAX/MIN cases above.
+  if (node.type === 'FunctionCall') {
+    return functionCallToBigDecimalOperand(node);
   }
 
   if (node.type === 'ArithmeticExpression') {
@@ -9060,7 +9152,12 @@ function generateCall(statement, indent = 0) {
     // for why BY REFERENCE specifically needs a LIVE read on every call, not
     // a cached snapshot).
     const preLines = [];
-    const snapshotVar = (i, j) => `_call${i}Snapshot${j}`;
+    // round-36 finding 1 (ll01): `callSiteId` makes this CALL statement's own
+    // snapshot vars unique across the WHOLE generated method, not just
+    // within this one CALL node's own argument list - see nextCallSiteId's
+    // doc comment above.
+    const callSiteId = nextCallSiteId();
+    const snapshotVar = (i, j) => `_call${callSiteId}_${i}Snapshot${j}`;
     usingParams.forEach((param, i) => {
       const leafShapes = target.paramLeafShapes?.[i] || [{ scalaType: target.paramTypes?.[i] || 'String' }];
       const mode = String(param.mode || 'REFERENCE').toUpperCase();

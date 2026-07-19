@@ -41,6 +41,7 @@ import {
   setLinageRegistry,
   setCallProgramRegistry,
   resetCallRetSeq,
+  resetCallSiteSeq,
   defaultZeroValueForScalaType,
   generateCobolFmtHelper,
   generateCobolInspectHelper,
@@ -3707,6 +3708,11 @@ export function generateScala(ast, options = {}) {
   // comment for the bug this counter itself fixes) - every generateScala()
   // call starts its own program's `_callRet<N>` numbering fresh at 0.
   resetCallRetSeq();
+  // Round-36 finding 1 (ll01): same reasoning, for generateCall's
+  // `target.recursive` branch's own `_call<siteId>_<i>Snapshot<j>` BY
+  // CONTENT/VALUE snapshot vars - see expression-gen.js's resetCallSiteSeq/
+  // nextCallSiteId doc comment.
+  resetCallSiteSeq();
 
   // Case-class names that collide across two different top-level records
   // (see case-class-gen.js's collectAmbiguousGroupClassNames/resolveClassName

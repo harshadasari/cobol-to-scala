@@ -419,13 +419,127 @@ function parseFunctionCall(ctx) {
 }
 
 /**
- * Parse a single FUNCTION argument (literal, variable reference, or a
- * nested FUNCTION call).
+ * Parse a single FUNCTION argument - a full arithmetic expression (round-36
+ * finding 2, ll07/ll15), not just a bare operand.
+ *
+ * Before this fix, this was a bare `parseOperand(ctx)` call - correct for the
+ * overwhelmingly common case (a literal, identifier, or nested FUNCTION call
+ * with nothing else), but wrong the instant an argument is itself an
+ * arithmetic expression: `FUNCTION MOD(FUNCTION NUMVAL(WS-STR1) * 10,
+ * FUNCTION NUMVAL(WS-STR2))`'s first argument is `FUNCTION NUMVAL(WS-STR1) *
+ * 10`, not just `FUNCTION NUMVAL(WS-STR1)`. `parseOperand` consumed only the
+ * leading `FUNCTION NUMVAL(WS-STR1)` term and returned, leaving `* 10,
+ * FUNCTION NUMVAL(WS-STR2))` sitting unconsumed in the token stream -
+ * silently desyncing every statement parsed afterward (ll07's fuller repro:
+ * `FUNCTION MOD` ends up with only 1 argument, and the leftover tokens
+ * corrupt the surrounding COMPUTE's own `ON SIZE ERROR`/`END-COMPUTE`
+ * structure).
+ *
+ * Deliberately NOT a plain `parseArithmeticExpression(ctx)` call: that
+ * function's own leaf level (`parsePrimary`) only handles a parenthesized
+ * sub-expression, a numeric literal, a FUNCTION call, or a variable
+ * reference - it has no case for a STRING literal, a figurative constant
+ * (ZERO/SPACES/...), or an ALL literal, all of which `parseOperand` already
+ * supports and at least one existing corpus program actually uses as a
+ * FUNCTION argument (`p15-intrinsics.cbl`'s `FUNCTION LENGTH('HELLO')`) -
+ * delegating straight to parseArithmeticExpression would silently drop
+ * support for those shapes entirely (parsePrimary returns null, so the
+ * argument - and every one after it - would vanish). It would also change
+ * the AST *shape* of every ordinary bare-operand argument from a direct
+ * Literal/VariableReference/FunctionCall node to an ArithmeticExpression
+ * wrapper around one - breaking every downstream FUNCTION-argument consumer
+ * that pattern-matches the un-wrapped shape directly (functionLength's own
+ * `arg.type === 'Literal'`/`'VariableReference'` branches,
+ * generateDisplay's ref-mod'd-FUNCTION-LENGTH special case, etc.,
+ * generator/expression-gen.js).
+ *
+ * Instead, this is the SAME add/subtract -> multiply/divide -> power ->
+ * unary precedence chain parseArithmeticExpression itself uses (see
+ * parseAddSubtract/parseMultiplyDivide/parsePower/parseUnary below), just
+ * with its own leaf level delegating to parseOperand (this function's own
+ * pre-fix behavior) instead of parsePrimary - so a bare, operator-free
+ * argument parses to EXACTLY the same node parseOperand always produced (no
+ * wrapping at all - each precedence level simply returns its child's result
+ * untouched when no operator token follows), while an argument that DOES
+ * continue with `+`/`-`/`*`/`/`/`**` now correctly consumes the whole
+ * expression into a real ArithmeticExpression tree (whose leaves are
+ * whatever parseOperand produced - convertArithmeticExpression, generator/
+ * expression-gen.js, already dispatches on Literal/VariableReference/
+ * FunctionCall at ANY position in an ArithmeticExpression, not just at the
+ * top, so no generator change is needed for this new shape).
  */
 function parseFunctionArgument(ctx) {
-  if (ctx.checkValue('FUNCTION')) {
-    return parseFunctionCall(ctx);
+  return parseFunctionArgAddSubtract(ctx);
+}
+
+function parseFunctionArgAddSubtract(ctx) {
+  let left = parseFunctionArgMultiplyDivide(ctx);
+  if (left === null) return null;
+
+  while (ctx.check(TokenType.OP_PLUS) || ctx.check(TokenType.OP_MINUS)) {
+    const operator = ctx.advance().value;
+    const right = parseFunctionArgMultiplyDivide(ctx);
+    left = new ArithmeticExpression({ operator, left, right });
   }
+
+  return left;
+}
+
+function parseFunctionArgMultiplyDivide(ctx) {
+  let left = parseFunctionArgPower(ctx);
+  if (left === null) return null;
+
+  while (ctx.check(TokenType.OP_MULTIPLY) || ctx.check(TokenType.OP_DIVIDE)) {
+    const operator = ctx.advance().value;
+    const right = parseFunctionArgPower(ctx);
+    left = new ArithmeticExpression({ operator, left, right });
+  }
+
+  return left;
+}
+
+function parseFunctionArgPower(ctx) {
+  let left = parseFunctionArgUnary(ctx);
+  if (left === null) return null;
+
+  while (ctx.check(TokenType.OP_POWER)) {
+    const operator = ctx.advance().value;
+    const right = parseFunctionArgUnary(ctx);
+    left = new ArithmeticExpression({ operator, left, right });
+  }
+
+  return left;
+}
+
+function parseFunctionArgUnary(ctx) {
+  if (ctx.check(TokenType.OP_MINUS)) {
+    ctx.advance();
+    const expr = parseFunctionArgOperand(ctx);
+    return new ArithmeticExpression({ unaryMinus: true, right: expr });
+  }
+
+  if (ctx.check(TokenType.OP_PLUS)) {
+    ctx.advance();
+  }
+
+  return parseFunctionArgOperand(ctx);
+}
+
+function parseFunctionArgOperand(ctx) {
+  // A parenthesized sub-expression *within* one argument (e.g. `FUNCTION
+  // MOD((A + B) * 10, C)`'s first argument) - distinct from the FUNCTION
+  // call's own outer argument-list parens, which parseFunctionCall's caller
+  // already consumes before/after calling parseFunctionArgument for each
+  // argument.
+  if (ctx.check(TokenType.OP_LPAREN)) {
+    ctx.advance();
+    const expr = parseFunctionArgAddSubtract(ctx);
+    ctx.match(TokenType.OP_RPAREN);
+    return expr;
+  }
+  // parseOperand already recognizes FUNCTION (a nested intrinsic call),
+  // every literal shape (string/numeric/figurative/ALL), and a plain
+  // variable reference - unchanged from this function's pre-fix behavior.
   return parseOperand(ctx);
 }
 

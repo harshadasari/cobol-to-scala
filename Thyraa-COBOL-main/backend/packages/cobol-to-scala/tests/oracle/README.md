@@ -2472,3 +2472,35 @@ fix's own targeted tests had not been broad enough to catch.
   `groupChildConstructorExprIndexed`'s own recursion (distinct from the
   outer table-of-groups' `indexVar` it already carries) if a future program
   needs this specific two-level nesting.
+
+- **UNSTRING never supports a DATA-NAME delimiter, unlike STRING's own
+  `DELIMITED BY` (round-36, flagged by the round-36 refuter's ll13, not a
+  regression or a new finding)** - `unstringDelimiterLiteralText`
+  (`generator/expression-gen.js`) only resolves a *literal* (or figurative
+  constant) `DELIMITED BY` operand to compile-time text; a variable
+  delimiter (`UNSTRING WS-SRC DELIMITED BY WS-DELIM OR ","`, ll13's own
+  shape - one data-name delimiter OR'd with one literal delimiter in the
+  SAME clause) can't be folded into a literal at generation time, and the
+  gap is already deliberately, visibly documented in that function's own doc
+  comment ("a variable delimiter can't be folded into a literal at
+  generation time and is intentionally left unsupported ... rather than
+  guessed"): the ENTIRE `UNSTRING` statement falls through to the
+  pre-existing honest, compiling `// UNSTRING ...: DELIMITED BY clause
+  missing or not a compile-time-resolvable literal - not supported (no
+  corpus target exercises this shape)` no-op marker - visible, honestly
+  declined, never silently wrong or crashing (ll13's own INTO targets all
+  correctly stay at their declared blank default, and `TALLYING IN` stays
+  0, exactly matching an honest no-op). STRING's own `DELIMITED BY`
+  (`stringSourceSegmentExpr`/parseStringStatement's `source.delimitedBy`)
+  has no such restriction - a data-name delimiter operand there resolves at
+  RUNTIME (a live Scala expression compared against the scan position, not
+  a compile-time-folded literal), so this is a genuine asymmetry between the
+  two statements' own delimiter models, not merely two instances of the same
+  gap. Not promoted as a fix this round (out of scope for round-36's own two
+  triaged findings, and not a regression - no prior round ever claimed to
+  support this) - revisit by teaching `generateUnstring`
+  (`generator/expression-gen.js`) to build its own `delimsScala` Seq from a
+  RUNTIME Scala expression per delimiter (mirroring STRING's own
+  `stringSourceSegmentExpr` convention) instead of requiring every delimiter
+  to fold to a JS-side compile-time string via `unstringDelimiterLiteralText`,
+  if a future program needs a data-name UNSTRING delimiter.

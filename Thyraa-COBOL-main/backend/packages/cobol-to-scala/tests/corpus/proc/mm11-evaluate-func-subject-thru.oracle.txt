@@ -1,0 +1,5 @@
+N=1 HIGH
+N=2 MID
+N=3 LOW
+N=4 HIGH
+N=5 MID

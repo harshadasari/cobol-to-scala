@@ -1802,6 +1802,44 @@ corpus programs (gg01/gg05/gg15), not new declines; the round-31 refuter's
 other 12 probes (gg02-gg04, gg06-gg14) were already passing/honest at
 hand-off and needed no further work this round.
 
+### Round-32 adversarial-refutation findings (hh01/hh02/hh03/hh04/hh12) and their fixes
+
+A round-32 refuter (explicitly briefed to keep pressure-testing round 31's
+own fixes as its primary strategy, given rounds 22-31 all found real bugs
+this same way) left 12 new probes (hh01-hh12, 7 already passing/honest);
+this section covers the 5 that were failing - fixed in priority order:
+the byte-layout bug (findings 3/4/5, foundational and shared across three
+probes) first, then the compile crash (part of the same finding), then the
+occVar content-fingerprint gap (finding 2, the most architecturally
+significant), then WRITE's AT END-OF-PAGE clause (finding 1, lowest
+priority, resolved with a real fix rather than a decline once the
+triggering condition turned out to be simple).
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 3 | **An OCCURS table of GROUPS (each group containing a signed field and a plain field) in a RELATIVE-file record crashed at Scala COMPILE time.** `groupChildConstructorExpr`'s `allowTables` path (round-30 finding 1, `generator/expression-gen.js`) was built to handle a table of plain ELEMENTARY fields (a `Vector[Int]`/`Vector[String]` constructor argument) - a table whose own elements are themselves GROUPS (hh03: `REC-ROW OCCURS 2 TIMES { ROW-AMT PIC S9(3)V99. ROW-TAG PIC X(2). }`) needs a `Vector[<nested case class>]` argument instead, and the pre-fix code conflated the two shapes, passing a flat scalar-typed Vector where the constructor expected a nested-case-class-typed one - a hard type mismatch | Extended the leaf-resolution machinery to recognize a table child that is ITSELF a group (not just a table of scalars) and build the correct `Vector[<RowCaseClass>](<RowCaseClass>(...), ...)` nested constructor expression, generating a genuine per-row case class for the table's own row shape exactly like an ordinary (non-table) nested group already gets. Verified against installed GnuCOBOL and scala-cli (hh03): both rows' own signed/plain fields round-trip correctly through WRITE/READ | hh03 |
+| 4/5 | **A nested (non-repeating) group containing an OCCURS table of signed elements misaligned every keyed READ by exactly one whole record.** The fixed-width RELATIVE-file byte-width calculation (round 29-30's own `itemByteLength`-derived record length) undercounted the total width whenever an OCCURS table sat inside a nested, non-repeating group rather than directly at the record's own top level - the table child's own per-occurrence width times its occurs count was not being correctly summed into the ENCLOSING group's own total before that group's own width was added to the record's grand total, so the record's own declared fixed-width chunk size was too small. Every keyed READ then read from the WRONG byte offset - starting mid-way through record 1 and ending mid-way through record 2 - so the very first READ returned the SECOND written record's data instead of the first. Confirmed independently with both default trailing-overpunch (hh04) and `SIGN IS LEADING SEPARATE` (hh12) sign representations, proving the bug was in the WIDTH/OFFSET arithmetic itself, not the sign encoding | Fixed the nested-group width-summing recursion to correctly multiply a table child's own per-occurrence width by its occurs count BEFORE adding it into the enclosing (non-repeating) group's own running total, for any nesting depth - not just when the table sits directly at the record's own top level. Verified against installed GnuCOBOL and scala-cli (hh04, hh12): both records now read back in the correct order with the correct field values | hh04, hh12 |
+| 2 | **Round-31's own occVar staleness check (comparing array LENGTH only) could be defeated by coincidence.** Round 31 fixed a cross-logical-file-same-physical-path staleness bug by comparing the persisted `occVar`'s length against the freshly-reloaded `bufVar`'s length on every reopen - but this only detects a CHANGE IN RECORD COUNT, not a change in WHICH records are occupied while the count stays the same. hh02 engineers exactly this: FILE-B rewrites the shared physical file with the SAME total record count FILE-A last saw, but a DIFFERENT specific record (key 2) is now a genuine gap - FILE-A's stale, coincidentally-same-length `occVar` survives round 31's check undetected, and reading the now-gap slot crashes decoding blank placeholder bytes as real data | Added a lightweight content fingerprint per file (`someFileSig`, captured at CLOSE time as the exact string content of the buffer just flushed to disk) as a THIRD disjunct in the reload-staleness check: `occVar == null \|\| occVar.length != bufVar.length \|\| fileSig != freshSig` (the freshly-reloaded buffer's own content, computed at the same reload site). A length-preserving rewrite by a different logical file now changes the fingerprint even though the record count didn't change, correctly forcing a rebuild from content; an untouched file (the overwhelming common case) has a fingerprint that trivially matches itself, so round 30/31's own reuse-when-safe behavior is completely unchanged for every pre-existing corpus program. Verified against installed GnuCOBOL and scala-cli (hh02): FILE-A's reopened READ now correctly detects FILE-B's rewrite and reports status 23 for the genuine gap at key 2, matching cobc exactly | hh02 |
+| 1 | **WRITE's `AT END-OF-PAGE ... NOT AT END-OF-PAGE` clause was entirely unimplemented** - parsed into the AST but never consulted by `generateWriteStatement` at all, silently dropping both branches with zero visible marker, undocumented anywhere as a Known Gap. Investigated cobc's own real trigger condition rather than assuming it was too complex to implement (hh01: `LINAGE IS 2 LINES`, 4 successive WRITEs, alternating NOTEOP/EOP/NOTEOP/EOP) | Implemented for real, not a decline: a per-file LINAGE line-counter (`LINAGE IS <n> LINES`, a plain integer literal), incremented by one on every WRITE to a LINAGE-bearing file, compared against that file's own declared page size, resetting to 0 the instant it reaches that size (a fresh page) - AT END-OF-PAGE fires exactly on that reset, matching "line counter reaches the declared page size" precisely. A file with no LINAGE clause at all (every pre-existing corpus program) has no registry entry, so this is a pure addition - the pre-existing silent-drop behavior is unchanged for it. Verified against installed GnuCOBOL and scala-cli (hh01): NOTEOP/EOP/NOTEOP/EOP across 4 WRITEs, matching cobc byte-for-byte | hh01 |
+
+See `tests/round32-fixes.test.js` for focused, toolchain-independent unit
+tests of all 5 findings above, including regression coverage confirming
+round 30/31's own occVar-reuse behavior is byte-for-byte unchanged when no
+cross-file rewrite has actually occurred, and that a table of plain
+(non-group) elements or a top-level (non-nested) table keeps its
+pre-existing generated shape exactly as round 30/31 left it.
+
+Net effect on the whole-suite `todo` count: all 5 fixes above are genuine,
+oracle-verified corrections to already-promoted corpus programs
+(hh01/hh02/hh03/hh04/hh12), not new declines - the round-32 refuter's other
+7 probes (hh05-hh11) were already passing/honest at hand-off and needed no
+further work this round. Independently re-verified by the orchestrator
+after an activity gap interrupted the fix agent's own first verification
+attempt mid-run: a complete, from-scratch full-suite pass showed 1624/1653
+passing, 0 failing, 29 todo - unchanged from round 31's own baseline,
+confirming none of this round's 5 fixes introduced a new decline or left
+any prior gap unresolved.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read

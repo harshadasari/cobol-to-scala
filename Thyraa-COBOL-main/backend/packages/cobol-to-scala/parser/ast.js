@@ -145,6 +145,12 @@ export class FileDescription extends ASTNode {
     this.labelRecords = options.labelRecords || 'STANDARD';
     this.dataRecords = options.dataRecords || [];
     this.records = options.records || [];           // Array of DataItem (01-level records)
+    // round-32 finding 1 (hh01): `LINAGE IS <n> LINES` page size, a plain
+    // integer literal only (a data-name-driven LINAGE, e.g. `LINAGE IS
+    // WS-PAGE-SIZE LINES`, is parsed as `null` here - not exercised by any
+    // corpus program) - drives WRITE's own AT END-OF-PAGE/NOT AT END-OF-PAGE
+    // clause (see generator/expression-gen.js's generateWriteStatement).
+    this.linageLines = options.linageLines || null;
   }
 }
 

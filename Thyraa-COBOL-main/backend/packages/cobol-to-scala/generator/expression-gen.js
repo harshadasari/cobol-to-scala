@@ -435,6 +435,44 @@ function relativeRecordLengthFor(fileName) {
 }
 
 /**
+ * round-32 finding 1 (hh01): FD file name (upper) -> its own `LINAGE IS <n>
+ * LINES` page size (a plain integer literal only - see parser/data-division-
+ * parser.js's parseFileDescription). Drives WRITE's own AT END-OF-PAGE/NOT
+ * AT END-OF-PAGE clause (generateWriteStatement below): a real, compiler-
+ * verified fix rather than a silent no-op or a `???` decline, since the
+ * triggering condition turned out to be exactly this simple - a per-file
+ * line counter, incremented by one on every WRITE to a LINAGE-bearing file,
+ * compared against this file's own declared page size, resetting to 0 the
+ * instant it reaches that size (a fresh page). Compiler-verified against
+ * installed GnuCOBOL (hh01: `LINAGE IS 2 LINES`, 4 successive WRITEs) -
+ * NOTEOP/EOP/NOTEOP/EOP, i.e. AT END-OF-PAGE fires on exactly every 2nd
+ * WRITE, matching "line counter reaches the declared page size" precisely.
+ * A file with no LINAGE clause at all (every pre-existing corpus program)
+ * has no entry here, so this is a pure addition - generateWriteStatement's
+ * pre-existing behavior (silently dropping AT END-OF-PAGE/NOT AT END-OF-PAGE
+ * entirely) is unchanged for it.
+ */
+let LINAGE_REGISTRY = new Map();
+
+export function setLinageRegistry(registry) {
+  LINAGE_REGISTRY = registry instanceof Map ? registry : new Map();
+}
+
+function linageLinesFor(fileName) {
+  return LINAGE_REGISTRY.get(String(fileName || '').toUpperCase()) || null;
+}
+
+/**
+ * round-32 finding 1: per-file LINAGE line-counter flat-var name - a plain
+ * top-level `var`, exactly like every other per-file handle (bufVar/occVar/
+ * ...), declared once in generateFileHandleDeclarations (file-io-gen.js) and
+ * mutated by every WRITE to this file (generateWriteStatement below).
+ */
+function toLinageCounterVarName(fileName) {
+  return toCamelCase(fileName) + 'LinageCtr';
+}
+
+/**
  * round-29 finding 5: the Scala expression for a full-width "never actually
  * written" gap-fill placeholder for a RELATIVE file with a known
  * `recordLength` - an all-NUL (0x00) string of exactly that many
@@ -5764,6 +5802,25 @@ function groupContainsSignedDisplay(groupKey) {
  * differing-layout path already documents), an OCCURS table child when
  * `allowTables` is false, a nested group whose case-class name is ambiguous
  * across two different records, or a child with no registry info at all.
+ *
+ * round-32 finding 3 (hh03): a child that is BOTH a nested group AND itself
+ * an OCCURS table (`REC-ROW OCCURS 2 TIMES` containing its own signed/plain
+ * children - a table of GROUPS, each occurrence a whole nested record, not a
+ * single bare scalar) used to fall into the plain `c.groupKey` branch below
+ * exactly like an ordinary (non-repeating) nested group - producing ONE
+ * `NestedClassName(<whole-table flat vars>)` call, passing the flat Vector
+ * vars straight through as if they were this ONE occurrence's own SCALAR
+ * field values (a `Vector[Int]` where the nested case class's constructor
+ * declares a plain `Int`), a Scala compile-time type error - AND wrapping
+ * only one instance where the outer record's own field is declared
+ * `Vector[NestedClassName]` (case-class-gen.js always wraps an OCCURS-group
+ * field in `Vector[...]`), a second, independent type mismatch. A table of
+ * groups needs a `Vector.tabulate(<count>)(i => NestedClassName(<per-index
+ * args>))` instead - one instance built per occurrence, each of its OWN
+ * leaf fields read from that same index `i` of its own flat Vector var
+ * (groupChildConstructorExprIndexed, below) - safe under the exact same
+ * "flat var is always a full max-size Vector" invariant `allowTables`
+ * already relies on for a plain (non-group) table.
  */
 function groupChildConstructorExpr(groupKey, allowTables = false) {
   const children = GROUP_REGISTRY.get(groupKey);
@@ -5777,10 +5834,21 @@ function groupChildConstructorExpr(groupKey, allowTables = false) {
     // must not contribute a constructor argument for it either.
     if (c.isRedefines) continue;
     if (c.isFiller) return null;
-    if (c.nameUpper && TABLE_REGISTRY.has(c.nameUpper) && !allowTables) return null;
+    const tableInfo = c.nameUpper ? TABLE_REGISTRY.get(c.nameUpper) : null;
+    const isTableChild = !!tableInfo && tableInfo.times > 1;
+    if (isTableChild && !allowTables) return null;
     if (c.groupKey) {
       const nestedClassName = toPascalCase(c.nameUpper);
       if (AMBIGUOUS_GROUP_CLASS_NAMES.has(nestedClassName)) return null;
+      if (isTableChild) {
+        // round-32 finding 3: a table OF GROUPS - build one nested-class
+        // instance per occurrence, indexed into each of its own leaf
+        // descendants' flat Vector vars at that same occurrence index.
+        const nestedArgs = groupChildConstructorExprIndexed(c.groupKey, 'i');
+        if (nestedArgs == null) return null;
+        parts.push(`Vector.tabulate(${tableInfo.times})(i => ${nestedClassName}(${nestedArgs}))`);
+        continue;
+      }
       const nestedArgs = groupChildConstructorExpr(c.groupKey, allowTables);
       if (nestedArgs == null) return null;
       parts.push(`${nestedClassName}(${nestedArgs})`);
@@ -5788,6 +5856,44 @@ function groupChildConstructorExpr(groupKey, allowTables = false) {
     }
     if (!c.info || !c.camel) return null;
     parts.push(c.camel);
+  }
+  return parts.join(', ');
+}
+
+/**
+ * round-32 finding 3 companion: builds the constructor-argument list for ONE
+ * occurrence of a table-of-groups element (see groupChildConstructorExpr's
+ * `isTableChild` branch above) - identical recursion, except every plain
+ * elementary leaf contributes `<camel>(<indexVar>)` (this occurrence's own
+ * slot of its whole-table flat Vector var) instead of the bare flat-var
+ * identifier a non-repeating group's constructor call uses. A further
+ * nested OCCURS table found *inside* one table-of-groups element (a table
+ * nested inside a table, two independent OCCURS dimensions) is not
+ * supported - returns `null` rather than guess at a second index dimension
+ * (not exercised by any corpus program; the ONE dimension `indexVar` already
+ * carries is exactly hh03's own shape: `REC-ROW OCCURS 2 TIMES` containing
+ * only plain scalar children, no OCCURS of its own).
+ */
+function groupChildConstructorExprIndexed(groupKey, indexVar) {
+  const children = GROUP_REGISTRY.get(groupKey);
+  if (!children || children.length === 0) return null;
+
+  const parts = [];
+  for (const c of children) {
+    if (c.isRedefines) continue;
+    if (c.isFiller) return null;
+    const tableInfo = c.nameUpper ? TABLE_REGISTRY.get(c.nameUpper) : null;
+    if (tableInfo && tableInfo.times > 1) return null;
+    if (c.groupKey) {
+      const nestedClassName = toPascalCase(c.nameUpper);
+      if (AMBIGUOUS_GROUP_CLASS_NAMES.has(nestedClassName)) return null;
+      const nestedArgs = groupChildConstructorExprIndexed(c.groupKey, indexVar);
+      if (nestedArgs == null) return null;
+      parts.push(`${nestedClassName}(${nestedArgs})`);
+      continue;
+    }
+    if (!c.info || !c.camel) return null;
+    parts.push(`${c.camel}(${indexVar})`);
   }
   return parts.join(', ');
 }
@@ -7058,6 +7164,87 @@ function generateReturn(statement, indent = 0) {
  *   - `{ mode: 'none', camel: null, width: 0 }` - nothing could be resolved
  *     at all (matches the old `{ camel: null, width: 0 }` return exactly).
  */
+/**
+ * round-32 findings 3/4/5 (hh03/hh04/hh12): recursively resolves every LEAF
+ * flat-var target reachable from `groupKey`'s own children, through any
+ * depth of nested (non-repeating) sub-groups AND through a nested group that
+ * is itself an OCCURS table (a table of GROUPS, hh03's own shape), returning
+ * `[{ camel, ccField } | { camel, mapExpr }, ...]`:
+ *   - `{ camel, ccField }` - `ccField` is the dotted path from the parsed
+ *     record's own case class down to that leaf's constructor field (e.g.
+ *     `recDetail.detItem` for a leaf nested one non-repeating group deep),
+ *     always relative to the TOP-level `_parsed` value a caller already has
+ *     in scope - assign via `camel = _parsed.<ccField>`. `camel` is the
+ *     leaf's own flat-var identifier (an elementary field's flat var - a
+ *     plain scalar or, for an OCCURS-bearing elementary child, its own
+ *     whole-table flat Vector var, which already has the exact same shape/
+ *     width the parsed case class's own table field does, per round-30
+ *     finding 1's `allowTables` convention - so a direct assignment is
+ *     correct for either shape, no per-element loop needed).
+ *   - `{ camel, mapExpr }` - a leaf that lives INSIDE a table-of-groups
+ *     ancestor: `mapExpr` is a complete, self-contained expression (already
+ *     referencing `_parsed` itself) that maps over that ancestor's own
+ *     `Vector[NestedClass]` field, extracting this leaf's own value at each
+ *     occurrence - assign via `camel = <mapExpr>` directly (not wrapped in
+ *     `_parsed.` again). Mirrors groupChildConstructorExprIndexed's own
+ *     per-occurrence indexing on the WRITE side, in reverse.
+ *
+ * Before round 32 this recursion did not exist at all - a group child that
+ * was itself a nested group (rather than a bare elementary field) made the
+ * ENTIRE enclosing record's READ decline to 'unsupported' (see readDestination's
+ * old `!c.isGroup` requirement), even though the WRITE side (writeRecordPlan/
+ * groupChildConstructorExpr) and the parsed case class itself already fully
+ * support this exact shape (both the plain-nested-group and the
+ * table-of-groups shape, after this round's own groupChildConstructorExpr
+ * fix above).
+ *
+ * Returns `null` (declines, same as any other unsupported shape) when a
+ * child can't be resolved this way at all - a FILLER child (no case-class
+ * constructor-slot correspondence), or a table of groups nested inside
+ * ANOTHER table of groups (two independent OCCURS dimensions across group
+ * levels - not exercised by any corpus program; the single `mapExpr`
+ * dimension built here already covers hh03's own shape, a table of groups
+ * with only plain scalar children of its own). A REDEFINES child is simply
+ * skipped (never blocks the rest of the group), matching groupChildInfos's
+ * own pre-existing REDEFINES handling (round-26 root cause 4).
+ */
+function collectGroupReadLeaves(groupKey, pathPrefix) {
+  const children = GROUP_REGISTRY.get(groupKey);
+  if (!children || children.length === 0) return null;
+
+  const leaves = [];
+  for (const c of children) {
+    if (c.isRedefines) continue;
+    if (c.isFiller || !c.nameUpper) return null;
+    if (c.groupKey) {
+      const tableInfo = TABLE_REGISTRY.get(c.nameUpper);
+      if (tableInfo && tableInfo.times > 1) {
+        // round-32 finding 3 companion: a table OF GROUPS - resolve this
+        // one occurrence's own leaves (paths relative to a single element,
+        // not `_parsed`), then wrap each into a mapExpr that indexes this
+        // table's own Vector[NestedClass] field at every occurrence.
+        const innerLeaves = collectGroupReadLeaves(c.groupKey, '');
+        if (innerLeaves == null) return null;
+        for (const inner of innerLeaves) {
+          if (inner.mapExpr) return null; // a table nested inside a table of groups: not supported
+          leaves.push({
+            camel: inner.camel,
+            mapExpr: `(0 until ${tableInfo.times}).map(_i => _parsed.${pathPrefix}${c.camel}(_i).${inner.ccField}).toVector`,
+          });
+        }
+        continue;
+      }
+      const nested = collectGroupReadLeaves(c.groupKey, `${pathPrefix}${c.camel}.`);
+      if (nested == null) return null;
+      leaves.push(...nested);
+      continue;
+    }
+    if (!c.info || !c.camel) return null;
+    leaves.push({ camel: c.camel, ccField: `${pathPrefix}${c.camel}` });
+  }
+  return leaves;
+}
+
 function readDestination(statement, fileName) {
   const recordNameRaw = statement.into
     ? (statement.into.name || statement.into)
@@ -7071,9 +7258,8 @@ function readDestination(statement, fileName) {
 
   const recordNameUpper = String(recordNameRaw).toUpperCase();
   if (GROUP_REGISTRY.has(recordNameUpper) && !AMBIGUOUS_GROUP_CLASS_NAMES.has(toPascalCase(recordNameUpper))) {
-    const children = groupChildInfos(recordNameUpper);
-    const usable = children.length > 0 && children.every(c => c.info && !c.isGroup && !c.isFiller && c.ccField);
-    if (usable) {
+    const children = collectGroupReadLeaves(recordNameUpper, '');
+    if (children && children.length > 0) {
       const lenRaw = GROUP_BYTE_LENGTH_REGISTRY.get(recordNameUpper);
       const width = lenRaw ? Number(lenRaw) : 0;
       return { mode: 'group', className: toPascalCase(recordNameUpper), width, children };
@@ -7111,7 +7297,12 @@ function readAssignLines(dest, lineExpr, indentStr) {
       `${indentStr}val _parsed = ${dest.className}.parse((${fitted}).getBytes(java.nio.charset.StandardCharsets.ISO_8859_1))`,
     ];
     for (const c of dest.children) {
-      lines.push(`${indentStr}${assignExpr(c.camel, `_parsed.${c.ccField}`)}`);
+      // round-32 findings 3/4/5: a leaf inside a table-of-groups ancestor
+      // carries a pre-built, self-contained `mapExpr` (already referencing
+      // `_parsed` itself) instead of a plain `_parsed.<ccField>` path - see
+      // collectGroupReadLeaves's own doc comment.
+      const rhs = c.mapExpr ? c.mapExpr : `_parsed.${c.ccField}`;
+      lines.push(`${indentStr}${assignExpr(c.camel, rhs)}`);
     }
     return lines;
   }
@@ -7779,10 +7970,54 @@ function generateKeyedWriteStatement(statement, fileName, finalTextExpr, statusV
   return lines.join('\n');
 }
 
+/**
+ * round-32 finding 1 (hh01): `WRITE ... AT END-OF-PAGE ... NOT AT END-OF-PAGE
+ * ...` real codegen, appended (as extra Scala statements, same indent level)
+ * immediately after the WRITE's own write action - see LINAGE_REGISTRY's own
+ * doc comment for the compiler-verified triggering condition ("a per-file
+ * line counter, incremented by one on every WRITE, reaching the file's own
+ * declared LINAGE page size"). Returns `null` (a pure no-op - the caller's
+ * pre-existing return value is used completely unchanged) whenever this
+ * file has no registered LINAGE page size (every pre-existing corpus
+ * program) OR this particular WRITE has neither clause at all (an ordinary
+ * WRITE with no AT END-OF-PAGE at all is unaffected either way).
+ */
+function linageEopLines(fileName, statement, indent) {
+  const linageLines = linageLinesFor(fileName);
+  if (!linageLines) return null;
+  const hasEop = (Array.isArray(statement.atEndOfPage) && statement.atEndOfPage.length > 0) ||
+    (Array.isArray(statement.notAtEndOfPage) && statement.notAtEndOfPage.length > 0);
+  if (!hasEop) return null;
+
+  const indentStr = '  '.repeat(indent);
+  const bi = `${indentStr}  `;
+  const ctr = toLinageCounterVarName(fileName);
+  const lines = [];
+  lines.push(`${indentStr}${ctr} += 1`);
+  lines.push(`${indentStr}if ${ctr} >= ${linageLines} then`);
+  lines.push(`${bi}${ctr} = 0`);
+  const eop = statement.atEndOfPage || [];
+  lines.push(eop.length > 0 ? eop.map(s => generateExpression(s, indent + 1)).join('\n') : `${bi}()`);
+  lines.push(`${indentStr}else`);
+  const notEop = statement.notAtEndOfPage || [];
+  lines.push(notEop.length > 0 ? notEop.map(s => generateExpression(s, indent + 1)).join('\n') : `${bi}()`);
+  return lines.join('\n');
+}
+
 function generateWriteStatement(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const recordName = statement.recordName || statement.record || 'record';
   const fileName = fileNameForRecord(recordName);
+  // round-32 finding 1: appends the real AT END-OF-PAGE/NOT AT END-OF-PAGE
+  // codegen (linageEopLines) immediately after whichever write action this
+  // function decides to emit below - a pure no-op (returns `writeLine`
+  // completely unchanged) for every file/WRITE combination that isn't a
+  // LINAGE-bearing file with an actual AT END-OF-PAGE/NOT AT END-OF-PAGE
+  // clause on THIS statement.
+  const withEop = (writeLine) => {
+    const eop = linageEopLines(fileName, statement, indent);
+    return eop ? `${writeLine}\n${eop}` : writeLine;
+  };
   // round-27 finding 8: see isIndexedRandomAccess's own doc comment - this is
   // the exact statement (cc04) that crashed with a NullPointerException
   // before this fix (OPEN built a keyed-only handle, but WRITE - since
@@ -7851,9 +8086,9 @@ function generateWriteStatement(statement, indent = 0) {
     // fixed-length record's trailing bytes (spaces, NULs, or otherwise) are
     // real stored content, not insignificant whitespace to trim.
     const rawTextExpr = plainRecordTextExpr(fileName, plan);
-    return statusVar
+    return withEop(statusVar
       ? `${indentStr}{ ${writerVar}.print(${rawTextExpr});${statusSuffix} }`
-      : `${indentStr}${writerVar}.print(${rawTextExpr})`;
+      : `${indentStr}${writerVar}.print(${rawTextExpr})`);
   }
 
   // round-10 finding 3: a record containing a non-DISPLAY (packed/binary/
@@ -7866,9 +8101,9 @@ function generateWriteStatement(statement, indent = 0) {
   if (plan.mode === 'bytes') {
     const bytesExpr = `${plan.className}.format(${plan.className}(${plan.ctorArgs}))`;
     const textExpr = `new String(${bytesExpr}, java.nio.charset.StandardCharsets.ISO_8859_1)`;
-    return statusVar
+    return withEop(statusVar
       ? `${indentStr}{ ${writerVar}.print(${textExpr}); ${writerVar}.print("\\n");${statusSuffix} }`
-      : `${indentStr}{ ${writerVar}.print(${textExpr}); ${writerVar}.print("\\n") }`;
+      : `${indentStr}{ ${writerVar}.print(${textExpr}); ${writerVar}.print("\\n") }`);
   }
   // (plan.mode === 'bytes-unsupported' already returned early above, before
   // the keyed-access check - kept there so it applies uniformly regardless
@@ -7877,9 +8112,9 @@ function generateWriteStatement(statement, indent = 0) {
   const contentExpr = plan.expr;
 
   if (!ADVANCING_FILES.has(String(fileName || '').toUpperCase())) {
-    return statusVar
+    return withEop(statusVar
       ? `${indentStr}{ ${writerVar}.println((${contentExpr}).stripTrailing());${statusSuffix} }`
-      : `${indentStr}${writerVar}.println((${contentExpr}).stripTrailing())`;
+      : `${indentStr}${writerVar}.println((${contentExpr}).stripTrailing())`);
   }
 
   const textExpr = `(${contentExpr}).stripTrailing()`;
@@ -7897,9 +8132,9 @@ function generateWriteStatement(statement, indent = 0) {
   }
 
   if (position === 'BEFORE') {
-    return `${indentStr}{ ${writerVar}.print(${textExpr}); ${writerVar}.print(${sepExpr});${statusSuffix} }`;
+    return withEop(`${indentStr}{ ${writerVar}.print(${textExpr}); ${writerVar}.print(${sepExpr});${statusSuffix} }`);
   }
-  return `${indentStr}{ ${writerVar}.print(${sepExpr}); ${writerVar}.print(${textExpr});${statusSuffix} }`;
+  return withEop(`${indentStr}{ ${writerVar}.print(${sepExpr}); ${writerVar}.print(${textExpr});${statusSuffix} }`);
 }
 
 /**

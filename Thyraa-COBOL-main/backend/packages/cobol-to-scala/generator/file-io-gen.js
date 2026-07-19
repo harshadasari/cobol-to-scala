@@ -124,6 +124,40 @@ function toStartInvalidVarName(cobolFileName) {
 }
 
 /**
+ * round-32 finding 2 (hh02): a content-based fingerprint of exactly what
+ * THIS logical file itself last persisted to its own physical path, taken
+ * at CLOSE time (see generateClose) - compared, at this file's own NEXT
+ * OPEN, against a matching fingerprint of the file's CURRENT on-disk
+ * content (see pushBufferLoadLines). Round-30 finding 2 established that
+ * `occVar` (the occupied-slot tracker) can be safely reused verbatim across
+ * a close/reopen cycle rather than re-derived from ambiguous content alone -
+ * but only WHEN NOTHING ELSE could have changed the file's bytes in
+ * between. Round-31 finding 1 caught the case where a DIFFERENT logical
+ * file sharing the same physical path changes the record COUNT out from
+ * under this one (caught by comparing bufVar/occVar lengths) - but two
+ * different logical files can rewrite the SAME physical path with a
+ * DIFFERENT occupied-slot pattern that happens to leave the SAME record
+ * count (hh02's own probe: FILE-A writes keys 1/2/3, all occupied; FILE-B
+ * then truncates the same path and writes only keys 1 and 3, auto-extending
+ * to the same 3-slot count but leaving key 2 a genuine gap) - a length
+ * comparison alone cannot see this. Comparing this file's own last-CLOSE
+ * content fingerprint against the file's CURRENT on-disk content closes
+ * this gap directly: if they still agree, nothing besides this program's own
+ * WRITE/REWRITE/DELETE (already kept in lockstep with occVar) could have
+ * touched the file since - not a heuristic at all, ground truth, exactly
+ * like round-30's own null-check reasoning; if they disagree (regardless of
+ * whether the record COUNT happens to still match), some other actor
+ * rewrote the file's actual bytes, so occVar must be rebuilt from the fresh
+ * content instead, exactly as if this were a true first open. Only ever
+ * meaningful for a file that reaches pushBufferLoadLines (RANDOM/DYNAMIC
+ * access, or I-O) - a plain SEQUENTIAL-access file's `bufVar` is always null
+ * and this fingerprint is simply never read for it.
+ */
+function toSigVarName(cobolFileName) {
+  return toCamelCase(cobolFileName) + 'Sig';
+}
+
+/**
  * Extract file name from various formats
  */
 function extractFileName(file) {
@@ -161,6 +195,7 @@ export function fileHandleVarNames(fileName) {
     hasCurrentVar: toHasCurrentVarName(fileName),
     occVar: toOccVarName(fileName),
     startInvalidVar: toStartInvalidVarName(fileName),
+    sigVar: toSigVarName(fileName),
   };
 }
 
@@ -400,7 +435,7 @@ export function generateOpen(statement, indent = 0) {
 
   for (const file of files) {
     const fileName = extractFileName(file);
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, sigVar } = fileHandleVarNames(fileName);
     const mode = (statement.mode || file?.mode || 'INPUT').toUpperCase();
     const statusVar = fileStatusVarFor(fileName);
     const handlerMethod = declarativeHandlerFor(fileName, mode);
@@ -515,7 +550,21 @@ export function generateOpen(statement, indent = 0) {
         // shape since we last saw it" (lengths differ - occVar can no
         // longer be trusted at all, so rebuild from content exactly as if
         // this were a true first open).
-        openLines.push(`${bi}if ${occVar} == null || ${occVar}.length != ${bufVar}.length then`);
+        //
+        // round-32 finding 2 (hh02): the length comparison above only
+        // catches a change in record COUNT - it cannot see two different
+        // logical files sharing a physical path where the REWRITING file
+        // happens to leave the SAME record count but a genuinely DIFFERENT
+        // occupied-slot pattern (see toSigVarName's own doc comment).
+        // `_${toCamelCase(fileName)}FreshSig` is a content fingerprint of
+        // the file's CURRENT on-disk bytes (the exact same `.mkString`
+        // convention generateClose uses to compute `${sigVar}` when this
+        // logical file itself last wrote this content) - comparing it
+        // against `${sigVar}` (what THIS file left behind at its own last
+        // CLOSE) catches a content change regardless of whether the record
+        // count happens to still agree.
+        openLines.push(`${bi}val _${toCamelCase(fileName)}FreshSig = ${bufVar}.mkString`);
+        openLines.push(`${bi}if ${occVar} == null || ${occVar}.length != ${bufVar}.length || ${sigVar} != _${toCamelCase(fileName)}FreshSig then`);
         openLines.push(`${bi}  ${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_ != "\\u0000" * ${recLen}))`);
       } else {
         const srcVar = `_${toCamelCase(fileName)}Src`;
@@ -539,7 +588,13 @@ export function generateOpen(statement, indent = 0) {
         // length no longer matches the freshly-reloaded bufVar (a different
         // logical file sharing this physical path rewrote it while this one
         // was closed) is rebuilt from content instead of trusted verbatim.
-        openLines.push(`${bi}if ${occVar} == null || ${occVar}.length != ${bufVar}.length then`);
+        //
+        // round-32 finding 2: same content-fingerprint companion as the
+        // recLen branch above - a same-length, different-content rewrite by
+        // another logical file sharing this physical path is caught even
+        // when the record count happens to coincide.
+        openLines.push(`${bi}val _${toCamelCase(fileName)}FreshSig = ${bufVar}.mkString("\\n")`);
+        openLines.push(`${bi}if ${occVar} == null || ${occVar}.length != ${bufVar}.length || ${sigVar} != _${toCamelCase(fileName)}FreshSig then`);
         openLines.push(`${bi}  ${occVar} = scala.collection.mutable.ArrayBuffer.from(${bufVar}.map(_.nonEmpty))`);
         openLines.push(`${bi}${srcVar}.close()`);
       }
@@ -716,7 +771,7 @@ export function generateClose(statement, indent = 0) {
 
   for (const file of files) {
     const fileName = extractFileName(file);
-    const { fileVar, readerVar, writerVar, randomVar, bufVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, randomVar, bufVar, sigVar } = fileHandleVarNames(fileName);
 
     // Round-6 finding 1: a file using the ADVANCING deferred-terminator
     // WRITE model (see expression-gen.js's generateWriteStatement) leaves
@@ -751,16 +806,21 @@ export function generateClose(statement, indent = 0) {
     {
       const recLen = relativeRecordLengthFor(fileName);
       if (recLen) {
+        // round-32 finding 2: capture this file's own content fingerprint
+        // (see toSigVarName's own doc comment) from the EXACT bufVar
+        // content just flushed to disk, before it is nulled - the same
+        // `.mkString` convention pushBufferLoadLines's own fresh-content
+        // fingerprint uses on the next OPEN.
         lines.push(
           `${indentStr}if ${bufVar} != null then { val _fos = new java.io.FileOutputStream(${fileVar}); ` +
           `try ${bufVar}.foreach(r => _fos.write(r.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1))) ` +
-          `finally _fos.close(); ${bufVar} = null }`
+          `finally _fos.close(); ${sigVar} = ${bufVar}.mkString; ${bufVar} = null }`
         );
       } else {
         lines.push(
           `${indentStr}if ${bufVar} != null then { val _w = new java.io.PrintWriter(new java.io.OutputStreamWriter(` +
           `new java.io.FileOutputStream(${fileVar}), java.nio.charset.StandardCharsets.ISO_8859_1)); ` +
-          `try ${bufVar}.foreach(_w.println) finally _w.close(); ${bufVar} = null }`
+          `try ${bufVar}.foreach(_w.println) finally _w.close(); ${sigVar} = ${bufVar}.mkString("\\n"); ${bufVar} = null }`
         );
       }
     }
@@ -793,12 +853,12 @@ export function generateClose(statement, indent = 0) {
  * WRITE/CLOSE dereferences the same variable in a correct program (a READ/
  * WRITE before OPEN is invalid COBOL to begin with).
  */
-export function generateFileHandleDeclarations(fileNames, indent = 1) {
+export function generateFileHandleDeclarations(fileNames, indent = 1, linageRegistry = null) {
   const indentStr = '  '.repeat(indent);
   const lines = [];
 
   for (const fileName of fileNames) {
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, startInvalidVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, startInvalidVar, sigVar } = fileHandleVarNames(fileName);
     lines.push(`${indentStr}var ${fileVar}: java.io.File = null`);
     lines.push(`${indentStr}var ${readerVar}: scala.io.BufferedSource = null`);
     lines.push(`${indentStr}var ${writerVar}: java.io.PrintWriter = null`);
@@ -816,6 +876,16 @@ export function generateFileHandleDeclarations(fileNames, indent = 1) {
     lines.push(`${indentStr}var ${occVar}: scala.collection.mutable.ArrayBuffer[Boolean] = null`);
     // round-27 finding 7: see toStartInvalidVarName's own doc comment above.
     lines.push(`${indentStr}var ${startInvalidVar}: Boolean = false`);
+    // round-32 finding 2: see toSigVarName's own doc comment above.
+    lines.push(`${indentStr}var ${sigVar}: String = null`);
+    // round-32 finding 1 (hh01): per-file LINAGE line counter - only
+    // declared for a file whose FD actually carries a `LINAGE IS <n> LINES`
+    // clause (see expression-gen.js's toLinageCounterVarName/generateWriteStatement) -
+    // a pure addition, absent (and zero cost) for every file with no LINAGE
+    // clause at all.
+    if (linageRegistry instanceof Map && linageRegistry.has(String(fileName || '').toUpperCase())) {
+      lines.push(`${indentStr}var ${toCamelCase(fileName)}LinageCtr: Int = 0`);
+    }
   }
 
   return lines.join('\n');

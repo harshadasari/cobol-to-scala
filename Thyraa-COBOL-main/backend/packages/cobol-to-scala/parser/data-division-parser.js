@@ -1057,6 +1057,27 @@ function parseFileDescription(ctx) {
       continue;
     }
 
+    // round-32 finding 1 (hh01): `LINAGE IS <n> LINES` - the page size a
+    // WRITE's own AT END-OF-PAGE/NOT AT END-OF-PAGE clause fires against
+    // (see generator/expression-gen.js's generateWriteStatement). Only a
+    // plain integer literal is captured (`fd.linageLines`) - a data-name
+    // (`LINAGE IS WS-PAGE-SIZE LINES`) is left unset, same as before this
+    // fix, and any `WITH FOOTING AT`/`LINES AT TOP`/`LINES AT BOTTOM`
+    // sub-clause tokens fall through to the generic catch-all `ctx.advance()`
+    // below untouched (consumed one token at a time, same as any other
+    // not-yet-modeled FD clause already was before this fix - not a new
+    // parsing risk).
+    if (ctx.matchValue('LINAGE')) {
+      ctx.matchValue('IS');
+      if (ctx.check(TokenType.NUMERIC_LITERAL)) {
+        fd.linageLines = parseInt(ctx.advance().value, 10);
+      } else if (ctx.check(TokenType.IDENTIFIER)) {
+        ctx.advance(); // data-name-driven LINAGE: not supported, not captured
+      }
+      ctx.matchValue('LINES');
+      continue;
+    }
+
     ctx.advance();
   }
 

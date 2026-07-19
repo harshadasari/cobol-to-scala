@@ -2422,6 +2422,26 @@ function parseWriteStatement(ctx) {
     stmt.atEndOfPage = parseStatementBlock(ctx, ['NOT', 'END-WRITE']);
   }
 
+  // round-32 finding 1 (hh01): WRITE's grammar has the SAME two-independent-
+  // "NOT ..."-clauses shape round-31 finding 3 (gg15) fixed for READ - `NOT
+  // AT END-OF-PAGE` and `NOT INVALID KEY` - but only the INVALID-KEY-oriented
+  // check existed below (written assuming a bare `if (ctx.matchValue('NOT'))`
+  // could only ever mean NOT INVALID KEY, since no corpus program had ever
+  // used NOT AT END-OF-PAGE at all). `WRITE ... AT END-OF-PAGE ... NOT AT
+  // END-OF-PAGE ...` (legal COBOL) had its own NOT token greedily consumed by
+  // that INVALID-KEY-oriented check with no lookahead, then misparsed
+  // everything from `AT END-OF-PAGE <body>` onward as garbage - silently
+  // dropping the NOT AT END-OF-PAGE clause and its imperative statements
+  // entirely, with no crash or marker. Same fix as gg15: look ahead
+  // (peek(1), without consuming NOT) to confirm the next token is actually
+  // AT before treating this as NOT AT END-OF-PAGE at all.
+  if (ctx.checkValue('NOT') && ctx.peek(1)?.value?.toUpperCase() === 'AT') {
+    ctx.advance(); // consume NOT
+    ctx.matchValue('AT');
+    ctx.matchValue('END-OF-PAGE', 'EOP');
+    stmt.notAtEndOfPage = parseStatementBlock(ctx, ['INVALID', 'NOT', 'END-WRITE']);
+  }
+
   // Parse INVALID KEY
   if (ctx.matchValue('INVALID')) {
     ctx.matchValue('KEY');

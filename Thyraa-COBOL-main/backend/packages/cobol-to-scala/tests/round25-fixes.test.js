@@ -145,7 +145,11 @@ describe('round-25 finding 1 (o01/o02/o03): OPEN I-O initializes the read iterat
   // 0x0A byte inside a binary-encoded field's own value (see this file's
   // ee06 counterpart in tests/oracle/README.md's round-29 entry).
   test('CLOSE flushes the I-O buffer back to disk (raw, undelimited fixed-width bytes) before closing the other (unused) handles', () => {
-    assert.match(scala, /if someFileBuf != null then \{ val _fos = new java\.io\.FileOutputStream\(someFileFile\); try someFileBuf\.foreach\(r => _fos\.write\(r\.getBytes\(java\.nio\.charset\.StandardCharsets\.ISO_8859_1\)\)\) finally _fos\.close\(\); someFileBuf = null \}/);
+    // round-32 finding 2 (hh02): CLOSE also captures this file's own content
+    // fingerprint (someFileSig) from the exact buffer content just flushed,
+    // before nulling it - see tests/round32-fixes.test.js/tests/oracle/
+    // README.md's round-32 entry.
+    assert.match(scala, /if someFileBuf != null then \{ val _fos = new java\.io\.FileOutputStream\(someFileFile\); try someFileBuf\.foreach\(r => _fos\.write\(r\.getBytes\(java\.nio\.charset\.StandardCharsets\.ISO_8859_1\)\)\) finally _fos\.close\(\); someFileSig = someFileBuf\.mkString; someFileBuf = null \}/);
   });
 
   // round-29 finding 5 update: a plain OPEN INPUT of a RELATIVE-organization

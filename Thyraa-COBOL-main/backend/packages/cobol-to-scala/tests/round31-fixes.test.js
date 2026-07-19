@@ -197,8 +197,8 @@ describe('round-31 finding 1 (gg01): occVar reload also rebuilds on a length mis
 `;
   const scala = scalaOf(src);
 
-  test('the recLen (fixed-width RELATIVE) occVar reload check compares BOTH null-ness and length, not null-ness alone', () => {
-    assert.match(scala, /if fileAOcc == null \|\| fileAOcc\.length != fileABuf\.length then/);
+  test('the recLen (fixed-width RELATIVE) occVar reload check compares null-ness AND length (round-32 finding 2 additionally appends a content-fingerprint check to this same condition - see round32-fixes.test.js)', () => {
+    assert.match(scala, /if fileAOcc == null \|\| fileAOcc\.length != fileABuf\.length \|\| fileASig != _fileAFreshSig then/);
   });
 
   test('round-30\'s own reuse (no rebuild when both null-check and length agree) is unchanged in shape - still a single conditional rebuild', () => {

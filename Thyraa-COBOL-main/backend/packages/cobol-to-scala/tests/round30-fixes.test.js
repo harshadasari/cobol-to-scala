@@ -264,9 +264,13 @@ describe('round-30 finding 2 (ff13): occVar reload preserves in-memory state ins
     // triggers a rebuild, since a different logical file sharing the same
     // physical path may have rewritten the file's actual on-disk shape out
     // from under this one's own cached occVar - see tests/round31-fixes.test.js
-    // and tests/oracle/README.md's round-31 entry. Still gated behind a
-    // runtime check (not an unconditional rebuild), round-30's own point here.
-    assert.match(scala, /if relFileOcc == null \|\| relFileOcc\.length != relFileBuf\.length then\s+relFileOcc = scala\.collection\.mutable\.ArrayBuffer\.from\(relFileBuf\.map\(_ != "\\u0000" \* \d+\)\)/);
+    // and tests/oracle/README.md's round-31 entry. round-32 finding 2 (hh02)
+    // added a THIRD disjunct - a content-fingerprint mismatch also triggers a
+    // rebuild, catching a same-length-but-different-content rewrite the
+    // length check alone can't see - see tests/round32-fixes.test.js. Still
+    // gated behind a runtime check (not an unconditional rebuild), round-30's
+    // own point here.
+    assert.match(scala, /if relFileOcc == null \|\| relFileOcc\.length != relFileBuf\.length \|\| relFileSig != _relFileFreshSig then\s+relFileOcc = scala\.collection\.mutable\.ArrayBuffer\.from\(relFileBuf\.map\(_ != "\\u0000" \* \d+\)\)/);
   });
 
   test('CLOSE still never nulls occVar itself (only the record buffer) - the precondition the fix depends on', () => {

@@ -38,6 +38,7 @@ import {
   setAccessModeRegistry as setAccessModeRegistryExpr,
   setIndexedOrganizationFiles as setIndexedOrganizationFilesExpr,
   setRelativeRecordLengthRegistry as setRelativeRecordLengthRegistryExpr,
+  setLinageRegistry,
   setCallProgramRegistry,
   resetCallRetSeq,
   defaultZeroValueForScalaType,
@@ -3502,9 +3503,17 @@ export function generateScala(ast, options = {}) {
   // completely unaffected, keeping the pre-existing text-line model exactly
   // as before.
   const relativeRecordLengthRegistry = new Map();
+  // round-32 finding 1 (hh01): FD file name (upper) -> its own `LINAGE IS
+  // <n> LINES` page size - see expression-gen.js's own LINAGE_REGISTRY doc
+  // comment for the full rationale (drives WRITE's AT END-OF-PAGE/NOT AT
+  // END-OF-PAGE clause).
+  const linageRegistry = new Map();
   const fdFilesByName = new Map();
   for (const f of getFileSectionFiles(ast)) {
     if (f?.name) fdFilesByName.set(String(f.name).toUpperCase(), f);
+    if (f?.name && Number.isInteger(f.linageLines) && f.linageLines > 0) {
+      linageRegistry.set(String(f.name).toUpperCase(), f.linageLines);
+    }
   }
   for (const fc of getFileControls(ast)) {
     const fname = fc.name || fc.fileName;
@@ -3579,6 +3588,7 @@ export function generateScala(ast, options = {}) {
   setIndexedOrganizationFilesFileIO(indexedOrganizationFiles);
   setRelativeRecordLengthRegistryExpr(relativeRecordLengthRegistry);
   setRelativeRecordLengthRegistryFileIO(relativeRecordLengthRegistry);
+  setLinageRegistry(linageRegistry);
 
   // DECLARATIVES `USE AFTER STANDARD ERROR PROCEDURE` handler methods +
   // registries (round-10 finding 1, registry-population ordering fixed by
@@ -3712,7 +3722,7 @@ export function generateScala(ast, options = {}) {
     .map(f => f.name);
   const allFileNames = [...new Set([...fileControlNames, ...fdFileNames].map(n => n.toUpperCase()))]
     .map(upper => fileControlNames.find(n => n.toUpperCase() === upper) || fdFileNames.find(n => n.toUpperCase() === upper));
-  const fileHandleDecls = generateFileHandleDeclarations(allFileNames, 1);
+  const fileHandleDecls = generateFileHandleDeclarations(allFileNames, 1, linageRegistry);
   if (fileHandleDecls) {
     sections.push('');
     sections.push('  // File handles');

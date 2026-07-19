@@ -1,0 +1,2 @@
+TARGET=[ABCD                ] PTR=05
+A=[     ] B=[A    ] C=[     ] D=[B    ] E=[     ] CNT=5

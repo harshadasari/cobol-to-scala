@@ -11,6 +11,11 @@ _(none currently open - all prior pins resolved; see cycle entries. Tracked-OPEN
 - **Refutation rounds:** 8 so far (11,16,15,16,6,6,8,4 findings - all fixed through r7; r8 fix in flight)
 
 ## Activity
+### Cycle: Round 33 committed (2026-07-19 ~08:15 UTC)
+Nineteenth feature-combination round, the 12th consecutive round to find real bugs by pressure-testing the immediately preceding round's own fixes. 3 dishonest findings, all fixed for real: round 32's LINAGE fix only handled the bare LINES-only form, silently dropping WITH FOOTING AT (real cobc fires the page break earlier once only the footing area remains - fixed, and confirmed via a compiler probe that LINES AT TOP/BOTTOM don't affect timing); STRING's pointer value after ON OVERFLOW truncation was silently wrong (advanced as if the full source had been written, fixed by tracking each segment's real written-character count); a doubly-nested table-of-groups (a table row itself containing another table) crashed at compile time via a broken fallback chain, converted to a proper visible honest decline. Independently verified 1660/1691, 0 fail, after fixing one stale regex assertion in round6-fixes.test.js myself (confirmed legitimate staleness from round 33's own real STRING fix, not a regression). 31 todos (29 pre-existing + 2 new: one honest decline, one file hitting a pre-existing gap for the first time). Corpus 453 -> 466.
+
+Convergence status: trend now 8-6-8-8-4-2-3-4-4-5-6-8-8-4-8-4-3-5-3. Still not converged.
+
 ### Cycle: Round 32 committed (2026-07-19 ~06:50 UTC) - after a multi-day activity gap
 Eighteenth feature-combination round, again pressure-testing the immediately preceding round's own fixes - the strategy continues to pay off. 5 dishonest findings, all fixed for real: a nested group containing an OCCURS table of signed elements misaligned every keyed READ by one whole record (byte-width recursion bug, fixed); a table of GROUPS (not scalars) crashed at compile time (constructor-building conflation, fixed); round 31's own length-only occVar staleness check could be defeated by a same-length, different-content rewrite from a different logical file sharing the same physical path (fixed with a genuine content fingerprint captured at CLOSE); WRITE's AT END-OF-PAGE clause, previously a complete silent no-op, got a real LINAGE-based implementation.
 

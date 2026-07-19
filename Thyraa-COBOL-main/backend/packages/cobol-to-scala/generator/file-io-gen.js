@@ -215,6 +215,31 @@ export function setAdvancingFiles(fileNames) {
 }
 
 /**
+ * round-34 finding 2 (jj03): FD file names (upper) whose `LINAGE IS <n>
+ * LINES WITH FOOTING AT <m>` clause has a statically-known-invalid
+ * combination - `m > n` (the footing area alone would be larger than the
+ * whole page). Real cobc rejects this at OPEN time with a hard runtime
+ * abort (`libcob: error: LINAGE values invalid (status = 57)`) and writes
+ * ZERO records - the program never gets past OPEN. Both `linageLines` and
+ * `linageFootingLines` are plain integer literals only (see
+ * data-division-parser.js's own doc comment - a data-name-driven LINAGE/
+ * FOOTING is never captured at all), so this is always statically
+ * determinable at Scala-generation time; there is no runtime-only case to
+ * handle here. A file with no entry (every LINAGE-less file, and every
+ * LINAGE file whose FOOTING is absent or `<= ` its own page size) is
+ * completely unaffected - this is a pure addition gated on this registry.
+ */
+let LINAGE_INVALID_FILES = new Set();
+
+export function setLinageInvalidFiles(fileNames) {
+  LINAGE_INVALID_FILES = fileNames instanceof Set ? fileNames : new Set();
+}
+
+function isLinageInvalid(fileName) {
+  return LINAGE_INVALID_FILES.has(String(fileName || '').toUpperCase());
+}
+
+/**
  * FD file name (upper) -> its `FILE STATUS IS <field>` field's camelCase
  * flat-var name - round-6 finding 2/3's t04 companion gap. See
  * expression-gen.js's own identical copy (FILE_STATUS_REGISTRY) for the full
@@ -439,6 +464,25 @@ export function generateOpen(statement, indent = 0) {
     const mode = (statement.mode || file?.mode || 'INPUT').toUpperCase();
     const statusVar = fileStatusVarFor(fileName);
     const handlerMethod = declarativeHandlerFor(fileName, mode);
+
+    // round-34 finding 2 (jj03): a `LINAGE IS <n> LINES WITH FOOTING AT <m>`
+    // clause where `m > n` is statically invalid (the footing area alone
+    // would exceed the whole page) - real cobc raises a hard runtime abort
+    // AT OPEN TIME (`libcob: error: LINAGE values invalid (status = 57)`)
+    // and the program produces ZERO output records; it never gets past
+    // OPEN. Checked and emitted here, BEFORE any handle is built for this
+    // file (mirroring round-27 finding 8's own isIndexedRandomAccess decline
+    // immediately below), so no WRITE for this file can ever run. A file
+    // with no entry in LINAGE_INVALID_FILES (every LINAGE-less file, and
+    // every LINAGE file whose FOOTING is absent or within its own page
+    // size) is completely unaffected.
+    if (isLinageInvalid(fileName)) {
+      lines.push(
+        `${indentStr}System.err.println("libcob: error: LINAGE values invalid (status = 57) for file ${fileName}")`
+      );
+      lines.push(`${indentStr}sys.exit(1)`);
+      continue;
+    }
 
     // round-27 finding 8: an ORGANIZATION IS INDEXED file opened in RANDOM/
     // DYNAMIC access mode is not implemented at all (see isIndexedRandomAccess's
@@ -1157,4 +1201,5 @@ export default {
   setAccessModeRegistry,
   setIndexedOrganizationFiles,
   setRelativeRecordLengthRegistry,
+  setLinageInvalidFiles,
 };

@@ -1,6 +1,38 @@
-# cobc did not run cleanly (phase=run exitCode=1)
-# stderr:
-libcob: error: LINAGE values invalid (status = 57) for file PRINT-FILE ('JJP4.DAT')
-libcob: warning: implicit CLOSE of PRINT-FILE ('JJP4.DAT')
-
-# stdout:
+# cobc RUNTIME ERROR (exit 1) - EXPECTED, not a toolchain gap
+#
+# This program's FD deliberately specifies `LINAGE IS 5 LINES WITH FOOTING
+# AT 7` - a statically-invalid combination (the footing area alone, 7
+# lines, exceeds the whole 5-line page). Real GnuCOBOL rejects this AT OPEN
+# TIME with a hard runtime abort and writes ZERO output records - the
+# program never gets past its own OPEN OUTPUT statement:
+#
+#   libcob: error: LINAGE values invalid (status = 57) for file PRINT-FILE ('JJP4.DAT')
+#   libcob: warning: implicit CLOSE of PRINT-FILE ('JJP4.DAT')
+#
+# stdout: (empty - confirms zero records written before the abort)
+#
+# Renamed to *.cbl.txt (not *.cbl) for the SAME reason cc04/cc07's own notes
+# explain - so tests/oracle/oracle.test.js's `walkCblFiles()` sweep (which
+# requires every discovered *.cbl under tests/corpus/ to both compile AND
+# EXIT ZERO under cobc, with no escape hatch for a single file) doesn't pick
+# this file up and hard-fail on a cobc exit code that is the entire POINT of
+# this probe, not a toolchain limitation or a mistake.
+#
+# THE ACTUAL FINDING (round-34 finding 2): before this round's fix, the
+# engine's generated Scala had no equivalent validation at all - it ran the
+# (buggy, see round-34 finding 1) EOP/counter formula as if the FOOTING
+# value were fine, silently writing 8 records where real cobc writes zero.
+# Fixed by statically detecting `footingLines > pageSize` at Scala-
+# generation time (both values are always compile-time-known integer
+# literals - see data-division-parser.js's own doc comment, a data-name-
+# driven LINAGE/FOOTING is never captured at all) and emitting a runtime
+# abort (`System.err.println(...); sys.exit(1)`) as the very first thing
+# OPEN does for this file, before any handle is built - see file-io-gen.js's
+# `isLinageInvalid`/`LINAGE_INVALID_FILES` and generateOpen's own new check.
+#
+# Verified with scala-cli against the engine's own generated Scala for this
+# exact program: stdout is empty, no output file is ever created, and the
+# process exits nonzero - matching cobc's own "zero records written, hard
+# abort before any output" behavior (exact stderr text is not required to
+# match - see tests/oracle/README.md's round-34 entry - only the "zero
+# output" behavioral bar is).

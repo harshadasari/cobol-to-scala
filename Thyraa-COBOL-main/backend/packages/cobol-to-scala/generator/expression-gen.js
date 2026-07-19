@@ -8031,21 +8031,34 @@ function linageEopLines(fileName, statement, indent) {
   const indentStr = '  '.repeat(indent);
   const bi = `${indentStr}  `;
   const ctr = toLinageCounterVarName(fileName);
-  // round-33 finding 1 (ii01): with a `WITH FOOTING AT <m>` clause present,
-  // real cobc fires AT END-OF-PAGE once the running line counter reaches
-  // (pageSize - footingLines) - the page is considered "full" the instant
-  // only the footing area remains - and keeps firing on every subsequent
-  // WRITE until the counter actually reaches the full pageSize, at which
-  // point (and ONLY at which point) the counter resets for a fresh page.
-  // Compiler-verified against installed GnuCOBOL (ii01: `LINAGE IS 5 LINES
-  // WITH FOOTING AT 3`, 8 successive WRITEs) - NOTEOP/EOP/EOP/EOP/EOP/
-  // NOTEOP/EOP/EOP, i.e. AT END-OF-PAGE fires from counter==2 (5-3) through
-  // counter==5 (the full page, where the reset happens), then the cycle
-  // repeats. With no FOOTING clause at all (footingLines null), the
-  // threshold degenerates to pageSize itself - the reset and the EOP
-  // condition then fire on the exact same WRITE, reproducing round 32's own
-  // pre-existing bare-LINAGE behavior byte-for-byte (a pure addition).
-  const threshold = footingLines != null ? pageSize - footingLines : pageSize;
+  // round-33 finding 1 (ii01) ORIGINALLY used (pageSize - footingLines) as
+  // this threshold - WRONG, but not caught by ii01's own regression test,
+  // since ii01 happened to pick pageSize=5/footingLines=3, where
+  // (pageSize - footingLines) = 2 numerically coincides with the CORRECT
+  // formula below (footingLines - 1 = 2), masking the bug.
+  //
+  // round-34 finding 1 (jj01/jj02): a direct cobc probe with DIFFERENT
+  // pageSize/footingLines values exposes the real formula. `LINAGE IS 5
+  // LINES WITH FOOTING AT 4` (jj01, 10 successive WRITEs) gives cobc's own
+  // NOTEOP/NOTEOP/EOP/EOP/EOP/NOTEOP/NOTEOP/EOP/EOP/EOP - AT END-OF-PAGE
+  // fires from counter==3 (footingLines - 1 = 4 - 1 = 3, NOT
+  // pageSize - footingLines = 5 - 4 = 1) through counter==5 (the full page,
+  // where the reset happens), then the cycle repeats. `LINAGE IS 5 LINES
+  // WITH FOOTING AT 5` (jj02, footing == page size, 8 successive WRITEs)
+  // confirms it further: cobc gives NOTEOP/NOTEOP/NOTEOP/EOP/EOP/NOTEOP/
+  // NOTEOP/NOTEOP - threshold = footingLines - 1 = 4 (NOT
+  // pageSize - footingLines = 0, which would make EVERY WRITE report EOP).
+  // The correct threshold is simply (footingLines - 1) - the page is
+  // considered "full" the instant the footing area (footingLines lines,
+  // counted from the end of the page) is about to be entered - and keeps
+  // firing on every subsequent WRITE until the counter actually reaches the
+  // full pageSize, at which point (and ONLY at which point) the counter
+  // resets for a fresh page. With no FOOTING clause at all (footingLines
+  // null), the threshold degenerates to pageSize itself - the reset and the
+  // EOP condition then fire on the exact same WRITE, reproducing round 32's
+  // own pre-existing bare-LINAGE behavior byte-for-byte (unaffected by this
+  // fix).
+  const threshold = footingLines != null ? footingLines - 1 : pageSize;
   const lines = [];
   lines.push(`${indentStr}${ctr} += 1`);
   lines.push(`${indentStr}if ${ctr} >= ${threshold} then`);

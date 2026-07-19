@@ -1879,6 +1879,48 @@ pass below. The round-33 refuter's other 10 probes (ii02-ii05, ii07-ii08,
 ii10-ii13) were already passing/honest at hand-off and needed no further
 work this round.
 
+### Round-34 adversarial-refutation findings (jj01/jj02/jj03) and their fixes
+
+A round-34 refuter (again briefed to keep pressure-testing prior rounds' own
+fixes, given rounds 22-33 all found real bugs this same way, most recently
+round 33's own brand-new LINAGE FOOTING logic) left 13 new probes
+(jj01-jj13, 10 already passing/honest); this section covers the 2 distinct
+dishonest root causes across the 3 that were failing - both inside round
+33's own `WITH FOOTING AT` implementation, which its own regression test
+(ii01) failed to catch because of a values coincidence explained below.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | **Round-33's own `WITH FOOTING AT` threshold formula, `(pageSize - footingLines)`, is WRONG - the real cobc threshold is `(footingLines - 1)` - and round-33's own regression test (ii01) never caught it because ii01's chosen values (pageSize=5, footingLines=3) make both formulas numerically coincide (`5-3=2` and `3-1=2`), producing an identical generated threshold either way.** `linageEopLines` (`generator/expression-gen.js`) compared the running per-file line counter against `footingLines != null ? pageSize - footingLines : pageSize`. A direct cobc probe with DIFFERENT values exposes the real rule: jj01 (`LINAGE IS 5 LINES WITH FOOTING AT 4`, 10 successive WRITEs) gives cobc's own `NOTEOP/NOTEOP/EOP/EOP/EOP/NOTEOP/NOTEOP/EOP/EOP/EOP` - AT END-OF-PAGE first fires at counter==3 (`footingLines - 1 = 4 - 1 = 3`), NOT counter==1 (`pageSize - footingLines = 5 - 4 = 1`, which round-33's formula would have used). jj02 (`LINAGE IS 5 LINES WITH FOOTING AT 5`, footing == page size, 8 successive WRITEs) confirms it further: cobc gives `NOTEOP/NOTEOP/NOTEOP/EOP/EOP/NOTEOP/NOTEOP/NOTEOP` - threshold 4 (`footingLines - 1`), not 0 (`pageSize - footingLines`, which would make EVERY write report EOP - visibly absurd, and visibly NOT what cobc does) | Changed `linageEopLines`'s threshold to `footingLines != null ? footingLines - 1 : pageSize` (was `pageSize - footingLines`). The reset condition (separate, unconditional `if <ctr> >= <pageSize> then <ctr> = 0`, round-33's own fix) is untouched - only the EOP-firing threshold itself changes. With no FOOTING clause at all (`footingLines` null), the threshold still degenerates to `pageSize` exactly as before - completely unaffected by this fix. Verified against installed GnuCOBOL and scala-cli (jj01, jj02): both match cobc byte-for-byte; confirmed zero regression on round-33's own ii01 case (footingLines=3, pageSize=5 - threshold is still 2, the exact coincidence that masked this bug in round 33 also means this fix doesn't change ii01's own generated output at all) and on hh01's own bare-LINAGE corpus program (no FOOTING clause - threshold still degenerates to `pageSize` unchanged) | jj01, jj02 |
+| 2 | **`WITH FOOTING AT <m>` where `m` exceeds the FD's own `LINAGE IS <n> LINES` page size is a statically-invalid combination the engine never validated at all - it ran the (buggy, see finding 1) formula as if nothing were wrong, silently producing 8 lines of WRITE output where real cobc produces ZERO.** Real cobc rejects `LINAGE IS 5 LINES WITH FOOTING AT 7` with a hard runtime abort AT OPEN TIME (`libcob: error: LINAGE values invalid (status = 57) for file PRINT-FILE`) - the program never gets past its own `OPEN OUTPUT` statement, so not one record is ever written. The engine had no equivalent check anywhere - `linageEopLines`/the WRITE codegen just computed a (now also independently wrong, see finding 1) threshold and happily wrote every record | Both `linageLines` (LINES) and `linageFootingLines` (FOOTING AT) are always compile-time-known plain integer literals (`parser/data-division-parser.js` never captures a data-name-driven value for either), so this is fully statically determinable at Scala-generation time - no runtime-only case exists to handle. Added a new per-file registry, `LINAGE_INVALID_FILES`/`setLinageInvalidFiles` (`generator/file-io-gen.js`), populated in `generator/scala-generator.js` whenever `footingLines > pageSize` for a file's FD. `generateOpen` checks it FIRST, before any other per-file OPEN codegen (including round-27 finding 8's own `isIndexedRandomAccess` decline) - a flagged file's OPEN body is ENTIRELY replaced with `System.err.println("libcob: error: LINAGE values invalid (status = 57) for file <NAME>"); sys.exit(1)`, so no file handle/writer is ever constructed for it and no WRITE can ever run. A file with no registry entry (every LINAGE-less file, and every LINAGE file whose FOOTING is absent or `<=` its own page size - jj01/jj02's own shape) is completely unaffected. Verified with scala-cli against the engine's own generated Scala for jj03: stdout is empty, no output file is ever created, and the process exits nonzero - matching cobc's own "zero records written, hard abort before any output" behavior (exact stderr text is not required to match, only the zero-output behavioral bar). jj03 itself is not directly `oracleCompare()`-able (cobc's own real exit code for this program is legitimately nonzero, which `tests/oracle/harness.js`'s `oracleCompare` always treats as "did not run cleanly" regardless of what the generated Scala does) - renamed `jj03-linage-exceeds.cbl` to `jj03-linage-exceeds.cbl.txt` for the SAME reason round-27's cc04/cc07 notes already established (so `tests/oracle/oracle.test.js`'s `walkCblFiles()` sweep, which requires every discovered `*.cbl` to both compile AND exit zero under cobc, doesn't hard-fail on a cobc exit code that is the entire point of this probe) | jj03 |
+
+See `tests/round34-fixes.test.js` for focused, toolchain-independent unit
+tests of both findings above - including tests that re-derive the expected
+NOTEOP/EOP sequence directly from a from-scratch JS simulation of the
+documented counter/threshold/reset rule and cross-check that simulation
+against the real cobc-captured `jj01-linage-footing-formula.oracle.txt`/
+`jj02-linage-footing-equals-page.oracle.txt` files (rather than hardcoding
+the expected sequence independently of them), regression coverage
+confirming round-33's own ii01 case and hh01's own bare-LINAGE case both
+keep byte-identical generated thresholds, and regression coverage
+confirming the new FOOTING-exceeds-LINES abort does NOT fire for
+jj01/jj02/a bare-LINAGE file (only for a genuinely invalid FOOTING value).
+
+Net effect on the whole-suite `todo` count: both fixes above are genuine,
+oracle-verified corrections - finding 1 (jj01, jj02) corrects round-33's own
+WRITE AT END-OF-PAGE threshold formula for two already-promoted corpus
+programs; finding 2 (jj03) adds a new, previously entirely-absent OPEN-time
+validation, verified independently via scala-cli (zero output, nonzero
+exit) since jj03's own real cobc exit code makes it permanently ineligible
+for `oracleCompare()`'s automatic byte-diff (matching round-27's cc04/cc07
+precedent, not a new gap in the harness). The round-34 refuter's other 10
+probes (jj04-jj13) were already passing/honest at hand-off and needed no
+further work this round. Overall dishonest-finding count for round 34: 2
+(both inside round 33's own brand-new LINAGE FOOTING logic - a threshold
+formula error masked by round-33's own regression test picking coincidence-
+prone values, and a missing FOOTING-exceeds-LINES validation round 33 never
+considered at all).
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read

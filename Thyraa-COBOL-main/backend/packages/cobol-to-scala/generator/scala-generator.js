@@ -78,6 +78,7 @@ import {
   setAccessModeRegistry as setAccessModeRegistryFileIO,
   setIndexedOrganizationFiles as setIndexedOrganizationFilesFileIO,
   setRelativeRecordLengthRegistry as setRelativeRecordLengthRegistryFileIO,
+  setLinageInvalidFiles as setLinageInvalidFilesFileIO,
 } from './file-io-gen.js';
 import { generateSql, generateDoobieImports, generateTransactorSetup } from './sql-gen.js';
 
@@ -3511,6 +3512,11 @@ export function generateScala(ast, options = {}) {
   // FOOTING AT` clause was present) rather than a bare integer, so
   // linageEopLines can compute the footing-aware AT END-OF-PAGE threshold.
   const linageRegistry = new Map();
+  // round-34 finding 2 (jj03): FD file names (upper) whose `WITH FOOTING AT
+  // <m>` value statically exceeds its own `LINAGE IS <n> LINES` page size -
+  // see setLinageInvalidFilesFileIO's own doc comment (file-io-gen.js) for
+  // the full rationale (real cobc aborts at OPEN time, zero output).
+  const linageInvalidFiles = new Set();
   const fdFilesByName = new Map();
   for (const f of getFileSectionFiles(ast)) {
     if (f?.name) fdFilesByName.set(String(f.name).toUpperCase(), f);
@@ -3519,6 +3525,9 @@ export function generateScala(ast, options = {}) {
         ? f.linageFootingLines
         : null;
       linageRegistry.set(String(f.name).toUpperCase(), { pageSize: f.linageLines, footingLines });
+      if (footingLines != null && footingLines > f.linageLines) {
+        linageInvalidFiles.add(String(f.name).toUpperCase());
+      }
     }
   }
   for (const fc of getFileControls(ast)) {
@@ -3595,6 +3604,7 @@ export function generateScala(ast, options = {}) {
   setRelativeRecordLengthRegistryExpr(relativeRecordLengthRegistry);
   setRelativeRecordLengthRegistryFileIO(relativeRecordLengthRegistry);
   setLinageRegistry(linageRegistry);
+  setLinageInvalidFilesFileIO(linageInvalidFiles);
 
   // DECLARATIVES `USE AFTER STANDARD ERROR PROCEDURE` handler methods +
   // registries (round-10 finding 1, registry-population ordering fixed by

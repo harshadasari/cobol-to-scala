@@ -1023,9 +1023,31 @@ function defaultElementaryValueWithInheritance(item, scalaType, inheritedSlice, 
  * model rather than risk a partial/incorrect byte-accurate table model no
  * program here can verify.
  */
-function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry) {
+function characterSlicedGroupRedefinesLines(
+  realChildren, targetCamel, registry, declaredIndexNames = new Set(),
+  qualifiedRegistry = new Map(), ancestorNames = [], leafNameCounts = new Map()
+) {
   const lines = [];
   let offset = 0;
+
+  // round-35 finding 5 (kk12): register EVERY leaf this function declares
+  // through the same ambiguous-name disambiguation convention
+  // buildFieldRegistry's own ordinary (non-REDEFINES) leaf loop already
+  // uses - a REDEFINES-nested field whose bare name collides with a
+  // same-named field elsewhere (e.g. GROUP-A's own A-VIEW-SUB, nested under
+  // A-VIEW REDEFINES A-FIELD1, colliding with GROUP-B's own plain
+  // A-VIEW-SUB) must still get a real, qualifiable accessor - previously
+  // this function only ever called `registry.set(bareName, info)`
+  // unconditionally, with no qualifiedRegistry entry at all, so an `OF
+  // <ancestor>`-qualified reference to it had nothing but a lucky bare-name
+  // collision to fall back on.
+  function registerLeaf(nameUpper, info) {
+    const ambiguous = (leafNameCounts.get(nameUpper) || 0) > 1;
+    if (!ambiguous) registry.set(nameUpper, info);
+    for (const ancestor of ancestorNames) {
+      qualifiedRegistry.set(`${nameUpper}::${ancestor}`, info);
+    }
+  }
 
   // round-18 finding 7: the redefining item's own children can themselves be
   // nested GROUPs, arbitrarily many levels deep (g10: `01 WS-ALT REDEFINES
@@ -1055,12 +1077,86 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
         walk(realGrandchildren);
         continue;
       }
+      if (realGrandchildren.length > 0 && hasOccurs(child)) {
+        // round-35 finding 4 (kk09): an OCCURS-bearing GROUP child nested
+        // under a REDEFINES (a table-of-groups reached via REDEFINES, not
+        // directly under a plain 01-record/group) is genuinely out of scope
+        // for this character-slicing model (round-18 finding 7's own
+        // `!hasOccurs(child)` guard, above) - but falling through to
+        // processLeaf below (the pre-fix behavior) reads `child.pic.length`
+        // (`undefined` for a group), silently producing a ZERO-WIDTH slice
+        // for the whole table AND, critically, `tableRegistry.set(...)` was
+        // never called for it either (only processLeaf's own ordinary FIELD
+        // registry entry gets written) - generateSearch's own lookupTable
+        // then correctly finds nothing and degrades to its own honest,
+        // compiling "no OCCURS/INDEXED BY metadata found" comment, but that
+        // table's own INDEXED BY name(s) were NEVER declared as a var
+        // anywhere (that only happens in buildFieldRegistry's OUTER walk(),
+        // which never reaches an item hidden inside a REDEFINES's own
+        // children this way) - a bare `SET <idx> TO ...` (which does NOT
+        // consult tableRegistry) compiled to a raw, undeclared identifier: a
+        // hard Scala COMPILE FAILURE, not the honest, compiling decline
+        // every other REDEFINES-of-unsupported-shape branch in this file
+        // already uses (round-33 finding 2's own crash-to-decline
+        // precedent). Declaring the index var(s) here - real, working `Int`
+        // vars, exactly like buildFieldRegistry's own outer declaration -
+        // means SET/DISPLAY/comparison of the index itself still compiles
+        // and works correctly; only the TABLE itself (and its own row
+        // children) stays undeclared/unsupported, now a visible, compiling
+        // `???`/no-op stub instead of a silently mis-registered, zero-width
+        // leaf with an undeclared index.
+        const occ = child.occurs || {};
+        const idxCamels = (occ.indexedBy || []).map(toCamelCase);
+        (occ.indexedBy || []).forEach((idxName, i) => {
+          const upperIdx = String(idxName).toUpperCase();
+          if (declaredIndexNames.has(upperIdx)) return;
+          declaredIndexNames.add(upperIdx);
+          lines.push(`  var ${idxCamels[i]}: Int = 1`);
+          registry.set(upperIdx, {
+            camel: idxCamels[i],
+            scalaType: 'Int',
+            dataType: 'numeric',
+            integerDigits: 9,
+            decimalDigits: 0,
+            signed: true,
+            editPattern: null,
+            occursDepth: 0,
+            picLength: 0,
+            justified: false,
+            blankWhenZero: false,
+          });
+        });
+        const childCamel = toCamelCase(child.name);
+        const stubCount = hasOccurs(child) && occursCount(child) > 1 ? occursCount(child) : 1;
+        lines.push(
+          `  // REDEFINES: ??? TODO - ${child.name} is an OCCURS-bearing GROUP child nested under a ` +
+            `REDEFINES (a table-of-groups reached via REDEFINES) - not supported; ${child.name} and its own ` +
+            'children are not accessible (SEARCH/subscripted references degrade to an honest no-op)'
+        );
+        lines.push(
+          `  def ${childCamel}: Vector[String] = Vector.fill(${stubCount})("") ` +
+            `// TODO REDEFINES: unsupported table-of-groups-under-REDEFINES shape`
+        );
+        lines.push(
+          `  def ${childCamel}_=(v: Vector[String]): Unit = () ` +
+            `// TODO REDEFINES: write discarded (unsupported table-of-groups-under-REDEFINES shape)`
+        );
+        continue;
+      }
       processLeaf(child);
     }
   }
 
   function processLeaf(child) {
-    const camel = toCamelCase(child.name);
+    const nameUpper = (child.name || '').toUpperCase();
+    // round-35 finding 5 (kk12): use the SAME ancestor-qualified camel name
+    // an ordinarily-declared (non-REDEFINES) leaf already gets when its bare
+    // name collides with a same-named field elsewhere (buildFieldRegistry's
+    // own leaf loop) - a REDEFINES-nested field is just as addressable via
+    // `OF <ancestor>` qualification as an ordinary one, so it needs the same
+    // collision-avoiding treatment instead of an unconditional bare name.
+    const ambiguous = (leafNameCounts.get(nameUpper) || 0) > 1;
+    const camel = ambiguous ? toCamelCase([...ancestorNames, child.name].join('-')) : toCamelCase(child.name);
     const count = hasOccurs(child) && occursCount(child) > 1 ? occursCount(child) : 1;
     const usage = (child.usage || 'DISPLAY').toUpperCase();
     const isNonDisplay = usage !== 'DISPLAY';
@@ -1088,7 +1184,7 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
         );
 
         const childPic = child.pic && typeof child.pic === 'object' ? child.pic : null;
-        registry.set((child.name || '').toUpperCase(), {
+        registerLeaf(nameUpper, {
           camel,
           scalaType: baseType,
           dataType: baseType === 'String' ? 'alphanumeric' : 'numeric',
@@ -1126,7 +1222,7 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
       lines.push(
         `    ${targetCamel} = ${targetCamel}.substring(0, ${start}) + (0 until ${count}).map(i => CobolFmt.fitLeft(v(i), ${elementWidth})).mkString + ${targetCamel}.substring(${end})`
       );
-      registry.set((child.name || '').toUpperCase(), {
+      registerLeaf(nameUpper, {
         camel,
         scalaType: 'String',
         dataType: 'alphanumeric',
@@ -1157,7 +1253,7 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
       // alphanumeric children.
       const childPic = child.pic && typeof child.pic === 'object' ? child.pic : null;
       const childDataType = (childPic && childPic.dataType) || 'alphanumeric';
-      registry.set((child.name || '').toUpperCase(), {
+      registerLeaf(nameUpper, {
         camel,
         scalaType: 'String',
         dataType: childDataType,
@@ -1178,6 +1274,80 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
 }
 
 /**
+ * round-35 finding 3 (kk08): REDEFINES of an OCCURS elementary table (no
+ * group nesting on either side - just a bare `PIC X(n) OCCURS m TIMES`) by
+ * ANOTHER OCCURS elementary table with a DIFFERENT element width/count (but
+ * the SAME total byte width - the only shape real COBOL/cobc actually
+ * allows here). `item` is the REDEFINING item (has its own OCCURS, no real
+ * children - e.g. WS-TABLE-B, OCCURS 2 TIMES PIC X(4)); `targetInfo` is the
+ * TARGET's own already-registered field info (e.g. WS-TABLE-A, OCCURS 4
+ * TIMES PIC X(2) - registered with `occursDepth: 1`, `scalaType: 'String'`,
+ * `picLength` the target's own PER-ELEMENT width, `occursCounts[0]` its own
+ * element count - see buildFieldRegistry's ordinary elementary-leaf
+ * registration above). Builds a synthetic flat-character view over the
+ * TARGET's own Vector (`targetCamel.mkString`, concatenating its elements in
+ * order - exactly the same convention characterSlicedGroupRedefinesLines
+ * uses for a flat String target, just applied to a Vector[String] target's
+ * own concatenated form instead) and reslices it into `item`'s OWN element
+ * boundaries; the setter does the reverse (concatenate `item`'s own new
+ * elements, reslice back into the TARGET's own element boundaries, and
+ * reassign the target's Vector) - so a write through either view is visible
+ * through the other, matching COBOL REDEFINES storage-sharing semantics
+ * exactly like every other REDEFINES accessor in this file. Returns `null`
+ * (an honest decline, not a guess) whenever this model can't represent the
+ * shape: the target isn't itself a plain (non-nested) OCCURS table of
+ * String elements, `item`'s own OCCURS elements aren't PIC X-shaped either,
+ * or the two sides' total byte widths don't actually match (invalid COBOL -
+ * no corpus program exercises it).
+ */
+function occursElementaryOverOccursElementaryRedefinesLines(item, targetInfo, registry) {
+  if (!targetInfo || targetInfo.occursDepth !== 1 || targetInfo.scalaType !== 'String') return null;
+  const itemBaseType = scalaBaseType(item);
+  if (itemBaseType !== 'String') return null;
+  const itemPic = item.pic && typeof item.pic === 'object' ? item.pic : null;
+  if (!itemPic || !itemPic.length) return null;
+
+  const itemCount = occursCount(item);
+  const itemWidth = itemPic.length;
+  const targetCount = (Array.isArray(targetInfo.occursCounts) && targetInfo.occursCounts[0]) || 0;
+  const targetWidth = targetInfo.picLength || 0;
+  if (!itemCount || !targetCount || !targetWidth) return null;
+  if (itemCount * itemWidth !== targetCount * targetWidth) return null;
+
+  const camel = toCamelCase(item.name);
+  const targetCamel = targetInfo.camel;
+
+  const lines = [
+    `  // REDEFINES ${item.redefines}: ${item.name} (OCCURS ${itemCount} TIMES, ${itemWidth} chars each) reinterprets`,
+    `  // ${item.redefines}'s own OCCURS ${targetCount} TIMES (${targetWidth} chars each) storage across`,
+    '  // different element boundaries (round-35 finding 3) via a synthetic flat',
+    `  // character view, resliced into ${item.name}'s own ${itemWidth}-character elements.`,
+    `  def ${camel}: Vector[String] =`,
+    `    (0 until ${itemCount}).map(i => ${targetCamel}.mkString.substring(i * ${itemWidth}, (i + 1) * ${itemWidth})).toVector`,
+    `  def ${camel}_=(v: Vector[String]): Unit =`,
+    `    ${targetCamel} = (0 until ${targetCount}).map(i => v.map(x => CobolFmt.fitLeft(x, ${itemWidth})).mkString` +
+      `.substring(i * ${targetWidth}, (i + 1) * ${targetWidth})).toVector`,
+  ];
+
+  registry.set((item.name || '').toUpperCase(), {
+    camel,
+    scalaType: 'String',
+    dataType: 'alphanumeric',
+    integerDigits: 0,
+    decimalDigits: 0,
+    signed: false,
+    editPattern: null,
+    occursDepth: 1,
+    occursCounts: [itemCount],
+    picLength: itemWidth,
+    justified: false,
+    blankWhenZero: false,
+  });
+
+  return lines;
+}
+
+/**
  * Generate the accessor (`def`/`def_=`) pairs for a REDEFINES entry.
  *
  * - Elementary REDEFINES (no children): a plain pass-through alias onto the
@@ -1192,11 +1362,43 @@ function characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry)
  * - Group REDEFINES over an ALPHANUMERIC target (children): see
  *   characterSlicedGroupRedefinesLines above - character-position slicing,
  *   including REDEFINES over an OCCURS table.
+ * - OCCURS on the REDEFINING elementary item itself (no children), over an
+ *   OCCURS elementary target (no children either) - see
+ *   occursElementaryOverOccursElementaryRedefinesLines above (round-35
+ *   finding 3).
  */
-function redefinesAccessorLines(item, registry, siblingList, tableRegistry, targetAbsOffset = 0) {
+function redefinesAccessorLines(
+  item, registry, siblingList, tableRegistry, targetAbsOffset = 0, declaredIndexNames = new Set(),
+  qualifiedRegistry = new Map(), ancestorNames = [], leafNameCounts = new Map()
+) {
   const targetUpper = String(item.redefines || '').toUpperCase();
-  const targetInfo = registry.get(targetUpper);
+  let targetInfo = registry.get(targetUpper);
   const lines = [];
+
+  if (!targetInfo) {
+    // round-35 finding 5 (kk12): the target may be a perfectly ordinary
+    // ELEMENTARY item that simply never got a BARE registry entry because
+    // its own name is AMBIGUOUS across sibling records (buildFieldRegistry's
+    // own `if (!ambiguous) registry.set(nameUpper, info)` guard, below) - a
+    // group is not the ONLY reason a bare lookup can miss. e.g. A-FIELD1
+    // exists in both GROUP-A and GROUP-B, so only its QUALIFIED registry
+    // entries (keyed `NAME::ANCESTOR`) exist. REDEFINES requires its target
+    // to be an immediately-preceding SIBLING in the SAME list, so it always
+    // shares this item's own `ancestorNames` chain - try that lookup FIRST,
+    // before assuming "no bare entry" always means "target is a GROUP"
+    // (round-3 finding 6's original reasoning, which didn't anticipate an
+    // ambiguous ELEMENTARY target at all - see the "target not found"
+    // fallback below, which is what an ambiguous elementary target used to
+    // silently hit instead, leaving every one of this REDEFINES item's own
+    // children completely undeclared).
+    for (const ancestor of ancestorNames) {
+      const qualified = qualifiedRegistry.get(`${targetUpper}::${ancestor}`);
+      if (qualified) {
+        targetInfo = qualified;
+        break;
+      }
+    }
+  }
 
   if (!targetInfo) {
     // The target has no flat-var registry entry of its own - either it
@@ -1230,7 +1432,7 @@ function redefinesAccessorLines(item, registry, siblingList, tableRegistry, targ
       if (redefiningRealChildren.length === 0) {
         return elementaryOverGroupRedefinesLines(item, targetItem, registry, targetAbsOffset);
       }
-      return groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry, targetAbsOffset);
+      return groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry, targetAbsOffset, declaredIndexNames, qualifiedRegistry, ancestorNames, leafNameCounts);
     }
     lines.push(`  // REDEFINES ${item.redefines}: target not found - ${item.name} not accessible`);
     return lines;
@@ -1241,6 +1443,31 @@ function redefinesAccessorLines(item, registry, siblingList, tableRegistry, targ
 
   if (realChildren.length === 0) {
     const camel = toCamelCase(item.name);
+
+    // round-35 finding 3 (kk08): the REDEFINING item may carry its OWN
+    // OCCURS clause even though it has no real children of its own (a bare
+    // `PIC X(n) OCCURS m TIMES` elementary table) - this must NOT fall
+    // through to the plain scalar alias below (which would emit `def
+    // <camel>: String = <targetCamel>`, aliasing the ENTIRE target Vector as
+    // if it were one opaque String value, while every subscripted reference
+    // elsewhere still emits Vector-indexed `<camel>(i)` syntax against it - a
+    // hard type mismatch at Scala compile time). Checked BEFORE the COMP-1/
+    // COMP-2 byte-reinterpretation branch below (which only ever applies to
+    // a genuinely scalar, non-OCCURS elementary REDEFINES anyway) and before
+    // the plain alias - a `null` return (this model can't represent the
+    // shape - see the function's own doc comment) falls through to the
+    // pre-existing plain-alias code below unchanged, converted into a
+    // visible, compiling honest-decline marker rather than the silent wrong
+    // scalar alias.
+    if (hasOccurs(item)) {
+      const occursLines = occursElementaryOverOccursElementaryRedefinesLines(item, targetInfo, registry);
+      if (occursLines) return occursLines;
+      return [
+        `  // REDEFINES ${item.redefines}: ??? TODO - OCCURS-bearing elementary REDEFINES over this target shape is not supported`,
+        `  def ${camel}: Vector[String] = Vector.fill(${occursCount(item) || 1})("") // TODO REDEFINES ${item.redefines}: unsupported OCCURS/target shape`,
+        `  def ${camel}_=(v: Vector[String]): Unit = () // TODO REDEFINES ${item.redefines}: write discarded (unsupported OCCURS/target shape)`,
+      ];
+    }
 
     // round-29 finding 3: an elementary REDEFINES pairing a COMP-1/COMP-2
     // (Float/Double) item with a DIFFERENTLY-represented item sharing the
@@ -1313,7 +1540,45 @@ function redefinesAccessorLines(item, registry, siblingList, tableRegistry, targ
   }
 
   if (targetInfo.scalaType === 'String') {
-    return characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry);
+    return characterSlicedGroupRedefinesLines(realChildren, targetCamel, registry, declaredIndexNames, qualifiedRegistry, ancestorNames, leafNameCounts);
+  }
+
+  // round-35 finding 5 (kk12): a GROUP redefining a NUMERIC target whose own
+  // children are NOT purely numeric digit-slices (e.g. A-VIEW-SUB PIC X(3)
+  // viewing A-FIELD1 PIC 9(3)'s own raw DISPLAY digit bytes as characters -
+  // legal COBOL: an unsigned DISPLAY numeric's storage genuinely IS just its
+  // digit characters) - the digit-ARITHMETIC loop below assumes every child
+  // is itself a numeric digit-width slice (`child.pic.integerDigits`, always
+  // 0/undefined for an alphanumeric child), which would silently produce a
+  // wrong-typed, always-zero accessor instead of the child's real character
+  // view. Only attempted for the narrow, unambiguous shape this can model
+  // exactly: an UNSIGNED, whole-number (no decimal places) target - its
+  // digit text is exactly its DISPLAY storage bytes, no overpunch/decimal-
+  // point nuance to lose. A signed or fractional target (or one with no
+  // real digit-width info) falls through to the pre-existing digit-slicing
+  // loop unchanged (matching every pre-round-35 corpus program using this
+  // path, none of which mixes a non-numeric child in).
+  const hasNonNumericRedefiningChild = realChildren.some(c => scalaBaseType(c) === 'String');
+  if (hasNonNumericRedefiningChild && !targetInfo.signed && (targetInfo.decimalDigits || 0) === 0 && (targetInfo.integerDigits || 0) > 0) {
+    const flatName = `${toCamelCase(item.name)}BaseFlat`;
+    const targetIntDigits = targetInfo.integerDigits;
+    const targetSetExpr = targetInfo.scalaType === 'Int'
+      ? 'CobolFmt.numval(v).toIntExact'
+      : targetInfo.scalaType === 'Long'
+        ? 'CobolFmt.numval(v).toLongExact'
+        : 'CobolFmt.numval(v)';
+    const flatLines = [
+      `  // REDEFINES ${item.redefines}: ${item.redefines}'s own unsigned DISPLAY digit text reinterpreted`,
+      `  // as characters (round-35 finding 5) - ${flatName} is a synthetic flat-character view so`,
+      `  // ${item.name}'s own alphanumeric child(ren) below can character-slice it exactly like a`,
+      '  // REDEFINES over a real PIC X target.',
+      `  def ${flatName}: String = CobolFmt.digitsOf(BigDecimal(${targetCamel}), ${targetIntDigits}, 0)`,
+      `  def ${flatName}_=(v: String): Unit = ${targetCamel} = ${targetSetExpr}`,
+    ];
+    return [
+      ...flatLines,
+      ...characterSlicedGroupRedefinesLines(realChildren, flatName, registry, declaredIndexNames, qualifiedRegistry, ancestorNames, leafNameCounts),
+    ];
   }
 
   if (!['Int', 'Long', 'BigDecimal'].includes(targetInfo.scalaType)) {
@@ -1337,7 +1602,18 @@ function redefinesAccessorLines(item, registry, siblingList, tableRegistry, targ
   const widths = realChildren.map(c => (c.pic && c.pic.integerDigits) || 0);
   for (let i = 0; i < realChildren.length; i++) {
     const child = realChildren[i];
-    const camel = toCamelCase(child.name);
+    const nameUpper = (child.name || '').toUpperCase();
+    // round-35 finding 5: a REDEFINES-nested numeric-digit-slice child can
+    // ALSO collide with a same-named field elsewhere (the ordinary
+    // ambiguous-name disambiguation buildFieldRegistry's own leaf loop
+    // already applies to a ordinarily-declared field) - use the same
+    // ancestor-qualified camel name when ambiguous, and register a
+    // qualified-lookup entry either way, so an `OF <ancestor>` reference to
+    // this child resolves correctly instead of silently colliding with (or
+    // losing to) whichever same-named sibling field happens to be
+    // registered under the bare name.
+    const ambiguous = (leafNameCounts.get(nameUpper) || 0) > 1;
+    const camel = ambiguous ? toCamelCase([...ancestorNames, child.name].join('-')) : toCamelCase(child.name);
     const w = widths[i];
     const r = widths.slice(i + 1).reduce((a, b) => a + b, 0);
     const modBase = 10 ** w;
@@ -1348,7 +1624,7 @@ function redefinesAccessorLines(item, registry, siblingList, tableRegistry, targ
     );
 
     const childPic = child.pic && typeof child.pic === 'object' ? child.pic : null;
-    registry.set((child.name || '').toUpperCase(), {
+    const info = {
       camel,
       scalaType: 'Int',
       dataType: 'numeric',
@@ -1360,7 +1636,11 @@ function redefinesAccessorLines(item, registry, siblingList, tableRegistry, targ
       picLength: 0,
       justified: false,
       blankWhenZero: false,
-    });
+    };
+    if (!ambiguous) registry.set(nameUpper, info);
+    for (const ancestor of ancestorNames) {
+      qualifiedRegistry.set(`${nameUpper}::${ancestor}`, info);
+    }
   }
 
   return lines;
@@ -2004,7 +2284,10 @@ function todoStubRedefinesLines(redefiningItem, registry, tableRegistry) {
  * variable reference to that helper's generated code without any changes to
  * it at all.
  */
-function groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry, targetAbsOffset = 0) {
+function groupOverGroupRedefinesLines(
+  item, targetItem, registry, tableRegistry, targetAbsOffset = 0, declaredIndexNames = new Set(),
+  qualifiedRegistry = new Map(), ancestorNames = [], leafNameCounts = new Map()
+) {
   const redefiningRealChildren = (item.children || []).filter(c => !isLevel(c, 88));
 
   // round-18 finding 6: OCCURS directly on the REDEFINES item ITSELF (not on
@@ -2060,7 +2343,7 @@ function groupOverGroupRedefinesLines(item, targetItem, registry, tableRegistry,
     ...buildFlatViewLines(flatName, ops),
   ];
 
-  lines.push(...characterSlicedGroupRedefinesLines(redefiningRealChildren, flatName, registry));
+  lines.push(...characterSlicedGroupRedefinesLines(redefiningRealChildren, flatName, registry, declaredIndexNames, qualifiedRegistry, ancestorNames, leafNameCounts));
   return lines;
 }
 
@@ -2403,7 +2686,10 @@ function buildFieldRegistry(ast) {
 
       if (item.redefines) {
         const targetAbsOffset = itemAbsoluteOffsets.get(String(item.redefines).toUpperCase()) ?? 0;
-        const accessorLines = redefinesAccessorLines(item, registry, list, tableRegistry, targetAbsOffset);
+        const accessorLines = redefinesAccessorLines(
+          item, registry, list, tableRegistry, targetAbsOffset, declaredIndexNames,
+          qualifiedRegistry, ancestorNames, leafNameCounts
+        );
         if (accessorLines.length) lines.push(...accessorLines);
 
         // round-17 finding 8: an 88-level condition-name declared under a
@@ -3525,7 +3811,14 @@ export function generateScala(ast, options = {}) {
         ? f.linageFootingLines
         : null;
       linageRegistry.set(String(f.name).toUpperCase(), { pageSize: f.linageLines, footingLines });
-      if (footingLines != null && footingLines > f.linageLines) {
+      // round-35 finding 1 (kk04): the invalid-FOOTING check must inspect
+      // the RAW parsed `f.linageFootingLines` (an integer <= 0 is invalid,
+      // the same bucket as footingLines > pageSize), NOT the already-
+      // nulled `footingLines` derived above for the EOP-threshold formula
+      // - that derivation silently treats FOOTING AT 0 as "no FOOTING
+      // clause at all", which would make this check never see it.
+      if (Number.isInteger(f.linageFootingLines) &&
+          (f.linageFootingLines <= 0 || f.linageFootingLines > f.linageLines)) {
         linageInvalidFiles.add(String(f.name).toUpperCase());
       }
     }
@@ -4189,6 +4482,27 @@ function generateRecursiveEntryMethod(paramInfos, paramLeafShapes, units, ambigu
     `${indentStr}def entry(${paramList}): Unit =`,
   ];
   flatLeaves.forEach((leaf, i) => {
+    // round-35 finding 2 (kk07), CORRECTED: the first attempt at this fix
+    // gave EVERY leaf (BY CONTENT and BY REFERENCE alike) a local var cached
+    // ONCE at entry from `_get${i}()`. That broke BY REFERENCE: this
+    // codebase's WORKING-STORAGE model for RECURSIVE programs treats
+    // WORKING-STORAGE as SHARED, non-reentrant storage across the whole
+    // recursion call chain (unchanged, pre-existing - see how this method
+    // nests paragraphs inside entry() but still references OUTER
+    // module-level `var` declarations for ordinary WORKING-STORAGE items).
+    // A BY-REFERENCE-aliased LINKAGE parameter's correct, cobc-verified
+    // behavior requires every read to be LIVE (re-invoking `_get${i}()`
+    // fresh each time), so that a DEEPER nested recursive call mutating the
+    // SAME shared WORKING-STORAGE variable is visible to an OUTER
+    // activation's LATER read of its own aliased parameter - exactly
+    // matching real cobc's own observed behavior (j10/dd02/k01's oracle
+    // captures). Caching the value once at entry breaks this (the
+    // "off-by-one RECURSIVE depth" regression). kk07's actual StackOverflow
+    // bug (a BY CONTENT write being silently discarded, so a local mutation
+    // was never visible even within the SAME activation) is instead fixed at
+    // the CALL SITE - see generateCall (generator/expression-gen.js), which
+    // now gives a BY CONTENT/VALUE argument its own isolated, call-site-local
+    // snapshot var with a REAL (non-no-op) setter, instead of caching here.
     lines.push(`${bi}def ${leaf.camel}: ${leaf.scalaType} = _get${i}()`);
     lines.push(`${bi}def ${leaf.camel}_=(v: ${leaf.scalaType}): Unit = _set${i}(v)`);
   });

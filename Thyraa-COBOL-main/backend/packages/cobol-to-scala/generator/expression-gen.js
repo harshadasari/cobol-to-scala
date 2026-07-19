@@ -9039,6 +9039,28 @@ function generateCall(statement, indent = 0) {
   // argument.
   if (target.recursive) {
     const closureArgs = [];
+    // round-35 finding 2, CORRECTED: a BY CONTENT/VALUE operand (and the
+    // zero-default fallback below, which has no caller-side variable at
+    // all) must NOT alias the caller's own live variable and must NOT use a
+    // no-op setter either - a no-op setter silently discards a mutation the
+    // callee makes to its OWN linkage view, so a later read within that SAME
+    // callee activation never sees it (kk07's actual StackOverflow bug: a
+    // decrementing counter that never appeared to decrement). Instead, each
+    // such leaf gets its own isolated, call-site-scoped local snapshot var
+    // (seeded once from the caller's current value, or the leaf's own
+    // default), declared here as a `preLine` emitted BEFORE the entry()
+    // call, with the getter/setter closures operating on THAT local var -
+    // giving BY CONTENT/VALUE a REAL working per-call-site-local mutable
+    // copy (writes visible to later reads within the callee's own
+    // activation) while never connecting back to the caller's real storage.
+    // A BY REFERENCE plain-var/named-group operand is completely unaffected:
+    // still a live getter/setter pair aliasing the caller's own variable
+    // directly, exactly as finding 2's fix originally intended for that mode
+    // (see generateRecursiveEntryMethod's own doc comment, scala-generator.js,
+    // for why BY REFERENCE specifically needs a LIVE read on every call, not
+    // a cached snapshot).
+    const preLines = [];
+    const snapshotVar = (i, j) => `_call${i}Snapshot${j}`;
     usingParams.forEach((param, i) => {
       const leafShapes = target.paramLeafShapes?.[i] || [{ scalaType: target.paramTypes?.[i] || 'String' }];
       const mode = String(param.mode || 'REFERENCE').toUpperCase();
@@ -9051,24 +9073,37 @@ function generateCall(statement, indent = 0) {
       if (isPlainRefVar) {
         const camel = toCamelCase(name);
         const scalaType = leafShapes[0]?.scalaType || target.paramTypes?.[i] || 'String';
-        // round-23 (l12/l04): this closure's own caller-side variable may
-        // ITSELF be a recursive-LINKAGE-aliased leaf (a RECURSIVE program
-        // CALLing itself/a sibling, passing its own LINKAGE item BY
-        // REFERENCE - l12/l04's own exact shape) - assignExpr routes through
-        // the same explicit `<camel>_=(v)` setter-call detour renderAssignment
-        // uses, instead of a bare `${camel} = v` that would hit the identical
-        // "Reassignment to val" compile error for such a name.
-        const setter = mode === 'REFERENCE' ? `(v: ${scalaType}) => ${assignExpr(camel, 'v')}` : `(_: ${scalaType}) => ()`;
-        closureArgs.push(`() => ${camel}, ${setter}`);
+        if (mode === 'REFERENCE') {
+          // round-23 (l12/l04): this closure's own caller-side variable may
+          // ITSELF be a recursive-LINKAGE-aliased leaf (a RECURSIVE program
+          // CALLing itself/a sibling, passing its own LINKAGE item BY
+          // REFERENCE - l12/l04's own exact shape) - assignExpr routes
+          // through the same explicit `<camel>_=(v)` setter-call detour
+          // renderAssignment uses, instead of a bare `${camel} = v` that
+          // would hit the identical "Reassignment to val" compile error for
+          // such a name.
+          const setter = `(v: ${scalaType}) => ${assignExpr(camel, 'v')}`;
+          closureArgs.push(`() => ${camel}, ${setter}`);
+        } else {
+          const sv = snapshotVar(i, 0);
+          preLines.push(`${indentStr}var ${sv}: ${scalaType} = ${camel}`);
+          closureArgs.push(`() => ${sv}, (v: ${scalaType}) => ${sv} = v`);
+        }
         return;
       }
 
       if (isNamedGroup) {
         const callerLeaves = flattenGroupLeaves(resolveGroupKey(String(name).toUpperCase()));
         if (callerLeaves && callerLeaves.length === leafShapes.length) {
-          callerLeaves.forEach(leaf => {
-            const setter = mode === 'REFERENCE' ? `(v: ${leaf.scalaType}) => ${assignExpr(leaf.camel, 'v')}` : `(_: ${leaf.scalaType}) => ()`;
-            closureArgs.push(`() => ${leaf.camel}, ${setter}`);
+          callerLeaves.forEach((leaf, j) => {
+            if (mode === 'REFERENCE') {
+              const setter = `(v: ${leaf.scalaType}) => ${assignExpr(leaf.camel, 'v')}`;
+              closureArgs.push(`() => ${leaf.camel}, ${setter}`);
+            } else {
+              const sv = snapshotVar(i, j);
+              preLines.push(`${indentStr}var ${sv}: ${leaf.scalaType} = ${leaf.camel}`);
+              closureArgs.push(`() => ${sv}, (v: ${leaf.scalaType}) => ${sv} = v`);
+            }
           });
           return;
         }
@@ -9077,12 +9112,16 @@ function generateCall(statement, indent = 0) {
         // callee-declared leaf.
       }
 
-      leafShapes.forEach(leaf => {
+      leafShapes.forEach((leaf, j) => {
         const scalaType = leaf.scalaType || 'String';
-        closureArgs.push(`() => (${leafShapes.length === 1 ? argExprs[i] : defaultZeroValueForScalaType(scalaType)}), (_: ${scalaType}) => ()`);
+        const initExpr = leafShapes.length === 1 ? argExprs[i] : defaultZeroValueForScalaType(scalaType);
+        const sv = snapshotVar(i, j);
+        preLines.push(`${indentStr}var ${sv}: ${scalaType} = ${initExpr}`);
+        closureArgs.push(`() => ${sv}, (v: ${scalaType}) => ${sv} = v`);
       });
     });
-    return `${indentStr}${target.objectName}.entry(${closureArgs.join(', ')})`;
+    const callLine = `${indentStr}${target.objectName}.entry(${closureArgs.join(', ')})`;
+    return [...preLines, callLine].join('\n');
   }
 
   const callExpr = `${target.objectName}.entry(${argExprs.join(', ')})`;

@@ -1,0 +1,6 @@
+# cobc did not run cleanly (phase=run exitCode=1)
+# stderr:
+libcob: error: LINAGE values invalid (status = 57) for file PRINT-FILE ('JJP4.DAT')
+libcob: warning: implicit CLOSE of PRINT-FILE ('JJP4.DAT')
+
+# stdout:

@@ -1953,6 +1953,60 @@ kk09, kk12) - with finding 2 requiring one additional corrective iteration
 after independent full-suite verification caught a regression the original
 fix's own targeted tests had not been broad enough to catch.
 
+### Round-36 adversarial-refutation findings (ll01, ll07/ll15) and their fixes
+
+A round-36 refuter left 15 new probes (ll01-ll15, 13 already passing/honest,
+including ll11/ll12's own honest declines matching kk09's established
+pattern); this section covers the 2 that were failing. (Note: the original
+round-36 fix agent's own work was committed without writing this table -
+reconstructed directly from the actual code changes, matching round-32's
+own precedent for a missing ledger entry.)
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | **Round-35 finding 2's own BY CONTENT call-site snapshot-variable naming (`_call<i>Snapshot<j>`) was unique only WITHIN one CALL statement's own argument list, not across the whole generated method** - two textually distinct CALL statements to a RECURSIVE program in the SAME paragraph, each with a BY CONTENT first argument, both declared a local var named `_call0Snapshot0` in the same Scala method scope, a hard `is already defined as variable _call0Snapshot0` compile error. Real cobc runs this fine (sequential calls, no storage conflict) | `generateCall`'s `target.recursive` branch (`generator/expression-gen.js`) now assigns each CALL node its own `callSiteId` (via a running `nextCallSiteId()` counter scoped to one program's Scala-generation pass) and threads it into the snapshot-var name: `_call<callSiteId>_<i>Snapshot<j>`, unique across the whole method regardless of argument position. Verified against installed GnuCOBOL and scala-cli (ll01): compiles and matches oracle (`BEFORE A=010 B=020` / `IN SUB VAL=110` / `IN SUB VAL=120` / `AFTER A=010 B=020`); confirmed zero regression on ll14 (the same call site executed 3x in a runtime loop, not duplicated in source - was never affected by this bug, still passes) and kk07 (finding 2's own original regression-guard program, updated to the new naming scheme in `tests/round35-fixes.test.js`) | ll01 |
+| 2 | **`parseFunctionArgument` (`parser/procedure-parser.js`) called a bare-operand parser (`parseOperand`) for a FUNCTION's own argument instead of a full arithmetic-expression parser** - when a FUNCTION argument was ITSELF an arithmetic expression (e.g. `FUNCTION MOD(FUNCTION NUMVAL(WS-STR1) * 10, FUNCTION NUMVAL(WS-STR2))`), only the leading term (`FUNCTION NUMVAL(WS-STR1)`) was consumed, leaving `* 10, FUNCTION NUMVAL(WS-STR2))` unconsumed in the token stream - silently desyncing everything parsed afterward in the SAME statement (confirmed via direct AST dump: `FUNCTION MOD` ended up with only 1 argument, and in ll07's fuller repro even the trailing `ON SIZE ERROR`/`DISPLAY`/`END-COMPUTE` structure was corrupted, with the `DISPLAY` detached into an unconditional sibling statement and `END-COMPUTE` becoming a stray `UnknownStatement` node) | `parseFunctionArgument` now delegates to a dedicated argument-scoped arithmetic-expression parser chain (`parseFunctionArgAddSubtract` -> `parseFunctionArgMultiplyDivide` -> `parseFunctionArgPower` -> `parseFunctionArgUnary` -> `parseFunctionArgOperand`), mirroring the shape of this codebase's ordinary COMPUTE/arithmetic-expression precedence chain but scoped specifically to a single FUNCTION argument (so it still stops correctly at the argument-separating comma/closing paren `parseFunctionCall`'s own caller consumes). A simple bare-operand argument (a literal, identifier, or nested FUNCTION call with no surrounding arithmetic) parses identically to before - this only changes behavior when a FUNCTION argument contains its own arithmetic operators. Verified against installed GnuCOBOL and scala-cli: ll07 (the full statement, including `ON SIZE ERROR`/`DISPLAY`/`END-COMPUTE`) and ll15 (the minimal one-line isolation) both now parse correctly and byte-match their oracles; the full suite's many other pre-existing FUNCTION-argument tests are unaffected (this parser function is shared/pervasive, so this was checked carefully) | ll07, ll15 |
+
+See `tests/round36-fixes.test.js` for focused, toolchain-independent unit
+tests of both findings above.
+
+Net effect on the whole-suite `todo` count: both findings are genuine
+crash-to-fix corrections; round 36 added exactly 3 new honest todos (ll11,
+ll12 - table-of-groups-under-REDEFINES declines matching kk09's precedent -
+and ll13 - the UNSTRING data-name-delimiter gap noted below), verified
+individually against the pre-round todo list to rule out any hidden
+regression (a lesson carried directly from round 35's own todo-count spike).
+Overall dishonest-finding count for round 36: 2 (ll01, ll07/ll15).
+
+### Round-37 adversarial-refutation findings: none (0 dishonest)
+
+A round-37 refuter, briefed to keep pressure-testing rounds 35-36's own
+fixes (duplicate/interleaved BY CONTENT call sites across 2-4 sites and
+2 different paragraphs; FUNCTION arguments nested 3+ levels deep, inside
+parentheses, as table subscripts, combined with ROUNDED/ON SIZE ERROR, using
+`**`/unary minus) plus fresh-territory probes (SORT INPUT/OUTPUT PROCEDURE
+sharing one record; INITIALIZE REPLACING into a REDEFINES-nested field;
+PERFORM THRU across a SECTION boundary; CALL identifier with a changing
+data-name value; EVALUATE with a FUNCTION-call subject and THRU ranges),
+left 15 new probes (mm01-mm15) - **all 15 matched the real cobc oracle
+byte-for-byte. Zero dishonest findings.** mm10 (dynamic `CALL <data-name>`
+with a changing value between two calls) hits the pre-existing, deliberately
+documented round-7 finding 1c gap (a non-literal program name can't resolve
+at Scala-generation time, so the CALL honestly no-ops with a visible
+compiling marker) - confirmed stable/repeatable, not a new finding.
+
+**This is the first round since the campaign resumed at round 15 to meet
+the convergence bar (0-2 dishonest findings) for two consecutive rounds**
+(round 36: 2, round 37: 0). Per standing instruction, the campaign continues
+through round 40 regardless of this milestone, then moves to the wrap-up
+track (final completeness-critic audit, docs truth-pass, final report).
+
+Independently verified (full suite, run by the orchestrator after the
+refuter's own report, since this round made no code changes): 1808/1845
+passing, 0 failures, 37 honest todos (up from 36 by exactly 1 - mm10's own
+new todo entry for the pre-existing dynamic-CALL gap, confirmed against the
+pre-round todo list). No fix agent was needed this round.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read

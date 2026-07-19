@@ -1,0 +1,2 @@
+TARGET=[AB   CDEFWXYZ                 ]
+PTR=14

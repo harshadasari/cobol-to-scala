@@ -1,0 +1,5 @@
+DEPTH=5 TAG=HIGH      
+DEPTH=4 TAG=HIGH      
+DEPTH=3 TAG=MID       
+DEPTH=2 TAG=LOW       
+DEPTH=1 TAG=LOW       

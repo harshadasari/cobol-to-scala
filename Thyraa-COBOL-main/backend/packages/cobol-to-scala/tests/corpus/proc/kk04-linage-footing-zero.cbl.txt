@@ -1,0 +1,75 @@
+      * kk04 (round 35): `WITH FOOTING AT 0` - round-34 finding 2 added a
+      * static `footingLines > pageSize` OPEN-time abort (LINAGE_INVALID_
+      * FILES/isLinageInvalid, file-io-gen.js) but never checked the OTHER
+      * side of the legal range: FOOTING must also be >= 1. A direct cobc
+      * probe confirms FOOTING AT 0 is EQUALLY invalid - cobc aborts at
+      * OPEN time with the identical "LINAGE values invalid (status = 57)"
+      * error and writes ZERO records, exit 1 - exactly like round-34's own
+      * jj03 (FOOTING exceeding LINES).
+      *
+      * THE ENGINE'S BUG: `scala-generator.js`'s own FD-registry-building
+      * loop captures `footingLines` as
+      *   Number.isInteger(f.linageFootingLines) && f.linageFootingLines > 0
+      *     ? f.linageFootingLines : null
+      * - i.e. a FOOTING value of 0 (not > 0) is silently treated as
+      * "no FOOTING clause was present at all" (null), NOT as "an invalid
+      * FOOTING value that should abort". `linageInvalidFiles.add(...)` is
+      * only ever populated by comparing this ALREADY-NULLED footingLines
+      * against pageSize (`footingLines != null && footingLines > f.linageLines`),
+      * so a raw value of 0 never reaches that check either - it's simply
+      * invisible to the whole invalid-FOOTING registry.
+      *
+      * RESULT: the engine's generated Scala silently degrades to the
+      * bare-LINAGE model (threshold = pageSize, matching hh01's own no-
+      * FOOTING-clause behavior) and writes ALL 10 records with a full
+      * NOTEOP/NOTEOP/NOTEOP/NOTEOP/EOP/NOTEOP/NOTEOP/NOTEOP/NOTEOP/EOP
+      * cycle, instead of aborting with ZERO output like real cobc. This is
+      * a genuine silent-wrong-output bug on a feature (LINAGE WITH
+      * FOOTING AT validation) the engine explicitly added support for one
+      * round ago (round-34 finding 2) - it just didn't cover this half of
+      * the legal-range boundary.
+      *
+      * LIKELY FIX: also flag a file as LINAGE-invalid whenever the RAW
+      * (pre-null-coercion) `f.linageFootingLines` is an integer <= 0 -
+      * i.e. change the registry-building condition in scala-generator.js
+      * (near the existing `if (footingLines != null && footingLines >
+      * f.linageLines)` check) to also catch
+      * `Number.isInteger(f.linageFootingLines) && f.linageFootingLines <= 0`,
+      * using the RAW parsed value rather than the already-nulled derived
+      * one, since the current code nulls out exactly the value the check
+      * would need to see.
+      *
+      * Renamed to *.cbl.txt (not *.cbl), following round-34's own jj03/
+      * round-27's cc04/cc07 precedent, so tests/oracle/oracle.test.js's
+      * walkCblFiles() sweep (which requires every discovered *.cbl to
+      * compile AND exit zero under cobc) doesn't hard-fail on a cobc exit
+      * code that is the entire point of this probe.
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. KK04LINFOOT0.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT PRINT-FILE ASSIGN TO "KK04PRT.DAT"
+               ORGANIZATION IS LINE SEQUENTIAL.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  PRINT-FILE
+           LINAGE IS 5 LINES
+           WITH FOOTING AT 0.
+       01  PRINT-REC PIC X(10).
+       WORKING-STORAGE SECTION.
+       01  WS-I PIC 9(2).
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           OPEN OUTPUT PRINT-FILE.
+           PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > 10
+               MOVE "LINE" TO PRINT-REC
+               WRITE PRINT-REC
+                   AT END-OF-PAGE
+                       DISPLAY "EOP AT I=" WS-I
+                   NOT AT END-OF-PAGE
+                       DISPLAY "NOTEOP AT I=" WS-I
+               END-WRITE
+           END-PERFORM.
+           CLOSE PRINT-FILE.
+           STOP RUN.

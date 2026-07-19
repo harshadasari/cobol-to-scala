@@ -1,0 +1,18 @@
+# cobc COMPILE ERROR (exit 1) - EXPECTED, not a toolchain gap
+#
+# kk05.cbl:13: error: LINAGE clause with wrong file type
+#
+# Confirms (round-35, answering round-34's own open question): a LINAGE
+# clause combined with ORGANIZATION IS RELATIVE is rejected by GnuCOBOL at
+# COMPILE time, not merely at OPEN/runtime - "LINAGE clause with wrong file
+# type". A companion probe (not itself promoted into this corpus) swapping
+# in ORGANIZATION IS INDEXED (with a RECORD KEY clause added) produces the
+# identical compile error. LINAGE is only valid for a sequential
+# (typically LINE SEQUENTIAL) print-oriented file in real COBOL.
+#
+# Renamed to *.cbl.txt (not *.cbl) since cobc does not compile this program
+# at all - see this file's own .cbl.txt header comment for the full
+# analysis, including why this is HONEST/out-of-scope rather than a new
+# dishonest finding (the engine has no FD-clause/organization compatibility
+# validation and is simply more permissive than cobc's own front end here;
+# it neither crashes nor hangs on this out-of-scope input).

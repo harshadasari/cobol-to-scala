@@ -1,0 +1,23 @@
+# cobc RUNTIME ERROR (exit 1) - EXPECTED, not a toolchain gap
+#
+# stdout:
+GOOD-FILE-DONE
+#
+# stderr:
+# libcob: error: LINAGE values invalid (status = 57) for file BAD-FILE ('KK06BAD.DAT')
+# libcob: warning: implicit CLOSE of BAD-FILE ('KK06BAD.DAT')
+#
+# GOOD-FILE ('KK06GOOD.DAT') is fully written (two records, "GOODLINE1"/
+# "GOODLINE2") and closed successfully before the abort; BAD-FILE
+# ('KK06BAD.DAT') is created (0 bytes) but never written - the program
+# aborts at BAD-FILE's own OPEN, so "BAD-FILE-DONE" never prints. Overall
+# exit code: 1.
+#
+# Renamed to *.cbl.txt (not *.cbl) since cobc's own real exit code for this
+# program is legitimately nonzero (the abort IS the point of the probe) -
+# see this file's own .cbl.txt header comment. HONEST (round 35): verified
+# against the engine's own generated Scala - stdout is byte-for-byte
+# "GOOD-FILE-DONE" only, matching cobc exactly, and the process exits 1 -
+# round-34 finding 2's LINAGE_INVALID_FILES abort is correctly scoped to
+# only the one invalid FD in a multi-FD program; GOOD-FILE's own OPEN/
+# WRITE/CLOSE is completely unaffected.

@@ -1,0 +1,6 @@
+B1=[AABB]
+B2=[CCDD]
+A1=[WX]
+A2=[YZ]
+A3=[CC]
+A4=[DD]

@@ -1,0 +1,34 @@
+# cobc RUNTIME ERROR (exit 1) - EXPECTED, not a toolchain gap
+#
+# This program's FD deliberately specifies `LINAGE IS 5 LINES WITH FOOTING
+# AT 0` - a statically-invalid combination just like round-34's own jj03
+# (FOOTING exceeding LINES), except at the OTHER end of the legal range:
+# FOOTING must be >= 1, not merely <= LINES. Real GnuCOBOL rejects this AT
+# OPEN TIME with the identical hard runtime abort and writes ZERO output
+# records - the program never gets past its own OPEN OUTPUT statement:
+#
+#   libcob: error: LINAGE values invalid (status = 57) for file PRINT-FILE ('KK04PRT.DAT')
+#   libcob: warning: implicit CLOSE of PRINT-FILE ('KK04PRT.DAT')
+#
+# stdout: (empty - confirms zero records written before the abort)
+# exit code: 1
+#
+# Renamed to *.cbl.txt (not *.cbl) for the SAME reason jj03/cc04/cc07's own
+# notes explain - so tests/oracle/oracle.test.js's `walkCblFiles()` sweep
+# (which requires every discovered *.cbl to both compile AND exit zero
+# under cobc) doesn't hard-fail on a cobc exit code that is the entire
+# POINT of this probe.
+#
+# THE ACTUAL FINDING (round-35, DISHONEST - see this file's own .cbl.txt
+# header comment for full root-cause detail): round-34 finding 2 added a
+# static `footingLines > pageSize` OPEN-time abort, but never checked
+# `footingLines <= 0` - scala-generator.js's FD-registry-building loop
+# silently coerces a FOOTING value of 0 to `null` (treated as "no FOOTING
+# clause present at all") BEFORE the invalid-FOOTING check ever runs, so
+# this genuinely-invalid FD is completely invisible to LINAGE_INVALID_FILES.
+# The engine's generated Scala for this exact program does NOT abort - it
+# silently falls back to the bare-LINAGE model (threshold = pageSize) and
+# writes all 10 records with a full
+# NOTEOP/NOTEOP/NOTEOP/NOTEOP/EOP/NOTEOP/NOTEOP/NOTEOP/NOTEOP/EOP cycle,
+# instead of matching cobc's "zero records written, hard abort before any
+# output" behavior.

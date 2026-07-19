@@ -1,0 +1,61 @@
+      * kk05 (round 35): round-34's own open question ("does LINAGE even
+      * apply to a RELATIVE/INDEXED file in real cobc?") - answered
+      * definitively here via a direct GnuCOBOL probe: NO. Combining
+      * `ORGANIZATION IS RELATIVE` with a `LINAGE IS <n> LINES` clause on
+      * the SAME FD is a hard COMPILE-TIME error under GnuCOBOL 4.0-early-
+      * dev.0 - "LINAGE clause with wrong file type" - not merely a
+      * runtime concern. An identical probe swapping in `ORGANIZATION IS
+      * INDEXED` (with a RECORD KEY clause) produces the SAME compile
+      * error. Since real COBOL programs cannot even legally COMBINE these
+      * two clauses, this is not "the engine failing to support a
+      * documented feature" (there is no valid COBOL program of this shape
+      * to support) - it answers the round-34 refuter's own open question
+      * rather than reporting a transpiler bug.
+      *
+      * For completeness: the engine's own convertToScala() does NOT
+      * reject this combination at all (it has no FD-clause/organization
+      * compatibility validation of any kind) - it silently generates
+      * Scala that compiles and runs, treating the RELATIVE file's LINAGE
+      * clause exactly like an ordinary LINE-SEQUENTIAL LINAGE file (the
+      * WRITE/AT END-OF-PAGE output it produces has no cobc oracle to
+      * compare against, since cobc itself never gets past compilation for
+      * this input). This is flagged HONEST/out-of-scope, not a new
+      * dishonest finding - the engine is more PERMISSIVE than real cobc's
+      * own front end here, not silently wrong about a real program's real
+      * behavior, and it does not crash or hang on this out-of-scope input
+      * either.
+      *
+      * Renamed to *.cbl.txt (not *.cbl), following the cc04/cc07/jj03
+      * precedent, since cobc does not compile this program at all -
+      * tests/oracle/oracle.test.js's walkCblFiles() sweep requires every
+      * discovered *.cbl to both compile AND run cleanly under cobc.
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. KK05LINRELORG.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT PRINT-FILE ASSIGN TO "KK05PRT.DAT"
+               ORGANIZATION IS RELATIVE
+               ACCESS MODE IS SEQUENTIAL.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  PRINT-FILE
+           LINAGE IS 5 LINES
+           WITH FOOTING AT 3.
+       01  PRINT-REC PIC X(10).
+       WORKING-STORAGE SECTION.
+       01  WS-I PIC 9(2).
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           OPEN OUTPUT PRINT-FILE.
+           PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > 8
+               MOVE "LINE" TO PRINT-REC
+               WRITE PRINT-REC
+                   AT END-OF-PAGE
+                       DISPLAY "EOP AT I=" WS-I
+                   NOT AT END-OF-PAGE
+                       DISPLAY "NOTEOP AT I=" WS-I
+               END-WRITE
+           END-PERFORM.
+           CLOSE PRINT-FILE.
+           STOP RUN.

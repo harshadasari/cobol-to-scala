@@ -1,0 +1,60 @@
+      * kk06 (round 35): confirms round-34 finding 2's OPEN-time LINAGE-
+      * invalid abort (LINAGE_INVALID_FILES/isLinageInvalid, file-io-gen.js)
+      * is correctly SCOPED to only the one FD that is actually invalid,
+      * across a program with TWO FDs - GOOD-FILE (no LINAGE clause at all)
+      * is fully opened, written (two records), and CLOSED BEFORE BAD-FILE
+      * (LINAGE IS 5 LINES WITH FOOTING AT 7, footingLines > pageSize,
+      * jj03's own invalid shape) is ever opened. Confirms real cobc: (a)
+      * GOOD-FILE's own OPEN/WRITE/CLOSE succeeds completely and its content
+      * is fully flushed to disk BEFORE the abort, (b) "GOOD-FILE-DONE"
+      * prints but "BAD-FILE-DONE" never does (the abort happens mid-
+      * program, at BAD-FILE's own OPEN), (c) the overall program exit code
+      * is nonzero. Verified against the engine's own generated Scala
+      * (scala-cli): stdout is byte-for-byte "GOOD-FILE-DONE" only, matching
+      * cobc exactly, and the process exits 1 - LINAGE_INVALID_FILES is
+      * correctly a per-file Set (populated by a `for` loop over every FD in
+      * scala-generator.js, one `.add()` call per invalid file) rather than
+      * a single global flag, so GOOD-FILE's own OPEN/WRITE/CLOSE codegen is
+      * completely unaffected by BAD-FILE's own invalid-FOOTING flag. HONEST
+      * - this round's own probe confirms round-34's fix generalizes
+      * correctly to a multi-FD program, no new bug found here.
+      *
+      * Renamed to *.cbl.txt (not *.cbl), following the jj03/cc04/cc07
+      * precedent, since cobc's own real exit code for this program is
+      * legitimately nonzero (the abort IS the point of the probe) - see
+      * tests/oracle/oracle.test.js's walkCblFiles() sweep, which requires
+      * every discovered *.cbl to both compile AND exit zero under cobc.
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. KK06LINSCOPED.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT GOOD-FILE ASSIGN TO "KK06GOOD.DAT"
+               ORGANIZATION IS LINE SEQUENTIAL.
+           SELECT BAD-FILE ASSIGN TO "KK06BAD.DAT"
+               ORGANIZATION IS LINE SEQUENTIAL.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  GOOD-FILE.
+       01  GOOD-REC PIC X(10).
+       FD  BAD-FILE
+           LINAGE IS 5 LINES
+           WITH FOOTING AT 7.
+       01  BAD-REC PIC X(10).
+       WORKING-STORAGE SECTION.
+       01  WS-I PIC 9(2).
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           OPEN OUTPUT GOOD-FILE.
+           MOVE "GOODLINE1" TO GOOD-REC.
+           WRITE GOOD-REC.
+           MOVE "GOODLINE2" TO GOOD-REC.
+           WRITE GOOD-REC.
+           CLOSE GOOD-FILE.
+           DISPLAY "GOOD-FILE-DONE".
+           OPEN OUTPUT BAD-FILE.
+           MOVE "SHOULDNT" TO BAD-REC.
+           WRITE BAD-REC.
+           CLOSE BAD-FILE.
+           DISPLAY "BAD-FILE-DONE".
+           STOP RUN.

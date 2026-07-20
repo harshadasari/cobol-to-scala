@@ -1,0 +1,81 @@
+      * pp09 (round 40): round-39 finding 7 (oo15) fixed a non-RECURSIVE
+      * 3-program cycle (A calls B calls C calls A). This probe pressure-
+      * tests the SIMPLEST possible cycle: just 2 programs, A calls B calls
+      * A directly (no C) - checking the _callActive guard fires correctly
+      * on the very first re-entry, not just after a longer chain. NOTE:
+      * the cyclic CALL back to PP09MAIN deliberately passes NO argument
+      * (PP09MAIN's own PROCEDURE DIVISION has no USING clause at all) -
+      * seeing pp09b's own isolated finding (a CALL passing MORE actual
+      * arguments than the callee's declared USING count is a separate,
+      * distinct Scala-compile crash - generateCall never truncates
+      * argExprs to the callee's own registered paramCount), this probe
+      * is kept argument-count-clean so it actually exercises finding 7's
+      * cycle-abend behavior instead of tripping over pp09b's own bug
+      * first.
+      *
+      * OUTCOME (DISHONEST - new, narrower root cause than round-39
+      * finding 7): real cobc aborts with "libcob: error: recursive CALL
+      * from PP09PB to PP09MAIN which is NOT RECURSIVE" right after "IN B
+      * N=1" (3 stdout lines total before the abend). The generated Scala
+      * instead prints a SPURIOUS 4th line ("MAIN CALLING A" a second
+      * time) and only aborts one call later, blaming the wrong program
+      * ("recursive CALL into PP09PA" instead of PP09MAIN). Root cause:
+      * generateMainMethod's `@main def run()` (generator/scala-
+      * generator.js) invokes this program's own paragraph dispatcher
+      * (`implicitMainParagraph()`) DIRECTLY, never touching the sibling
+      * `entry()` method's `_callActive` guard (round-39 finding 7) at
+      * all - so `_callActive` for the FIRST/"main" program of a multi-
+      * PROGRAM-ID source stays `false` for the program's entire initial
+      * (top-level) activation. A cyclic CALL back into that same program
+      * via `entry()` (PP09PB's `CALL "PP09MAIN"`) therefore never sees
+      * `_callActive == true` and the guard silently passes, re-running
+      * the ENTIRE main-program body from the top (the spurious extra
+      * "MAIN CALLING A") before the cycle is (coincidentally) still
+      * caught one level deeper, when THAT re-entered execution calls
+      * PP09PA again (PP09PA's own separate, still-`true` `_callActive`
+      * from the original, still-unwound outer activation correctly trips
+      * there instead). Renamed `.cbl.txt` (cobc deliberately exits 1,
+      * same oo15/oo07/jj03/kk04/cc04/cc07 precedent for a program that
+      * can never satisfy oracleCompare()'s own `exitCode === 0`
+      * requirement) - independently verified with a direct `scala-cli
+      * run` of the converted Scala, compared by hand against the cobc
+      * capture above. Suggested fix: make `run()` go through `entry()`
+      * (or otherwise toggle the same `_callActive` flag around its own
+      * direct body invocation) so the guard applies uniformly to the
+      * FIRST program's initial activation, not just to its later
+      * CALL-triggered re-entries.
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PP09MAIN.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-N PIC 9 VALUE 1.
+       PROCEDURE DIVISION.
+           DISPLAY "MAIN CALLING A".
+           CALL "PP09PA" USING WS-N.
+           DISPLAY "MAIN DONE".
+           STOP RUN.
+       END PROGRAM PP09MAIN.
+
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PP09PA.
+       DATA DIVISION.
+       LINKAGE SECTION.
+       01  LK-N PIC 9.
+       PROCEDURE DIVISION USING LK-N.
+           DISPLAY "IN A N=" LK-N.
+           CALL "PP09PB" USING LK-N.
+           DISPLAY "A DONE N=" LK-N.
+           GOBACK.
+       END PROGRAM PP09PA.
+
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PP09PB.
+       DATA DIVISION.
+       LINKAGE SECTION.
+       01  LK-N PIC 9.
+       PROCEDURE DIVISION USING LK-N.
+           DISPLAY "IN B N=" LK-N.
+           CALL "PP09MAIN".
+           DISPLAY "B DONE N=" LK-N.
+           GOBACK.
+       END PROGRAM PP09PB.

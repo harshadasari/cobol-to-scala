@@ -1,0 +1,5 @@
+# program exited 1
+MAIN CALLING A
+IN A N=1
+IN B N=1
+libcob: error: recursive CALL from PP09PB to PP09MAIN which is NOT RECURSIVE

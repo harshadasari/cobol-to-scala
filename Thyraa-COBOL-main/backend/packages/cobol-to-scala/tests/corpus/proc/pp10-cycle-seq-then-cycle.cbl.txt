@@ -1,0 +1,73 @@
+      * pp10 (round 40): round-39 finding 7's _callActive flag must reset
+      * correctly after each NON-overlapping call (already regression-
+      * tested by oo15's own note re: v01/d13/j09) - this probe pressure-
+      * tests that in combination with an ACTUAL cycle: the SAME
+      * non-RECURSIVE program (PP10PA) is called twice, sequentially,
+      * non-overlapping, and returns normally BOTH times (so _callActive
+      * must go back to false after each) - only on the THIRD call does A
+      * recurse into B which calls back into A while A is still active,
+      * finally triggering the real cobc abend. If the flag ever got stuck
+      * `true` after call 1 or 2, the (harmless, non-cyclic) second/third
+      * calls would wrongly abend immediately instead of only on the true
+      * cycle.
+      *
+      * OUTCOME (HONEST - byte-match): unlike pp09 (whose cycle closes
+      * back through the FIRST/"main" program of the source and exposes a
+      * real, distinct gap - see that probe's own OUTCOME note), this
+      * shape never involves the main program's own entry()/run()
+      * duplication at all (PP10PA/PP10PB are both ordinary siblings) -
+      * the generated Scala's stdout is byte-identical to cobc's own
+      * capture for all 11 pre-abend lines, and both sides correctly
+      * blame PP10PA in the abend. Renamed `.cbl.txt` for the same
+      * structural reason as pp09/oo15 (cobc deliberately exits 1) -
+      * verified with a direct `scala-cli run` compared by hand against
+      * the cobc capture above, not by oracleCompare()'s own
+      * `exitCode === 0`-gated sweep. Confirms round-39 finding 7's fix is
+      * solid for the ordinary (non-main-program) sequential-then-cycle
+      * shape.
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PP10MAIN.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-MODE PIC 9 VALUE 0.
+       PROCEDURE DIVISION.
+           DISPLAY "CALL1".
+           MOVE 0 TO WS-MODE.
+           CALL "PP10PA" USING WS-MODE.
+           DISPLAY "CALL1 DONE".
+           DISPLAY "CALL2".
+           MOVE 0 TO WS-MODE.
+           CALL "PP10PA" USING WS-MODE.
+           DISPLAY "CALL2 DONE".
+           DISPLAY "CALL3-CYCLE".
+           MOVE 1 TO WS-MODE.
+           CALL "PP10PA" USING WS-MODE.
+           DISPLAY "CALL3 DONE".
+           STOP RUN.
+       END PROGRAM PP10MAIN.
+
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PP10PA.
+       DATA DIVISION.
+       LINKAGE SECTION.
+       01  LK-MODE PIC 9.
+       PROCEDURE DIVISION USING LK-MODE.
+           DISPLAY "IN A MODE=" LK-MODE.
+           IF LK-MODE = 1
+               CALL "PP10PB" USING LK-MODE
+           END-IF.
+           DISPLAY "A DONE".
+           GOBACK.
+       END PROGRAM PP10PA.
+
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PP10PB.
+       DATA DIVISION.
+       LINKAGE SECTION.
+       01  LK-MODE PIC 9.
+       PROCEDURE DIVISION USING LK-MODE.
+           DISPLAY "IN B MODE=" LK-MODE.
+           CALL "PP10PA" USING LK-MODE.
+           DISPLAY "B DONE".
+           GOBACK.
+       END PROGRAM PP10PB.

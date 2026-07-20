@@ -1,0 +1,13 @@
+# program exited 1
+CALL1
+IN A MODE=0
+A DONE
+CALL1 DONE
+CALL2
+IN A MODE=0
+A DONE
+CALL2 DONE
+CALL3-CYCLE
+IN A MODE=1
+IN B MODE=1
+libcob: error: recursive CALL from PP10PB to PP10PA which is NOT RECURSIVE

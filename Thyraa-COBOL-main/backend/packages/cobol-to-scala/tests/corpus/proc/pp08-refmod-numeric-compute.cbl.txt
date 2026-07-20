@@ -1,0 +1,39 @@
+      * pp08 (round 40): round-39 finding 6 fixed a ref-mod'd numeric
+      * operand used as an IF/EVALUATE COMPARISON operand (routed through
+      * relationalOperandDescriptor into the safe alphanumeric branch
+      * instead of crashing BigDecimal("")). This probe instead uses a
+      * ref-mod'd numeric operand as a COMPUTE/arithmetic OPERAND (not a
+      * comparison) - a different code path (convertArithmeticExpression /
+      * convertIdentifier), which was never touched by that fix. A bare
+      * ref-mod read there degrades to a raw `???` (type Nothing) - fine as
+      * a whole standalone RHS, but embedded inside a larger arithmetic
+      * expression (`??? + 1`) this may not even type-check in Scala 3.
+      *
+      * OUTCOME: real cobc itself REJECTS this at compile time -
+      * "'WS-DATE8 (5:4)' is not a numeric value" (error) - a reference-
+      * modified operand is always alphanumeric per COBOL semantics, so
+      * using it directly as an arithmetic operand is invalid COBOL, full
+      * stop, not just an engine gap. This is therefore a genuinely
+      * invalid-COBOL probe (cobc itself never produces a runnable oracle
+      * for it), matching the oo07/jj03/kk04/cc04/cc07 precedent for a
+      * program permanently ineligible for oracleCompare()'s byte-diff -
+      * renamed .cbl.txt for the identical reason. NOT counted as a
+      * dishonest finding: the engine's own Scala output for this input
+      * (a hard "Ambiguous overload" COMPILE crash from `BigDecimal(???)`
+      * embedded in a larger arithmetic expression, confirming the
+      * `??? + 1` type-check concern above is real) is irrelevant to the
+      * "matches real cobc on valid COBOL" bar, since there is no valid-
+      * COBOL behavior here to diverge from. Documented for completeness
+      * only, in case a future round wants an honest parse-time validation
+      * pass that rejects this shape instead of reaching codegen at all.
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PP08REFCOMP.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-DATE8 PIC 9(8) VALUE 20260720.
+       01  WS-RESULT PIC 9(6).
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           COMPUTE WS-RESULT = WS-DATE8(5:4) + 1.
+           DISPLAY "RESULT=" WS-RESULT.
+           STOP RUN.

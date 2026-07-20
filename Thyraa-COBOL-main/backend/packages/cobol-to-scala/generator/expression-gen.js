@@ -1444,14 +1444,30 @@ export function generateCobolFmtHelper() {
     '  def num(v: BigDecimal, intDigits: Int, decDigits: Int, signed: Boolean, decimalComma: Boolean = false): String =',
     '    val neg = v.signum < 0',
     '    val absVal = v.abs',
-    '    val totalDigits = intDigits + decDigits',
-    '    val unscaled = (absVal * BigDecimal(10).pow(decDigits)).setScale(0, BigDecimal.RoundingMode.HALF_UP).toBigInt.toString',
-    '    val digits = if unscaled.length < totalDigits then ("0" * (totalDigits - unscaled.length)) + unscaled else unscaled',
-    '    val intPart = if intDigits > 0 then digits.dropRight(decDigits) else ""',
-    '    val decPart = if decDigits > 0 then digits.takeRight(decDigits) else ""',
     '    val signStr = if signed then (if neg then "-" else "+") else ""',
-    '    val body = if decDigits > 0 then intPart + (if decimalComma then "," else ".") + decPart else intPart',
-    '    signStr + body',
+    '    // round-38 finding 4 (nn09): a NEGATIVE decDigits is this generator\'s own',
+    '    // encoding for a PICTURE with a TRAILING P scaling run (e.g. `9(3)PPP`) -',
+    '    // see data-division-parser.js\'s PIC-scan `case \'P\':` branch - meaning "no',
+    '    // fractional part is ever displayed; the value (already rounded to a',
+    '    // multiple of 10^-decDigits by CobolFmt.truncNumeric at store time) is',
+    '    // rendered directly as a whole number, zero-padded to intDigits\' own full',
+    '    // width". The ordinary positive-decDigits formula below can\'t express this',
+    '    // (its own `absVal * 10^decDigits` SHRINKS the digit string for a negative',
+    '    // exponent instead of just displaying the already-correct magnitude) - a',
+    '    // pre-round-38 PIC could never actually produce a negative decDigits at',
+    '    // all, so this branch is unreachable for any program predating this fix.',
+    '    if decDigits < 0 then',
+    '      val digits = absVal.setScale(0, BigDecimal.RoundingMode.HALF_UP).toBigInt.toString',
+    '      val padded = if digits.length < intDigits then ("0" * (intDigits - digits.length)) + digits else digits',
+    '      signStr + padded',
+    '    else',
+    '      val totalDigits = intDigits + decDigits',
+    '      val unscaled = (absVal * BigDecimal(10).pow(decDigits)).setScale(0, BigDecimal.RoundingMode.HALF_UP).toBigInt.toString',
+    '      val digits = if unscaled.length < totalDigits then ("0" * (totalDigits - unscaled.length)) + unscaled else unscaled',
+    '      val intPart = if intDigits > 0 then digits.dropRight(decDigits) else ""',
+    '      val decPart = if decDigits > 0 then digits.takeRight(decDigits) else ""',
+    '      val body = if decDigits > 0 then intPart + (if decimalComma then "," else ".") + decPart else intPart',
+    '      signStr + body',
     '',
     '  // round-7 findings 2/3: DISPLAY of a COMP-1/COMP-2 (Float/Double) item -',
     '  // these have no PIC clause (no fixed integer/decimal digit counts to',
@@ -2693,30 +2709,60 @@ function fieldRefToBigDecimalExpr(camel, info) {
  * and never itself triggers it (see CobolFmt.fitsDigits). `finalExpr` is
  * exactly the expression this statement would generate with no ON SIZE
  * ERROR clause at all (already coerced to the target's declared Scala
- * type/rounding). On a size error, no target is updated at all (COBOL
- * leaves every receiving field unchanged) and the ON SIZE ERROR statements
- * run instead; otherwise every target is assigned as normal and NOT ON SIZE
- * ERROR runs. `extraErrorCond`, when given, is OR'd into the size-error test
- * ahead of every digit-capacity check (DIVIDE's BY ZERO test - BigDecimal
- * division by zero raises an exception before a digit-capacity check could
- * even run, so the zero test must short-circuit first via `||`).
+ * type/rounding). `extraErrorCond`, when given, is OR'd into the size-error
+ * test ahead of every digit-capacity check (DIVIDE's BY ZERO test -
+ * BigDecimal division by zero raises an exception before a digit-capacity
+ * check could even run, so the zero test must short-circuit first via `||`).
+ *
+ * round-38 finding 5 (nn13): the ON SIZE ERROR imperative fires once if ANY
+ * target's own calculation overflows, but each target's own STORE is gated
+ * INDEPENDENTLY on only that target's own digit-capacity check - COBOL
+ * evaluates and applies ON SIZE ERROR per receiving field, not as one
+ * all-or-nothing group. `COMPUTE WS-SMALL WS-BIG = 12345 + 100` (nn13:
+ * WS-SMALL PIC S9(1) overflows, WS-BIG PIC S9(5) does not) leaves WS-SMALL
+ * unchanged but still stores WS-BIG's own correctly computed value - the
+ * pre-fix version of this function (see its own now-corrected prior doc
+ * comment, "no target is updated at all") ORed every target's overflow
+ * check into ONE combined condition and skipped storing ALL targets on ANY
+ * single overflow, which is simply wrong for the multi-target case (and
+ * happened to be indistinguishable from correct for the single-target case,
+ * which this fix leaves completely unaffected - see below). Shared by ADD/
+ * SUBTRACT/MULTIPLY/DIVIDE per this function's own multi-caller role, so
+ * this generalization benefits all of them uniformly, not just COMPUTE.
+ *
+ * `extraErrorCond` (DIVIDE BY ZERO) is a WHOLE-STATEMENT error, not a
+ * per-target one - when the divisor is zero, NONE of `entries`' own
+ * `resultBD` expressions can even be evaluated at all (a BigDecimal
+ * division by zero raises `ArithmeticException` before any digit check
+ * could run), so the per-target re-check below is itself guarded behind
+ * `!(extraErrorCond)` - every target simply stays unchanged in that specific
+ * case, exactly like the pre-fix "no target updated at all" behavior, but
+ * ONLY for this whole-statement condition, never for an ordinary per-target
+ * digit overflow.
  */
 function generateArithmeticSizeErrorCheck(indent, statement, entries, extraErrorCond) {
   const indentStr = '  '.repeat(indent);
   const bi = '  '.repeat(indent + 1);
+  const bi2 = '  '.repeat(indent + 2);
 
-  const digitConds = entries.map(e => {
+  const fitsConds = entries.map(e => {
     const info = lookupFieldForRef(e.target);
     const intDigits = info && info.integerDigits > 0 ? info.integerDigits : 18;
-    return `!CobolFmt.fitsDigits(${e.resultBD}, ${intDigits})`;
+    return `CobolFmt.fitsDigits(${e.resultBD}, ${intDigits})`;
   });
-  const cond = [extraErrorCond, ...digitConds].filter(Boolean).join(' || ');
+  const cond = [extraErrorCond, ...fitsConds.map(c => `!${c}`)].filter(Boolean).join(' || ');
 
   const lines = [`${indentStr}if (${cond}) then`];
   const onErrStmts = Array.isArray(statement.onSizeError) ? statement.onSizeError : [];
-  lines.push(
-    onErrStmts.length > 0 ? onErrStmts.map(s => generateExpression(s, indent + 1)).join('\n') : `${bi}()`
-  );
+  const perTargetStoreLines = (storeIndent) =>
+    entries.map((e, i) => `${storeIndent}if (${fitsConds[i]}) then ${renderAssignment(e.target, e.finalExpr)}`);
+  const onErrBody = [
+    ...(extraErrorCond
+      ? [`${bi}if !(${extraErrorCond}) then`, ...perTargetStoreLines(bi2)]
+      : perTargetStoreLines(bi)),
+    ...onErrStmts.map(s => generateExpression(s, indent + 1)),
+  ];
+  lines.push(onErrBody.length > 0 ? onErrBody.join('\n') : `${bi}()`);
   lines.push(`${indentStr}else`);
   const notErrStmts = Array.isArray(statement.notOnSizeError) ? statement.notOnSizeError : [];
   const body = [
@@ -3133,7 +3179,24 @@ function renderVariableMoveSource(source, info) {
   }
 
   if (info.dataType === 'numeric' || (info.dataType !== 'alphanumeric' && info.dataType !== 'edited')) {
-    const intDigits = info.integerDigits > 0 ? info.integerDigits : 18;
+    // round-38 finding 4 (nn09): `integerDigits === 0` here is ambiguous on
+    // its own - it could mean "no real PIC-derived digit info at all" (the
+    // `: 18` fallback below exists for that case, so a MOVE into such a
+    // target doesn't spuriously truncate a value the receiving field's own
+    // shape genuinely can't bound) OR it could mean "this field genuinely
+    // has ZERO integer digit positions" (a leading-P-scaled PIC like
+    // `SPPP9(3)` - see data-division-parser.js's PIC-scan `case 'P':`
+    // branch - or an all-fractional `PIC V9(3)`, legal COBOL with no digits
+    // before the implied decimal point at all). `decimalDigits > 0` is the
+    // signal that distinguishes them: a field with real fractional digit
+    // info IS a field this parser actually derived PIC metadata for, so its
+    // own `integerDigits === 0` is trustworthy as a genuine zero, not a
+    // placeholder for "unknown" - trusting it (rather than substituting 18)
+    // is what makes CobolFmt.truncNumeric correctly discard a MOVE source's
+    // entire integer part for such a target (verified against nn09's own
+    // oracle: MOVEing 123456 into `SPPP9(3)` yields exactly 0, since none of
+    // 123456's digits fit within zero integer-digit positions).
+    const intDigits = (info.integerDigits > 0 || info.decimalDigits > 0) ? info.integerDigits : 18;
     const decDigits = info.decimalDigits || 0;
     // A numeric-edited source (round-5 finding 6) is stored as its already-
     // formatted PICTURE text (e.g. "  12.50" for PIC ZZ9.99, zero-suppressed
@@ -7519,7 +7582,7 @@ function generateReadStatement(statement, indent = 0) {
       'is not supported (no INDEXED-file cobc oracle is available in this sandbox to verify a real ' +
       'implementation against - see tests/oracle/README.md known gaps); record area left unchanged';
   }
-  const { iteratorVar, hasCurrentVar, startInvalidVar } = fileHandleVarNames(fileName);
+  const { iteratorVar, hasCurrentVar, startInvalidVar, isOpenVar, pastEndVar } = fileHandleVarNames(fileName);
   const dest = readDestination(statement, fileName);
   // round-6 finding 2/3 companion (t04): a registered FILE STATUS field must
   // become "00" on a successful READ and "10" once the iterator is
@@ -7599,6 +7662,11 @@ function generateReadStatement(statement, indent = 0) {
     // file-io-gen.js) - a pure addition, harmless for a file never REWRITE/
     // DELETE-d.
     lines.push(`${indentStr}  ${hasCurrentVar} = true`);
+    // round-38 finding 3 (nn07): a record was actually found - the "did the
+    // MOST RECENT read already hit end-of-file" flag resets, so a LATER
+    // end-of-file read (once this file is eventually exhausted again)
+    // reports "10" (first past-end), not "46" (see the `else` branch below).
+    lines.push(`${indentStr}  ${pastEndVar} = false`);
 
     if (hasNotAtEnd) {
       for (const stmt of statement.notAtEnd) {
@@ -7616,9 +7684,15 @@ function generateReadStatement(statement, indent = 0) {
     lines.push(`${indentStr}else`);
 
     if (statusVar) {
-      lines.push(`${indentStr}  ${assignExpr(statusVar, '"10"')}`);
+      // round-38 finding 3 (nn07): the FIRST past-end READ reports "10";
+      // a SECOND (or later) CONSECUTIVE past-end READ with no successful
+      // READ in between reports "46" instead - compiler-verified against
+      // installed GnuCOBOL (nn07: READ3(PASTEND) STATUS=10,
+      // READ4(PASTEND-AGAIN) STATUS=46).
+      lines.push(`${indentStr}  ${assignExpr(statusVar, `(if ${pastEndVar} then "46" else "10")`)}`);
     }
     lines.push(`${indentStr}  ${hasCurrentVar} = false`);
+    lines.push(`${indentStr}  ${pastEndVar} = true`);
 
     if (hasAtEnd) {
       for (const stmt of statement.atEnd) {
@@ -7637,9 +7711,14 @@ function generateReadStatement(statement, indent = 0) {
     lines.push(...readAssignLines(dest, '_record', `${indentStr}  `));
     lines.push(`${indentStr}  ${assignExpr(statusVar, '"00"')}`);
     lines.push(`${indentStr}  ${hasCurrentVar} = true`);
+    lines.push(`${indentStr}  ${pastEndVar} = false`);
     lines.push(`${indentStr}else`);
-    lines.push(`${indentStr}  ${assignExpr(statusVar, '"10"')}`);
+    // round-38 finding 3 (nn07): see the identical comment in the
+    // hasAtEnd/hasNotAtEnd branch above - "10" for the first past-end READ,
+    // "46" for a second (or later) consecutive one.
+    lines.push(`${indentStr}  ${assignExpr(statusVar, `(if ${pastEndVar} then "46" else "10")`)}`);
     lines.push(`${indentStr}  ${hasCurrentVar} = false`);
+    lines.push(`${indentStr}  ${pastEndVar} = true`);
     // round-10 finding 1: no AT END clause on this READ means nothing else
     // handles the end-of-file condition - a registered DECLARATIVES
     // handler for this file (or its INPUT mode generically) fires here,
@@ -7707,12 +7786,40 @@ function generateReadStatement(statement, indent = 0) {
   // element on '\n' first, so the 2-space bump lands on every physical
   // line (not just once per array element), fixes that at any nesting
   // depth.
-  return [
+  const innerLines = [
     `${indentStr}if ${startInvalidVar} then`,
     `${indentStr}  ${hasCurrentVar} = false`,
     ...(statusVar ? [`${indentStr}  ${assignExpr(statusVar, '"46"')}`] : []),
     `${indentStr}else`,
     ...lines.flatMap(l => l.split('\n')).map(l => `  ${l}`),
+  ];
+
+  // round-38 finding 3 (nn07): a READ issued after this file has already
+  // been CLOSEd (or before its first OPEN) used to reach straight for
+  // `iteratorVar` - already closed along with its underlying `readerVar`/
+  // Source at CLOSE time - and calling `.hasNext`/`.next()` on an iterator
+  // over an already-closed `scala.io.Source` throws a raw, uncaught
+  // `java.io.IOException: Stream Closed`, a hard runtime crash real cobc
+  // never has (cobc just sets FILE STATUS "47" - "an I-O statement other
+  // than OPEN/CLOSE was attempted on a file not currently open" - and keeps
+  // running). Wrapping the ENTIRE pre-existing body (unchanged above,
+  // including the startInvalidVar guard) in this OUTER isOpenVar check -
+  // same uniform re-indent convention as that guard's own doc comment
+  // above - means neither AT END/NOT AT END clause ever fires and
+  // `iteratorVar` is never touched at all when the file isn't open, exactly
+  // mirroring real cobc's own "no record area/no clause dispatch" behavior
+  // for this condition (compiler-verified against installed GnuCOBOL: nn07
+  // - a READ after CLOSE just reports FILE STATUS "47" and the program
+  // continues to completion). A file with no registered FILE STATUS field
+  // still gets the crash fix (the `hasCurrentVar = false` line alone, no
+  // status to set) even though the wrong status value itself isn't
+  // observable without one.
+  return [
+    `${indentStr}if !${isOpenVar} then`,
+    `${indentStr}  ${hasCurrentVar} = false`,
+    ...(statusVar ? [`${indentStr}  ${assignExpr(statusVar, '"47"')}`] : []),
+    `${indentStr}else`,
+    ...innerLines.flatMap(l => l.split('\n')).map(l => `  ${l}`),
   ].join('\n');
 }
 
@@ -9166,6 +9273,8 @@ function generateCall(statement, indent = 0) {
       const isNamedGroup = name && !param.value?.refMod && !hasSubscripts &&
         isRegisteredGroupName(String(name).toUpperCase());
       const isPlainRefVar = name && !param.value?.refMod && !hasSubscripts && !isNamedGroup;
+      const isSubscriptedRefVar = name && !param.value?.refMod && hasSubscripts && !isNamedGroup;
+      const isRefModRefVar = name && param.value?.refMod && !hasSubscripts;
 
       if (isPlainRefVar) {
         const camel = toCamelCase(name);
@@ -9187,6 +9296,64 @@ function generateCall(statement, indent = 0) {
           closureArgs.push(`() => ${sv}, (v: ${scalaType}) => ${sv} = v`);
         }
         return;
+      }
+
+      // round-38 finding 2 (nn03/nn04): a SUBSCRIPTED (`WS-TABLE(WS-IDX)`) or
+      // REF-MODIFIED (`WS-STR(3:4)`) BY REFERENCE operand used to fall
+      // straight through to the BY-CONTENT/VALUE call-site snapshot
+      // mechanism further below (isPlainRefVar/isNamedGroup are both false
+      // for either shape) - correct for BY CONTENT/VALUE (a one-time read is
+      // all that mode ever needs regardless of operand shape), but WRONG for
+      // BY REFERENCE: a snapshot never writes back to the caller, so a
+      // callee's mutation through such a parameter was silently lost the
+      // instant the callee was RECURSIVE (nn15's own non-recursive control
+      // case already aliases a subscripted BY REFERENCE operand correctly -
+      // see this same function's ordinary, non-recursive refWriters/
+      // renderWriteback path further below - this gap is narrowly specific
+      // to the RECURSIVE target.recursive branch). Only applies when
+      // mode === 'REFERENCE'; a BY CONTENT/VALUE operand of either shape
+      // still falls through unchanged to the snapshot fallback below.
+      if (isSubscriptedRefVar && mode === 'REFERENCE') {
+        const scalaType = leafShapes[0]?.scalaType || target.paramTypes?.[i] || 'String';
+        // convertIdentifier/renderAssignment are the SAME subscript-read/
+        // subscript-write conventions this generator's ordinary (non-
+        // recursive) CALL writeback path already uses (see
+        // `scalar-subscripted`/renderWriteback above) - reused here verbatim
+        // rather than inventing a new subscript-indexing scheme.
+        const getterExpr = convertIdentifier(param.value);
+        const setterStmt = renderAssignment(param.value, 'v');
+        closureArgs.push(`() => ${getterExpr}, (v: ${scalaType}) => { ${setterStmt} }`);
+        return;
+      }
+
+      if (isRefModRefVar && mode === 'REFERENCE') {
+        // Only attempted for the narrow, unambiguous shape this can model
+        // exactly - a plain alphanumeric (String-typed) base field, so a
+        // direct character-splice read/write is a byte-for-byte-correct
+        // COBOL ref-mod (no sign/decimal-point nuance to lose, matching
+        // round-35 finding 5/kk12's own "unsigned, whole-number" narrow-
+        // shape precedent for a different REDEFINES gap). Any other base
+        // shape (e.g. a numeric ref-mod, or one lookupFieldForRef can't
+        // resolve at all) falls through to the pre-existing snapshot
+        // fallback rather than guessing at a wrong write - ref-mod's own
+        // general read/write semantics remain out of scope everywhere else
+        // in this generator (see tests/oracle/README.md known gaps); this is
+        // a call-site-local special case, not a change to that broader gap.
+        const baseInfo = lookupFieldForRef(param.value);
+        if (baseInfo && baseInfo.scalaType === 'String') {
+          const baseCamel = toCamelCase(name);
+          const startExpr = `(${convertArithmeticExpression(param.value.refMod.start)} - 1)`;
+          const lengthExpr = param.value.refMod.length != null
+            ? `(${convertArithmeticExpression(param.value.refMod.length)})`
+            : `(${baseCamel}.length - (${startExpr}))`;
+          const getterExpr =
+            `{ val _s = ${startExpr}; val _l = ${lengthExpr}; ${baseCamel}.substring(_s, _s + _l) }`;
+          const setterStmt =
+            `{ val _s = ${startExpr}; val _l = ${lengthExpr}; ` +
+            `${baseCamel} = ${baseCamel}.substring(0, _s) + v + ${baseCamel}.substring(_s + _l, ${baseCamel}.length) }`;
+          closureArgs.push(`() => ${getterExpr}, (v: String) => ${setterStmt}`);
+          return;
+        }
       }
 
       if (isNamedGroup) {

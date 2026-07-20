@@ -2007,6 +2007,103 @@ function elementaryOverGroupRedefinesLines(item, targetItem, registry, targetAbs
     : (flattenRedefinesLeavesBytes(targetItem, targetAbsOffset) || []).map(byteLeafOp);
 
   if (itemBaseType !== 'String' || ops.length === 0) {
+    // round-38 finding 1 (nn01/nn02): itemBaseType !== 'String' means `item`
+    // is a NUMERIC elementary REDEFINES-ing a GROUP (e.g. `WS-NUM REDEFINES
+    // WS-GROUP PIC 9(4)`) - a shape this function's ops-based flat-character
+    // view (built to serve alphanumeric redefiners only) never modeled.
+    // Before this fix, this branch stubbed `item`'s own accessor (`??? `)
+    // WITHOUT ever registering it in the field registry - so a later MOVE of
+    // `item` into an alphanumeric target found `sourceInfo == null` in
+    // renderVariableMoveSource and fell into its "no source info" fallback,
+    // feeding item's raw Int/Long/BigDecimal-typed accessor call directly
+    // into a String-typed helper (CobolFmt.fitLeft) - a hard Scala COMPILE
+    // error (Found: Int, Required: String), not the intended honest decline.
+    //
+    // For the narrow, unambiguous shape this CAN actually be modeled exactly
+    // - an UNSIGNED, whole-number (no decimal places) numeric item over a
+    // target whose own children are all plain digit-text leaves (ops.length
+    // > 0) - reuse the exact same ops-based flat-character view this
+    // function already builds for the String case below, wrapped through
+    // CobolFmt.numval/CobolFmt.digitsOf (the same pattern round-35 finding 5/
+    // kk12 established for the mirror-image "group REDEFINES over a numeric
+    // target" shape) to parse/format the digit text as this item's own
+    // numeric type - a REAL, correct accessor, not just a registry-only
+    // placeholder, for nn01/nn02's own exact shape.
+    if (
+      ['Int', 'Long', 'BigDecimal'].includes(itemBaseType) &&
+      ops.length > 0 &&
+      !(item.pic && item.pic.signed) &&
+      ((item.pic && item.pic.decimalDigits) || 0) === 0
+    ) {
+      const itemIntDigits = (item.pic && item.pic.integerDigits) || elementaryByteLength(item) || 0;
+      const getterExpr = ops.map(op => op.encode(op.camel)).join(' + ');
+      const numExpr =
+        itemBaseType === 'Int'
+          ? 'CobolFmt.numval(_flat).toIntExact'
+          : itemBaseType === 'Long'
+            ? 'CobolFmt.numval(_flat).toLongExact'
+            : 'CobolFmt.numval(_flat)';
+      const lines = [
+        `  // REDEFINES ${item.redefines}: ${item.name}'s own unsigned whole-number digit text`,
+        `  // reconstructed from ${item.redefines}'s own child storage (round-38 finding 1)`,
+        `  def ${camel}: ${itemBaseType} = { val _flat = (${getterExpr}); ${numExpr} }`,
+        `  def ${camel}_=(v: ${itemBaseType}): Unit =`,
+        `    val _new = CobolFmt.digitsOf(BigDecimal(v), ${itemIntDigits}, 0)`,
+      ];
+      let offset = 0;
+      let anyAssignment = false;
+      for (const op of ops) {
+        const start = offset;
+        const end = offset + op.width;
+        offset = end;
+        if (op.camel === null) continue;
+        anyAssignment = true;
+        lines.push(`    ${op.camel} = ${op.decode(`_new.substring(${start}, ${end})`)}`);
+      }
+      if (!anyAssignment) lines.push('    ()');
+
+      registry.set((item.name || '').toUpperCase(), {
+        camel,
+        scalaType: itemBaseType,
+        dataType: 'numeric',
+        integerDigits: itemIntDigits,
+        decimalDigits: 0,
+        signed: false,
+        editPattern: null,
+        occursDepth: 0,
+        picLength: elementaryByteLength(item) || 0,
+        justified: false,
+        blankWhenZero: false,
+      });
+
+      return lines;
+    }
+
+    // Any other numeric shape (signed, has decimal places, or the target's
+    // own children aren't a modelable flat digit-text view at all) still
+    // falls back to the pre-existing honest `???`/no-op stub pair - but NOW
+    // also registers a real (if honestly-degraded) placeholder registry
+    // entry for it, matching round-17's `refModNumericPlaceholder` precedent
+    // of substituting a concrete, honestly-wrong stand-in rather than
+    // leaving no registry entry at all - so renderVariableMoveSource's
+    // `sourceInfo` is never null for this item, and a later MOVE of it
+    // routes through the ordinary numeric-source conversion path (still
+    // visibly wrong/zero at runtime, since the getter itself is still `???`,
+    // but a COMPILING honest decline, never a hard compile error).
+    registry.set((item.name || '').toUpperCase(), {
+      camel,
+      scalaType: itemBaseType,
+      dataType: itemBaseType === 'String' ? 'alphanumeric' : 'numeric',
+      integerDigits: (item.pic && item.pic.integerDigits) || 0,
+      decimalDigits: (item.pic && item.pic.decimalDigits) || 0,
+      signed: !!(item.pic && item.pic.signed),
+      editPattern: (item.pic && item.pic.editPattern) || null,
+      occursDepth: 0,
+      picLength: elementaryByteLength(item) || 0,
+      justified: false,
+      blankWhenZero: false,
+    });
+
     return [
       `  // REDEFINES ${item.redefines}: ??? TODO - this elementary-over-group REDEFINES shape ` +
         '(FILLER gap / nested OCCURS / unsupported type, or a non-alphanumeric redefining item) is not ' +

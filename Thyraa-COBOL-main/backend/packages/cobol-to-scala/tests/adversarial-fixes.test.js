@@ -271,15 +271,31 @@ test('generator: MULTIPLY ON SIZE ERROR checks digit capacity and leaves the tar
   const code = convertToScala(source, {}).scala;
   const mainBody = code.slice(code.indexOf('def main'));
   assert.match(mainBody, /if \(!CobolFmt\.fitsDigits\(\(wsA \* wsB\), 18\)\) then/);
-  // The assignment to wsR must only happen in the else (not-on-size-error)
-  // branch, after the error check - not unconditionally. The stored value
-  // itself is now (round-3 findings 8/13) truncated to WS-R's own declared
-  // digit widths at store time via CobolFmt.truncNumeric (no ROUNDED here),
-  // not the bare exact product.
+  // round-38 finding 5: the store is now gated PER TARGET (each target's own
+  // digit-capacity check), not by one combined all-targets-OR'd condition -
+  // this generalizes correctly to multiple GIVING targets with independent
+  // overflow (see tests/round38-fixes.test.js), and for this single-target
+  // program degenerates to the same two shapes checked below: the ON SIZE
+  // ERROR (`then`) branch's own copy of the assignment is reachable only
+  // behind ITS OWN nested `fitsDigits` guard (always false here, since it's
+  // the negation of the outer condition that put us in this branch at all -
+  // dead but harmless), while the NOT ON SIZE ERROR (`else`) branch's own
+  // copy is unconditional - so WS-R is stored exactly once, only when there
+  // truly was no overflow, matching the pre-round-38 runtime behavior
+  // exactly. The stored value itself is (round-3 findings 8/13) truncated to
+  // WS-R's own declared digit widths at store time via CobolFmt.truncNumeric
+  // (no ROUNDED here), not the bare exact product.
   const ifIdx = mainBody.indexOf('if (!CobolFmt.fitsDigits');
   const elseIdx = mainBody.indexOf('else', ifIdx);
-  const assignIdx = mainBody.indexOf('wsR = CobolFmt.truncNumeric((wsA * wsB), 18, 0)');
-  assert.ok(assignIdx > elseIdx && elseIdx > ifIdx, 'assignment must be inside the else (no-size-error) branch');
+  const assignRe = /wsR = CobolFmt\.truncNumeric\(\(wsA \* wsB\), 18, 0\)/g;
+  const beforeElse = mainBody.slice(ifIdx, elseIdx);
+  const afterElse = mainBody.slice(elseIdx);
+  assert.match(afterElse, assignRe, 'the not-on-size-error branch must store WS-R unconditionally');
+  const guardedInErrorBranch = /if \(CobolFmt\.fitsDigits\(\(wsA \* wsB\), 18\)\) then wsR = CobolFmt\.truncNumeric\(\(wsA \* wsB\), 18, 0\)/;
+  assert.ok(
+    !new RegExp(assignRe.source).test(beforeElse) || guardedInErrorBranch.test(beforeElse),
+    'any copy of the assignment inside the on-size-error branch must itself be guarded by a fitsDigits check, never unconditional'
+  );
 });
 
 test('generator: DIVIDE ON SIZE ERROR also guards against divide-by-zero', () => {

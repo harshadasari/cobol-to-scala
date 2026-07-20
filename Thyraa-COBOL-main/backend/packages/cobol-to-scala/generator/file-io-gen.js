@@ -106,6 +106,45 @@ function toOccVarName(cobolFileName) {
 }
 
 /**
+ * round-38 finding 3 (nn07): "is this file CURRENTLY open" flag - true from
+ * a successful OPEN until the next CLOSE (or until this program ends,
+ * whichever comes first), false before the first OPEN and after any CLOSE.
+ * Closes a gap this generator's file-handle model never tracked at all: a
+ * READ issued after CLOSE used to reach straight for `iteratorVar` (already
+ * closed along with its underlying `readerVar`/Source at CLOSE time), and
+ * calling `.hasNext`/`.next()` on an iterator over an already-closed
+ * `scala.io.Source` throws a raw, uncaught `java.io.IOException: Stream
+ * Closed` - a hard runtime crash real cobc never has (cobc just sets FILE
+ * STATUS "47" - "an I-O statement other than OPEN/CLOSE was attempted on a
+ * file not currently open" - and keeps running). Checked by
+ * generateReadStatement (expression-gen.js) before ever touching
+ * `iteratorVar`; also used by generateOpen/generateClose themselves to
+ * report OPEN-while-already-open ("41") and CLOSE-while-already-closed
+ * ("42") without touching any java.io handle at all in either case
+ * (matching cobc: neither condition changes the file's actual open/closed
+ * state or has any other side effect).
+ */
+function toIsOpenVarName(cobolFileName) {
+  return toCamelCase(cobolFileName) + 'IsOpen';
+}
+
+/**
+ * round-38 finding 3 (nn07): "did the MOST RECENT READ against this file
+ * already report end-of-file" flag - distinguishes cobc's FIRST past-end
+ * sequential READ (FILE STATUS "10") from a SECOND (or later) consecutive
+ * past-end READ with no successful READ in between (FILE STATUS "46" - "a
+ * READ was attempted past the point a prior READ had already reached
+ * end-of-file"). Reset to `false` by any read that actually finds a record
+ * (a later READ past a NEW end-of-file position - not applicable to this
+ * generator's forward-only iterator model, but the reset is still correct
+ * conceptually) and by a fresh OPEN (a reopened file has no "prior READ" of
+ * its own yet).
+ */
+function toPastEndVarName(cobolFileName) {
+  return toCamelCase(cobolFileName) + 'PastEnd';
+}
+
+/**
  * round-27 finding 7: "did the most recent keyed START against this file
  * fail (INVALID KEY - no record satisfied its comparison)" flag - see
  * generateStartStatement/generateReadStatement's own doc comments
@@ -196,6 +235,8 @@ export function fileHandleVarNames(fileName) {
     occVar: toOccVarName(fileName),
     startInvalidVar: toStartInvalidVarName(fileName),
     sigVar: toSigVarName(fileName),
+    isOpenVar: toIsOpenVarName(fileName),
+    pastEndVar: toPastEndVarName(fileName),
   };
 }
 
@@ -460,10 +501,27 @@ export function generateOpen(statement, indent = 0) {
 
   for (const file of files) {
     const fileName = extractFileName(file);
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, sigVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, sigVar, isOpenVar, pastEndVar } = fileHandleVarNames(fileName);
     const mode = (statement.mode || file?.mode || 'INPUT').toUpperCase();
     const statusVar = fileStatusVarFor(fileName);
     const handlerMethod = declarativeHandlerFor(fileName, mode);
+
+    // round-38 finding 3 (nn07): OPENing a file that is ALREADY open (no
+    // intervening CLOSE) is a distinct FILE STATUS condition real cobc
+    // reports as "41". `fileBodyStart` marks where this file's own ordinary
+    // OPEN codegen begins in `lines`; once the whole switch/try/catch below
+    // has finished emitting it (unchanged from the pre-round-38 logic), it
+    // is spliced back out, re-indented one level, and wrapped in
+    // `if !isOpenVar then ... else <41>` - see the bottom of this loop body.
+    // So it has ZERO side effects on the file's already-open handles beyond
+    // the status value itself, matching cobc (the file stays open with
+    // whatever it already had - no handler is registered/invoked for this
+    // condition either, since it isn't an OPEN *failure* the DECLARATIVES
+    // USE AFTER ERROR PROCEDURE convention models, just a distinct
+    // non-fatal status). A file that has never been opened yet (the
+    // overwhelming common case, and every pre-round-38 corpus program) has
+    // `isOpenVar` false, so this is a pure no-op addition for them.
+    const fileBodyStart = lines.length;
 
     // round-34 finding 2 (jj03): a `LINAGE IS <n> LINES WITH FOOTING AT <m>`
     // clause where `m > n` is statically invalid (the footing area alone
@@ -760,6 +818,22 @@ export function generateOpen(statement, indent = 0) {
         break;
     }
 
+    // round-38 finding 3 (nn07): splice this file's own OPEN codegen (from
+    // `fileBodyStart` to wherever it currently ends) back out of `lines`,
+    // re-indent it one level, and wrap it in `if !isOpenVar then <body> else
+    // <41>` - see fileBodyStart's own doc comment above. Called from both
+    // remaining exit points below (the unrecognized-mode `continue` and the
+    // normal try/catch path, which falls through to this loop's natural
+    // end) since both need the exact same wrapping.
+    function wrapFileBodyWithOpenGuard() {
+      const bodyLines = lines.splice(fileBodyStart, lines.length - fileBodyStart);
+      const reindented = bodyLines.map(l => `  ${l}`);
+      lines.push(`${indentStr}if ${isOpenVar} then`);
+      lines.push(`${indentStr}  ${statusVar ? `${statusVar} = "41"` : '()'}`);
+      lines.push(`${indentStr}else`);
+      lines.push(...reindented);
+    }
+
     if (!canFail) {
       // Unrecognized mode: never touches java.io at all, so nothing can
       // throw - no try/catch needed, just the plain comment (and, as
@@ -768,6 +842,12 @@ export function generateOpen(statement, indent = 0) {
       if (statusVar) {
         lines.push(`${indentStr}${statusVar} = "00"`);
       }
+      // round-38 finding 3: this generator's own open/closed bookkeeping is
+      // independent of whether the program even declared a FILE STATUS
+      // field - always updated, regardless.
+      lines.push(`${indentStr}${isOpenVar} = true`);
+      lines.push(`${indentStr}${pastEndVar} = false`);
+      wrapFileBodyWithOpenGuard();
       continue;
     }
 
@@ -776,6 +856,11 @@ export function generateOpen(statement, indent = 0) {
     if (statusVar) {
       openLines.push(`${bi}${statusVar} = "00"`);
     }
+    // round-38 finding 3: see the !canFail branch's identical comment above -
+    // only reached on a SUCCESSFUL open (inside the try, before any
+    // exception could be thrown by the mode-specific lines above it).
+    openLines.push(`${bi}${isOpenVar} = true`);
+    openLines.push(`${bi}${pastEndVar} = false`);
 
     lines.push(`${indentStr}try`);
     lines.push(...openLines);
@@ -799,6 +884,8 @@ export function generateOpen(statement, indent = 0) {
     lines.push(...catchBody(fileNotFoundStatus));
     lines.push(`${bi}case _: java.io.IOException =>`);
     lines.push(...catchBody('30'));
+
+    wrapFileBodyWithOpenGuard();
   }
 
   return lines.join('\n');
@@ -815,7 +902,19 @@ export function generateClose(statement, indent = 0) {
 
   for (const file of files) {
     const fileName = extractFileName(file);
-    const { fileVar, readerVar, writerVar, randomVar, bufVar, sigVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, randomVar, bufVar, sigVar, isOpenVar } = fileHandleVarNames(fileName);
+    // round-38 finding 3 (nn07): a second CLOSE of an already-closed file
+    // (no intervening OPEN) is a distinct FILE STATUS condition real cobc
+    // reports as "42" - see generateOpen's identical `fileBodyStart`/
+    // `wrapFileBodyWithOpenGuard` convention for "41" (OPEN of an
+    // already-open file); this is its CLOSE-side mirror image. This file's
+    // own ordinary CLOSE codegen (unchanged from the pre-round-38 logic) is
+    // spliced back out, re-indented one level, and wrapped in
+    // `if isOpenVar then ... else <42>` at the bottom of this loop body -
+    // so re-closing an already-closed file has ZERO side effects (no
+    // handle is touched - they are all already null/closed) beyond the
+    // status value itself.
+    const closeBodyStart = lines.length;
 
     // Round-6 finding 1: a file using the ADVANCING deferred-terminator
     // WRITE model (see expression-gen.js's generateWriteStatement) leaves
@@ -883,6 +982,22 @@ export function generateClose(statement, indent = 0) {
     if (statusVar) {
       lines.push(`${indentStr}${statusVar} = "00"`);
     }
+    // round-38 finding 3: a successful CLOSE marks this file as no longer
+    // open (only reached below this loop's own already-closed guard, so
+    // this is a real close, not a repeat one).
+    lines.push(`${indentStr}${isOpenVar} = false`);
+
+    // Splice this file's own ordinary CLOSE codegen back out, re-indent it
+    // one level, and wrap it in `if isOpenVar then ... else <42>` - mirrors
+    // generateOpen's identical wrapFileBodyWithOpenGuard convention above.
+    {
+      const bodyLines = lines.splice(closeBodyStart, lines.length - closeBodyStart);
+      const reindented = bodyLines.map(l => `  ${l}`);
+      lines.push(`${indentStr}if ${isOpenVar} then`);
+      lines.push(...reindented);
+      lines.push(`${indentStr}else`);
+      lines.push(`${indentStr}  ${statusVar ? `${statusVar} = "42"` : '()'}`);
+    }
   }
 
   return lines.join('\n');
@@ -902,12 +1017,16 @@ export function generateFileHandleDeclarations(fileNames, indent = 1, linageRegi
   const lines = [];
 
   for (const fileName of fileNames) {
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, startInvalidVar, sigVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, startInvalidVar, sigVar, isOpenVar, pastEndVar } = fileHandleVarNames(fileName);
     lines.push(`${indentStr}var ${fileVar}: java.io.File = null`);
     lines.push(`${indentStr}var ${readerVar}: scala.io.BufferedSource = null`);
     lines.push(`${indentStr}var ${writerVar}: java.io.PrintWriter = null`);
     lines.push(`${indentStr}var ${iteratorVar}: Iterator[String] = Iterator.empty`);
     lines.push(`${indentStr}var ${randomVar}: java.io.RandomAccessFile = null`);
+    // round-38 finding 3: see toIsOpenVarName/toPastEndVarName's own doc
+    // comments above.
+    lines.push(`${indentStr}var ${isOpenVar}: Boolean = false`);
+    lines.push(`${indentStr}var ${pastEndVar}: Boolean = false`);
     // round-25 root cause 1: OPEN I-O's in-memory line buffer + read-position
     // counter (see generateOpen's I-O branch and generateRewriteStatement/
     // generateDeleteStatement in expression-gen.js) - null/0 defaults are a

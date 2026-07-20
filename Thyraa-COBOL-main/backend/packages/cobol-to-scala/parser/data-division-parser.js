@@ -206,10 +206,63 @@ function parsePicPattern(pattern) {
         }
         break;
       case 'P':
-        // Scaling position - affects the decimal point but occupies no storage
+        // round-38 finding 4 (nn09): scaling position - occupies no storage,
+        // but its effect on the represented VALUE's magnitude/decimal-digit
+        // count depends on which SIDE of the digit-9 run it falls on, which
+        // the pre-fix code never distinguished (it only ever asked "are we
+        // already past an explicit V/.", always false for a plain P-only
+        // PICTURE with no V at all - so both a leading and a trailing P run
+        // fell into the same `else` branch, both decrementing decDigits
+        // identically, even though real cobc treats them as opposite
+        // scaling directions). Derived directly from nn09's own real-cobc
+        // oracle capture (tests/corpus/proc/nn09-picture-p-scaling.oracle.txt)
+        // and by tracing exactly how `integerDigits`/`decimalDigits` drive
+        // the embedded runtime's CobolFmt.truncNumeric (store-time
+        // truncation) and CobolFmt.num (DISPLAY text) - not guessed from a
+        // textbook description:
+        //   - a P occurring AFTER an explicit V (rare/unusual, but
+        //     unambiguous once V has already flipped inDecimalPart) is just
+        //     another fractional scaling position, same as leading-P below.
+        //   - a P occurring BEFORE any digit-9 has been seen at all
+        //     (`digitCount === 0`) is a LEADING P run - `PIC SPPP9(3)`,
+        //     scale DOWN: the implied decimal point sits to the LEFT of
+        //     every P *and* every digit-9 that follows (nn09: MOVEing a
+        //     123456 into this PIC yields SCALED-DOWN=+.000000 - the whole
+        //     value is sub-1.0, and the source's integer part doesn't fit at
+        //     all, i.e. `integerDigits` must end up genuinely 0). Each
+        //     leading P contributes one more fractional (decimal) digit
+        //     position, and - critically - flips `inDecimalPart` true
+        //     (exactly like V would) so every digit-9 STILL TO COME in this
+        //     same run is *also* counted as a decimal digit, not an integer
+        //     one (the whole item is fractional, not just the P run
+        //     itself).
+        //   - a P occurring AFTER at least one digit-9 has already been
+        //     counted (`digitCount > 0`) is a TRAILING P run - `PIC
+        //     9(3)PPP`, scale UP: the implied decimal point sits to the
+        //     RIGHT of the P's (nn09: MOVEing 123456 into this PIC yields
+        //     SCALED-UP=+123000 - the stored digits are the high-order part
+        //     of a larger integer whose low-order digits are always zero).
+        //     This needs BOTH counters to move: `integerDigits` grows by one
+        //     (so CobolFmt.truncNumeric's own high-order-digit modulus spans
+        //     the FULL conceptual width - 6 for `S9(3)PPP` - not just the 3
+        //     physically-stored digits, matching cobc's own "round down to
+        //     the nearest 10^<P-count>" MOVE truncation, verified via
+        //     BigDecimal.setScale(-3, DOWN) against nn09's own 123456 ->
+        //     123000), AND `decimalDigits` goes NEGATIVE (a value CobolFmt.num
+        //     - generator/expression-gen.js's generateCobolFmtHelper - reads
+        //     as "render the digit text directly, zero-padded to
+        //     integerDigits, no decimal point at all", since a positive-only
+        //     "totalDigits = integerDigits + decimalDigits" formula can't
+        //     otherwise express a value whose magnitude and displayed digit
+        //     count are wider than either count alone once truncNumeric's
+        //     own truncation has already run above).
         if (inDecimalPart) {
           decDigits++;
+        } else if (digitCount === 0) {
+          decDigits++;
+          inDecimalPart = true;
         } else {
+          intDigits++;
           decDigits--;
         }
         break;

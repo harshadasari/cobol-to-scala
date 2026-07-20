@@ -1,0 +1,4 @@
+ITEM1=[ABCD      ] PTR=05
+ITEM2=[XYZ       ] PTR=04
+ITEM1-STILL=[ABCD      ]
+ITEM3-UNTOUCHED=[          ]

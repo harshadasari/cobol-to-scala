@@ -1,0 +1,6 @@
+# program exited 1
+MAIN CALLING A
+IN A N=1
+IN B N=1
+IN C N=1
+libcob: error: recursive CALL from OO15PC to OO15PA which is NOT RECURSIVE

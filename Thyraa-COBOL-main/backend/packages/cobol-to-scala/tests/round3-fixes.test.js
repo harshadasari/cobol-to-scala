@@ -112,8 +112,14 @@ test("Finding 3: reference modification (start:length) parses cleanly (doesn't c
   // parseVariableReference fix).
   assert.match(code, /\?\?\? \/\* TODO: reference modification \(read\) not implemented/);
   // Write path: likewise a visible, compiling TODO - not the mis-dispatch
-  // into subscript codegen the pre-fix parser produced.
-  assert.match(code, /wsField = \?\?\? \/\/ \?\?\? TODO: reference modification \(write\) not implemented/);
+  // into subscript codegen the pre-fix parser produced. round-39 finding 2:
+  // this is now a BLOCK comment (`/* ... */`), not the original's line
+  // comment (`// ...`) - assignExpr's RECURSIVE_LEAF_NAMES branch (needed so
+  // a ref-mod write TARGET naming a RECURSIVE program's own LINKAGE leaf
+  // doesn't hit a "Reassignment to val" compile crash - see oo04) wraps this
+  // value expression inside `<camel>_=( ... )`, and a `//` line comment
+  // would have swallowed the closing `)` into the comment too.
+  assert.match(code, /wsField = \?\?\? \/\* TODO: reference modification \(write\) not implemented/);
   // The DISPLAY statement (and everything else in the paragraph) must still
   // have parsed correctly - not been swallowed by a corrupted cursor.
   assert.match(code, /println\(\(wsSub\)/);

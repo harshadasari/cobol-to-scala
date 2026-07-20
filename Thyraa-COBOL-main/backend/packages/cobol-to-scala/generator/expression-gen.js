@@ -1181,7 +1181,32 @@ function renderAssignment(targetRef, valueExpr) {
     // exact assignment is ever actually reached at runtime, never at
     // declaration/compile time, and is grep-able as an honest, undone gap
     // rather than a silent wrong write.
-    return `${targetCamelFor(targetRef)} = ??? // ??? TODO: reference modification (write) not implemented - see tests/oracle/README.md known gaps`;
+    //
+    // oo04 (round 39, finding 2): this line used to build the assignment
+    // with a hardcoded bare `=` instead of going through assignExpr - every
+    // OTHER write path in this generator already routes through assignExpr/
+    // renderAssignment's ordinary branches specifically to dodge Scala 3's
+    // refusal to desugar `x = v` into a setter call (`x_=(v)`) for a
+    // LOCALLY-NESTED def/def _= pair (round-23's RECURSIVE_LEAF_NAMES
+    // detour - see assignExpr's own doc comment) - only true object/class
+    // members support assignment-sugar desugaring. A ref-mod write TARGET
+    // that happens to name a RECURSIVE program's own LINKAGE leaf (oo04's
+    // LK-SLICE) hit that exact "Reassignment to val" compile crash because
+    // this one spot never checked RECURSIVE_LEAF_NAMES at all. assignExpr
+    // already falls back to a plain `=` for any name NOT in
+    // RECURSIVE_LEAF_NAMES, so this is a pure compile-crash fix with zero
+    // behavior change for the ordinary (non-RECURSIVE-leaf) case - the
+    // ref-mod write itself is still the same honest `???` decline/no-op.
+    // NOTE: a block comment (`/* ... */`), not the original bare form's
+    // line comment (`// ...`) - assignExpr's RECURSIVE_LEAF_NAMES branch
+    // wraps this value expression inside `<camel>_=( ... )`; a `//` line
+    // comment here would swallow the closing `)` into the comment too,
+    // an unclosed-paren compile error. A block comment is safe in both the
+    // wrapped-call form and the plain `<camel> = ...` fallback form.
+    return assignExpr(
+      targetCamelFor(targetRef),
+      '??? /* TODO: reference modification (write) not implemented - see tests/oracle/README.md known gaps */'
+    );
   }
 
   const camel = targetCamelFor(targetRef);
@@ -4056,6 +4081,23 @@ function relationalOperandDescriptor(node) {
   }
 
   if (simple && simple.type === 'VariableReference') {
+    // oo13 (round 39, finding 6): COBOL reference modification
+    // (`identifier(start:length)`) ALWAYS yields an ALPHANUMERIC view,
+    // regardless of the base field's own declared numeric/alphanumeric
+    // type - checked here BEFORE consulting the base field's registered
+    // info, which otherwise reports the base field's own (possibly
+    // numeric) descriptor. relationalOperandExpr's own ref-mod branch
+    // already substitutes a String-typed honest-decline placeholder
+    // (refModStringPlaceholder) for a ref-mod'd operand - without this
+    // check, a ref-mod'd operand over a NUMERIC base field routed
+    // renderComparisonExpr's numeric branch into wrapping that String
+    // placeholder in `BigDecimal(...)`, and `BigDecimal("")` throws
+    // `NumberFormatException` at RUNTIME, unlike every other ref-mod-read
+    // honest-decline site in this codebase, which stays a safe (if
+    // honestly-wrong) string comparison.
+    if (simple.refMod) {
+      return { scalaClass: 'string', semantic: 'alphanumeric' };
+    }
     const info = lookupFieldForRef(simple);
     if (info) {
       const isString = info.scalaType === 'String';
@@ -6523,6 +6565,16 @@ function coerceAcceptValue(rawExpr, info) {
  * renderAssignment/field-registry path any other statement uses, with
  * coerceAcceptValue applying the same numeric/edited/alphanumeric coercion
  * an ordinary MOVE source would get.
+ *
+ * oo13 (round 39, findings 4/5): two DATE/DAY-family gaps fixed here -
+ *   - finding 4: `ACCEPT ... FROM DAY` (YYDDD - a 2-digit year PLUS the
+ *     3-digit day-of-year, e.g. cobc's `26201` for day 201 of 2026) had no
+ *     year component at all (`getDayOfYear.toString` alone gives only
+ *     `201`/`00201` once zero-padded) - the 2-digit year is now prepended.
+ *   - finding 5: `ACCEPT ... FROM DATE YYYYMMDD` (the 4-digit-year variant -
+ *     see AcceptStatement's own `fourDigitYear` flag, set by
+ *     parseAcceptStatement) uses a `"yyyyMMdd"` format pattern instead of
+ *     the ordinary (2-digit-year) form's `"yyMMdd"`.
  */
 function generateAccept(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
@@ -6531,11 +6583,18 @@ function generateAccept(statement, indent = 0) {
 
   let rawExpr;
   if (statement.from === 'DATE') {
-    rawExpr = 'java.time.LocalDate.now.format(java.time.format.DateTimeFormatter.ofPattern("yyMMdd"))';
+    const pattern = statement.fourDigitYear ? 'yyyyMMdd' : 'yyMMdd';
+    rawExpr = `java.time.LocalDate.now.format(java.time.format.DateTimeFormatter.ofPattern("${pattern}"))`;
   } else if (statement.from === 'TIME') {
     rawExpr = 'java.time.LocalTime.now.format(java.time.format.DateTimeFormatter.ofPattern("HHmmss"))';
   } else if (statement.from === 'DAY') {
-    rawExpr = 'java.time.LocalDate.now.getDayOfYear.toString';
+    // finding 4: cobc's ACCEPT FROM DAY is YYDDD, not a bare day-of-year -
+    // the 2-digit year (`getYear % 100`, zero-padded to 2 digits) comes
+    // first, then the 3-digit day-of-year (coerceAcceptValue/the target's
+    // own PIC zero-pads the WHOLE concatenated string on the left if it's
+    // still short, e.g. day 1 of a year - not exercised by oo13, whose own
+    // WS-DAY PIC 9(5) exactly matches YYDDD's own natural 5-digit width).
+    rawExpr = '(f"${(java.time.LocalDate.now.getYear % 100)}%02d" + f"${java.time.LocalDate.now.getDayOfYear}%03d")';
   } else if (statement.from === 'DAY-OF-WEEK') {
     // ISO day-of-week (1=Monday..7=Sunday) - matches GnuCOBOL's own
     // ACCEPT FROM DAY-OF-WEEK numbering (verified against installed
@@ -8271,7 +8330,47 @@ function linageEopLines(fileName, statement, indent) {
   return lines.join('\n');
 }
 
+/**
+ * oo05/oo06 (round 39, finding 3): round-38 finding 3 (nn07) added
+ * isOpenVar/pastEndVar lifecycle tracking and wired it into generateOpen/
+ * generateClose/generateReadStatement - but WRITE/REWRITE/DELETE never
+ * consulted isOpenVar (or an access-mode flag) at all, so a WRITE/REWRITE/
+ * DELETE issued after CLOSE (oo05: cobc reports FILE STATUS 48/49/49,
+ * writes nothing, and keeps running - it does NOT abend for this
+ * condition, unlike a READ-after-CLOSE, which DOES abend in cobc and was
+ * already fixed in round 38) or while open in the wrong mode - e.g. INPUT
+ * when a WRITE needs OUTPUT/I-O/EXTEND (oo06: 48/49) - dereferenced a
+ * writer/buffer handle that's null, a raw NullPointerException.
+ *
+ * This wrapper is the SAME "check state before touching any handle"
+ * convention generateReadStatement's own outer `if !isOpenVar then ... else
+ * ...` guard already established (see its doc comment) - generateWriteStatement's
+ * ENTIRE pre-existing body (every branch: keyed/RANDOM access, fixed-length
+ * RELATIVE, byte-level/non-DISPLAY records, ADVANCING, plain text, the
+ * various "not supported" TODO declines) is preserved completely unchanged
+ * as generateWriteStatementInner below and re-indented one level under a
+ * new outer `else`; the `if` branch short-circuits with FILE STATUS "48"
+ * (compiler-verified against installed GnuCOBOL for both oo05's
+ * closed-file case and oo06's wrong-open-mode case) and touches no handle
+ * at all - not even the ones the various inner branches build lazily.
+ */
 function generateWriteStatement(statement, indent = 0) {
+  const indentStr = '  '.repeat(indent);
+  const recordName = statement.recordName || statement.record || 'record';
+  const fileName = fileNameForRecord(recordName);
+  const { isOpenVar, openModeVar } = fileHandleVarNames(fileName);
+  const statusVar = fileStatusVarFor(fileName);
+  const innerText = generateWriteStatementInner(statement, indent);
+  const guardCond = `!${isOpenVar} || (${openModeVar} != "OUTPUT" && ${openModeVar} != "I-O" && ${openModeVar} != "EXTEND")`;
+  return [
+    `${indentStr}if ${guardCond} then`,
+    statusVar ? `${indentStr}  ${assignExpr(statusVar, '"48"')}` : `${indentStr}  ()`,
+    `${indentStr}else`,
+    ...innerText.split('\n').map(l => `  ${l}`),
+  ].join('\n');
+}
+
+function generateWriteStatementInner(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const recordName = statement.recordName || statement.record || 'record';
   const fileName = fileNameForRecord(recordName);
@@ -8505,7 +8604,33 @@ function generateKeyedRewriteStatement(statement, fileName, finalTextExpr, statu
   return lines.join('\n');
 }
 
+/**
+ * oo05/oo06 (round 39, finding 3): same "check isOpenVar/openModeVar BEFORE
+ * touching any handle" wrapper as generateWriteStatement above, for REWRITE.
+ * A REWRITE issued after CLOSE (oo05) or while open in a mode other than
+ * I-O (oo06: open INPUT) reports FILE STATUS "49" (compiler-verified against
+ * installed GnuCOBOL for both cases) with the file's own handle completely
+ * untouched, instead of a NullPointerException. generateRewriteStatementInner
+ * below is the ENTIRE pre-existing REWRITE body, unchanged, re-indented one
+ * level under this wrapper's own `else`.
+ */
 function generateRewriteStatement(statement, indent = 0) {
+  const indentStr = '  '.repeat(indent);
+  const recordNameRaw = statement.recordName || statement.record || 'record';
+  const fileName = fileNameForRecord(recordNameRaw);
+  const { isOpenVar, openModeVar } = fileHandleVarNames(fileName);
+  const statusVar = fileStatusVarFor(fileName);
+  const innerText = generateRewriteStatementInner(statement, indent);
+  const guardCond = `!${isOpenVar} || ${openModeVar} != "I-O"`;
+  return [
+    `${indentStr}if ${guardCond} then`,
+    statusVar ? `${indentStr}  ${assignExpr(statusVar, '"49"')}` : `${indentStr}  ()`,
+    `${indentStr}else`,
+    ...innerText.split('\n').map(l => `  ${l}`),
+  ].join('\n');
+}
+
+function generateRewriteStatementInner(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const recordNameRaw = statement.recordName || statement.record || 'record';
   const fileName = fileNameForRecord(recordNameRaw);
@@ -8687,8 +8812,31 @@ function generateKeyedDeleteStatement(statement, fileName, statusVar, indent) {
  * already does.
  *
  * round-27 finding 8: see isIndexedRandomAccess's own doc comment.
+ *
+ * oo05/oo06 (round 39, finding 3): same "check isOpenVar/openModeVar BEFORE
+ * touching any handle" wrapper as generateWriteStatement/generateRewriteStatement
+ * above. A DELETE issued after CLOSE (oo05) reports FILE STATUS "49" with the
+ * file's own handle completely untouched, instead of a NullPointerException
+ * (compiler-verified against installed GnuCOBOL). generateDeleteStatementInner
+ * below is the ENTIRE pre-existing DELETE body, unchanged, re-indented one
+ * level under this wrapper's own `else`.
  */
 function generateDeleteStatement(statement, indent = 0) {
+  const indentStr = '  '.repeat(indent);
+  const fileNameRaw = statement.fileName || statement.file || 'file';
+  const { isOpenVar, openModeVar } = fileHandleVarNames(fileNameRaw);
+  const statusVarOuter = fileStatusVarFor(fileNameRaw);
+  const innerText = generateDeleteStatementInner(statement, indent);
+  const guardCond = `!${isOpenVar} || ${openModeVar} != "I-O"`;
+  return [
+    `${indentStr}if ${guardCond} then`,
+    statusVarOuter ? `${indentStr}  ${assignExpr(statusVarOuter, '"49"')}` : `${indentStr}  ()`,
+    `${indentStr}else`,
+    ...innerText.split('\n').map(l => `  ${l}`),
+  ].join('\n');
+}
+
+function generateDeleteStatementInner(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const fileNameRaw = statement.fileName || statement.file || 'file';
   if (isIndexedRandomAccess(fileNameRaw, statement)) {
@@ -9272,8 +9420,22 @@ function generateCall(statement, indent = 0) {
       const hasSubscripts = Array.isArray(param.value?.subscripts) && param.value.subscripts.length > 0;
       const isNamedGroup = name && !param.value?.refMod && !hasSubscripts &&
         isRegisteredGroupName(String(name).toUpperCase());
+      // oo03 (round 39, finding 1): a SUBSCRIPTED operand whose base name is
+      // ITSELF a registered GROUP-table name (`WS-ITEM(2)`, a row of an
+      // OCCURS-of-GROUPS table) - distinct from an ordinary subscripted
+      // SCALAR table (`isSubscriptedRefVar` below). An OCCURS-of-GROUPS
+      // table has no single flat Vector named after the group at all: it is
+      // flattened per-LEAF, one Vector per child field (`wsItemVal:
+      // Vector[Int]`, `wsItemTag: Vector[String]`, ...), never combined -
+      // see flattenGroupLeaves's own doc comment. Must be checked (and
+      // handled, below) BEFORE isSubscriptedRefVar, which would otherwise
+      // wrongly assume a single flat scalar Vector named after the group
+      // itself exists.
+      const isSubscriptedNamedGroup = name && !param.value?.refMod && hasSubscripts &&
+        isRegisteredGroupName(String(name).toUpperCase());
       const isPlainRefVar = name && !param.value?.refMod && !hasSubscripts && !isNamedGroup;
-      const isSubscriptedRefVar = name && !param.value?.refMod && hasSubscripts && !isNamedGroup;
+      const isSubscriptedRefVar = name && !param.value?.refMod && hasSubscripts &&
+        !isNamedGroup && !isSubscriptedNamedGroup;
       const isRefModRefVar = name && param.value?.refMod && !hasSubscripts;
 
       if (isPlainRefVar) {
@@ -9296,6 +9458,62 @@ function generateCall(statement, indent = 0) {
           closureArgs.push(`() => ${sv}, (v: ${scalaType}) => ${sv} = v`);
         }
         return;
+      }
+
+      // oo03 (round 39, finding 1): a subscripted GROUP-table row
+      // (`WS-ITEM(2)`, an OCCURS-of-GROUPS table element) gets ONE
+      // getter/setter closure pair PER LEAF child, exactly like isNamedGroup's
+      // own (unsubscripted) per-leaf fan-out further below - just with the
+      // row subscript threaded into each leaf's own flat Vector read/write
+      // expression instead of a bare (unsubscripted) name. BY REFERENCE gets
+      // a real live closure pair straight into the caller's own per-leaf
+      // Vectors (a mutation is visible to the caller the instant it happens,
+      // and on every subsequent read within the same callee activation); BY
+      // CONTENT/VALUE gets its own call-site-scoped local snapshot var per
+      // leaf (seeded once from the caller's current row value), matching
+      // round-35 finding 2's own BY CONTENT/VALUE convention for every other
+      // shape in this branch.
+      if (isSubscriptedNamedGroup) {
+        const callerLeaves = flattenGroupLeaves(resolveGroupKey(String(name).toUpperCase()));
+        if (callerLeaves && callerLeaves.length === leafShapes.length) {
+          const idxs = param.value.subscripts.map(subscriptIndexExpr);
+          const idxChain = idxs.map(ix => `(${ix})`).join('');
+          // Same recursive `.updated(...)` shape renderAssignment's own
+          // subscripted-scalar branch uses, generalized to an arbitrary
+          // (defensive - only ever 1 dimension in any corpus program so far)
+          // number of subscript dimensions.
+          const updatedExpr = (baseExpr) => {
+            function rec(depth, expr) {
+              if (depth === idxs.length - 1) return `${expr}.updated(${idxs[depth]}, v)`;
+              return `${expr}.updated(${idxs[depth]}, ${rec(depth + 1, `${expr}(${idxs[depth]})`)})`;
+            }
+            return rec(0, baseExpr);
+          };
+          callerLeaves.forEach((leaf, j) => {
+            if (mode === 'REFERENCE') {
+              closureArgs.push(
+                `() => ${leaf.camel}${idxChain}, (v: ${leaf.scalaType}) => { ${leaf.camel} = ${updatedExpr(leaf.camel)} }`
+              );
+            } else {
+              const sv = snapshotVar(i, j);
+              preLines.push(`${indentStr}var ${sv}: ${leaf.scalaType} = ${leaf.camel}${idxChain}`);
+              closureArgs.push(`() => ${sv}, (v: ${leaf.scalaType}) => ${sv} = v`);
+            }
+          });
+          return;
+        }
+        // Shape mismatch (defensive - not exercised by any corpus program):
+        // falls through to the ordinary isSubscriptedRefVar-style handling
+        // just below (isSubscriptedRefVar's own flag doesn't cover this
+        // case, so re-check the raw shape directly here rather than
+        // duplicating that whole block).
+        if (mode === 'REFERENCE') {
+          const scalaType = leafShapes[0]?.scalaType || target.paramTypes?.[i] || 'String';
+          const getterExpr = convertIdentifier(param.value);
+          const setterStmt = renderAssignment(param.value, 'v');
+          closureArgs.push(`() => ${getterExpr}, (v: ${scalaType}) => { ${setterStmt} }`);
+          return;
+        }
       }
 
       // round-38 finding 2 (nn03/nn04): a SUBSCRIPTED (`WS-TABLE(WS-IDX)`) or

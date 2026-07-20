@@ -2957,6 +2957,15 @@ function parseAcceptStatement(ctx) {
   if (ctx.matchValue('FROM')) {
     if (ctx.matchValue('DATE')) {
       stmt.from = 'DATE';
+      // oo13 (round 39, finding 5): `ACCEPT ... FROM DATE YYYYMMDD` - an
+      // optional trailing keyword requesting the 4-digit-year variant of
+      // ACCEPT FROM DATE. Previously left unconsumed here - the next token
+      // (the bare identifier `YYYYMMDD`) fell through to this function's own
+      // return, then got misinterpreted downstream as the start of a NEW
+      // paragraph-name declaration, silently corrupting the paragraph
+      // structure of every program using this ACCEPT variant (see
+      // generateAccept's own doc comment for the full root-cause story).
+      stmt.fourDigitYear = ctx.matchValue('YYYYMMDD');
     } else if (ctx.matchValue('TIME')) {
       stmt.from = 'TIME';
     } else if (ctx.matchValue('DAY')) {

@@ -4114,6 +4114,28 @@ export function generateScala(ast, options = {}) {
     sections.push('  private object CobolExitSectionSignal extends RuntimeException(null, null, false, false)');
   }
 
+  // oo15 (round 39, finding 7): a non-RECURSIVE program has no notion of
+  // "am I already active on the call stack" at all - real cobc tracks this
+  // per PROGRAM-ID and ABENDS at runtime the instant a non-RECURSIVE
+  // program's own entry() is re-entered while an outer activation of the
+  // SAME program is still running (a CALL cycle - A calls B calls C calls A
+  // again, none declared RECURSIVE - compiler-verified against installed
+  // GnuCOBOL: `libcob: error: recursive CALL from <caller> to <callee> which
+  // is NOT RECURSIVE`, nonzero exit, no further output). Without this guard,
+  // the JVM/Scala call stack has no opposing rule and just lets the cycle
+  // run to completion, producing full (but spurious - real cobc would never
+  // let this finish) output. Only emitted for a program that (a) gets an
+  // entry() at all (multi-PROGRAM-ID mode) and (b) is NOT itself RECURSIVE -
+  // a RECURSIVE program legitimately re-enters via generateRecursiveEntryMethod's
+  // own per-activation closure mechanism and must NOT get this guard.
+  if (opts.emitEntryPoint && !isRecursiveProgram(ast)) {
+    sections.push('');
+    // Scoped to THIS program's own object - no cross-program name collision
+    // risk, so a short, fixed name is fine (unlike a module-level var shared
+    // across an entire generated file).
+    sections.push('  private var _callActive: Boolean = false');
+  }
+
   // File constants
   const fileConstants = generateFileConstants(ast, 1);
   if (fileConstants) {
@@ -4387,19 +4409,26 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
       ? paramInfos[0].scalaType
       : `(${paramInfos.map(p => p.scalaType).join(', ')})`;
 
-  const lines = [
-    `${indentStr}// round-7 finding 1: CALL entry point for a sibling program in this same`,
-    `${indentStr}// multi-PROGRAM-ID source - see this function's own doc comment above and`,
-    `${indentStr}// generateCall's (generator/expression-gen.js) for the full BY REFERENCE`,
-    `${indentStr}// "value-in/tuple-out" convention this pairs with.`,
-    `${indentStr}def entry(${paramList}): ${returnType} =`,
-  ];
+  // oo15 (round 39, finding 7): a genuinely NON-recursive program (the
+  // common case reaching this function) gets the "already active" call-
+  // cycle guard below; a program that IS declared RECURSIVE but fell
+  // through to this ordinary (non-generateRecursiveEntryMethod) path
+  // anyway - zero USING params, or an unresolvable paramLeafShapes shape,
+  // see this function's own gating just above - legitimately re-enters
+  // itself and must NOT get this guard (no `_callActive` var was even
+  // declared for it - see the `!isRecursiveProgram(ast)` gate on that
+  // declaration, generateScala above).
+  const needsCycleGuard = !isRecursiveProgram(ast);
+  const bodyIndent = needsCycleGuard ? indent + 2 : indent + 1;
+  const bodyBi = '  '.repeat(bodyIndent);
+
+  const bodyLines = [];
   paramInfos.forEach((p, i) => {
     if (!p.isGroup) {
-      lines.push(`${bi}${p.camel} = _arg${i}`);
+      bodyLines.push(`${bodyBi}${p.camel} = _arg${i}`);
       return;
     }
-    const scattered = scatterGroupFromString(p.groupKey, `_arg${i}`, indent + 1);
+    const scattered = scatterGroupFromString(p.groupKey, `_arg${i}`, bodyIndent);
     if (scattered == null) {
       // round-23 finding (l10): this fallback is reached for ANY program
       // (recursive or not) whose GROUP LINKAGE parameter can't be
@@ -4436,23 +4465,23 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
       // non-recursive case above) - this is a visible, compiling decline,
       // not an attempt at correctness.
       if (isRecursiveProgram(ast)) {
-        lines.push(
-          `${bi}throw new NotImplementedError("CALL ... USING ${p.groupKey}: group parameter scatter not supported ` +
+        bodyLines.push(
+          `${bodyBi}throw new NotImplementedError("CALL ... USING ${p.groupKey}: group parameter scatter not supported ` +
             'for this shape (an OCCURS child, or a child with no registered field info) on a RECURSIVE program - ' +
             'declining honestly here instead of silently leaving this program\'s own loop-guard field frozen at ' +
             'its default forever (genuine infinite recursion) - see tests/oracle/README.md known gaps")'
         );
       } else {
-        lines.push(
-          `${bi}() // TODO: CALL ... USING ${p.groupKey}: group parameter scatter not supported for this ` +
+        bodyLines.push(
+          `${bodyBi}() // TODO: CALL ... USING ${p.groupKey}: group parameter scatter not supported for this ` +
             'shape (an OCCURS child, or a child with no registered field info) - value left unchanged'
         );
       }
       return;
     }
-    lines.push(...scattered);
+    bodyLines.push(...scattered);
   });
-  lines.push(...generateProgramFlowLines(units, indent + 1, ambiguousNames));
+  bodyLines.push(...generateProgramFlowLines(units, bodyIndent, ambiguousNames));
   if (paramInfos.length === 1 || paramInfos.length > 1) {
     const returnExprs = paramInfos.map(p => {
       if (!p.isGroup) return p.camel;
@@ -4464,7 +4493,44 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
       // never a guessed/wrong value.
       return groupExpr ? `(${groupExpr})` : `"" /* TODO: group return unsupported for this shape */`;
     });
-    lines.push(paramInfos.length === 1 ? `${bi}${returnExprs[0]}` : `${bi}(${returnExprs.join(', ')})`);
+    bodyLines.push(paramInfos.length === 1 ? `${bodyBi}${returnExprs[0]}` : `${bodyBi}(${returnExprs.join(', ')})`);
+  }
+
+  const lines = [
+    `${indentStr}// round-7 finding 1: CALL entry point for a sibling program in this same`,
+    `${indentStr}// multi-PROGRAM-ID source - see this function's own doc comment above and`,
+    `${indentStr}// generateCall's (generator/expression-gen.js) for the full BY REFERENCE`,
+    `${indentStr}// "value-in/tuple-out" convention this pairs with.`,
+    `${indentStr}def entry(${paramList}): ${returnType} =`,
+  ];
+
+  if (needsCycleGuard) {
+    // oo15 (round 39, finding 7): mirrors cobc's own "recursive CALL into a
+    // NOT RECURSIVE program" runtime abend - see this function's own doc
+    // comment on `needsCycleGuard` above. `try ... finally` (not a bare
+    // sequential `_callActive = false` statement after the body) because
+    // GOBACK/EXIT PROGRAM inside this program's own flow compiles to a bare
+    // Scala `return` (method-gen.js) - a non-local return that would
+    // otherwise skip straight past a trailing reset statement, leaving
+    // `_callActive` stuck `true` forever and wrongly abending every LATER
+    // (legitimate, non-overlapping, sequential) call to this same program
+    // for the rest of the run. `finally` runs regardless of how the try
+    // block's control flow actually exits (a `return`, a thrown exception,
+    // or normal completion) - restoring the flag correctly in all three
+    // cases, not just the "falls off the end" one.
+    const gi = '  '.repeat(indent + 1);
+    lines.push(`${gi}if _callActive then`);
+    lines.push(
+      `${gi}  System.err.println("libcob: error: recursive CALL into ${extractProgramName(ast) || 'PROGRAM'} which is NOT RECURSIVE")`
+    );
+    lines.push(`${gi}  sys.exit(1)`);
+    lines.push(`${gi}_callActive = true`);
+    lines.push(`${gi}try`);
+    lines.push(...bodyLines);
+    lines.push(`${gi}finally`);
+    lines.push(`${gi}  _callActive = false`);
+  } else {
+    lines.push(...bodyLines);
   }
 
   return lines.join('\n');

@@ -809,6 +809,11 @@ export class AcceptStatement extends Statement {
     super('AcceptStatement', options);
     this.target = options.target || null;
     this.from = options.from || null;               // DATE, TIME, DAY, etc.
+    // oo13 (round 39, findings 4/5): `ACCEPT ... FROM DATE YYYYMMDD` - the
+    // 4-digit-year variant of ACCEPT FROM DATE (see parseAcceptStatement/
+    // generateAccept). false for the ordinary (2-digit-year, `from ===
+    // 'DATE'` with no trailing keyword) form - every pre-round-39 program.
+    this.fourDigitYear = options.fourDigitYear || false;
   }
 }
 

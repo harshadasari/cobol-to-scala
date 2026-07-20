@@ -145,6 +145,29 @@ function toPastEndVarName(cobolFileName) {
 }
 
 /**
+ * round-39 finding 3 (oo05/oo06): the OPEN mode ("INPUT"/"OUTPUT"/"I-O"/
+ * "EXTEND") this file is CURRENTLY open under - distinct from
+ * accessModeFor's ACCESS MODE (SEQUENTIAL/RANDOM/DYNAMIC, a static FD
+ * property that never changes), and updated on every successful OPEN (see
+ * generateOpen, which sets this alongside isOpenVar). Consulted by
+ * generateWriteStatement/generateRewriteStatement/generateDeleteStatement so
+ * a WRITE issued while the file is open in a mode that doesn't permit it
+ * (e.g. WRITE while open INPUT, oo06) reports the correct FILE STATUS ("48"
+ * for WRITE, "49" for REWRITE/DELETE) instead of dereferencing a writer/
+ * buffer handle OPEN never actually built for that mode - the exact same
+ * "check state before touching any handle" convention round-38 finding 3
+ * already established for isOpenVar/READ. Round-38 only guarded READ
+ * (against a file that isn't open AT ALL); this closes the analogous gap
+ * for WRITE/REWRITE/DELETE, including the "open but in the WRONG mode" case
+ * READ itself doesn't need to worry about (READ only ever needs INPUT/I-O,
+ * and this generator's own READ codegen path is only ever reached for a file
+ * actually declared/opened that way).
+ */
+function toOpenModeVarName(cobolFileName) {
+  return toCamelCase(cobolFileName) + 'OpenMode';
+}
+
+/**
  * round-27 finding 7: "did the most recent keyed START against this file
  * fail (INVALID KEY - no record satisfied its comparison)" flag - see
  * generateStartStatement/generateReadStatement's own doc comments
@@ -237,6 +260,7 @@ export function fileHandleVarNames(fileName) {
     sigVar: toSigVarName(fileName),
     isOpenVar: toIsOpenVarName(fileName),
     pastEndVar: toPastEndVarName(fileName),
+    openModeVar: toOpenModeVarName(fileName),
   };
 }
 
@@ -501,7 +525,7 @@ export function generateOpen(statement, indent = 0) {
 
   for (const file of files) {
     const fileName = extractFileName(file);
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, sigVar, isOpenVar, pastEndVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, sigVar, isOpenVar, pastEndVar, openModeVar } = fileHandleVarNames(fileName);
     const mode = (statement.mode || file?.mode || 'INPUT').toUpperCase();
     const statusVar = fileStatusVarFor(fileName);
     const handlerMethod = declarativeHandlerFor(fileName, mode);
@@ -847,6 +871,8 @@ export function generateOpen(statement, indent = 0) {
       // field - always updated, regardless.
       lines.push(`${indentStr}${isOpenVar} = true`);
       lines.push(`${indentStr}${pastEndVar} = false`);
+      // round-39 finding 3: see toOpenModeVarName's own doc comment above.
+      lines.push(`${indentStr}${openModeVar} = "${mode}"`);
       wrapFileBodyWithOpenGuard();
       continue;
     }
@@ -861,6 +887,8 @@ export function generateOpen(statement, indent = 0) {
     // exception could be thrown by the mode-specific lines above it).
     openLines.push(`${bi}${isOpenVar} = true`);
     openLines.push(`${bi}${pastEndVar} = false`);
+    // round-39 finding 3: see toOpenModeVarName's own doc comment above.
+    openLines.push(`${bi}${openModeVar} = "${mode}"`);
 
     lines.push(`${indentStr}try`);
     lines.push(...openLines);
@@ -1017,7 +1045,7 @@ export function generateFileHandleDeclarations(fileNames, indent = 1, linageRegi
   const lines = [];
 
   for (const fileName of fileNames) {
-    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, startInvalidVar, sigVar, isOpenVar, pastEndVar } = fileHandleVarNames(fileName);
+    const { fileVar, readerVar, writerVar, iteratorVar, randomVar, bufVar, posVar, hasCurrentVar, occVar, startInvalidVar, sigVar, isOpenVar, pastEndVar, openModeVar } = fileHandleVarNames(fileName);
     lines.push(`${indentStr}var ${fileVar}: java.io.File = null`);
     lines.push(`${indentStr}var ${readerVar}: scala.io.BufferedSource = null`);
     lines.push(`${indentStr}var ${writerVar}: java.io.PrintWriter = null`);
@@ -1027,6 +1055,8 @@ export function generateFileHandleDeclarations(fileNames, indent = 1, linageRegi
     // comments above.
     lines.push(`${indentStr}var ${isOpenVar}: Boolean = false`);
     lines.push(`${indentStr}var ${pastEndVar}: Boolean = false`);
+    // round-39 finding 3: see toOpenModeVarName's own doc comment above.
+    lines.push(`${indentStr}var ${openModeVar}: String = ""`);
     // round-25 root cause 1: OPEN I-O's in-memory line buffer + read-position
     // counter (see generateOpen's I-O branch and generateRewriteStatement/
     // generateDeleteStatement in expression-gen.js) - null/0 defaults are a

@@ -199,6 +199,34 @@ function isRecursiveProgram(ast) {
 }
 
 /**
+ * round-40 finding 8 (pp15): True if this program's own PROGRAM-ID clause
+ * carries the INITIAL attribute (`PROGRAM-ID. NAME INITIAL.` - every CALL
+ * to this program gets a FRESH copy of WORKING-STORAGE reset to its own
+ * VALUE-clause defaults, not a persistent, shared state across calls).
+ * Scanned exactly the same way isRecursiveProgram (above) scans PROGRAM-ID's
+ * own clause for RECURSIVE - just looking for a different keyword.
+ */
+function isInitialProgram(ast) {
+  if (!ast.tokens || !Array.isArray(ast.tokens)) return false;
+  for (let i = 0; i < ast.tokens.length; i++) {
+    const token = ast.tokens[i];
+    if (token.value?.toUpperCase() === 'PROGRAM-ID' || token.type === 'PROGRAM-ID') {
+      let j = i + 1;
+      while (j < ast.tokens.length && (ast.tokens[j].type === 'PERIOD' || ast.tokens[j].value === '.')) j++;
+      j++;
+      while (j < ast.tokens.length) {
+        const t = ast.tokens[j];
+        if (t.type === 'PERIOD' || t.value === '.') break;
+        if (String(t.value).toUpperCase() === 'INITIAL') return true;
+        j++;
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
  * Generate Scala package declaration
  */
 function generatePackageDeclaration(packageName) {
@@ -2701,6 +2729,21 @@ function buildFieldRegistry(ast) {
   // generateGroupMove with no changes to any of them - RENAMES becomes "just
   // another group" from their point of view.
   const flatLeafOrder = [];
+  // round-40 finding 8 (pp15): `<camel> = <defaultExpr>` reset-assignment
+  // lines, ONE PER top-level-WORKING-STORAGE elementary leaf (and FILLER),
+  // in the exact same declaration order/shape as this walk's own `var
+  // <camel>: <scalaType> = <defaultExpr>` declaration lines below - reusing
+  // that SAME already-computed `defaultExpr` (VALUE-clause default, or the
+  // type's own zero/spaces default when there is none) rather than
+  // recomputing it. Only populated while `collectReset` is true (the
+  // WORKING-STORAGE-only `walk(wsItems, ...)` call at the bottom of this
+  // function, and any group recursion nested under it) - FILE SECTION/
+  // LINKAGE items never contribute here, since PROGRAM-ID ... INITIAL only
+  // resets WORKING-STORAGE. Consumed by generateEntryMethod/
+  // generateMainMethod (isInitialProgram gate) to reset every WORKING-
+  // STORAGE var back to its own declared default at the very start of
+  // every single CALL to an INITIAL program.
+  const wsResetLines = [];
   // round-15 finding 1/2: `baseOffset` is the ABSOLUTE byte offset (from the
   // whole record's own start) at which THIS `list` begins - threaded down
   // through nested-group recursion (see the group branch below) exactly like
@@ -2710,7 +2753,7 @@ function buildFieldRegistry(ast) {
   // local `offset` happens to be 0 at. Defaults to 0 for the top-level calls
   // (`walk(wsItems, [], [])` and friends) below, which is already correct -
   // a top-level 01-record's own children genuinely do start at absolute 0.
-  function walk(list, occursChain, ancestorNames, parentValueText, baseOffset = 0, isFileSection = false) {
+  function walk(list, occursChain, ancestorNames, parentValueText, baseOffset = 0, isFileSection = false, collectReset = false) {
     let offset = 0;
     // round-16 finding 1: every real (named, non-88) sibling's own ABSOLUTE
     // record offset (after its own SYNC padding, if any), keyed by its
@@ -2975,7 +3018,7 @@ function buildFieldRegistry(ast) {
         // round-15 finding 2: thread this group's own absolute start offset
         // down as the new baseOffset for its children's recursive walk() -
         // see the doc comment on walk()'s own `baseOffset` parameter above.
-        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain, [...ancestorNames, parentUpper], effectiveValueText, groupStartOffset, isFileSection);
+        walk(realChildren, ownCount ? [...occursChain, ownCount] : occursChain, [...ancestorNames, parentUpper], effectiveValueText, groupStartOffset, isFileSection, collectReset);
 
         // Group registry: immediate child names (COBOL name + camel), used
         // by MOVE/ADD CORRESPONDING to match children between two group
@@ -3082,6 +3125,7 @@ function buildFieldRegistry(ast) {
           defaultExpr = `Vector.fill(${fullChain[i]})(${defaultExpr})`;
         }
         lines.push(`  var ${fillerCamel}: ${scalaType} = ${defaultExpr}`);
+        if (collectReset) wsResetLines.push(`${fillerCamel} = ${defaultExpr}`);
         const fillerPic = item.pic && typeof item.pic === 'object' ? item.pic : null;
         item._fillerCamel = fillerCamel;
         item._fillerInfo = {
@@ -3146,6 +3190,7 @@ function buildFieldRegistry(ast) {
       }
 
       lines.push(`  var ${camel}: ${scalaType} = ${defaultExpr}`);
+      if (collectReset) wsResetLines.push(`${camel} = ${defaultExpr}`);
 
       const pic = item.pic && typeof item.pic === 'object' ? item.pic : null;
       const info = {
@@ -3223,7 +3268,9 @@ function buildFieldRegistry(ast) {
     }
   }
 
-  walk(wsItems, [], []);
+  // round-40 finding 8 (pp15): `collectReset = true` ONLY for this
+  // WORKING-STORAGE walk - see wsResetLines' own doc comment above.
+  walk(wsItems, [], [], undefined, 0, false, true);
   // round-24 finding (m08): isFileSection=true - see defaultElementaryValue's
   // own doc comment on why an FD/SD record's own alphanumeric field defaults
   // to LOW-VALUES here, unlike a WORKING-STORAGE/LINKAGE item's own default
@@ -3231,7 +3278,11 @@ function buildFieldRegistry(ast) {
   walk(fileItems, [], [], undefined, 0, true);
   walk(linkageItems, [], []);
 
-  return { lines: lines.join('\n'), registry, tableRegistry, groupRegistry, groupKeyRegistry, groupByteLengthRegistry, qualifiedRegistry, conditionRegistry };
+  return {
+    lines: lines.join('\n'), registry, tableRegistry, groupRegistry, groupKeyRegistry,
+    groupByteLengthRegistry, qualifiedRegistry, conditionRegistry,
+    wsResetAssignments: wsResetLines,
+  };
 }
 
 /**
@@ -3711,7 +3762,45 @@ function generateMainMethod(ast, options, indent = 1) {
   const ambiguousNames = collectAmbiguousParagraphNames(topLevelParagraphs, sections);
 
   const lines = [`${indentStr}@main def run(): Unit =`];
-  lines.push(...generateProgramFlowLines(units, indent + 1, ambiguousNames));
+
+  // round-40 finding 4 (pp09): round-39 finding 7 gave every non-RECURSIVE
+  // program that gets an entry() (multi-PROGRAM-ID mode) its own
+  // `_callActive` guard, checked at the top of entry() - but `run()` (the
+  // FIRST/"main" program's own top-level activation, in multi-PROGRAM-ID
+  // mode) invokes this SAME program's paragraph flow DIRECTLY, never
+  // touching entry()'s own `_callActive` flag at all, so a cyclic CALL back
+  // into this program via its OWN entry() (from a sibling program deeper in
+  // the cycle) never sees `_callActive == true` for the still-running
+  // top-level activation and incorrectly passes the guard - a spurious
+  // duplicate re-execution of the whole program body before the cycle is
+  // (mis-)detected one level later, blaming the wrong program (compiler-
+  // verified against installed GnuCOBOL: pp09). Fixed by setting/clearing
+  // the identical `_callActive` guard around run()'s own direct body
+  // invocation too - same `try ... finally` convention as entry() uses (a
+  // bare sequential reset would be skipped by GOBACK/STOP RUN's own
+  // non-local `return`/`sys.exit`), gated on the EXACT SAME condition that
+  // decides whether `_callActive` is even declared for this program
+  // (`opts.emitEntryPoint && !isRecursiveProgram(ast)` - see this file's own
+  // `_callActive` declaration site, generateScala above): a single-program
+  // (non-multi-PROGRAM-ID) conversion never declares `_callActive` at all
+  // (no entry() exists to cycle back through), so `run()` must not reference
+  // an undeclared variable in that case.
+  const needsCycleGuard = options.emitEntryPoint && !isRecursiveProgram(ast);
+  if (needsCycleGuard) {
+    const gi = '  '.repeat(indent + 1);
+    lines.push(`${gi}if _callActive then`);
+    lines.push(
+      `${gi}  System.err.println("libcob: error: recursive CALL into ${extractProgramName(ast) || 'PROGRAM'} which is NOT RECURSIVE")`
+    );
+    lines.push(`${gi}  sys.exit(1)`);
+    lines.push(`${gi}_callActive = true`);
+    lines.push(`${gi}try`);
+    lines.push(...generateProgramFlowLines(units, indent + 2, ambiguousNames));
+    lines.push(`${gi}finally`);
+    lines.push(`${gi}  _callActive = false`);
+  } else {
+    lines.push(...generateProgramFlowLines(units, indent + 1, ambiguousNames));
+  }
 
   return lines.join('\n');
 }
@@ -3787,6 +3876,7 @@ export function generateScala(ast, options = {}) {
     groupByteLengthRegistry,
     qualifiedRegistry,
     conditionRegistry,
+    wsResetAssignments,
   } = buildFieldRegistry(ast);
   setFieldRegistry(fieldRegistry);
   setTableRegistry(tableRegistry);
@@ -4205,6 +4295,14 @@ export function generateScala(ast, options = {}) {
   }
 
   // Main method
+  //
+  // round-40 finding 8 (pp15): PROGRAM-ID ... INITIAL's WORKING-STORAGE
+  // reset (see generateEntryMethod's own doc comment below) only matters for
+  // a program CALLed more than once - run() is the JVM process's own single
+  // entry point, invoked exactly once per run, so its own WORKING-STORAGE is
+  // already at a fresh, just-declared default the first (only) time this
+  // runs; no reset needed here even when the FIRST/"main" program happens to
+  // be declared INITIAL itself.
   const mainMethod = generateMainMethod(ast, opts, 1);
   if (mainMethod) {
     sections.push('');
@@ -4216,7 +4314,7 @@ export function generateScala(ast, options = {}) {
   // the source); false by default, so no single-program-file output changes
   // at all.
   if (opts.emitEntryPoint) {
-    const entryMethod = generateEntryMethod(ast, fieldRegistry, 1);
+    const entryMethod = generateEntryMethod(ast, fieldRegistry, 1, wsResetAssignments);
     if (entryMethod) {
       sections.push('');
       sections.push(entryMethod);
@@ -4325,7 +4423,7 @@ function computeParamLeafShapes(usingNames, fieldRegistry, groupRegistry, groupK
   return shapes;
 }
 
-function generateEntryMethod(ast, fieldRegistry, indent = 1) {
+function generateEntryMethod(ast, fieldRegistry, indent = 1, wsResetAssignments = []) {
   const indentStr = '  '.repeat(indent);
   const bi = '  '.repeat(indent + 1);
 
@@ -4423,6 +4521,24 @@ function generateEntryMethod(ast, fieldRegistry, indent = 1) {
   const bodyBi = '  '.repeat(bodyIndent);
 
   const bodyLines = [];
+  // round-40 finding 8 (pp15): `PROGRAM-ID ... INITIAL` means every single
+  // CALL to this program gets a FRESH copy of WORKING-STORAGE, reset to its
+  // own VALUE-clause defaults (or the type's zero/spaces default) - not the
+  // ordinary, persistent-across-calls module-level `var` every other
+  // (non-INITIAL) program relies on. Reusing the EXACT SAME default-value
+  // expressions buildFieldRegistry already computed for each WORKING-STORAGE
+  // var's own initial declaration (wsResetAssignments, generateScala above) -
+  // emitted here as the FIRST statements in entry()'s body, before any
+  // paragraph logic (or even this program's own LINKAGE-parameter scatter
+  // immediately below) runs, so every activation starts from a truly clean
+  // slate. Gated on isInitialProgram(ast) (mirrors isRecursiveProgram's own
+  // PROGRAM-ID-clause scan) - every other (non-INITIAL) program is
+  // completely unaffected.
+  if (isInitialProgram(ast)) {
+    for (const assignment of wsResetAssignments) {
+      bodyLines.push(`${bodyBi}${assignment}`);
+    }
+  }
   paramInfos.forEach((p, i) => {
     if (!p.isGroup) {
       bodyLines.push(`${bodyBi}${p.camel} = _arg${i}`);

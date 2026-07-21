@@ -1996,10 +1996,19 @@ function parseCallStatement(ctx) {
     let currentMode = 'REFERENCE';
 
     while (ctx.check(TokenType.IDENTIFIER) || ctx.check(TokenType.STRING_LITERAL) ||
+           ctx.check(TokenType.NUMERIC_LITERAL) ||
            ctx.checkValue('BY') || ctx.checkValue('REFERENCE') ||
            ctx.checkValue('CONTENT') || ctx.checkValue('VALUE') ||
            ctx.check(TokenType.OMITTED) ||
            ctx.check(TokenType.COMMA)) {
+      // round-40 finding 1 (pp02/pp02b): a bare NUMERIC_LITERAL USING
+      // operand (e.g. `CALL "X" USING WS-VAR 2`) was never recognized by
+      // this loop's own continuation condition, so the loop exited the
+      // instant it saw one, leaving it (and the statement's own
+      // terminating period) completely unconsumed - corrupting whatever
+      // parsed next. parseOperand (below) already handles a numeric
+      // literal operand correctly; only this continuation check was
+      // missing the token type.
 
       // round-7 finding 1a: `CALL "X" USING BY REFERENCE A, B, C` (commas
       // between operands - legal COBOL, and the overwhelmingly common style

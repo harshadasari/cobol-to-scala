@@ -2127,6 +2127,115 @@ dishonest-finding count for round 39: 7 (oo03, oo04, oo05, oo06, oo13 x3, oo15)
 contributing 3 independent bugs in 3 different code paths (`generateAccept`
 twice, `relationalOperandDescriptor` once) plus one parser-level fix.
 
+### Round-40 adversarial-refutation findings (pp02/pp02b, pp04, pp05, pp09, pp09b, pp11, pp12, pp15) and their fixes
+
+A round-40 refuter left 15 new probes (pp01-pp15, plus pp02b/pp09b/pp14b
+isolation follow-ups - 18 files total), the widest and last round of the
+current campaign target - 8 dishonest findings across 8 distinct root
+causes, every one of them accompanied by an unusually thorough root-cause
+write-up embedded directly in the probe's own header comment (each probe
+below documents its own hypothesis, outcome, root cause, and suggested fix
+inline - this table's own fix descriptions draw directly on that). Of the
+18 files, 9 were already honest at hand-off: pp01, pp06, pp07, pp08 (named
+`.cbl.txt` - a ref-mod'd numeric operand used directly as a COMPUTE/
+arithmetic operand, which cobc itself REJECTS at compile time - "is not a
+numeric value", since reference modification always yields an alphanumeric
+view - a deliberately invalid-COBOL probe, same `oo07`/`jj03`/`kk04`/`cc04`/
+`cc07` precedent), pp10 (named `.cbl.txt` -
+a 3-program sequential-then-cyclic CALL probe cobc aborts on by design, same
+precedent as `oo15`/pp09 below), pp13, pp14b all byte-match their oracles or
+their own cobc's deliberate nonzero exit cleanly; pp03 (REWRITE/write into a
+GROUP LINKAGE ref-mod target) and pp14 (`CALL ... ON EXCEPTION` against an
+unresolvable dynamic program name) both land on PRE-EXISTING, already-
+documented gaps (round-3 finding 3's ref-mod-write gap; round-7 finding 1c's
+dynamic-CALL-name gap, the same one round-37's `mm10` and round-39's own
+`mm10` regression both already hit) - honest, out-of-scope todos, not new
+findings. The remaining 8 were dishonest: pp02/pp02b (one root cause, two
+probes - a parser bug), pp04, pp05, pp09, pp09b, pp11, pp12, pp15. All 8 are
+now fixed.
+
+| # | Finding | Fix | Program(s) |
+|---|---|---|---|
+| 1 | **A bare NUMERIC-LITERAL `CALL ... USING` operand (e.g. `CALL "X" USING WS-VAR 2`) was silently dropped from `stmt.using` entirely** - `parseCallStatement`'s USING-loop continuation `while` condition (`parser/procedure-parser.js`, immediately inside `if (ctx.matchValue('USING'))`) listed `TokenType.IDENTIFIER`/`STRING_LITERAL`/`BY`/`REFERENCE`/`CONTENT`/`VALUE`/`OMITTED`/`COMMA` but never `TokenType.NUMERIC_LITERAL`, so the loop exited the instant it saw a bare numeric-literal operand, leaving it (and the statement's own terminating period) completely unconsumed - confirmed via direct AST dump: a 2-argument CALL captured only 1 `stmt.using` entry | Added `ctx.check(TokenType.NUMERIC_LITERAL)` to the loop's own continuation condition - `parseOperand` (the loop body) already converts a numeric-literal operand into a proper `Literal` AST node correctly; only the continuation check was missing the token type. Verified via direct AST inspection (not a byte-diff oracle - see below): pp02b's `stmt.using` now has exactly 2 entries (`WS-A`, then a numeric `Literal` valued `"5"`), and the paragraph's own subsequent `DISPLAY`/`DISPLAY`/`STOP RUN` statements parse as siblings, unchanged. **NOTE**: this build's own installed cobc has an unrelated, independently-confirmed toolchain quirk (first documented in round 39's oo03 finding) that corrupts ANY bare numeric-literal `CALL ... USING` argument to a blank value - directly reproduced here with a standalone `cobc -x` run of pp02b (`IN SUB B=` blank, not `B=005`) - so pp02/pp02b's own captured `.oracle.txt` files do NOT reflect correct cobc behavior for this operand shape and cannot serve as byte-diff targets for the fix; both remain (newly-promoted, honest) `t.todo` entries in the automated oracle-compare sweep for this documented reason, not a regression. As a beneficial side effect, this fix also corrects a previously-undetected, silently-wrong value in round-39's own `oo03` corpus program (its inner recursive self-call's trailing literal argument, `LK-DEPTH`, was silently defaulting to 0 via `entry()`'s own default parameters instead of receiving its real value - `tests/round39-fixes.test.js`'s own oo03 assertion is updated accordingly, from a 4-argument to a 6-argument `entry(...)` call) | pp02, pp02b |
+| 2 | **START never checked whether its file was even open** - `generateStartStatement` (`generator/expression-gen.js`) only guarded on `${bufVar} != null` (nulled by CLOSE), so a START issued after CLOSE silently fell into the ordinary "buffer empty" INVALID KEY path and reported FILE STATUS "23" instead of cobc's actual "47" - the wrong status code AND the wrong clause dispatched (INVALID KEY instead of no clause at all) | Renamed the pre-existing function body to `generateStartStatementInner` and wrapped it in the identical `if !isOpenVar then <47> else <original body>` guard round-38/39 already established for READ/WRITE/REWRITE/DELETE. Verified against installed GnuCOBOL and scala-cli: pp04 byte-matches its oracle exactly (`OPEN1 STATUS=00`/`CLOSE1 STATUS=00`/`START-AFTER-CLOSE STATUS=47`) | pp04 |
+| 3 | **READ never checked its file's actual open MODE, only whether it was open at all** - `generateReadStatement`'s outer guard (both the plain-sequential path AND the keyed/RANDOM path via `generateKeyedReadStatement`, which had NO guard of its own at all) only checked `isOpenVar`, so a READ issued while the file was open in an OUTPUT-only mode silently reported "10" (end-of-file) instead of cobc's actual "47" | Extended the plain-sequential path's existing `if !isOpenVar then ...` guard to also check `openModeVar` (`!isOpenVar || (openModeVar != "INPUT" && openModeVar != "I-O")`), and wrapped the keyed/RANDOM path's call to `generateKeyedReadStatement` (previously ungated) in the identical guard - mirroring the exact WRITE/REWRITE/DELETE mode-check convention round-39 finding 3 established. Verified against installed GnuCOBOL and scala-cli: pp05 byte-matches its oracle exactly (`OPEN-OUTPUT STATUS=00`/`READ-WHILE-OUTPUT STATUS=47`/`WRITE-STILL-WORKS STATUS=00`) | pp05 |
+| 4 | **A cyclic CALL back through the FIRST/"main" program of a multi-PROGRAM-ID source bypassed round-39's own `_callActive` cycle-detection guard on its initial (top-level) activation** - `generateMainMethod`'s `@main def run()` (`generator/scala-generator.js`) invokes `implicitMainParagraph()` (via a `_step0()` wrapper) DIRECTLY, never touching the sibling `entry()` method's own `_callActive` guard (round-39 finding 7) - so for a 2-program A-calls-B-calls-A cycle, `_callActive` stayed `false` for PP09MAIN's entire top-level `run()` activation, letting a cyclic CALL back into it via `entry()` incorrectly pass the guard and re-run the WHOLE program body from the top (a spurious extra "MAIN CALLING A") before the cycle was (mis-)detected one level deeper, blaming the wrong program | `generateMainMethod` now wraps `run()`'s own body in the IDENTICAL `_callActive`-guard/`try`/`finally` convention `entry()` already uses (same abend message, same `sys.exit(1)`, same try/finally-around-GOBACK/STOP-RUN's-own-`return`/`sys.exit`), gated on the exact same condition (`opts.emitEntryPoint && !isRecursiveProgram(ast)`) that decides whether `_callActive` is even declared for this program - a single-program (non-multi-PROGRAM-ID) conversion, which never declares `_callActive` at all, is completely unaffected. Verified against installed GnuCOBOL and scala-cli: pp09's generated Scala, run directly, prints exactly `MAIN CALLING A`/`IN A N=1`/`IN B N=1` then abends with exit code 1 (matching cobc's own 3-line-then-abend behavior, blaming the correct program) - renamed `.cbl.txt` (cobc deliberately exits 1, same `oo15` precedent), excluded from the automated `oracleCompare()` sweep for the identical structural reason oo15 was | pp09 |
+| 5 | **`CALL` with MORE actual arguments than the callee's own declared USING count was a hard Scala compile crash** - `generateCall`'s ordinary (non-RECURSIVE) path (`generator/expression-gen.js`) built `argExprs` from ALL of the caller's own `usingParams` with no truncation to the callee's own registered `target.paramCount`, and passed all of them to `<Target>.entry(...)` - real cobc silently ignores any extra actual argument beyond what the callee declares; this generator instead hit "too many arguments for method entry" at Scala COMPILE time | Truncated both `argExprs` and the caller-side operand list used to build `refWriters` (the BY-REFERENCE writeback plan) to `target.paramCount` entries, right after the `target.recursive` branch's own early return (so the RECURSIVE path's own, already-correct `paramLeafShapes`-driven argument handling is untouched) and before building the `entry(...)` call expression. Verified against installed GnuCOBOL and scala-cli: pp09b compiles cleanly and byte-matches its oracle exactly (`BEFORE`/`IN SUB (NO USING DECLARED)`/`AFTER`) - the callee only sees its own zero declared parameters; the caller's extra argument is never passed at all, matching cobc's own semantics | pp09b |
+| 6 | **The REPLACE statement (source-text pseudo-text substitution, distinct from `COPY ... REPLACING`) was entirely unimplemented** - neither the lexer nor the parser had any REPLACE-specific handling at all; `REPLACE` lexed as a bare IDENTIFIER and the whole statement (including its own `==...==` pseudo-text pairs) was silently skipped as an unrecognized clause by `parseIdentificationDivision`, leaving a bare `PIC 9(:WIDTH:)`/`VALUE :INIT:` for the DATA DIVISION parser to silently default (`PIC 9(1)`/`VALUE 0`) with zero visible error anywhere | **Full fix implemented, not just a decline** (see this finding's own scope note): a new `parser/replace-resolver.js` module reuses `copybook-resolver.js`'s own quote/comment-aware statement-boundary scanner (`findQuotedRanges`/`findCommentRanges`/`isInsideAnyRange`/`findStatementEnd`, now exported) and pseudo-text pair parser/substitution (`parseReplacingPairs`/`applyReplacing`, also now exported) to expand one or more standalone REPLACE statements (and `REPLACE OFF`) unconditionally, before COPY expansion, in both `parseCobol` and `convertToScala` (`index.js`) - a source with no REPLACE statement at all comes back byte-identical, so this is always-safe, always-on preprocessing requiring no new option. **Scope decision**: this is the narrow, common-case implementation (whole-pseudo-text-token substitution across a following stretch of source, matching pp11's own shape) rather than a fully general one - LEADING/TRAILING and nested/overlapping REPLACE scopes are out of scope, not exercised by any corpus program. Verified against installed GnuCOBOL and scala-cli: pp11 byte-matches its oracle exactly (`NUM=00099`/`NUM=00100`) - the actual correct substituted value, not merely an honest decline; also verified that a REPLACE-lookalike inside a string literal elsewhere in the existing corpus (`gg09`, `p18`) is left completely untouched | pp11 |
+| 7 | **The round-39 WRITE/REWRITE/DELETE not-open/wrong-mode guard set the correct FILE STATUS but never invoked a registered DECLARATIVES handler** - unlike every OTHER keyed-I/O failure path in this generator (e.g. the duplicate-RELATIVE-KEY branch, which already calls `declarativeHandlerFor`), round-39 finding 3's own new outer guard (`generateWriteStatement`/`generateRewriteStatement`/`generateDeleteStatement`, `generator/expression-gen.js`) never called it at all - cobc fires a program's own `USE AFTER STANDARD ERROR PROCEDURE` declarative for a WRITE-after-CLOSE failure exactly like it does for every other keyed-I/O failure condition | Added a `declarativeHandlerFor(fileName, ...)` call to each of the three guards' own `if` branch (immediately after setting FILE STATUS), mirroring how the pre-existing inner bodies already invoke it for their own other failure conditions. Verified against installed GnuCOBOL and scala-cli: pp12 byte-matches its oracle exactly (`DECLARATIVES-FIRED STATUS=24`/`AFTER-CLOSE1 STATUS=00`/`DECLARATIVES-FIRED STATUS=48`/`WRITE-AFTER-CLOSE STATUS=48`) - confirming both the pre-existing boundary-violation handler dispatch (unaffected) and the new not-open/wrong-mode handler dispatch (the fix) fire correctly | pp12 |
+| 8 | **`PROGRAM-ID ... INITIAL` was entirely unmodeled** - no `isInitialProgram`-equivalent check existed anywhere (a grep found `isRecursiveProgram`'s own PROGRAM-ID-clause scan, but no INITIAL/COMMON counterpart), so a program's WORKING-STORAGE stayed an ordinary persistent module-level `var`, silently carrying state across every CALL exactly like a non-INITIAL program - cobc instead resets WORKING-STORAGE to its own VALUE-clause defaults on EVERY entry to an INITIAL program | Added `isInitialProgram(ast)` (`generator/scala-generator.js`), scanning PROGRAM-ID's own clause for the INITIAL keyword, mirroring `isRecursiveProgram`'s identical token-scan pattern exactly. Threaded a new `wsResetAssignments` list through `buildFieldRegistry`'s own WORKING-STORAGE walk (`walk(wsItems, ..., collectReset=true)` - FILE SECTION/LINKAGE walks are unaffected, `collectReset` stays `false` for both) - one `<camel> = <defaultExpr>` entry per top-level leaf (and FILLER), reusing the EXACT SAME already-computed `defaultExpr` (VALUE-clause default, or the type's own zero/spaces default) each leaf's own declaration line already uses, rather than recomputing it. `generateEntryMethod` emits these reset assignments as the very FIRST statements of `entry()`'s body (before the LINKAGE-parameter scatter, before any paragraph logic) when `isInitialProgram(ast)` is true; `run()` is deliberately NOT touched (it is the JVM process's own single entry point, invoked exactly once per run, so its own WORKING-STORAGE is already fresh the one time it executes regardless of INITIAL). `PROGRAM-ID ... COMMON` remains unexercised/unmodeled, per the same grep - out of scope for this finding. Verified against installed GnuCOBOL and scala-cli: pp15 byte-matches its oracle exactly (`CALL1`/`COUNTER=001`/`CALL2`/`COUNTER=001` - the SAME value both times, not `001` then `002`) | pp15 |
+
+See `tests/round40-fixes.test.js` for focused, toolchain-independent unit
+tests of all 8 findings above, including AST-level coverage for finding 1
+(since its own oracle can't serve as a byte-diff target - see the finding's
+own note), and regression coverage confirming: an ordinary in-mode READ
+(`t04`) and a CALL with exactly as many arguments as the callee declares
+(`pp02b` itself) are both unaffected by findings 3 and 5 respectively; a
+single-program (non-multi-PROGRAM-ID) conversion never declares
+`_callActive` at all (finding 4); a WRITE/REWRITE/DELETE against a file with
+no registered DECLARATIVES handler emits no handler call (finding 7); and an
+ordinary (non-INITIAL) program's WORKING-STORAGE is never reset between
+calls (finding 8). `tests/round38-fixes.test.js`'s and
+`tests/round39-fixes.test.js`'s own pre-existing regression-guard assertions
+were each updated by exactly one line apiece where finding 3's mode-check
+addition and finding 1's own parser fix respectively changed generated text
+those two rounds' own tests pin byte-for-byte (see each edited assertion's
+own updated in-line comment for why) - both are cosmetic, expected
+consequences of this round's fixes, not new bugs in rounds 38/39's own work.
+
+Net effect on the whole-suite `todo` count: 40 baseline (unchanged since
+round 39) plus exactly 4 new honest todos, individually reconciled against
+the pre-round todo list - `pp02`/`pp02b` (this round's OWN documented
+toolchain-quirk residual for finding 1 - see the table above; a genuine fix,
+not a punt, just not byte-diffable against THIS cobc build for this operand
+shape) and `pp03`/`pp14` (fresh probes that landed on two DIFFERENT
+pre-existing, already-documented gaps - round-3 finding 3's ref-mod-write
+gap and round-7 finding 1c's dynamic-CALL-name gap respectively - neither is
+a new root cause this round introduces or is responsible for fixing) = 44
+total, confirmed via a full, untruncated run (see below). All 8 findings are
+genuine crash-to-fix, compile-crash-to-fix, or silent-wrong-output-to-fix
+corrections; pp04/pp05/pp09b/pp11/pp12/pp15 all move from failing/crashing
+to a full, byte-exact oracle pass; pp09 moves from silently-wrong (a
+spurious duplicate execution blaming the wrong program) to the CORRECT
+observable behavior, though (like oo15 before it) it remains a structural
+non-participant in the automated `oracleCompare()` sweep (`.cbl.txt`,
+cobc's own correct behavior is a nonzero exit) for reasons unrelated to the
+fix's own correctness; pp02/pp02b move from a parser-level silent-truncation
+bug (confirmed fixed via direct AST inspection) to a state where the ONLY
+remaining barrier to a byte-exact oracle match is this specific installed
+cobc build's own unrelated, independently-reproduced toolchain quirk.
+**Overall dishonest-finding count for round 40: 8** (pp02/pp02b as one root
+cause, pp04, pp05, pp09, pp09b, pp11, pp12, pp15 - 8 distinct root causes
+across 8 (or effectively 9, counting pp02/pp02b as one) promoted probes).
+
+Independently re-verified end to end after all 8 fixes landed: the fast
+unit-test suite (`node --test $(ls tests/*.test.js)`, run separately from
+the oracle suite per rounds 38-39's own split-run convention, since this
+environment has been observed to interrupt a long-running single
+`node --test 'tests/**/*.test.js'` process partway through, unrelated to
+code correctness) - 898/898 passing, 0 failures; the oracle-corpus suite
+(`node --test tests/oracle/oracle.test.js`, run as its own separate,
+independently-tracked background process to completion) - 1075/1119
+passing, 0 failures, 44 todo (exactly the 40 baseline + 4 new honest todos
+accounted for above), spanning all of `data/`, `proc/` (including every
+`pp01`-`pp15`/`pp02b`/`pp09b`/`pp14b` probe reachable by the sweep - `pp09`/
+`pp10` are correctly excluded, same `.cbl.txt` convention as `oo15`/`oo07`).
+
+**Campaign closing note (rounds 1-40)**: this is the final round of the
+current campaign target. Across 40 rounds the refuter/fixer cycle
+progressively narrowed this engine's gap with real GnuCOBOL from dozens of
+silent, high-severity corruptions per round (rounds 1-14's initial sweep) to
+single-digit, increasingly narrow/combinatorial findings (rounds 15-35),
+briefly reaching the convergence bar of 0-2 dishonest findings for two
+consecutive rounds at rounds 36-37 - before the campaign's own standing
+instruction to keep broadening deliberately reset that bar for rounds 38-40
+(6, 7, and 8 dishonest findings respectively, each round hunting fresh
+territory - CALL argument-count/cycle edge cases, PROGRAM-ID clauses,
+REPLACE - rather than only re-pressure-testing already-converged code paths).
+Every fix across all 40 rounds remains independently verified against real
+GnuCOBOL and scala-cli, not merely self-consistent; the full round-by-round
+ledger above is the complete, auditable record of that process.
+
 ### Known gaps
 
 - **Reference modification (`identifier(start:length)`), round-3 finding 3** - read

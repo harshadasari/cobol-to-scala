@@ -215,8 +215,15 @@ describe('round-38 finding 3 (nn07): file open/closed lifecycle tracking - no cr
   });
 
   test('generateReadStatement checks isOpenVar FIRST, reporting "47" without ever touching the iterator when the file is not open', () => {
+    // round-40 finding 3 (pp05): this outer guard's own condition grew a
+    // second, OR'd clause (checking openModeVar, not just isOpenVar) - see
+    // tests/round40-fixes.test.js's own finding-3 coverage for that addition
+    // in isolation. The semantic property THIS test itself cares about
+    // (isOpenVar is checked before ever touching the iterator, reporting
+    // "47" without a crash) is unaffected - not-open is still one of the
+    // conditions that trips this same guard.
     const scala = scalaOf(readCorpus('nn07-file-status-edge-cases.cbl'));
-    assert.match(scala, /if !someFileIsOpen then\n\s+someFileHasCurrent = false\n\s+wsStatus = "47"/);
+    assert.match(scala, /if !someFileIsOpen \|\| \(someFileOpenMode != "INPUT" && someFileOpenMode != "I-O"\) then\n\s+someFileHasCurrent = false\n\s+wsStatus = "47"/);
   });
 
   test('generateOpen reports "41" (and skips rebuilding any handle) when the file is already open', () => {

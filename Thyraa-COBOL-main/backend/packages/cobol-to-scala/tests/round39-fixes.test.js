@@ -128,10 +128,24 @@ describe('round-39 finding 1 (oo03): subscripted GROUP-table row BY REFERENCE in
   });
 
   test('WS-ITEM(2) BY REFERENCE gets one getter/setter closure pair PER LEAF, each indexing that leaf\'s own Vector - not a nonexistent flat "wsItem" Vector', () => {
+    // round-40 finding 1 (pp02/pp02b): this CALL's own trailing bare
+    // NUMERIC_LITERAL operand ("2", LK-DEPTH's incoming value) used to be
+    // silently dropped by parseCallStatement's own USING-loop continuation
+    // condition (the exact bug pp02/pp02b isolate) - so this call site
+    // previously reached entry() with only 4 arguments, silently relying on
+    // LK-DEPTH's own zero-default parameter instead of the literal 2 the
+    // source actually passes (a real, if previously-undetected, wrong-value
+    // bug in this exact program - entry()'s own trailing params all carry
+    // defaults, so the 4-argument call still compiled, just silently wrong).
+    // Now that the parser captures both operands, the trailing literal gets
+    // its own call-site-scoped snapshot closure pair (round-35/36's own BY
+    // CONTENT/VALUE convention - a bare literal has no caller-side variable
+    // to alias, regardless of the BY REFERENCE keyword), so the call now
+    // carries all 6 arguments and the literal's real value reaches LK-DEPTH.
     const scala = scalaOf(readCorpus('oo03-byref-tblgrp-recur.cbl'));
     assert.match(
       scala,
-      /Oo03sub\.entry\(\(\) => wsItemVal\(1\), \(v: Int\) => \{ wsItemVal = wsItemVal\.updated\(1, v\) \}, \(\) => wsItemTag\(1\), \(v: String\) => \{ wsItemTag = wsItemTag\.updated\(1, v\) \}\)/
+      /Oo03sub\.entry\(\(\) => wsItemVal\(1\), \(v: Int\) => \{ wsItemVal = wsItemVal\.updated\(1, v\) \}, \(\) => wsItemTag\(1\), \(v: String\) => \{ wsItemTag = wsItemTag\.updated\(1, v\) \}, \(\) => _call\d+_1Snapshot0, \(v: Int\) => _call\d+_1Snapshot0 = v\)/
     );
     assert.doesNotMatch(scala, /=> wsItem\(1\)/);
     assert.doesNotMatch(scala, /wsItem = wsItem\.updated/);

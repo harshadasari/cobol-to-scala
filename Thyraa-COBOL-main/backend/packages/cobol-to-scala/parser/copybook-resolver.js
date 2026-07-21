@@ -14,6 +14,15 @@
  * Copybook content is supplied as a map of name -> source text. Lookup is
  * case-insensitive and tolerant of common file extensions (.cpy, .cob,
  * .copy, .cbl). Expansion is recursive with cycle detection.
+ *
+ * round-40 finding 6: several of this file's own quote/comment-aware
+ * statement-boundary helpers (findQuotedRanges/findCommentRanges/
+ * isInsideAnyRange/findStatementEnd) and its pseudo-text pair parser/
+ * substitution (parseReplacingPairs/applyReplacing) are exported and reused
+ * as-is by parser/replace-resolver.js for the standalone REPLACE statement
+ * (`REPLACE ==text==BY==text==.` - source-text pseudo-text substitution NOT
+ * tied to a COPY, but using the identical pseudo-text substitution rules) -
+ * see that module's own doc comment.
  */
 
 import { detectFormat } from './lexer.js';
@@ -41,7 +50,7 @@ const COPY_HEADER_PATTERN = /\bCOPY\s+([A-Za-z0-9][A-Za-z0-9-]*)\s*(?:(?:OF|IN)\
  * regex-lookahead guess) is what lets COPY-statement detection agree with
  * the main tokenizer about what "inside a literal" means.
  */
-function findQuotedRanges(text) {
+export function findQuotedRanges(text) {
   const ranges = [];
   let i = 0;
   const n = text.length;
@@ -88,7 +97,7 @@ function findQuotedRanges(text) {
  * statement, matching cobc's own preprocessor, which never looks at
  * comment text at all.
  */
-function findCommentRanges(text) {
+export function findCommentRanges(text) {
   const ranges = [];
   const format = detectFormat(text);
   let offset = 0;
@@ -116,7 +125,7 @@ function findCommentRanges(text) {
  * the merged/concatenated list passed in here may not be, hence the full
  * scan rather than an early break).
  */
-function isInsideAnyRange(ranges, index) {
+export function isInsideAnyRange(ranges, index) {
   for (const [start, end] of ranges) {
     if (index >= start && index < end) return true;
   }
@@ -146,7 +155,7 @@ function isInsideAnyRange(ranges, index) {
  * quote-awareness to the clause's own END instead of assuming the first
  * literal `.` is always it.
  */
-function findStatementEnd(text, from, excludedRanges) {
+export function findStatementEnd(text, from, excludedRanges) {
   for (let i = from; i < text.length; i++) {
     if (text[i] === '.' && !isInsideAnyRange(excludedRanges, i)) return i;
   }
@@ -232,7 +241,7 @@ function buildLookup(copybooks) {
  * Parse the pairs of a REPLACING clause. Supports pseudo-text delimited
  * operands (==text==) and plain word operands.
  */
-function parseReplacingPairs(replacingClause) {
+export function parseReplacingPairs(replacingClause) {
   if (!replacingClause) return [];
 
   const body = replacingClause.replace(/^REPLACING\s+/i, '');
@@ -259,7 +268,7 @@ function parseReplacingPairs(replacingClause) {
  * ==:PRE:== BY ==CUST== works on partial words. Plain word operands only
  * replace whole COBOL words.
  */
-function applyReplacing(text, pairs) {
+export function applyReplacing(text, pairs) {
   let result = text;
   for (const { from, to, pseudoText } of pairs) {
     const escaped = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

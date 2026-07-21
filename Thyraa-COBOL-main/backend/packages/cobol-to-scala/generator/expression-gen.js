@@ -7641,7 +7641,7 @@ function generateReadStatement(statement, indent = 0) {
       'is not supported (no INDEXED-file cobc oracle is available in this sandbox to verify a real ' +
       'implementation against - see tests/oracle/README.md known gaps); record area left unchanged';
   }
-  const { iteratorVar, hasCurrentVar, startInvalidVar, isOpenVar, pastEndVar } = fileHandleVarNames(fileName);
+  const { iteratorVar, hasCurrentVar, startInvalidVar, isOpenVar, pastEndVar, openModeVar } = fileHandleVarNames(fileName);
   const dest = readDestination(statement, fileName);
   // round-6 finding 2/3 companion (t04): a registered FILE STATUS field must
   // become "00" on a successful READ and "10" once the iterator is
@@ -7661,7 +7661,22 @@ function generateReadStatement(statement, indent = 0) {
   // overwhelming pre-round-26 default: SEQUENTIAL access, or DYNAMIC's own
   // explicit NEXT/PREVIOUS forms) is completely unaffected below.
   if (isKeyedAccess(fileName, statement)) {
-    return generateKeyedReadStatement(statement, fileName, dest, statusVar, indent);
+    // round-40 finding 3 (pp05): generateKeyedReadStatement (below) never
+    // checked isOpenVar/openModeVar at all - a keyed (RANDOM/DYNAMIC) READ
+    // against a file open in a mode that doesn't permit reading (pp05: open
+    // OUTPUT-only) fell straight into the ordinary "buffer empty" EOF check
+    // and silently reported "10" instead of cobc's actual "47". Wrapped in
+    // the SAME outer isOpenVar/openModeVar guard as the plain (non-keyed)
+    // READ path below - generateKeyedReadStatement's own body is completely
+    // unchanged, just re-indented one level under this wrapper's own `else`.
+    const keyedInner = generateKeyedReadStatement(statement, fileName, dest, statusVar, indent);
+    const keyedGuardCond = `!${isOpenVar} || (${openModeVar} != "INPUT" && ${openModeVar} != "I-O")`;
+    return [
+      `${indentStr}if ${keyedGuardCond} then`,
+      statusVar ? `${indentStr}  ${assignExpr(statusVar, '"47"')}` : `${indentStr}  ()`,
+      `${indentStr}else`,
+      ...keyedInner.split('\n').map(l => `  ${l}`),
+    ].join('\n');
   }
 
   const lines = [];
@@ -7873,8 +7888,19 @@ function generateReadStatement(statement, indent = 0) {
   // still gets the crash fix (the `hasCurrentVar = false` line alone, no
   // status to set) even though the wrong status value itself isn't
   // observable without one.
+  //
+  // round-40 finding 3 (pp05): this outer guard originally only checked
+  // `isOpenVar` (is the file open AT ALL) - a READ issued while the file
+  // IS open, but in a mode that doesn't permit reading (e.g. an
+  // OUTPUT-only OPEN), fell through to the ordinary EOF-check logic below
+  // and silently reported "10" (end-of-file) instead of cobc's actual "47"
+  // (I-O attempted in an invalid mode). Extended to also check
+  // `openModeVar`, mirroring the exact WRITE/REWRITE/DELETE mode-check
+  // convention round-39 finding 3 (oo05/oo06) already established - READ
+  // requires the file to be open INPUT or I-O.
+  const readGuardCond = `!${isOpenVar} || (${openModeVar} != "INPUT" && ${openModeVar} != "I-O")`;
   return [
-    `${indentStr}if !${isOpenVar} then`,
+    `${indentStr}if ${readGuardCond} then`,
     `${indentStr}  ${hasCurrentVar} = false`,
     ...(statusVar ? [`${indentStr}  ${assignExpr(statusVar, '"47"')}`] : []),
     `${indentStr}else`,
@@ -8362,9 +8388,19 @@ function generateWriteStatement(statement, indent = 0) {
   const statusVar = fileStatusVarFor(fileName);
   const innerText = generateWriteStatementInner(statement, indent);
   const guardCond = `!${isOpenVar} || (${openModeVar} != "OUTPUT" && ${openModeVar} != "I-O" && ${openModeVar} != "EXTEND")`;
+  // round-40 finding 7 (pp12): this guard's own `if` branch never invoked a
+  // registered DECLARATIVES handler at all, unlike every OTHER keyed-I/O
+  // failure path in this generator (e.g. the duplicate-RELATIVE-KEY branch
+  // above, which calls declarativeHandlerFor(fileName, 'I-O')) - cobc fires
+  // a program's own USE AFTER STANDARD ERROR PROCEDURE declarative for a
+  // WRITE-after-CLOSE/wrong-mode failure exactly like it does for every
+  // other failure condition (compiler-verified against installed GnuCOBOL,
+  // pp12).
+  const notOpenHandler = declarativeHandlerFor(fileName, 'OUTPUT');
   return [
     `${indentStr}if ${guardCond} then`,
     statusVar ? `${indentStr}  ${assignExpr(statusVar, '"48"')}` : `${indentStr}  ()`,
+    ...(notOpenHandler ? [`${indentStr}  ${notOpenHandler}()`] : []),
     `${indentStr}else`,
     ...innerText.split('\n').map(l => `  ${l}`),
   ].join('\n');
@@ -8622,9 +8658,15 @@ function generateRewriteStatement(statement, indent = 0) {
   const statusVar = fileStatusVarFor(fileName);
   const innerText = generateRewriteStatementInner(statement, indent);
   const guardCond = `!${isOpenVar} || ${openModeVar} != "I-O"`;
+  // round-40 finding 7 (pp12): see generateWriteStatement's identical fix
+  // above - a registered DECLARATIVES handler must fire for this guard's
+  // own not-open/wrong-mode failure too, exactly like it already does for
+  // every other keyed-I/O failure this generator models.
+  const notOpenHandler = declarativeHandlerFor(fileName, 'I-O');
   return [
     `${indentStr}if ${guardCond} then`,
     statusVar ? `${indentStr}  ${assignExpr(statusVar, '"49"')}` : `${indentStr}  ()`,
+    ...(notOpenHandler ? [`${indentStr}  ${notOpenHandler}()`] : []),
     `${indentStr}else`,
     ...innerText.split('\n').map(l => `  ${l}`),
   ].join('\n');
@@ -8828,9 +8870,15 @@ function generateDeleteStatement(statement, indent = 0) {
   const statusVarOuter = fileStatusVarFor(fileNameRaw);
   const innerText = generateDeleteStatementInner(statement, indent);
   const guardCond = `!${isOpenVar} || ${openModeVar} != "I-O"`;
+  // round-40 finding 7 (pp12): see generateWriteStatement's identical fix
+  // above - a registered DECLARATIVES handler must fire for this guard's
+  // own not-open/wrong-mode failure too, exactly like it already does for
+  // every other keyed-I/O failure this generator models.
+  const notOpenHandler = declarativeHandlerFor(fileNameRaw, 'I-O');
   return [
     `${indentStr}if ${guardCond} then`,
     statusVarOuter ? `${indentStr}  ${assignExpr(statusVarOuter, '"49"')}` : `${indentStr}  ()`,
+    ...(notOpenHandler ? [`${indentStr}  ${notOpenHandler}()`] : []),
     `${indentStr}else`,
     ...innerText.split('\n').map(l => `  ${l}`),
   ].join('\n');
@@ -8922,7 +8970,32 @@ function generateDeleteStatementInner(statement, indent = 0) {
  * AT that position is the next one a sequential READ NEXT returns, and the
  * NOT INVALID KEY statements (if any) run.
  */
+/**
+ * round-40 finding 2 (pp04): the pre-fix version of this function only ever
+ * guarded on `${bufVar} != null` (nulled by CLOSE), so a START issued after
+ * CLOSE fell through into the ordinary "buffer empty" INVALID KEY path and
+ * silently reported "23" instead of cobc's actual "47" (I-O attempted on a
+ * file not currently open) - the wrong FILE STATUS code AND the wrong clause
+ * dispatched (INVALID KEY instead of no clause at all). Now wrapped in the
+ * same "check isOpenVar BEFORE touching any handle" outer guard round-38/39
+ * already established for READ/WRITE/REWRITE/DELETE: generateStartStatementInner
+ * below is the complete, unchanged pre-existing body.
+ */
 function generateStartStatement(statement, indent = 0) {
+  const indentStr = '  '.repeat(indent);
+  const fileNameRaw = statement.fileName || statement.file || 'file';
+  const { isOpenVar } = fileHandleVarNames(fileNameRaw);
+  const statusVar = fileStatusVarFor(fileNameRaw);
+  const innerText = generateStartStatementInner(statement, indent);
+  return [
+    `${indentStr}if !${isOpenVar} then`,
+    statusVar ? `${indentStr}  ${assignExpr(statusVar, '"47"')}` : `${indentStr}  ()`,
+    `${indentStr}else`,
+    ...innerText.split('\n').map(l => `  ${l}`),
+  ].join('\n');
+}
+
+function generateStartStatementInner(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const bi = `${indentStr}  `;
   const fileNameRaw = statement.fileName || statement.file || 'file';
@@ -9606,6 +9679,26 @@ function generateCall(statement, indent = 0) {
     return [...preLines, callLine].join('\n');
   }
 
+  // round-40 finding 5 (pp09b): real cobc silently IGNORES any CALL ...
+  // USING actual argument beyond what the callee's own PROCEDURE DIVISION
+  // USING clause declares (`target.paramCount`, recorded in
+  // CALL_PROGRAM_REGISTRY by generateMultiProgramScala - scala-generator.js)
+  // - this ordinary (non-RECURSIVE) path previously passed ALL of argExprs
+  // to `<Target>.entry(...)` with no truncation, and entry() only accepts
+  // exactly target.paramCount arguments, so a caller passing MORE actual
+  // arguments than the callee declares hit a hard Scala "too many arguments"
+  // COMPILE crash instead of cobc's own honest no-op. Truncating both
+  // argExprs (the call's own argument list) and the caller-side operand
+  // list used to build refWriters below (so a truncated-away argument's
+  // writeback is never attempted either - it was never passed to the
+  // callee in the first place, so its caller-side variable must be left
+  // completely untouched) fixes this. Placed AFTER the `target.recursive`
+  // branch above (which already returned) - the RECURSIVE path handles its
+  // own argument count correctly via target.paramLeafShapes and must not be
+  // touched by this truncation.
+  if (argExprs.length > target.paramCount) argExprs.length = target.paramCount;
+  const usingParamsForWriteback = usingParams.slice(0, target.paramCount);
+
   const callExpr = `${target.objectName}.entry(${argExprs.join(', ')})`;
 
   // Which caller-side variable (if any) each USING operand writes its
@@ -9616,7 +9709,7 @@ function generateCall(statement, indent = 0) {
   // group-shaped operand (round-8 finding 1) gets a `{ kind: 'group',
   // groupKey }` "scatter" writer instead of a plain `{ kind: 'scalar',
   // camel }` one - see renderWriteback/scatterGroupFromString.
-  const refWriters = usingParams.map(param => {
+  const refWriters = usingParamsForWriteback.map(param => {
     const mode = String(param.mode || 'REFERENCE').toUpperCase();
     if (mode !== 'REFERENCE') return null;
     const name = param.value?.name;

@@ -4,6 +4,7 @@ import { parseDataDivision } from './parser/data-division-parser.js';
 import { parseProcedureDivision } from './parser/procedure-parser.js';
 import { parseSqlBlock } from './parser/sql-parser.js';
 import { expandCopybooks } from './parser/copybook-resolver.js';
+import { expandReplaceStatements } from './parser/replace-resolver.js';
 import { parseEnvironmentDivision } from './parser/index.js';
 import { generateScala, generateMultiProgramScala } from './generator/scala-generator.js';
 
@@ -49,11 +50,17 @@ function parseCobolTokens(source, options) {
  * @param {string} [options.format] - 'fixed' | 'free' (auto-detected otherwise)
  */
 export function parseCobol(source, options = {}) {
-  let effectiveSource = source;
+  // round-40 finding 6: the standalone REPLACE statement (source-text
+  // pseudo-text substitution, distinct from COPY ... REPLACING) is expanded
+  // unconditionally, before COPY expansion - unlike COPY, it needs no
+  // external `options.copybooks` map, and a source with no REPLACE statement
+  // at all comes back byte-identical (see expandReplaceStatements's own doc
+  // comment), so this is always safe to run.
+  let effectiveSource = expandReplaceStatements(source);
   let copybookReport = { expanded: [], missing: [] };
 
   if (options.copybooks && Object.keys(options.copybooks).length > 0) {
-    const result = expandCopybooks(source, options.copybooks, options);
+    const result = expandCopybooks(effectiveSource, options.copybooks, options);
     effectiveSource = result.source;
     copybookReport = { expanded: result.expanded, missing: result.missing };
   }
@@ -111,11 +118,14 @@ function splitProgramSources(source) {
 }
 
 export function convertToScala(source, options = {}) {
-  let effectiveSource = source;
+  // round-40 finding 6: see parseCobol's identical comment above - REPLACE
+  // is expanded unconditionally, ahead of (and independently of) COPY
+  // expansion.
+  let effectiveSource = expandReplaceStatements(source);
   let copybookReport = { expanded: [], missing: [] };
 
   if (options.copybooks && Object.keys(options.copybooks).length > 0) {
-    const result = expandCopybooks(source, options.copybooks, options);
+    const result = expandCopybooks(effectiveSource, options.copybooks, options);
     effectiveSource = result.source;
     copybookReport = { expanded: result.expanded, missing: result.missing };
   }
@@ -161,5 +171,6 @@ export {
   parseProcedureDivision,
   generateScala,
   generateMultiProgramScala,
-  expandCopybooks
+  expandCopybooks,
+  expandReplaceStatements
 };

@@ -1,8 +1,8 @@
 # Thyraa: Unified COBOL Modernization Platform
 
-**Originally authored: 2026-02-08** · **Status annotated: 2026-07-11**
+**Originally authored: 2026-02-08** · **Status annotated: 2026-07-23**
 
-> This document is the product vision and system architecture for Thyraa, written five months ago as a forward-looking design. It remains legitimately aspirational in large part — that framing is kept intact below. What changed on 2026-07-11 is that the conversion engine at the center of this architecture went from "designed" to "built and independently verified" via a 14-round adversarial-verification campaign, while the platform layers around it (UI, gateway, orchestration, auth, deployment) are still exactly as aspirational as they were in February. The sections below are annotated throughout with **✅ Built & verified**, **🟡 Partial**, or **⬜ Vision (not yet built)** so the built/aspirational line is unmissable. See the new "Implementation Status" section immediately below for the full picture, `docs/ADVERSARIAL_ROUNDS_REPORT.md` for the campaign detail, and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` for the statement-level engine capability audit.
+> This document is the product vision and system architecture for Thyraa, written five and a half months ago as a forward-looking design. It remains legitimately aspirational in large part — that framing is kept intact below. What changed starting 2026-07-11 is that the conversion engine at the center of this architecture went from "designed" to "built and independently verified" via an adversarial-verification campaign that ran in two phases — an initial 14 rounds, paused by owner decision, then resumed at the owner's request and run to completion at round 40 as of 2026-07-23 — while the platform layers around it (UI, gateway, orchestration, auth, deployment) are still exactly as aspirational as they were in February; the campaign was engine-only and never touched them. The sections below are annotated throughout with **✅ Built & verified**, **🟡 Partial**, or **⬜ Vision (not yet built)** so the built/aspirational line is unmissable. See the new "Implementation Status" section immediately below for the full picture, `docs/PROGRESS_STATUS.md` for the closing campaign report (and `docs/ADVERSARIAL_ROUNDS_REPORT.md` for the original rounds 1-14 narrative), and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` for the statement-level engine capability audit.
 
 ## Product Vision
 
@@ -21,9 +21,9 @@
 
 ---
 
-## Implementation Status (2026-07-11)
+## Implementation Status (2026-07-23)
 
-*Added 2026-07-11, five months after original authoring. This section — and the ✅/🟡/⬜ tags used throughout the rest of the document — reflect what has actually been built and verified since, versus what remains architecture/product vision. Full detail: `docs/ADVERSARIAL_ROUNDS_REPORT.md` (14-round adversarial-verification campaign narrative) and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (statement-by-statement engine capability audit and roadmap).*
+*Added 2026-07-11, five months after original authoring; refreshed 2026-07-23 now that the campaign has run to completion. This section — and the ✅/🟡/⬜ tags used throughout the rest of the document — reflect what has actually been built and verified since, versus what remains architecture/product vision. Full detail: `docs/PROGRESS_STATUS.md` (closing report for the full 40-round campaign), `docs/ADVERSARIAL_ROUNDS_REPORT.md` (original rounds 1-14 narrative), `Thyraa-COBOL-main/backend/packages/cobol-to-scala/tests/oracle/README.md` (the complete round-by-round finding→fix→program ledger), `docs/AUTONOMOUS_BUILD_LOG.md` (per-cycle log), and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (statement-by-statement engine capability audit and roadmap).*
 
 ### ✅ BUILT & VERIFIED
 
@@ -32,9 +32,9 @@ The COBOL→Scala **conversion engine** (`Thyraa-COBOL-main/backend/packages/cob
 - **Real architecture**: lexer → parser → AST → Scala generator. Note this is a **Node.js/JavaScript package**, not a separate JVM/Scala microservice as the "Scala Engine Integration" section below envisions — see the annotation there.
 - **Byte-level codecs**: packed decimal/COMP-3, binary/COMP (including COMP-5 little-endian), zoned/overpunch numerics, EBCDIC cp037.
 - Field/group/table/CALL registries, DECLARATIVES support (including reentrancy and cross-conversion state isolation), multi-program `CALL`, SORT SD work-file model.
-- **209 oracle-verified COBOL programs** (grown from 48 pre-campaign): 19 under `tests/corpus/data/`, 190 under `tests/corpus/proc/`.
-- **879/879 automated tests passing**, 0 failing, 0 skipped.
-- **110 silent-divergence bugs found and fixed at root cause** across 14 adversarial rounds — each finding verified byte-for-byte against real GnuCOBOL (`cobc`) compiler output, not a hand-written expectation.
+- **574 oracle-verified corpus programs** (grown from 48 pre-campaign, 209 at the round-14 checkpoint): 563 `.cbl` programs that compile and run clean under real GnuCOBOL (`cobc`), plus 11 deliberately-named `.cbl.txt` probes whose own correct behavior is a nonzero `cobc` exit / compile rejection.
+- **~2,017 automated tests** (898 unit + 1,119 oracle-harness), 0 failing, plus 45 honest/individually-documented `t.todo()` work-queue entries (never silent) — up from 879/879 at the round-14 checkpoint.
+- **241 silent-divergence findings found and fixed at root cause** across all 40 completed adversarial rounds (110 in rounds 1-14, 131 more in rounds 15-40) — each finding verified byte-for-byte against real GnuCOBOL (`cobc`) compiler output, not a hand-written expectation. The campaign's own convergence bar (0-2 findings for two consecutive rounds) was met only once, briefly, at rounds 36-37; rounds 38-40 then deliberately broadened the search and found real bugs again at an *increasing* rate (6, then 7, then 8 per round), including two entirely-unimplemented statements (`REPLACE`, `PROGRAM-ID ... INITIAL`) discovered as late as round 40 — so the 40 completed rounds should not be read as "adversarially exhausted," only as "run to the owner's requested target." Major capability built (not just bugs fixed) along the way, in rounds 15-40: real RECURSIVE-program support (per-activation LINKAGE aliasing, BY REFERENCE/CONTENT semantics, self-call-cycle detection); a full architectural rewrite of RELATIVE file I/O after round 29 found the original storage model silently corrupted binary data containing a newline byte (the single most serious finding of the whole campaign); real LINAGE + FILE STATUS lifecycle support; and real IEEE-754 COMP-1/COMP-2 float/double codecs.
 - Four engine phases built: (1) data layer + codecs, (2) full PROCEDURE DIVISION logic, (3) `EXEC SQL` → Doobie generation + JCL parsing (MVP — compile-verified in isolation but **not yet spliced into the main generator's output path**), (4) CICS scaffolding (classification/BMS parsing/skeleton generation only — **not** behavioral conversion).
 - A minimal **analysis platform** (React frontend + Express backend + Bull/Redis job queue + regex-level dependency parsing) also exists and predates this campaign — see "Partial" below.
 
@@ -53,7 +53,7 @@ The platform layers *around* the engine were **not** part of this campaign (whic
 - A customer-facing **Validation Engine** (dual-run comparison as a *product feature* — the oracle-comparison harness in `tests/oracle/` is a developer test tool internal to the engine repo, not a service)
 - The **AI Layer** (Claude-powered documentation/explanation/business-rule-extraction as a product feature) — no such integration exists in the backend today
 - VS Code Extension, standalone CLI
-- Engine-internal gaps also still open: SQL wire-in, CICS behavioral conversion, reference-modification codegen, REWRITE/DELETE/START, SORT USING/GIVING, external/dynamic CALL, OCCURS DEPENDING ON dynamic sizing, general GO TO webs, JCL→sbt skeletons. The oracle is GnuCOBOL, not IBM Enterprise COBOL.
+- Engine-internal gaps also still open (per the full 40-round campaign's closing risk catalogue — see `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` §1.3 for the risk-ordered detail): reference modification (`field(start:length)`) still degrades to a placeholder for its actual value almost everywhere — the single largest remaining silent-wrong-output risk; `ORGANIZATION IS INDEXED` (VSAM-style keyed) files are unimplemented and unverifiable in this sandbox (the installed GnuCOBOL has indexed support compiled out); `CALL BY REFERENCE`/`CONTENT` of a GROUP containing an OCCURS table into an ordinary (non-recursive) subprogram silently passes empty/default data; plus SQL wire-in, CICS behavioral conversion, SORT USING/GIVING, external/dynamic CALL, OCCURS DEPENDING ON dynamic sizing, general GO TO webs, JCL→sbt skeletons. (REWRITE/DELETE/START file-status/lifecycle handling, previously listed here as open, was built during rounds 15-40 — see "Implementation Status" above.) The oracle is GnuCOBOL, not IBM Enterprise COBOL.
 
 ### 🟡 PARTIAL (exists already, predates this campaign, narrower than the vision below)
 
@@ -147,7 +147,7 @@ The platform layers *around* the engine were **not** part of this campaign (whic
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Layer-by-layer status (2026-07-11):**
+**Layer-by-layer status (2026-07-23):**
 
 | Layer | Status | Notes |
 |---|---|---|
@@ -233,7 +233,7 @@ The platform layers *around* the engine were **not** part of this campaign (whic
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Status per step (2026-07-11):** STEP 1 (Ingest) and STEP 2 (Analyze) are 🟡 Partial — the analysis pipeline is real, but "Generate documentation with AI" is ⬜ Vision (no AI integration exists). STEP 3 (Convert) is the strongest part of the whole journey: the actual COBOL parsing/type-mapping/case-class/enum/runtime generation is ✅ Built & verified (and far more capable than this five-month-old bullet list suggests — see "Implementation Status" above for the real internal architecture); "AI-enhanced documentation" in this step is still ⬜ Vision. STEP 4 (Validate) is ⬜ Vision as a product step — real oracle-comparison logic exists but only as an internal developer test harness (`tests/oracle/`), not a report/dashboard a user triggers. All 👤 HUMAN REVIEW checkpoints are ⬜ Vision — no review workflow UI exists. STEP 5 (Deploy) is entirely ⬜ Vision — no packaging, Docker, or CI/CD exists anywhere in the repo.
+**Status per step (2026-07-23):** STEP 1 (Ingest) and STEP 2 (Analyze) are 🟡 Partial — the analysis pipeline is real, but "Generate documentation with AI" is ⬜ Vision (no AI integration exists). STEP 3 (Convert) is the strongest part of the whole journey: the actual COBOL parsing/type-mapping/case-class/enum/runtime generation is ✅ Built & verified (and far more capable than this five-month-old bullet list suggests — see "Implementation Status" above for the real internal architecture); "AI-enhanced documentation" in this step is still ⬜ Vision. STEP 4 (Validate) is ⬜ Vision as a product step — real oracle-comparison logic exists but only as an internal developer test harness (`tests/oracle/`), not a report/dashboard a user triggers. All 👤 HUMAN REVIEW checkpoints are ⬜ Vision — no review workflow UI exists. STEP 5 (Deploy) is entirely ⬜ Vision — no packaging, Docker, or CI/CD exists anywhere in the repo.
 
 ---
 
@@ -297,7 +297,7 @@ The platform layers *around* the engine were **not** part of this campaign (whic
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Reality check (2026-07-11):** 🟡 Partial, and structured differently than pictured. `POST /analyze` is real and does queue through Bull. `POST /convert` is real (`/api/convert/parse`, `/api/convert/scala`, `/api/convert/batch`) but is **not** queued — the controller calls the conversion engine's `convertToScala()` directly, in-process, synchronously (`backend/api/controllers/conversion.controller.js`), and the "CONVERSION ENGINE (Scala JVM)" box does not exist as a separate JVM process — see the note under "Scala Engine Integration" below. `POST /validate` does not exist at all — ⬜ Vision. There is no PostgreSQL and no shared "SHARED DATA STORE" beyond the analysis job queue's Redis instance.
+**Reality check (2026-07-23):** 🟡 Partial, and structured differently than pictured. `POST /analyze` is real and does queue through Bull. `POST /convert` is real (`/api/convert/parse`, `/api/convert/scala`, `/api/convert/batch`) but is **not** queued — the controller calls the conversion engine's `convertToScala()` directly, in-process, synchronously (`backend/api/controllers/conversion.controller.js`), and the "CONVERSION ENGINE (Scala JVM)" box does not exist as a separate JVM process — see the note under "Scala Engine Integration" below. `POST /validate` does not exist at all — ⬜ Vision. There is no PostgreSQL and no shared "SHARED DATA STORE" beyond the analysis job queue's Redis instance.
 
 ---
 
@@ -609,7 +609,7 @@ thyraa/
 │   └── postgres.yaml
 │
 └── docs/                        # ✅ exists (this docs/ directory), though with different filenames than pictured —
-    ├── architecture.md          #   see this file, ADVERSARIAL_ROUNDS_REPORT.md, CAPABILITY_AUDIT_AND_ROADMAP.md, etc.
+    ├── architecture.md          #   see this file, PROGRESS_STATUS.md, ADVERSARIAL_ROUNDS_REPORT.md, CAPABILITY_AUDIT_AND_ROADMAP.md, etc.
     ├── api.md
     └── deployment.md
 ```
@@ -618,7 +618,7 @@ thyraa/
 
 ## Deployment Architecture
 
-⬜ **Vision — entirely unbuilt.** Confirmed by filesystem search: there is no `Dockerfile`, no `docker-compose.yml`, and no Kubernetes manifest anywhere in this repo as of 2026-07-11. No container image has ever been built for any component. Both subsections below (Docker Compose and Kubernetes) describe a deployment model that does not exist yet in any form, not even a partial one.
+⬜ **Vision — entirely unbuilt.** Confirmed by filesystem search: there is no `Dockerfile`, no `docker-compose.yml`, and no Kubernetes manifest anywhere in this repo as of 2026-07-23. No container image has ever been built for any component. This was never in scope for the (now-complete) 40-round engine campaign, which was engine-only. Both subsections below (Docker Compose and Kubernetes) describe a deployment model that does not exist yet in any form, not even a partial one.
 
 ### Docker Compose (Development/Small Scale)
 
@@ -766,7 +766,7 @@ volumes:
 
 ## Implementation Phases
 
-> **Note (2026-07-11):** these are the *platform-integration* phases (1–6, below) — do not confuse them with the conversion engine's own internal build phases referenced in "Implementation Status" above (data layer, procedure logic, EXEC SQL/JCL, CICS scaffolding), which are a completely different numbering scheme and are already built. Everything below is still ⬜ Vision except where noted.
+> **Note (2026-07-23):** these are the *platform-integration* phases (1–6, below) — do not confuse them with the conversion engine's own internal build phases referenced in "Implementation Status" above (data layer, procedure logic, EXEC SQL/JCL, CICS scaffolding), which are a completely different numbering scheme and are already built. Everything below is still ⬜ Vision except where noted.
 
 ### Phase 1: Integration Foundation (2-3 weeks)
 - [ ] Set up monorepo structure — ⬜ not done, repo is not structured as pictured
@@ -789,10 +789,10 @@ volumes:
 - [ ] Create inline documentation generation — ⬜ not done
 
 ### Phase 4: Validation Engine (2-3 weeks)
-- [x] Build Scala test runner — 🟡 partial, but not the product feature pictured: `tests/oracle/` is a real, working oracle-comparison harness against GnuCOBOL, used internally by the engine's own adversarial-verification campaign (879/879 tests, 209 programs) — it is a developer test tool, not a UI-facing "Validation Engine" a customer triggers per-project
+- [x] Build Scala test runner — 🟡 partial, but not the product feature pictured: `tests/oracle/` is a real, working oracle-comparison harness against GnuCOBOL, used internally by the engine's own adversarial-verification campaign (now complete at 40 rounds: ~2,017 tests — 898 unit + 1,119 oracle — 0 failures, 574 corpus programs) — it is a developer test tool, not a UI-facing "Validation Engine" a customer triggers per-project
 - [x] Implement dual-run comparison — ✅ done, but as above: internal to the engine's own test suite, not exposed as a platform feature
 - [ ] Create validation dashboard — ⬜ not done
-- [ ] Add metrics and reporting — ⬜ not done (as a product feature; the engine's own `docs/ADVERSARIAL_ROUNDS_REPORT.md` is a report, but a human-authored one, not a generated dashboard)
+- [ ] Add metrics and reporting — ⬜ not done (as a product feature; the engine's own `docs/PROGRESS_STATUS.md` closing report and `docs/ADVERSARIAL_ROUNDS_REPORT.md` are reports, but human-authored ones, not a generated dashboard)
 
 ### Phase 5: Enterprise Features (2-3 weeks)
 - [ ] Add user authentication (OAuth/SAML) — ⬜ not done
@@ -802,7 +802,7 @@ volumes:
 - [ ] Kubernetes deployment manifests — ⬜ not done
 
 ### Phase 6: Polish & Launch (1-2 weeks)
-- [ ] Documentation — 🟡 partial: extensive engine-side docs exist (`docs/ADVERSARIAL_ROUNDS_REPORT.md`, `docs/CAPABILITY_AUDIT_AND_ROADMAP.md`, this document); platform-side docs (api.md, deployment.md) do not
+- [ ] Documentation — 🟡 partial: extensive engine-side docs exist (`docs/PROGRESS_STATUS.md`, `docs/ADVERSARIAL_ROUNDS_REPORT.md`, `docs/CAPABILITY_AUDIT_AND_ROADMAP.md`, `docs/AUTONOMOUS_BUILD_LOG.md`, this document); platform-side docs (api.md, deployment.md) do not
 - [ ] Performance optimization — ⬜ not evaluated at platform level
 - [ ] Security audit — ⬜ not done (informal gap analysis exists: `docs/ENTERPRISE_READINESS_GAP_ANALYSIS.md`, but no formal audit)
 - [ ] Beta testing with pilot customer — ⬜ not done
@@ -811,12 +811,12 @@ volumes:
 
 ## Technology Summary
 
-| Component | Technology | Purpose | Status (2026-07-11) |
+| Component | Technology | Purpose | Status (2026-07-23) |
 |-----------|------------|---------|---|
 | Frontend | React + TypeScript + Tailwind | User interface | 🟡 Partial — real, narrower than pictured |
 | API Gateway | Express.js | Route handling, orchestration | 🟡 Partial — real routes, no gateway-grade features (auth, rate limiting) |
 | Analysis Engine | Node.js | GitHub ingestion, dependency analysis | 🟡 Partial — real, but regex-level parsing, not a full COBOL AST |
-| Conversion Engine | ~~Scala 3 + http4s~~ Node.js/JavaScript, emitting Scala 3 source | COBOL parsing, Scala generation | ✅ Built & verified — 209 oracle-verified programs, 879/879 tests; see "Implementation Status" |
+| Conversion Engine | ~~Scala 3 + http4s~~ Node.js/JavaScript, emitting Scala 3 source | COBOL parsing, Scala generation | ✅ Built & verified — 574 oracle-verified corpus programs, ~2,017 tests (0 failures) across a completed 40-round adversarial campaign; see "Implementation Status" |
 | Job Queue | Bull + Redis | Async job processing | 🟡 Partial — real for analysis only; conversion is not queued |
 | Database | PostgreSQL | Project data, results, audit | ⬜ Vision — no PostgreSQL anywhere in the repo |
 | Cache | Redis | API caching, session store | 🟡 Partial — real, used by the analysis pipeline |
@@ -828,7 +828,7 @@ volumes:
 
 ## Success Metrics
 
-⬜ **Vision — these are unmeasured targets, not reported results.** None of these have an instrumented measurement pipeline (no telemetry, no dashboard). The one row with a real, closely-related, *independently measured* number is "Conversion success rate": the actual engine-side result as of 2026-07-11 is **209/209 oracle-verified corpus programs producing byte-identical output to real GnuCOBOL** and **879/879 automated tests passing** — a stronger and more specific claim than the "95%/85%" estimate below, but it is a corpus-verification statistic (measured against a curated, growing adversarial test corpus), not a measurement of "success rate on arbitrary customer programs," so the two numbers aren't directly comparable. All other rows (analysis accuracy, processing speed, UI/API response time, validation pass rate, customer satisfaction) remain aspirational targets with no measurement in place.
+⬜ **Vision — these are unmeasured targets, not reported results.** None of these have an instrumented measurement pipeline (no telemetry, no dashboard). The one row with a real, closely-related, *independently measured* number is "Conversion success rate": the actual engine-side result as of 2026-07-23, at the close of the full 40-round adversarial campaign, is **574 oracle-verified corpus programs** (563 `.cbl` compiling and running clean under real GnuCOBOL, plus 11 `.cbl.txt` probes whose own correct behavior is a compile rejection) and **~2,017 automated tests passing, 0 failures** (898 unit + 1,119 oracle, plus 45 honest documented todos) — a stronger and more specific claim than the "95%/85%" estimate below, but it is a corpus-verification statistic (measured against a curated, growing adversarial test corpus), not a measurement of "success rate on arbitrary customer programs," so the two numbers aren't directly comparable. All other rows (analysis accuracy, processing speed, UI/API response time, validation pass rate, customer satisfaction) remain aspirational targets with no measurement in place.
 
 | Metric | Target |
 |--------|--------|
@@ -844,7 +844,7 @@ volumes:
 
 ## Next Steps
 
-*(Original 2026-02-08 next-steps list, kept as-is below for the historical record. As of 2026-07-11, items 3–5 have effectively been superseded: no monorepo was created, and rather than a separate Scala HTTP service, the conversion engine was built and hardened in-place as a Node.js package inside the existing `backend/packages/` structure — see "Scala Engine Integration" above. The real next step today is the platform work in "STILL VISION" at the top of this document: auth, job orchestration for conversion, a real validation product feature, and deployment infra, now that the engine itself is no longer the risky part.)*
+*(Original 2026-02-08 next-steps list, kept as-is below for the historical record. As of 2026-07-23, with the 40-round adversarial campaign now complete, items 3–5 have effectively been superseded: no monorepo was created, and rather than a separate Scala HTTP service, the conversion engine was built and hardened in-place as a Node.js package inside the existing `backend/packages/` structure — see "Scala Engine Integration" above. The real next step today is the platform work in "STILL VISION" at the top of this document: auth, job orchestration for conversion, a real validation product feature, and deployment infra, now that the engine itself is no longer the risky part — though see the engine-internal gaps also listed there (reference modification, indexed/VSAM files, GROUP+OCCURS BY REFERENCE into non-recursive subprograms) for what "no longer the risky part" does not yet cover.)*
 
 1. **Share this architecture with your friend**
 2. **Agree on the integration approach** (HTTP microservice recommended)

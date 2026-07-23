@@ -2,7 +2,7 @@
 ## 10-20 Hours to Working Product
 
 **Originally authored:** 2026-02-08
-**Status updated:** 2026-07-11
+**Status updated:** 2026-07-23
 
 ---
 
@@ -15,7 +15,7 @@
 
 ---
 
-## STATUS AS OF 2026-07-11
+## STATUS AS OF 2026-07-23
 
 > This plan was written on 2026-02-08 as a forward-looking 10-20 hour sprint
 > proposal, **before any of the work below happened**. Nothing in the
@@ -26,25 +26,39 @@
 > item-by-item truth.
 
 **What actually happened instead:** rather than a 10-20 hour integration
-sprint, a 14-round autonomous adversarial-verification campaign (~22 hours,
-2026-07-10 → 2026-07-11) rebuilt and hardened the COBOL→Scala **conversion
-engine** at
+sprint, an autonomous adversarial-verification campaign rebuilt and hardened
+the COBOL→Scala **conversion engine** at
 `Thyraa-COBOL-main/backend/packages/cobol-to-scala/` far beyond this plan's
 original scope — while almost everything this plan called "the product"
 (MCP server, Java/Python/Kotlin plugins, Docker/full-stack deployment,
 target-language dropdown, agent tooling) was **not** attempted, by design:
-the campaign was scoped to the engine only.
+the campaign was scoped to the engine only. The campaign ran in two phases:
+an initial 14 rounds (~22 hours, 2026-07-10 → 2026-07-11), paused by owner
+decision, then resumed at the owner's explicit request and run to completion
+at round 40 (closing 2026-07-23).
 
 **Headline numbers (verified, not projected):**
-- **209** oracle-verified COBOL programs (up from 48 at campaign start)
-- **879/879** automated tests passing (0 failing, 0 skipped, 0 todo)
-- **110** silent-divergence ("dishonest") bugs found and fixed across the campaign
-- **14** adversarial-refutation rounds, each writing new hostile COBOL, compiling with real GnuCOBOL (`cobc`), and diffing byte-for-byte against generated-then-compiled Scala output
-- Hunting **paused at round 14 by owner decision** (~22h into a 48h budget) — the finding-count plateaued at 3-5/round, not the 0-2 that would indicate convergence, so the engine is hardened, not "finished"
+- **574** oracle-verified COBOL programs (563 `.cbl` clean under real `cobc` + 11
+  `.cbl.txt` whose correct behavior is a nonzero cobc exit/compile rejection) — up
+  from 48 at campaign start and 209 at the round-14 pause point
+- **~2,017** automated tests (898 unit + 1,119 oracle), 0 failures, 45 honest
+  documented `t.todo()` entries — up from 879/879 at round 14
+- **241** silent-divergence ("dishonest") bugs found and fixed across the campaign
+  (110 in rounds 1-14, 131 more in rounds 15-40)
+- **40** adversarial-refutation rounds total, each writing new hostile COBOL,
+  compiling with real GnuCOBOL (`cobc`), and diffing byte-for-byte against
+  generated-then-compiled Scala output
+- The campaign's own convergence bar (0-2 findings for two consecutive rounds) was
+  met once, briefly, at rounds 36-37, before rounds 38-40 deliberately broadened
+  the search and found real bugs again at an increasing rate (6, 7, 8) — including
+  two previously entirely-unimplemented statements (`REPLACE`,
+  `PROGRAM-ID ... INITIAL`) discovered as late as round 40. Read this as the
+  broadened strategy working, not quality regressing — not as "adversarially
+  exhausted."
 
 **What got built (all 4 of the roadmap's later phases, not just this plan's Hour 0-20 scope):**
-1. **Data layer** — byte-level codecs for packed decimal/COMP-3, binary, zoned decimal, EBCDIC (cp037); PIC/COMP parsing; copybook expansion. ✅ Oracle-verified.
-2. **Procedure logic** — the full statement set: all PERFORM forms, IF/EVALUATE, SEARCH/SEARCH ALL, SORT/MERGE, STRING/UNSTRING/INSPECT, arithmetic with ROUNDED, MOVE (incl. CORRESPONDING), LINE SEQUENTIAL file I/O, DECLARATIVES, multi-program CALL, SECTIONs. ✅ Oracle-verified.
+1. **Data layer** — byte-level codecs for packed decimal/COMP-3, binary, zoned decimal, EBCDIC (cp037), real IEEE-754 COMP-1/COMP-2 codecs; PIC/COMP parsing; copybook expansion. ✅ Oracle-verified.
+2. **Procedure logic** — the full statement set: all PERFORM forms, IF/EVALUATE, SEARCH/SEARCH ALL, SORT/MERGE, STRING/UNSTRING/INSPECT, arithmetic with ROUNDED, MOVE (incl. CORRESPONDING), file I/O (incl. a full RELATIVE-organization storage-model rewrite in round 29, LINAGE, FILE STATUS lifecycle), DECLARATIVES, multi-program CALL, SECTIONs, real RECURSIVE-program support (built rounds 15-40). ✅ Oracle-verified.
 3. **SQL/JCL** — EXEC SQL → typed Doobie code (compile-verified against real `doobie-core`), JCL step/DD/PROC parsing with dataset-lineage JSON. 🟡 Built as an MVP; **the SQL generator is not yet wired into the main conversion pipeline** — a real, disclosed gap.
 4. **CICS** — EXEC CICS command classification, BMS screen-map parsing, Scala service-skeleton generation. 🟡 Scaffolding only — explicitly **not** a behavioral CICS converter (every risky method body is an honest `???`).
 
@@ -58,19 +72,28 @@ integration does exist). **The engine now far exceeds this plan's original
 "10-20 hour MVP" bar for its one target language (Scala); the productized,
 multi-language, agent-ready platform this plan envisioned was not built.**
 
-**Known, disclosed engine gaps** (i.e., NOT silent bugs — each surfaces a
-visible `??? /* TODO */` marker in generated code): EXEC SQL not wired into
-the main generator; EXEC CICS behavioral conversion; reference-modification
-codegen; REWRITE/DELETE/START; SORT `USING`/`GIVING`; external/dynamic CALL;
-OCCURS DEPENDING ON dynamic sizing; general (non-THRU-scoped)
+**Known, disclosed engine gaps, top three by risk** (i.e., NOT silent bugs —
+each surfaces a visible marker or documented decline): (1) **reference
+modification** (`field(start:length)`) still degrades to a placeholder for
+its actual value almost everywhere — the single largest remaining risk; (2)
+`ORGANIZATION IS INDEXED` (VSAM-style keyed) files are unimplemented and
+unverifiable in this project's own sandbox; (3) `CALL BY REFERENCE`/`CONTENT`
+of a GROUP containing an OCCURS table into an ordinary (non-recursive)
+subprogram silently passes empty/default data. Also still open: EXEC SQL not
+wired into the main generator; EXEC CICS behavioral conversion; SORT
+`USING`/`GIVING`; OCCURS DEPENDING ON dynamic sizing; general (non-THRU-scoped)
 inter-paragraph GO TO webs; JCL→sbt pipeline skeletons. The verification
-oracle throughout is GnuCOBOL, not IBM Enterprise COBOL, and the campaign
-did not converge (finding-rate plateaued at 3-5/round rather than 0-2).
+oracle throughout is GnuCOBOL, not IBM Enterprise COBOL. The campaign was
+**engine-only** — auth, CI/CD, containerization, observability, compliance,
+frontend, and API were not touched and remain the gating production
+blockers; the engine is no longer the weakest link.
 
 **For full detail, see:**
-- `docs/ADVERSARIAL_ROUNDS_REPORT.md` — the full 14-round campaign report (methodology, round-by-round narrative, bug-impact ranking, Known Gaps, resume plan)
+- `docs/PROGRESS_STATUS.md` — the closing report: full campaign retrospective, headline numbers, process lessons, recommended next steps
 - `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` — statement-by-statement audit of what the engine handles today vs. the 4-phase "don't miss any aspect of COBOL" roadmap
-- `docs/PROGRESS_STATUS.md` — the current top-level status snapshot (what's done, what's pending, where to look for more)
+- `tests/oracle/README.md` — the complete round-by-round (1-40) finding→fix→program ledger
+- `docs/AUTONOMOUS_BUILD_LOG.md` — the full autonomous run activity log
+- `docs/ADVERSARIAL_ROUNDS_REPORT.md` — the original rounds 1-14 campaign report (methodology, narrative, bug-impact ranking)
 
 ---
 
@@ -198,7 +221,7 @@ const tools = [
 [ ] AST → Java enums               -- ⬜ NOT STARTED
 [ ] MCP tool: convert_to_java      -- ⬜ NOT STARTED
 ```
-**This entire section remains undone.** No Java, Python, or Kotlin generator exists anywhere in the repo — the engine is, and has only ever been, single-target (COBOL → Scala). The "prove multi-target works" goal was never attempted; all 14 rounds of the later campaign hardened the one Scala target rather than proving the plugin architecture across languages.
+**This entire section remains undone.** No Java, Python, or Kotlin generator exists anywhere in the repo — the engine is, and has only ever been, single-target (COBOL → Scala). The "prove multi-target works" goal was never attempted; all 40 rounds of the later campaign (14 initial + 26 resumed) hardened the one Scala target rather than proving the plugin architecture across languages.
 
 ### Hour 14-18: UI Integration
 **Goal**: Working end-to-end flow
@@ -427,7 +450,8 @@ class JavaGenerator extends BaseGenerator {
 
 > **Status:** ⬜ NOT STARTED — no MCP server, no `@modelcontextprotocol/sdk`
 > dependency, and no `mcp/` directory exist anywhere in the repo. This
-> entire code sample remains aspirational as of 2026-07-11. The closest
+> entire code sample remains aspirational as of 2026-07-23 (the campaign, now
+> run to completion at round 40, was engine-only and never touched this). The closest
 > thing to an agent-usable entry point is the CLI demo
 > (`demo/convert-demo.sh`, `demo/convert.mjs`) — not MCP.
 
@@ -593,13 +617,13 @@ export default function(app) {
 
 ## What You Get in 20 Hours
 
-*(Original plan's projection vs. actual status 5 months later, 2026-07-11. This table was the plan's forecast, not a completed checklist — every "✅" below is what the plan **expected**; the new "Actual status" column is the truth.)*
+*(Original plan's projection vs. actual status after the full 40-round campaign, 2026-07-23. This table was the plan's forecast, not a completed checklist — every "✅" below is what the plan **expected**; the new "Actual status" column is the truth.)*
 
-| Feature | Planned as Included | Actual status (2026-07-11) |
+| Feature | Planned as Included | Actual status (2026-07-23) |
 |---------|----------|-----------------------------|
 | COBOL Parser (copybooks) | ✅ | ✅ DONE — far exceeded: full lexer/parser incl. byte-level codecs, not just copybooks |
 | Universal JSON AST | ✅ | 🟡 PARTIAL — rich internal AST exists but was never decoupled/published as a multi-language schema |
-| Scala generator | ✅ | ✅ DONE — far exceeded: 209 oracle-verified programs, 879/879 tests passing |
+| Scala generator | ✅ | ✅ DONE — far exceeded: 574 oracle-verified programs, ~2,017 tests passing, 0 failures |
 | Java generator | ✅ | ⬜ NOT STARTED — no Java generator exists |
 | REST API | ✅ | 🟡 PARTIAL — real endpoints exist (`/parse`, `/scala`, `/batch`, `/runtime`) but Scala-only, no generic target dispatch |
 | MCP Server | ✅ | ⬜ NOT STARTED — no MCP server anywhere in the repo |
@@ -608,12 +632,12 @@ export default function(app) {
 | Multi-target support | ✅ | ⬜ NOT STARTED — Scala only |
 | Agent-ready tools | ✅ | ⬜ NOT STARTED — no MCP/agent tool surface; only a CLI demo script |
 
-| Feature | Planned as NOT Included (Future) | Actual status (2026-07-11) |
+| Feature | Planned as NOT Included (Future) | Actual status (2026-07-23) |
 |---------|----------------------|-----------------------------|
 | PROCEDURE DIVISION | ❌ | ✅ DONE — the single biggest surprise: full statement-level PROCEDURE DIVISION support, oracle-verified against real GnuCOBOL (see docs/CAPABILITY_AUDIT_AND_ROADMAP.md §1.1) |
 | Full program conversion | ❌ | 🟡 PARTIAL — batch/data-layer programs convert and are oracle-verified end to end; CICS/online programs get scaffolding only, not behavioral conversion |
 | Python/Kotlin plugins | ❌ (easy to add) | ⬜ NOT STARTED — still not built (nor is Java) |
-| Validation engine | ❌ | ✅ DONE — far exceeded: the 14-round adversarial oracle-verification harness against real `cobc`, described in docs/ADVERSARIAL_ROUNDS_REPORT.md, is a full validation engine this plan didn't even scope |
+| Validation engine | ❌ | ✅ DONE — far exceeded: the 40-round adversarial oracle-verification harness against real `cobc` (241 findings fixed), described in `docs/PROGRESS_STATUS.md` and `tests/oracle/README.md`, is a full validation engine this plan didn't even scope |
 | AI documentation | ❌ | ⬜ NOT STARTED as a product feature — extensive documentation was produced (see docs/PROGRESS_STATUS.md etc.) but as project docs authored by the build process, not an in-product "explain this COBOL" AI documentation feature |
 
 ---
@@ -677,12 +701,13 @@ Should I start coding now?
 
 ---
 
-> **Historical note (2026-07-11):** this closing prompt is preserved as
+> **Historical note (2026-07-23):** this closing prompt is preserved as
 > written on 2026-02-08. What actually happened next was not this four-step
 > plan — steps 1 and 4 were pursued (an enhanced parser, integrated with the
 > backend), but step 2 stopped at Scala only (no Java plugin), and step 3
 > (MCP server) was never started. Instead, five months later, a separate
-> 14-round adversarial-verification campaign went deep on hardening the
-> single Scala target against real COBOL semantics rather than wide across
-> multiple target languages. See `docs/PROGRESS_STATUS.md` for what actually
-> happened and what remains open.
+> adversarial-verification campaign — 14 rounds, paused, then resumed at the
+> owner's request and run to completion at round 40 — went deep on hardening
+> the single Scala target against real COBOL semantics rather than wide
+> across multiple target languages. See `docs/PROGRESS_STATUS.md` for what
+> actually happened and what remains open.

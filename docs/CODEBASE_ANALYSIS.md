@@ -2,20 +2,27 @@
 
 *Originally authored: 2026-02-08.*
 
-> **Status note — updated 2026-07-11:** an autonomous 14-round adversarial-verification
+> **Status note — updated 2026-07-23:** an autonomous adversarial-verification
 > campaign hardened Thyraa-COBOL's conversion engine
 > (`Thyraa-COBOL-main/backend/packages/cobol-to-scala/`) since this analysis was first
 > written. The engine grew from an early-stage prototype into a lexer → parser → AST →
 > Scala-generator pipeline that is now oracle-verified (byte-for-byte against real
-> GnuCOBOL) across 209 corpus programs, with 879/879 automated tests passing and 110
-> silent-divergence bugs found and fixed at root cause across the 14 rounds. This means
-> the original framing below — "Thyraa-COBOL does analysis only, no code conversion" —
-> is **no longer accurate** and has been corrected in place where it appears, with
+> GnuCOBOL) across **574** corpus programs (563 `.cbl` + 11 `.cbl.txt`), with **~2,017**
+> automated tests passing (898 unit + 1,119 oracle), 0 failures, 45 honest documented
+> todos, and **241** silent-divergence bugs found and fixed at root cause across a
+> **40-round** campaign (an initial 14 rounds, paused by owner decision, then resumed at
+> the owner's request and run to completion at round 40). This means the original
+> framing below — "Thyraa-COBOL does analysis only, no code conversion" — is **no
+> longer accurate** and has been corrected in place where it appears, with
 > `(fixed in the 2026-07 verification campaign)` markers. The sections describing the
-> peer `cobol2scala` project itself are unchanged. See `docs/ADVERSARIAL_ROUNDS_REPORT.md`
-> (full campaign narrative) and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (current
-> capability/gap ledger) for the underlying detail; this document's comparative framing
-> has been updated to match but is not a restatement of those two.
+> peer `cobol2scala` project itself are unchanged. The campaign was **engine-only** —
+> it did not touch auth, CI/CD, containerization, observability, compliance, frontend,
+> or API, which remain the gating production blockers; the engine is no longer the
+> weakest link. See `docs/PROGRESS_STATUS.md` (closing report),
+> `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (current statement-level capability/gap
+> ledger), `tests/oracle/README.md` (full 40-round finding ledger), and
+> `docs/AUTONOMOUS_BUILD_LOG.md` for the underlying detail; this document's comparative
+> framing has been updated to match but is not a restatement of those.
 
 ## Executive Summary
 
@@ -27,8 +34,8 @@ You and your friend set out to build **complementary** solutions to the same pro
 | **Delivery** | Web Application (SaaS) | CLI / On-Premise Containers |
 | **Technology** | TypeScript/React + Node.js (analysis platform); the conversion engine is also Node.js, generating Scala 3 output | Scala 3 |
 | **Output** | Dependency graphs, flows, documentation; **also Scala 3 case classes, enums, and a runtime codec library from the conversion engine** | Scala 3 case classes, code |
-| **Target Language** | None for the analysis platform; **Scala 3 for the conversion engine** (209 oracle-verified programs, 0 SQL-generator wiring into the main pipeline yet) | Scala 3 |
-| **Stage** | Pre-conversion analysis for the dashboard; **the conversion engine has passed 14 rounds of adversarial verification** (879/879 tests, 110 bugs fixed) though it has not converged (finding-count plateaued at 3–5/round) | Actual conversion |
+| **Target Language** | None for the analysis platform; **Scala 3 for the conversion engine** (574 oracle-verified programs, 0 SQL-generator wiring into the main pipeline yet) | Scala 3 |
+| **Stage** | Pre-conversion analysis for the dashboard; **the conversion engine has passed a 40-round adversarial-verification campaign** (~2,017 tests, 0 failures, 241 bugs fixed) — the campaign's own convergence bar was met once, briefly (rounds 36-37), before rounds 38-40 deliberately broadened the search and found bugs at an increasing rate (6, 7, 8), including two previously-unimplemented statements as late as round 40 — not "adversarially exhausted" | Actual conversion |
 
 ---
 
@@ -122,47 +129,66 @@ GitHub Repo URL
 
 *(This diagram covers the analysis platform only. The conversion engine described below is a separate pipeline that lives alongside it in the same monorepo.)*
 
-### Conversion Engine (new since original analysis — as of 2026-07-11)
+### Conversion Engine (new since original analysis — as of 2026-07-23)
 
 The original version of this document described Thyraa-COBOL as analysis-only. That is
 no longer the whole picture: `Thyraa-COBOL-main/backend/packages/cobol-to-scala/` is a
-real COBOL→Scala conversion engine, hardened by a 14-round autonomous
-adversarial-verification campaign completed 2026-07-11. Full detail lives in
-`docs/ADVERSARIAL_ROUNDS_REPORT.md` and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md`; the
-verified headline facts:
+real COBOL→Scala conversion engine, hardened by an autonomous adversarial-verification
+campaign that ran 40 rounds total (an initial 14, paused by owner decision, then resumed
+at the owner's request and run to completion at round 40, closing 2026-07-23). Full
+detail lives in `docs/PROGRESS_STATUS.md` (closing report),
+`docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (current capability/gap ledger), and
+`tests/oracle/README.md` (the complete round-by-round ledger); the verified headline
+facts:
 
-- **Pipeline:** lexer → parser → AST → Scala generator (Node.js, ~9,500 lines before
-  the campaign), with byte-level codecs for packed decimal/COMP-3, binary/COMP
-  (including COMP-5 little-endian), zoned overpunch, and EBCDIC cp037; field/group/table/
-  CALL registries; DECLARATIVES support; multi-program CALL; a SORT SD work-file model.
-  Key directories: `parser/`, `generator/`, `runtime/`, `tests/oracle/` (the
+- **Pipeline:** lexer → parser → AST → Scala generator (Node.js), with byte-level
+  codecs for packed decimal/COMP-3, binary/COMP (including COMP-5 little-endian), real
+  IEEE-754 COMP-1/COMP-2 codecs, zoned overpunch, and EBCDIC cp037; field/group/table/
+  CALL registries; DECLARATIVES support; multi-program CALL; real RECURSIVE-program
+  support; a full RELATIVE file I/O storage-model rewrite (round 29, the most serious
+  finding of the whole campaign — the original line-delimited model silently corrupted
+  binary data); LINAGE and FILE STATUS lifecycle; a SORT SD work-file model. Key
+  directories: `parser/`, `generator/`, `runtime/`, `tests/oracle/` (the
   compiler-oracle harness).
-- **Verification:** 209 oracle-verified COBOL programs in the corpus (grown from 48),
-  plus 5 EXEC-SQL programs verified separately against real Doobie (214 `.cbl` files on
-  disk in total). 879/879 automated tests passing (`node --test`), 0 failing / 0 todo
-  (grown from ~379).
+- **Verification:** 574 oracle-verified COBOL programs in the corpus (563 `.cbl` clean
+  under real `cobc` + 11 `.cbl.txt` whose correct behavior is a nonzero cobc exit/compile
+  rejection), grown from 209 at the round-14 pause point, plus 5 EXEC-SQL programs
+  verified separately against real Doobie. **~2,017** automated tests passing (898 unit
+  + 1,119 oracle, `node --test`), 0 failing, 45 honest documented `t.todo()` entries
+  (grown from 879 at round 14).
 - **Method:** real GnuCOBOL (`cobc -x`) as the oracle, diffed byte-for-byte against the
   generated-then-compiled Scala (`scala-cli`); oracle fixtures are re-captured live from
   the compiler on every run rather than hand-maintained.
-- **Impact:** 110 silent-divergence bugs (wrong output, crash, or hang on a
-  claimed-supported feature) found and fixed at root cause across the 14 rounds
-  (per-round trend: 11, 16, 15, 16, 6, 6, 8, 4, 6, 6, 3, 4, 5, 4).
+- **Impact:** 241 silent-divergence bugs (wrong output, crash, or hang on a
+  claimed-supported feature) found and fixed at root cause across the 40 rounds (110 in
+  rounds 1-14, 131 more in rounds 15-40). The campaign's own convergence bar (0-2
+  findings for two consecutive rounds) was met once, briefly, at rounds 36-37, before
+  rounds 38-40 deliberately broadened the search and found real bugs again at an
+  increasing rate (6, 7, 8) — including two entirely unimplemented statements
+  (`REPLACE`, `PROGRAM-ID ... INITIAL`) discovered as late as round 40.
 - **Four roadmap phases built:** (1) data layer + codecs; (2) full procedure logic (all
   PERFORM forms, IF/EVALUATE, SEARCH/SEARCH ALL, SORT, STRING/UNSTRING/INSPECT,
   arithmetic with ROUNDED, MOVE incl. CORRESPONDING, file I/O, DECLARATIVES,
-  multi-program CALL, SECTIONs); (3) EXEC SQL→Doobie + JCL parsing as an MVP; (4) CICS
-  scaffolding.
-- **Still genuinely open** (unchanged by this campaign, not overclaimed): the SQL
-  generator is not wired into the main pipeline; CICS support is scaffolding only, not
-  behavioral; reference-modification codegen is a visible placeholder;
-  REWRITE/DELETE/START are stubbed; `SORT ... USING/GIVING` and external/dynamic `CALL`
-  are TODOs; OCCURS DEPENDING ON uses fixed-max sizing; general inter-paragraph GO TO
-  webs are unsupported; JCL→sbt skeletons are not generated. The oracle is GnuCOBOL, not
-  IBM Enterprise COBOL — closely compatible but a different dialect, so "verified" means
-  equivalent on these 209 programs against this compiler, not correct on arbitrary
-  COBOL. The campaign did not converge (bug-finding plateaued at 3–5/round against a
-  0–2 target); hunting was paused by owner decision, not because the engine ran out of
-  bugs to find.
+  multi-program CALL, SECTIONs, RECURSIVE programs); (3) EXEC SQL→Doobie + JCL parsing
+  as an MVP; (4) CICS scaffolding.
+- **Still genuinely open** (top three, ordered by risk — see
+  `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` §1.3 for the full list): (1) **reference
+  modification** (`field(start:length)`) still degrades to a placeholder for its actual
+  value almost everywhere — the single largest remaining risk, since it's a common,
+  everyday construct; (2) `ORGANIZATION IS INDEXED` (VSAM-style keyed) files are
+  unimplemented and unverifiable in this project's own sandbox (the installed GnuCOBOL
+  build has indexed-file support compiled out); (3) `CALL BY REFERENCE`/`CONTENT` of a
+  GROUP containing an OCCURS table into an ordinary (non-recursive) subprogram silently
+  passes empty/default data instead of the caller's real records. Also still open: the
+  SQL generator is not wired into the main pipeline; CICS support is scaffolding only,
+  not behavioral; `SORT ... USING/GIVING` and external/dynamic `CALL` are TODOs; OCCURS
+  DEPENDING ON uses fixed-max sizing; general inter-paragraph GO TO webs are
+  unsupported; JCL→sbt skeletons are not generated. The oracle is GnuCOBOL, not IBM
+  Enterprise COBOL — closely compatible but a different dialect, so "verified" means
+  equivalent on these 574 programs against this compiler, not correct on arbitrary
+  COBOL. The campaign was engine-only — auth, CI/CD, containerization, observability,
+  compliance, frontend, and API were not touched and remain the gating production
+  blockers.
 
 ### Strengths
 - Beautiful, modern UI
@@ -170,8 +196,8 @@ verified headline facts:
 - Interactive graph visualization
 - Scalable async job processing
 - Comprehensive GitHub integration
-- **Its conversion engine is now oracle-verified against a real compiler across 209
-  programs with 879/879 tests passing** *(new since original analysis)*
+- **Its conversion engine is now oracle-verified against a real compiler across 574
+  programs with ~2,017 tests passing, 0 failures** *(new since original analysis)*
 
 ### Limitations
 - ~~**No code conversion** - analysis only~~ **(fixed in the 2026-07 verification
@@ -186,11 +212,16 @@ verified headline facts:
   (`packages/cobol-to-scala/parser/`) is a real lexer/grammar, not regex-based.
 - Requires Redis infrastructure — still true (analysis platform only)
 - SaaS model may not suit air-gapped banks — still true
-- **New, not previously listed:** the conversion engine's own remaining gaps — SQL
-  generator not wired into the main pipeline, CICS scaffolding only, REWRITE/DELETE/
-  START stubbed, `SORT ... USING/GIVING` and external/dynamic `CALL` are TODOs, OCCURS
-  DEPENDING ON is fixed-max only, general inter-paragraph GO TO webs unsupported, and
-  verification is against GnuCOBOL rather than IBM Enterprise COBOL. See
+- **New, not previously listed:** the conversion engine's own remaining gaps, top three
+  by risk — reference modification still a placeholder almost everywhere (the largest
+  remaining risk), `ORGANIZATION IS INDEXED` files unimplemented and unverifiable in
+  this sandbox, `CALL BY REFERENCE` of a GROUP+OCCURS into a non-recursive callee
+  silently passes empty data — plus SQL generator not wired into the main pipeline,
+  CICS scaffolding only, `SORT ... USING/GIVING` and external/dynamic `CALL` are TODOs,
+  OCCURS DEPENDING ON is fixed-max only, general inter-paragraph GO TO webs unsupported,
+  and verification is against GnuCOBOL rather than IBM Enterprise COBOL. The campaign
+  was engine-only — auth, CI/CD, containerization, observability, compliance,
+  frontend, and API were never touched and remain the gating production blockers. See
   `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` for the full gap ledger.
 
 ---
@@ -309,7 +340,7 @@ Output: case classes + runtime support
 | PROCEDURE DIVISION | ⚠️ (calls only) | ⚠️ (planned) |
 | JCL files | ✅ | ❌ |
 
-> **Note (2026-07-11):** the "Thyraa-COBOL" column above describes the
+> **Note (2026-07-23):** the "Thyraa-COBOL" column above describes the
 > analysis-platform's own parser (`packages/cobol-analysis`, still regex-based, still
 > ⚠️/❌ as shown). Thyraa-COBOL now also contains a **second, independent** parser inside
 > its conversion engine (`packages/cobol-to-scala/parser/`) that fully and
@@ -333,10 +364,10 @@ Output: case classes + runtime support
 | Documentation | ✅ | ⚠️ (planned AI) |
 
 The four rows above were originally all ❌ for Thyraa-COBOL when this table was first
-written; that was accurate at the time (Thyraa was analysis-only). As of 2026-07-11,
+written; that was accurate at the time (Thyraa was analysis-only). As of 2026-07-23,
 Thyraa-COBOL's `packages/cobol-to-scala` engine produces all four, oracle-verified
-against real GnuCOBOL across 209 corpus programs (879/879 automated tests passing). See
-the "Conversion Engine" subsection above and `docs/ADVERSARIAL_ROUNDS_REPORT.md`.
+against real GnuCOBOL across 574 corpus programs (~2,017 automated tests passing, 0
+failures). See the "Conversion Engine" subsection above and `docs/PROGRESS_STATUS.md`.
 
 ### Technology Comparison
 
@@ -393,15 +424,16 @@ the "Conversion Engine" subsection above and `docs/ADVERSARIAL_ROUNDS_REPORT.md`
 
 **cobol2scala** answers: "How do we convert this to Scala? What's the equivalent code?"
 
-> **Note (2026-07-11):** the diagram above still describes the intended two-project
+> **Note (2026-07-23):** the diagram above still describes the intended two-project
 > pipeline as originally envisioned. In practice, Thyraa-COBOL has since built its own
 > in-house answer to Phase 2 ("How do we convert this to Scala?") — the
 > `packages/cobol-to-scala` engine covers copybook→case-class conversion, level-88→enum
 > generation, a runtime library, and procedure-to-method conversion, oracle-verified
 > against real GnuCOBOL. It has not built the AI-enhanced-documentation piece of Phase 2,
-> and Phase 3 (dual-run/byte-level validation) is exactly the discipline its 14-round
-> adversarial campaign already performs internally for its own 209-program corpus (see
-> `docs/ADVERSARIAL_ROUNDS_REPORT.md`), rather than a phase still waiting on
+> and Phase 3 (dual-run/byte-level validation) is exactly the discipline its 40-round
+> adversarial campaign (14 rounds, paused, then resumed to completion at round 40)
+> already performs internally for its own 574-program corpus (see
+> `docs/PROGRESS_STATUS.md`), rather than a phase still waiting on
 > cobol2scala. The two projects can still complement each other on delivery model,
 > tooling, and cross-verification — but the premise that only cobol2scala does
 > conversion no longer holds.
@@ -481,11 +513,11 @@ platform's own ingestion path) and any cross-pollination on verification methodo
 
 | Question | Answer |
 |----------|--------|
-| What did your friend build? | Web-based COBOL analysis platform with dependency graphs, **plus (as of 2026-07-11) a separately-hardened COBOL→Scala conversion engine, oracle-verified against real GnuCOBOL across 209 programs with 879/879 tests passing** |
+| What did your friend build? | Web-based COBOL analysis platform with dependency graphs, **plus (as of 2026-07-23) a separately-hardened COBOL→Scala conversion engine, oracle-verified against real GnuCOBOL across 574 programs with ~2,017 tests passing, 0 failures, across a 40-round adversarial campaign** |
 | What did we build? | CLI-based COBOL-to-Scala code converter |
-| Are they competing? | Originally: no. **As of 2026-07-11: partially** — both projects now do real COBOL→Scala conversion, so they overlap on that axis; they still differ on delivery model (SaaS web app vs. CLI/on-prem), tech stack (Node.js-generated Scala vs. Scala-native), and verification approach (oracle-diffed against GnuCOBOL vs. this project's own methods) |
+| Are they competing? | Originally: no. **As of 2026-07-23: partially** — both projects now do real COBOL→Scala conversion, so they overlap on that axis; they still differ on delivery model (SaaS web app vs. CLI/on-prem), tech stack (Node.js-generated Scala vs. Scala-native), and verification approach (oracle-diffed against GnuCOBOL vs. this project's own methods) |
 | Can they work together? | Yes, though less by necessity than before — Thyraa no longer needs cobol2scala's conversion capability to close its own gap, since it built one independently |
-| What's missing overall? | Integration layer, unified deployment; also unchanged: neither project's platform-level gaps (auth, CI/CD, deployment tooling) were touched by the 2026-07 campaign, which was scoped to the conversion engine only |
+| What's missing overall? | Integration layer, unified deployment; also unchanged: neither project's platform-level gaps (auth, CI/CD, deployment tooling) were touched by the 40-round campaign, which was scoped to the conversion engine only |
 
 Your friend focused on **understanding and documenting** the COBOL codebase, and — as
 this document's original framing did not anticipate — has since also built and

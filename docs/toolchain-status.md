@@ -1,6 +1,6 @@
 # Verification Toolchain Status
 
-Generated: 2026-07-11 (sandboxed Ubuntu 24.04.4 LTS container, kernel 6.18.5, x86_64)
+Generated: 2026-07-11 · **Re-confirmed still current 2026-07-23** (unchanged through the full 40-round campaign: `cobc (GnuCOBOL) 4.0-early-dev.0` and `scala-cli 1.9.1` / Scala 3.7.3 are exactly the versions the 40-round oracle harness ran against). Sandboxed Ubuntu 24.04.4 LTS container, kernel 6.18.5, x86_64.
 
 Summary: **both GnuCOBOL (`cobc`) and Scala CLI (`scala-cli`) are installed system-wide and
 verified working**, including COMP-3 packed-decimal handling in COBOL and case-class /

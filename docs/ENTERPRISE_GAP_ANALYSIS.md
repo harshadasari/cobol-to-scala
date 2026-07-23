@@ -26,7 +26,7 @@
 > entirely-unimplemented statements (`REPLACE`, `PROGRAM-ID ... INITIAL`) discovered as
 > late as round 40. **This is not "adversarially exhausted."** Full details, method, and
 > an honest list of what still isn't verified: **`docs/ADVERSARIAL_ROUNDS_REPORT.md`**
-> (original 14-round report), **`docs/PROGRESS_STATUS.md`** (closing report for the full
+> (full 40-round campaign report), **`docs/PROGRESS_STATUS.md`** (closing report for the full
 > campaign), **`docs/CAPABILITY_AUDIT_AND_ROADMAP.md`** (statement-level capability
 > audit), and `tests/oracle/README.md` (full 40-round finding ledger).
 >
@@ -270,7 +270,7 @@ Any user on the network can:
 
 > **Update 2026-07-23:** cross-checked against `tests/oracle/README.md` (the verification
 > ledger, now covering all 40 rounds), `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (truth-passed
-> for round 40), and `docs/ADVERSARIAL_ROUNDS_REPORT.md` (original 14-round report). This
+> for round 40), and `docs/ADVERSARIAL_ROUNDS_REPORT.md` (full 40-round campaign report). This
 > section's original claims were, in several cases, actually an *understatement* of how
 > broken the generator was in February — e.g. file I/O (§5.5) turned out to be completely
 > non-functional end-to-end, not merely "inconsistently wired." The current state reflects

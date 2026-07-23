@@ -174,7 +174,7 @@ Full 16-item list with precise scope in the report §6. Highlights: reference mo
 
 | What | Where |
 |---|---|
-| ⭐ **Full 14-round campaign report (impact, analysis, recommendations)** | `docs/ADVERSARIAL_ROUNDS_REPORT.md` |
+| ⭐ **Full 40-round campaign report (impact, analysis, recommendations)** | `docs/ADVERSARIAL_ROUNDS_REPORT.md` |
 | Complete verification ledger (every round, every finding, every fix) | `Thyraa-COBOL-main/backend/packages/cobol-to-scala/tests/oracle/README.md` |
 | Full autonomous run activity log (every cycle) | `docs/AUTONOMOUS_BUILD_LOG.md` |
 | Phase-by-phase capability roadmap | `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` |

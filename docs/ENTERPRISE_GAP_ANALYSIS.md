@@ -1,32 +1,47 @@
 # Enterprise Readiness Gap Analysis
 
 **Original analysis date:** 2026-02-09
-**Updated 2026-07-11 (engine dimensions only)**
+**Updated 2026-07-23 (engine dimensions only)**
 **Scope:** Full codebase analysis of cobol-to-scala platform
 **Overall Enterprise Readiness Score: 4.5 / 10** (was 3.5/10 on 2026-02-09)
 
 ---
 
-> ## Update banner — 2026-07-11
+> ## Update banner — 2026-07-23 (campaign complete, ran to round 40)
 >
-> Between 2026-02-09 and 2026-07-11, a 14-round autonomous adversarial-verification
-> campaign hardened **one subsystem only** — the COBOL→Scala conversion engine at
-> `Thyraa-COBOL-main/backend/packages/cobol-to-scala/`. It fixed 110 silent-divergence
-> bugs (wrong output, crashes, or hangs — never flagged by a compile error), grew the
-> real-compiler-verified corpus from 48 to 209 GnuCOBOL-oracle-verified programs, and
-> grew the engine's own test suite from ~379 to 879 passing tests. Full details, method,
-> and an honest list of what still isn't verified: **`docs/ADVERSARIAL_ROUNDS_REPORT.md`**
-> and **`docs/CAPABILITY_AUDIT_AND_ROADMAP.md`**.
+> Between 2026-02-09 and 2026-07-23, an autonomous adversarial-verification campaign
+> hardened **one subsystem only** — the COBOL→Scala conversion engine at
+> `Thyraa-COBOL-main/backend/packages/cobol-to-scala/`. The campaign ran in two phases:
+> an initial **14 rounds**, reported on 2026-07-11 (110 bugs fixed, corpus grown to 209
+> programs, 879 tests), then — at the owner's explicit request — **resumed and run to
+> completion at round 40**. Across the full 40 rounds the campaign fixed **241 total
+> dishonest findings** (110 in rounds 1-14, 131 in rounds 15-40), grew the real-compiler-
+> verified corpus from 48 to **574 GnuCOBOL-oracle-verified programs** (563 `.cbl` clean
+> under real GnuCOBOL + 11 `.cbl.txt` whose correct behavior is a nonzero cobc exit), and
+> grew the engine's own automated test count to **~2,017 tests** (898 unit + 1,119
+> oracle), **0 failures**, with **45 honestly documented `t.todo()` entries**. The
+> campaign's own convergence bar (0-2 findings for two consecutive rounds) was met
+> exactly once, briefly, at rounds 36-37 — before rounds 38-40 deliberately broadened the
+> search and found bugs again at an *increasing* rate (6, 7, 8), including two previously
+> entirely-unimplemented statements (`REPLACE`, `PROGRAM-ID ... INITIAL`) discovered as
+> late as round 40. **This is not "adversarially exhausted."** Full details, method, and
+> an honest list of what still isn't verified: **`docs/ADVERSARIAL_ROUNDS_REPORT.md`**
+> (original 14-round report), **`docs/PROGRESS_STATUS.md`** (closing report for the full
+> campaign), **`docs/CAPABILITY_AUDIT_AND_ROADMAP.md`** (statement-level capability
+> audit), and `tests/oracle/README.md` (full 40-round finding ledger).
 >
 > **Every other dimension of this platform is unchanged.** No security work, no
 > authentication, no CI/CD, no containerization, no observability, no compliance work,
-> and no frontend/API test coverage happened in this window. This overall score moves
-> from **3.5 → 4.5**, not further, precisely because 7 of the 10 scorecard dimensions
-> below are identical to February. **A correct conversion engine is necessary but not
+> and no frontend/API test coverage happened in this window — running the campaign out
+> to round 40 changed nothing about that. This overall score stays at **4.5**, unmoved
+> even by the engine's further progress from round 14 to round 40, precisely because 7 of
+> the 10 scorecard dimensions below are identical to February and gate the platform
+> regardless of engine correctness. **A correct conversion engine is necessary but not
 > sufficient for a production platform** — security, infrastructure, CI/CD, and
 > observability remain the gating blockers to enterprise deployment, exactly as they
-> were five months ago. Anyone citing "the engine got dramatically better" as evidence
-> the *platform* is enterprise-ready is misreading this document.
+> were five months ago, and are now the *sole* gating blockers, since the engine is the
+> one dimension that materially improved. Anyone citing "the engine got dramatically
+> better" as evidence the *platform* is enterprise-ready is misreading this document.
 
 ---
 
@@ -49,30 +64,30 @@
 
 ## 1. Executive Summary
 
-The cobol-to-scala platform has a solid architectural vision. As of 2026-02-09, it had a functional-but-shallow COBOL parsing + Scala generation pipeline for simple programs; as of 2026-07-11, that one pipeline — the conversion engine — has been adversarially hardened across 14 rounds against a real GnuCOBOL compiler oracle (209 verified programs, 879/879 tests, 110 root-cause bugs fixed; see the banner above). The platform as a whole, however, is **still not ready for enterprise deployment**. Nothing changed in this window for security, authentication, infrastructure/DevOps, observability, or compliance — those remain exactly as gap-ridden as they were five months ago. The codebase still represents roughly **35-45% of the planned platform**: substantially further along on COBOL language coverage and Scala generation correctness than in February, but with the same critical gaps across security, testing (outside the engine), infrastructure, and compliance.
+The cobol-to-scala platform has a solid architectural vision. As of 2026-02-09, it had a functional-but-shallow COBOL parsing + Scala generation pipeline for simple programs; as of 2026-07-23, that one pipeline — the conversion engine — has been adversarially hardened across a full 40-round campaign against a real GnuCOBOL compiler oracle (574 verified programs, ~2,017 tests with 0 failures, 241 root-cause bugs fixed; see the banner above). The platform as a whole, however, is **still not ready for enterprise deployment**. Nothing changed in this window for security, authentication, infrastructure/DevOps, observability, or compliance — those remain exactly as gap-ridden as they were five months ago, and are now the sole gating blockers since the engine is the one dimension that materially improved. The codebase still represents roughly **35-45% of the planned platform**: substantially further along on COBOL language coverage and Scala generation correctness than in February, but with the same critical gaps across security, testing (outside the engine), infrastructure, and compliance.
 
 ### Scorecard
 
 | Dimension                     | Score | Notes                                      |
 |-------------------------------|-------|---------------------------------------------|
-| Security                      | 2/10  | No auth, no CSRF, debug code in production. Unchanged since 2026-02-09; still true as of 2026-07-11 — no security work occurred in this window. |
-| COBOL Language Coverage       | 7/10 (was 4/10) | Broad and now **oracle-verified**: 209 programs byte-diffed against real GnuCOBOL output across 14 adversarial rounds, covering full procedure logic, byte-level codecs (packed decimal/COMP-3, binary, zoned, EBCDIC), COPY/REPLACE nesting, DECLARATIVES, same-file multi-program CALL, and SECTIONs. Not 10/10: reference-modification codegen, REWRITE/DELETE/START, SORT USING/GIVING (whole-file form), external/dynamic CALL, OCCURS DEPENDING ON dynamic sizing, general GO TO webs, CICS behavioral conversion, SQL not wired into the main generator path remain open; oracle is GnuCOBOL, not IBM Enterprise COBOL; the finding-count plateaued at 3-5/round rather than converging (0-2/round), so this is not adversarially exhausted. See §4. |
-| Scala Generation Correctness  | 8/10 (was 4/10) | The campaign's core win: 110 silent-correctness bugs (wrong output, crashes, hangs — none of which produced a compile error) fixed at root cause; all 209 corpus programs are byte-equivalent to real-compiler output. Not 10/10 for the same reasons as above — GnuCOBOL-only oracle, not adversarially exhausted, and a documented list of Known Gaps (`tests/oracle/README.md`) remains open by design. See §5. |
-| Test Coverage                 | 4/10 (was 1/10) | The **engine package alone** now has 879/879 passing tests plus a live compiler-oracle harness (real `cobc`/`scala-cli`) — a large jump for that one package. Stays well below the platform average because the platform still has **zero** frontend tests, zero API/E2E tests, zero security tests (SAST/DAST/fuzz), and no CI automation anywhere — see §6. |
-| Infrastructure / DevOps       | 0/10  | No Docker, no CI/CD, no K8s. Unchanged since 2026-02-09; still true as of 2026-07-11. |
-| Observability                 | 1/10  | Console.log only, minimal health check. Unchanged since 2026-02-09; still true as of 2026-07-11. |
-| Frontend Quality              | 5/10  | Good UI foundation, missing auth & tests. Unchanged since 2026-02-09; still true as of 2026-07-11. |
-| Documentation                 | 6/10 (was 5/10) | Good architecture docs, missing ops guides (still true). Bumped one point for two new, unusually rigorous engineering documents produced by this campaign — `docs/ADVERSARIAL_ROUNDS_REPORT.md` and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md`, plus the 1,000+ line verification ledger `tests/oracle/README.md` — which document methodology, findings, and honest known-gaps with a rigor well above the rest of the doc set. Still missing: OpenAPI spec, deployment guide, runbooks, SECURITY.md, CHANGELOG. |
-| API Completeness              | 3/10  | ~30% of planned endpoints implemented. Unchanged since 2026-02-09; still true as of 2026-07-11. |
-| Compliance Readiness          | 0/10  | No SOC2, GDPR, audit trail, or encryption. Unchanged since 2026-02-09; still true as of 2026-07-11. |
+| Security                      | 2/10  | No auth, no CSRF, debug code in production. Unchanged since 2026-02-09; still true as of 2026-07-23 — no security work occurred in this window. |
+| COBOL Language Coverage       | 7/10 (was 4/10) | Broad and now **oracle-verified**: 574 programs byte-diffed against real GnuCOBOL output across the full 40-round adversarial campaign (14 rounds reported 2026-07-11, then resumed and run to completion by 2026-07-23), covering full procedure logic, byte-level codecs (packed decimal/COMP-3, binary, zoned, EBCDIC, IEEE-754 COMP-1/COMP-2), COPY/REPLACE nesting plus standalone `REPLACE`, DECLARATIVES, RECURSIVE programs, LINAGE, FILE STATUS lifecycle, real RELATIVE-organization file I/O (rewritten in round 29 after a serious silent-corruption finding), same-file multi-program CALL, and SECTIONs. Not 10/10: reference-modification codegen (the single largest remaining risk), `ORGANIZATION IS INDEXED`/VSAM (unimplemented and unverifiable in this sandbox), `CALL BY REFERENCE` of a GROUP+OCCURS into a non-recursive callee (silently passes empty data), SORT USING/GIVING (whole-file form), external/dynamic CALL, OCCURS DEPENDING ON dynamic sizing, general GO TO webs, CICS behavioral conversion, SQL not wired into the main generator path remain open; oracle is GnuCOBOL, not IBM Enterprise COBOL; the campaign's own convergence bar was met only once, briefly (rounds 36-37), before broadening the search found bugs again at an increasing rate through round 40 — so this is not adversarially exhausted. See §4. |
+| Scala Generation Correctness  | 8/10 (was 4/10) | The campaign's core win: 241 silent-correctness bugs (wrong output, crashes, hangs — none of which produced a compile error) fixed at root cause across the full 40-round campaign; all 574 corpus programs are byte-equivalent to real-compiler output (or correctly reject, for the 11 deliberately-invalid `.cbl.txt` probes). Not 10/10 for the same reasons as above — GnuCOBOL-only oracle, not adversarially exhausted (rounds 38-40 found bugs at an increasing rate right through the final round), and a documented list of Known Gaps (`tests/oracle/README.md`, `docs/CAPABILITY_AUDIT_AND_ROADMAP.md`) remains open by design — most notably reference modification and non-recursive GROUP+OCCURS CALL BY REFERENCE. See §5. |
+| Test Coverage                 | 4/10 (was 1/10) | The **engine package alone** now has ~2,017 tests (898 unit + 1,119 oracle), 0 failures, plus a live compiler-oracle harness (real `cobc`/`scala-cli`) — a large jump for that one package, up from 879 at the round-14 checkpoint. Stays well below the platform average because the platform still has **zero** frontend tests, zero API/E2E tests, zero security tests (SAST/DAST/fuzz), and no CI automation anywhere — see §6. |
+| Infrastructure / DevOps       | 0/10  | No Docker, no CI/CD, no K8s. Unchanged since 2026-02-09; still true as of 2026-07-23. |
+| Observability                 | 1/10  | Console.log only, minimal health check. Unchanged since 2026-02-09; still true as of 2026-07-23. |
+| Frontend Quality              | 5/10  | Good UI foundation, missing auth & tests. Unchanged since 2026-02-09; still true as of 2026-07-23. |
+| Documentation                 | 6/10 (was 5/10) | Good architecture docs, missing ops guides (still true). Bumped one point for the new, unusually rigorous engineering documents produced by this campaign — `docs/ADVERSARIAL_ROUNDS_REPORT.md` (rounds 1-14), `docs/PROGRESS_STATUS.md` (closing report for the full 40-round campaign), and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md`, plus the 2,000+ line verification ledger `tests/oracle/README.md` — which document methodology, findings, and honest known-gaps with a rigor well above the rest of the doc set. Still missing: OpenAPI spec, deployment guide, runbooks, SECURITY.md, CHANGELOG. |
+| API Completeness              | 3/10  | ~30% of planned endpoints implemented. Unchanged since 2026-02-09; still true as of 2026-07-23. |
+| Compliance Readiness          | 0/10  | No SOC2, GDPR, audit trail, or encryption. Unchanged since 2026-02-09; still true as of 2026-07-23. |
 
-**Why the overall score only moves 3.5 → 4.5, not further:** the overall score is a holistic judgment of production-readiness, not a raw average of the ten rows above — and production-readiness is gated by its weakest blocking dimensions, not lifted by its strongest one. Security (2), Infrastructure/DevOps (0), Observability (1), and Compliance (0) are unconditional blockers for any enterprise deployment regardless of how correct the conversion engine is, and all four are completely untouched since February. A three-point jump in Scala Generation Correctness and a three-point jump in COBOL Language Coverage are real and substantial engine-level achievements, but they address only 2 of the 10 dimensions that gate enterprise readiness in any complete sense. The one-point Test Coverage move and one-point Documentation move are both explicitly *engine-adjacent* side effects of the same campaign, not independent platform progress. Read this as: **the hardest, most differentiated technical problem (COBOL semantic correctness) is now substantially de-risked; the operationally mandatory but comparatively mundane work (auth, CI/CD, monitoring, compliance) has not been started.**
+**Why the overall score only moves 3.5 → 4.5, not further:** the overall score is a holistic judgment of production-readiness, not a raw average of the ten rows above — and production-readiness is gated by its weakest blocking dimensions, not lifted by its strongest one. Security (2), Infrastructure/DevOps (0), Observability (1), and Compliance (0) are unconditional blockers for any enterprise deployment regardless of how correct the conversion engine is, and all four are completely untouched since February. A three-point jump in Scala Generation Correctness and a three-point jump in COBOL Language Coverage are real and substantial engine-level achievements, but they address only 2 of the 10 dimensions that gate enterprise readiness in any complete sense. The one-point Test Coverage move and one-point Documentation move are both explicitly *engine-adjacent* side effects of the same campaign, not independent platform progress. Read this as: **the hardest, most differentiated technical problem (COBOL semantic correctness) is now substantially de-risked; the operationally mandatory but comparatively mundane work (auth, CI/CD, monitoring, compliance) has not been started.** Running the same campaign on from its round-14 checkpoint to its round-40 completion moved the engine sub-dimensions further (see §4/§5) but did not add any new dimension to this list or move the overall score past 4.5 — the four blocking dimensions above are exactly as untouched today as they were at round 14.
 
 ---
 
 ## 2. Security Gaps
 
-*Still true as of 2026-07-11 — no work occurred in this area between 2026-02-09 and this update. Everything below is exactly as it was in the original analysis.*
+*Still true as of 2026-07-23 — no work occurred in this area between 2026-02-09 and this update (the engine campaign that ran through 2026-07-23 was scoped entirely to the conversion engine). Everything below is exactly as it was in the original analysis.*
 
 ### 2.1 CRITICAL: Debug Telemetry Code Left in Production
 
@@ -145,7 +160,7 @@ The `getRuntime()` method reads files from a directory using `path.join(process.
 
 ## 3. Authentication & Authorization
 
-*Still true as of 2026-07-11 — no work occurred in this area between 2026-02-09 and this update. Everything below is exactly as it was in the original analysis.*
+*Still true as of 2026-07-23 — no work occurred in this area between 2026-02-09 and this update (the engine campaign that ran through 2026-07-23 was scoped entirely to the conversion engine). Everything below is exactly as it was in the original analysis.*
 
 ### 3.1 Zero Authentication
 
@@ -179,62 +194,65 @@ Any user on the network can:
 
 ## 4. COBOL Parser Coverage Gaps
 
-> **Update 2026-07-11:** the sections below are cross-checked against the live verification
+> **Update 2026-07-23:** the sections below are cross-checked against the live verification
 > ledger, `Thyraa-COBOL-main/backend/packages/cobol-to-scala/tests/oracle/README.md`, and
-> `docs/CAPABILITY_AUDIT_AND_ROADMAP.md`. Items are marked **FIXED** only where the ledger's
-> "Current inventory" / round tables / Known Gaps section confirm oracle-verified behavior;
-> everything else is left as originally assessed, or narrowed to the specific sub-case that
-> remains open. This reflects the engine only — no other part of the platform changed.
+> `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` — both fully updated for the completed 40-round
+> campaign (an initial 14 rounds reported 2026-07-11; resumed and run to completion by
+> 2026-07-23). Items are marked **FIXED** only where the ledger's "Current inventory" /
+> round tables / Known Gaps section confirm oracle-verified behavior; everything else is
+> left as originally assessed, or narrowed to the specific sub-case that remains open.
+> This reflects the engine only — no other part of the platform changed.
 
 ### 4.1 What Works (Good Coverage)
 
 - Basic data types: `PIC X`, `PIC 9`, `PIC S9`, `PIC A`
-- Computational types: COMP-1, COMP-2, COMP-3, COMP-4, COMP-5
+- Computational types: COMP-1, COMP-2, COMP-3, COMP-4, COMP-5 (real IEEE-754 codecs for COMP-1/COMP-2 built during rounds 15-40)
 - Fixed OCCURS clauses (arrays)
-- REDEFINES (**FIXED for most shapes as of 2026-07-11** — see §5.2; one narrow group-with-OCCURS-over-group-with-OCCURS shape remains a stub)
+- REDEFINES (**FIXED for most shapes** — see §5.2; one narrow group-with-OCCURS-over-group-with-OCCURS shape remains a stub)
 - Level 88 conditions (simple values, and now compound `WHEN SET TO FALSE` forms — **FIXED**, round 12 also closed an infinite-parser-loop crash on this construct)
-- Basic file I/O: OPEN, CLOSE, READ, WRITE (**FIXED and oracle-verified for LINE SEQUENTIAL as of round 5** — the prior state was worse than described here: the main entry point never even parsed the ENVIRONMENT DIVISION, so every file operation silently referenced undeclared variables). REWRITE, DELETE, START, and any non-LINE-SEQUENTIAL organization (INDEXED, RELATIVE/VSAM) remain unimplemented stubs — see §4.3.
+- Basic file I/O: OPEN, CLOSE, READ, WRITE (**FIXED and oracle-verified for LINE SEQUENTIAL as of round 5**; **RELATIVE organization got a full storage-model rewrite in round 29** after the original line-delimited model was found to silently corrupt binary data containing a newline byte — the single most serious finding of the whole campaign — and now has real RELATIVE KEY random access, REWRITE/DELETE/START, and LINAGE/FILE STATUS lifecycle support, all oracle-verified). `ORGANIZATION IS INDEXED` (VSAM-style keyed access) remains genuinely unimplemented, and — uniquely among the engine's gaps — cannot even be oracle-verified in this project's own sandbox, since the installed GnuCOBOL build has indexed-file support compiled out — see §4.3.
 - Arithmetic: ADD, SUBTRACT, MULTIPLY, DIVIDE, COMPUTE (**scale/rounding/truncation semantics FIXED** — see §4.2 and §5.3)
 - Control flow: IF/ELSE, EVALUATE/WHEN (incl. TRUE/FALSE/ANY/ranges/arithmetic-expression subjects — **FIXED**), PERFORM (simple/TIMES/UNTIL/VARYING, incl. nested VARYING...AFTER — **FIXED**, see §4.2)
-- CALL with USING/RETURNING, now including full same-file multi-`PROGRAM-ID` interop (**FIXED**, round 7) — a genuinely external or dynamic-name subprogram still emits a visible TODO marker rather than converting (documented gap, not a silent failure)
+- CALL with USING/RETURNING, now including full same-file multi-`PROGRAM-ID` interop (**FIXED**, round 7), plus real `PROGRAM-ID ... RECURSIVE` support built across rounds 20-40 (per-activation LINKAGE aliasing, correct BY REFERENCE/CONTENT/VALUE writeback including for GROUP-shaped and subscripted operands) — a genuinely external or dynamic-name subprogram still emits a visible TODO marker rather than converting (documented gap, not a silent failure)
 - Basic EXEC SQL (SELECT, INSERT, UPDATE, DELETE) — parsing and a standalone, compile-verified Doobie generator now exist (`generator/sql-gen.js`), but it is **still not wired into the main generator's output path** — see §4.3
 
-### 4.2 CRITICAL Missing Features (P0) — original assessment vs. 2026-07-11 status
+### 4.2 CRITICAL Missing Features (P0) — original assessment vs. 2026-07-23 status
 
-| Feature | 2026-02-09 status | 2026-07-11 status |
+| Feature | 2026-02-09 status | 2026-07-23 status |
 |---------|--------------|-----------------|
-| **COPY/REPLACE with nesting** | Basic single-level only; not applied | **FIXED.** `parser/copybook-resolver.js` handles nested, cycle-safe COPY/REPLACE (OF/IN, pseudo-text and word replacement), wired through `options.copybooks`; standalone copybook fragments (no DATA DIVISION header) also parse. Oracle-verified via corpus programs `u09`/`u10`. |
-| **OCCURS DEPENDING ON** | Parsed, `dependingOn` captured; ignored at codegen | **Still OPEN.** `dependingOn` is captured but `parse`/`format` are sized at a fixed maximum, not the live counter field — every occurrence now carries a visible `// TODO(ODO)` marker (an honest degradation, not a silent one, but the underlying capability is still missing) rather than silently guessing. Dynamic-length handling is not implemented. |
-| **Reference modification** | Parsed (`refMod` with start:length); not generated | **Parser bug FIXED (round 3); codegen still a documented gap.** The parser previously mis-parsed `identifier(start:length)` badly enough to corrupt the rest of the statement's token stream — that corruption is fixed. Actual read/write substring semantics still degrade to a visible, compiling `???` marker rather than real behavior (Known Gap #1 in the ledger) — this is honest-but-incomplete, an improvement over the prior silent drop but not a working feature. |
-| **CALL BY REFERENCE/CONTENT/VALUE** | Parsed (`mode` field in AST); all treated as by-reference | **Substantially FIXED for the common case.** Same-file multi-`PROGRAM-ID` CALL now correctly marshals arguments via a value-in/tuple-out model approximating BY REFERENCE mutation (round 7). `CALL` of a GROUP item containing an OCCURS table across the boundary still degrades to a visible TODO placeholder rather than true byte-level marshalling (Known Gap #14). External/dynamic-name CALL still emits a TODO marker rather than converting. |
-| **Decimal arithmetic scale tracking** | Partial; scale not passed to arithmetic ops | **FIXED.** `storeNumericExpr`/`storeNumericByInfo` (round 3) now apply COBOL's real store-time semantics on every arithmetic statement: `ROUNDED` present → HALF_UP to the target's declared decimal digits; absent → truncate toward zero — verified directly against `cobc` (e.g. `COMPUTE X = 2.345` into a 2-decimal target with no ROUNDED now stores `2.34`, matching real GnuCOBOL, not display-time-rounded `2.35`). `ON SIZE ERROR` overflow checking was also implemented (round 1). |
+| **COPY/REPLACE with nesting** | Basic single-level only; not applied | **FIXED.** `parser/copybook-resolver.js` handles nested, cycle-safe COPY/REPLACE (OF/IN, pseudo-text and word replacement), wired through `options.copybooks`; standalone copybook fragments (no DATA DIVISION header) also parse. Oracle-verified via corpus programs `u09`/`u10`. Standalone source-level `REPLACE` (outside COPY) was found entirely unimplemented as late as round 40 and has now been implemented for real by reusing the same machinery. |
+| **OCCURS DEPENDING ON** | Parsed, `dependingOn` captured; ignored at codegen | **Still OPEN**, unchanged through round 40. `dependingOn` is captured but `parse`/`format` are sized at a fixed maximum, not the live counter field — every occurrence now carries a visible `// TODO(ODO)` marker (an honest degradation, not a silent one, but the underlying capability is still missing) rather than silently guessing. Dynamic-length handling is not implemented. |
+| **Reference modification** | Parsed (`refMod` with start:length); not generated | **Parser bug FIXED (round 3); codegen still open and now the single largest remaining risk in the engine.** The parser previously mis-parsed `identifier(start:length)` badly enough to corrupt the rest of the statement's token stream — that corruption is fixed. Actual read/write substring semantics still degrade to a visible, compiling `???`/placeholder almost everywhere (a handful of narrow carve-outs exist: literal-length `FUNCTION LENGTH`, STRING's own segment source) — confirmed still open through the full 40-round campaign and flagged by the closing report as the top item to check before trusting a converted program's output, since ref-mod is extremely common in production COBOL. |
+| **CALL BY REFERENCE/CONTENT/VALUE** | Parsed (`mode` field in AST); all treated as by-reference | **Substantially FIXED for same-file and RECURSIVE targets; a specific non-recursive shape still silently wrong.** Same-file multi-`PROGRAM-ID` CALL correctly marshals arguments via a value-in/tuple-out model approximating BY REFERENCE mutation (round 7), and a `PROGRAM-ID ... RECURSIVE` callee gets real per-leaf aliasing for GROUP+OCCURS operands (rounds 22, 39). **`CALL BY REFERENCE`/`CONTENT` of a GROUP containing an OCCURS table into an ordinary (non-recursive) subprogram remains open**: it compiles and runs with no crash, but the callee silently sees a default/empty table instead of the caller's real data (only a source-comment marker, not a runtime signal) — flagged by the round-40 completeness audit as a good next target, since it could reuse the same `flattenGroupLeaves` machinery. External/dynamic-name CALL still emits a TODO marker rather than converting. |
+| **Decimal arithmetic scale tracking** | Partial; scale not passed to arithmetic ops | **FIXED.** `storeNumericExpr`/`storeNumericByInfo` (round 3) now apply COBOL's real store-time semantics on every arithmetic statement: `ROUNDED` present → HALF_UP to the target's declared decimal digits; absent → truncate toward zero — verified directly against `cobc` (e.g. `COMPUTE X = 2.345` into a 2-decimal target with no ROUNDED now stores `2.34`, matching real GnuCOBOL, not display-time-rounded `2.35`). `ON SIZE ERROR` overflow checking was also implemented (round 1), later extended (round 38) so multi-target COMPUTE/arithmetic with `ON SIZE ERROR` uses COBOL's correct per-target-independent store rule rather than an all-or-nothing one. |
 | **SEARCH / SEARCH ALL** | Keyword recognized only; no parser or generator | **FIXED.** Real binary search for SEARCH ALL, including `VARYING other-index` and composite/multi-key tie-breaking, oracle-verified. |
-| **SORT / MERGE** | Keyword recognized only; no parser or generator | **FIXED for the procedural form** (multi-key, mixed ASCENDING/DESCENDING, INPUT/OUTPUT PROCEDURE, THRU ranges) — oracle-verified. **Still OPEN:** the whole-file `SORT ... USING <file> GIVING <file>` form (no INPUT/OUTPUT PROCEDURE) emits a visible TODO marker rather than converting (Known Gap #5). |
+| **SORT / MERGE** | Keyword recognized only; no parser or generator | **FIXED for the procedural form** (multi-key, mixed ASCENDING/DESCENDING, INPUT/OUTPUT PROCEDURE, THRU ranges) — oracle-verified; MERGE's own `... USING file1 file2 ... OUTPUT PROCEDURE` form is also implemented (round 18). **Still OPEN:** the whole-file `SORT ... USING <file> GIVING <file>` form (no INPUT/OUTPUT PROCEDURE) — and MERGE's equivalent `GIVING` form — emit a visible TODO marker rather than converting (round 40's completeness audit flagged this as newly tractable, since MERGE's own implementation built much of the needed machinery). |
 
-### 4.3 HIGH Missing Features (P1) — original assessment vs. 2026-07-11 status
+### 4.3 HIGH Missing Features (P1) — original assessment vs. 2026-07-23 status
 
-| Feature | 2026-02-09 status | 2026-07-11 status |
+| Feature | 2026-02-09 status | 2026-07-23 status |
 |---------|--------|--------|
-| **CICS commands** (SEND, RECEIVE, XCTL, LINK) | Parser recognizes syntax; no Scala generation | **Partially improved, still fundamentally OPEN.** A CICS/BMS classifier and an honest Scala service-*skeleton* generator now exist (`generator/cics-gen.js`) — request/response DTOs, repository traits, call stubs — but every method body that could be mistaken for real logic is deliberately `???`. This is **not a behavioral converter**; online transaction programs are still non-functional as generated code, just more honestly scaffolded than before. |
+| **CICS commands** (SEND, RECEIVE, XCTL, LINK) | Parser recognizes syntax; no Scala generation | **Partially improved, still fundamentally OPEN.** A CICS/BMS classifier and an honest Scala service-*skeleton* generator now exist (`generator/cics-gen.js`) — request/response DTOs, repository traits, call stubs — but every method body that could be mistaken for real logic is deliberately `???`. This is **not a behavioral converter**; online transaction programs are still non-functional as generated code, just more honestly scaffolded than before. Unchanged across rounds 15-40. |
 | **Dynamic SQL** (PREPARE/EXECUTE) | Not implemented | Still not implemented; unrelated to the standalone Doobie generator progress noted in §4.1. |
 | **Cursor operations** (OPEN/FETCH/CLOSE) | Parser stub; generator incomplete | Doobie generation now models cursors as materialized streams (compile-verified in isolation), but this is **not wired into the main generator path** — a program run through `convertToScala()` today gets none of this. |
 | **Complex PIC patterns** (Z, *, $, floating sign, SIGN LEADING SEPARATE) | Partially parsed; typed as String | **Largely FIXED for numeric-edited fields.** The lexer became PIC-aware (round-1-era fix, `PICTURE_STRING` token) and numeric-edited formatting (Z/9/./,/CR/DB, `DECIMAL-POINT IS COMMA`) is now applied both at DISPLAY time and at VALUE-clause declaration time via `CobolFmt.edited`/`formatEditedPicture`, oracle-verified (e.g. round-4 finding q02, round-7 finding u03b). Asterisk check-protection (`***9.99`) and scaling-position `P` combined with COMP-3 are not called out as independently spot-checked in the ledger — treat as unconfirmed rather than fixed; see §4.4. |
-| **VSAM / Indexed file access** | Organization parsed but treated as sequential | **Still OPEN, unchanged.** REWRITE, DELETE, START, and any non-LINE-SEQUENTIAL organization (INDEXED, RELATIVE) remain unimplemented comment-only stubs. |
-| **STRING/UNSTRING** | Parsed; generator produces comment stubs only | **FIXED.** Both statements, including STRING/UNSTRING `ON OVERFLOW`/`NOT ON OVERFLOW`, `WITH POINTER`, `DELIMITED BY ALL`, `DELIMITER IN`, and `COUNT IN`, are oracle-verified (rounds 4, 6). A prior unguarded copy loop that could crash with `StringIndexOutOfBoundsException` on overflow was also fixed (round 6). |
+| **VSAM / Indexed file access** | Organization parsed but treated as sequential | **Narrowed, one part FIXED.** `ORGANIZATION IS RELATIVE` got a full storage-model rewrite (round 29) plus real RELATIVE KEY access, REWRITE/DELETE/START (rounds 25-27), and FILE STATUS lifecycle (rounds 38-40) — all oracle-verified, no longer a stub. `ORGANIZATION IS INDEXED` (true VSAM-style keyed access) remains genuinely unimplemented, and — unlike every other gap in this document — cannot be oracle-verified at all in this sandbox, since the installed GnuCOBOL build has indexed-file support compiled out entirely (round 27). |
+| **STRING/UNSTRING** | Parsed; generator produces comment stubs only | **FIXED.** Both statements, including STRING/UNSTRING `ON OVERFLOW`/`NOT ON OVERFLOW`, `WITH POINTER`, `DELIMITED BY ALL`, `DELIMITER IN`, and `COUNT IN`, are oracle-verified (rounds 4, 6). A prior unguarded copy loop that could crash with `StringIndexOutOfBoundsException` on overflow was also fixed (round 6); STRING's pointer value after an ON OVERFLOW truncation was also found and fixed (round 33). |
 | **INSPECT REPLACING/TALLYING/CONVERTING** | Parsed; no Scala generation | **FIXED**, including `BEFORE INITIAL`/`AFTER INITIAL` region restriction (round 4) and correct multi-clause REPLACING snapshot semantics (round 14). |
 | **SQL WHENEVER** (NOT FOUND / SQLERROR) | Recognized; not generated | Now generated in the standalone Doobie path (`generator/sql-gen.js`), but — same caveat as Dynamic SQL/Cursors above — **not wired into the main generator**, so this doesn't yet reach a real conversion. |
 | **EVALUATE WHEN ALSO / WHEN THRU** | Partial parsing | **WHEN THRU (ranges) FIXED** and oracle-verified as part of the broader EVALUATE rewrite (round 2). Multi-subject `WHEN ... ALSO ...` is not explicitly confirmed in the ledger — treat as still unconfirmed/partial rather than fixed. |
 | **PERFORM VARYING AFTER** (nested loops) | Only first AFTER captured | **FIXED.** Nested AFTER levels are now reset to FROM correctly at every level per cobc's actual documented algorithm, oracle-verified (round 4, finding q07). |
+| **`PROGRAM-ID ... INITIAL`** | Not assessed in original analysis (not a known concept at the time) | **FIXED in round 40**, the campaign's final round: WORKING-STORAGE previously silently persisted across calls instead of resetting to VALUE-clause defaults every activation, the opposite of what INITIAL means — found entirely unimplemented as late as round 40 and implemented for real, mirroring the existing RECURSIVE-program detection pattern. |
 
 ### 4.4 PIC Clause Edge Cases
 
-| Pattern | 2026-02-09 issue | 2026-07-11 status |
+| Pattern | 2026-02-09 issue | 2026-07-23 status |
 |---------|-------|-------|
 | `PIC S9(7)V99 COMP-3` | Byte size calculation wrong (uses digit count, not COMP-3 encoding) | **FIXED.** Byte-accurate layout (`generator/layout.js`) is hand-verified for COMP-3 (e.g. `S9(13)V99 COMP-3` → 8 bytes) and oracle-verified across the corpus. |
 | `PIC Z(9)9.99` | Recognized as edited but treated as plain String | **FIXED** — see §4.3; numeric-edited formatting is applied via `CobolFmt.edited`. |
-| `PIC ***9.99` | Asterisk confuses lexer (treated as operator) | **Unconfirmed.** The lexer was rewritten to be PIC-aware, which plausibly fixes this class of bug, but the ledger does not call out this exact asterisk check-protection pattern as independently verified. Left as an open/unconfirmed item rather than claiming a fix without evidence. |
-| `PIC S9(5)P(3)` | Scaling position not applied to COMP-3 | **Unconfirmed / likely still open** — not mentioned as fixed anywhere in the verification ledger or roadmap doc. |
-| `PIC X(10)B(2)X(5)` | Parser stops at first pattern | **Unconfirmed / likely still open** — not mentioned as fixed anywhere in the verification ledger or roadmap doc. |
+| `PIC ***9.99` | Asterisk confuses lexer (treated as operator) | **Unconfirmed.** The lexer was rewritten to be PIC-aware, which plausibly fixes this class of bug, but neither the 14-round nor the full 40-round ledger calls out this exact asterisk check-protection pattern as independently verified. Left as an open/unconfirmed item rather than claiming a fix without evidence. |
+| `PIC S9(5)P(3)` | Scaling position not applied to COMP-3 | **Largely FIXED (round 38).** The general `P`-scaling-position bug was found and fixed: trailing-P (`PIC S9(3)PPP`) and leading-P (`PIC SPPP9(3)`) forms previously computed the same, wrong scaled value; real scaling-position arithmetic is now applied. The ledger's round-38 fix addresses `P`-scaling generally rather than the COMP-3-specific combination called out in the original row, so treat the exact COMP-3 pairing as very likely fixed rather than independently spot-checked. |
+| `PIC X(10)B(2)X(5)` | Parser stops at first pattern | **Unconfirmed / likely still open** — not mentioned as fixed anywhere in the verification ledger (rounds 1-40) or roadmap doc. |
 
 ### 4.5 Parser Error Recovery: Still Largely None
 
@@ -244,62 +262,71 @@ Any user on the network can:
 - Unmatched END statements (END-IF, END-PERFORM) not detected
 - Malformed PIC clauses cause cascade failures
 - No diagnostic messages for IDE integration
-- **One narrow reliability fix did land in this window:** round 12 found and fixed a genuine infinite-loop hang in the 88-level VALUE-clause parser (`WHEN SET TO FALSE IS <literal>`), and audited the whole parser for the same "loop doesn't require forward progress" anti-pattern (no other instance found). This is a crash/hang fix, not general error recovery — the bullet points above remain accurate.
+- **A small number of narrow reliability fixes landed across the campaign, but general error recovery was never in scope:** round 12 found and fixed a genuine infinite-loop hang in the 88-level VALUE-clause parser (`WHEN SET TO FALSE IS <literal>`), and audited the whole parser for the same "loop doesn't require forward progress" anti-pattern at the time (no other instance found then); a second, unrelated instance of the same anti-pattern (a bare numeric-literal CALL argument) was independently found and fixed in round 40. These are crash/hang fixes, not general error recovery — the bullet points above remain accurate through round 40.
 
 ---
 
 ## 5. Scala Generator Correctness Gaps
 
-> **Update 2026-07-11:** cross-checked against `tests/oracle/README.md` (the verification
-> ledger) and `docs/ADVERSARIAL_ROUNDS_REPORT.md`. This section's original claims were, in
-> several cases, actually an *understatement* of how broken the generator was in February —
-> e.g. file I/O (§5.5) turned out to be completely non-functional end-to-end, not merely
-> "inconsistently wired." The current state reflects 14 rounds of adversarial fixing; it does
-> not reflect any change to the platform outside this one engine package.
+> **Update 2026-07-23:** cross-checked against `tests/oracle/README.md` (the verification
+> ledger, now covering all 40 rounds), `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (truth-passed
+> for round 40), and `docs/ADVERSARIAL_ROUNDS_REPORT.md` (original 14-round report). This
+> section's original claims were, in several cases, actually an *understatement* of how
+> broken the generator was in February — e.g. file I/O (§5.5) turned out to be completely
+> non-functional end-to-end, not merely "inconsistently wired." The current state reflects
+> the full, completed 40-round campaign (14 rounds reported 2026-07-11; resumed and run to
+> round 40 by 2026-07-23); it does not reflect any change to the platform outside this one
+> engine package.
 
 ### 5.1 Reserved Keyword Collisions — Still OPEN, unchanged
 
-If COBOL has fields named `type`, `class`, `def`, `val`, `var`, `object`, `trait` — the generator produces invalid Scala that won't compile. No escaping with backticks (`` `type` ``) is performed. Nothing in the 14-round campaign's findings tables addresses this; it is not called out as fixed anywhere in the ledger and should be treated as still open.
+If COBOL has fields named `type`, `class`, `def`, `val`, `var`, `object`, `trait` — the generator produces invalid Scala that won't compile. No escaping with backticks (`` `type` ``) is performed. Nothing in the full 40-round campaign's findings tables addresses this; it is not called out as fixed anywhere in the ledger and should be treated as still open.
 
 ### 5.2 REDEFINES — Mostly FIXED, one narrow shape still stubbed
 
 **2026-02-09 state:** REDEFINES produced a case class with both fields always present (incorrect — REDEFINES means mutually exclusive interpretations of the same memory, not separate fields), and REDEFINES over an OCCURS table didn't even compile.
 
-**2026-07-11 state:** REDEFINES is implemented as lazy accessor views over the same underlying storage (not a `sealed trait`/ADT as originally suggested as the ideal shape, but functionally correct: reading through either name reflects the same bytes) and is oracle-verified for the common cases, including:
+**2026-07-23 state:** REDEFINES is implemented as lazy accessor views over the same underlying storage (not a `sealed trait`/ADT as originally suggested as the ideal shape, but functionally correct: reading through either name reflects the same bytes) and is oracle-verified for the common cases, including:
 - REDEFINES over an OCCURS table (round 1 compile failure — **FIXED**)
 - GROUP-over-GROUP REDEFINES with differing shapes, including one side containing an OCCURS (round 3, finding n06 — **FIXED**, via a synthesized flat-accessor pair)
+- An OCCURS table REDEFINED by a differently-shaped OCCURS table (round 32 — **FIXED**), and a numeric-over-group REDEFINES that previously crashed a later MOVE at compile time due to a missing field-registry entry (round 38 — **FIXED**)
 
-**Still a documented stub (Known Gap #15):** REDEFINES of a group-with-OCCURS by *another* group-with-OCCURS compiles and runs real SEARCH ALL code against the redefining table, but each elementary child is an honest `???` that throws `NotImplementedError` if actually read at runtime — a narrow, disclosed gap, not a silent one.
+**Still a documented stub (Known Gap):** REDEFINES of a group-with-OCCURS by *another* group-with-OCCURS compiles and runs real SEARCH ALL code against the redefining table, but each elementary child is an honest `???` that throws `NotImplementedError` if actually read at runtime — a narrow, disclosed gap, not a silent one, confirmed still open through round 40 (though round 40's completeness audit flags it as now more tractable, since later rounds built real byte-accurate REDEFINES flatteners that could plausibly be reused).
 
 ### 5.3 Arithmetic Precision Loss — Largely FIXED
 
 **2026-02-09 state:** bare `a + b`, no scale threading, ROUNDED parsed-but-ignored, ON SIZE ERROR recognized-but-not-generated, overflow undetected.
 
-**2026-07-11 state:**
+**2026-07-23 state:**
 - Scale/decimal-digit tracking through arithmetic store operations: **FIXED** (round 3's `storeNumericExpr`/`storeNumericByInfo`) — ROUNDED present routes through HALF_UP rounding to the target's declared decimal digits; absent, it truncates toward zero (matching real `cobc`, verified directly — e.g. `COMPUTE X = 2.345` into a 2-decimal target stores `2.34` without ROUNDED, not a display-time-rounded `2.35`). Applies uniformly to COMPUTE/ADD/SUBTRACT/MULTIPLY/DIVIDE, including multi-target GIVING and CORRESPONDING forms.
-- `ON SIZE ERROR`: **FIXED** (round 1 cluster).
+- `ON SIZE ERROR`: **FIXED** (round 1 cluster), and later corrected (round 38) so multi-target COMPUTE/arithmetic with `ON SIZE ERROR` applies COBOL's real per-target-independent store rule rather than an all-or-nothing one.
 - **Still unconfirmed/open:** integer overflow detection specifically for COMP fields with >9 digits is not separately called out as fixed in the ledger — treat as still open rather than assume it's covered by the ROUNDED/truncation fix above.
 - `DIVIDE ... GIVING ... REMAINDER` was found (round 9) to use BigDecimal's floor-division remainder instead of COBOL's own decimal-truncated-quotient remainder — **FIXED** as part of the same round.
+- Real IEEE-754 COMP-1/COMP-2 codecs were built during rounds 15-40 (previously not separately called out in this section).
 
 ### 5.4 Case Class Nesting Issues — Largely unchanged, still OPEN
 
-- Deep COBOL group hierarchies still produce deeply nested case classes; no flattening option was added in this window.
-- **Default field values:** COBOL's real per-category INITIALIZE default rules (ALPHABETIC/ALPHANUMERIC → SPACES, NUMERIC/NUMERIC-EDITED → ZERO) were implemented for the `INITIALIZE` *statement* specifically (round 5, previously 100%-non-functional — it emitted `.copy()` on a plain `var`, a guaranteed compile error). Whether a field's own *declaration-time* default (with no explicit VALUE clause and no INITIALIZE call) still incorrectly defaults `PIC X` to empty string rather than spaces, as originally reported, is **not directly confirmed either way** in the ledger — treat this specific sub-claim as unresolved rather than fixed.
+- Deep COBOL group hierarchies still produce deeply nested case classes; no flattening option was added across the whole campaign.
+- **Default field values:** COBOL's real per-category INITIALIZE default rules (ALPHABETIC/ALPHANUMERIC → SPACES, NUMERIC/NUMERIC-EDITED → ZERO) were implemented for the `INITIALIZE` *statement* specifically (round 5, previously 100%-non-functional — it emitted `.copy()` on a plain `var`, a guaranteed compile error), later extended to `INITIALIZE ... REPLACING` into a REDEFINES-nested field. Whether a field's own *declaration-time* default (with no explicit VALUE clause and no INITIALIZE call) still incorrectly defaults `PIC X` to empty string rather than spaces, as originally reported, is **not directly confirmed either way** in the ledger even after 40 rounds — treat this specific sub-claim as unresolved rather than fixed.
 
 ### 5.5 Runtime Library — FIXED; far more heavily exercised than described
 
 **2026-02-09 state:** runtime files existed but weren't consistently wired in; `FileIO.scala` was never instantiated; file definitions weren't mapped to file objects.
 
-**2026-07-11 state:** this was actually **worse than the original description** before round 5 — the engine's own `convertToScala()` entry point never even invoked `parseEnvironmentDivision()`, so FILE-CONTROL/SELECT information never reached the generator *regardless* of what the DATA/PROCEDURE DIVISIONs declared, meaning every file OPEN/READ/WRITE the engine had ever claimed to support was silently broken. This is now **FIXED and oracle-verified** for LINE SEQUENTIAL files: file handles are declared once as object-scope `var`s (no more duplicate-declaration compile errors across successive OPENs), WRITE/READ resolve the correct FD-derived file name via new record↔file registries, and on-disk behavior (trailing-space stripping, fixed-width padding, `WRITE ... ADVANCING`'s actual deferred-terminator model) was reverse-engineered from real `cobc` output rather than guessed at. The runtime library (`CobolFmt`, `CobolInspect`, `CobolUnstring`, byte-level codecs for packed/binary/zoned/EBCDIC) is now exercised end-to-end by all 209 oracle-verified corpus programs. **Still OPEN:** REWRITE, DELETE, START, and non-LINE-SEQUENTIAL (INDEXED/RELATIVE/VSAM) file organizations remain unimplemented stubs.
+**2026-07-23 state:** this was actually **worse than the original description** before round 5 — the engine's own `convertToScala()` entry point never even invoked `parseEnvironmentDivision()`, so FILE-CONTROL/SELECT information never reached the generator *regardless* of what the DATA/PROCEDURE DIVISIONs declared, meaning every file OPEN/READ/WRITE the engine had ever claimed to support was silently broken. This is now **FIXED and oracle-verified** for LINE SEQUENTIAL files: file handles are declared once as object-scope `var`s (no more duplicate-declaration compile errors across successive OPENs), WRITE/READ resolve the correct FD-derived file name via new record↔file registries, and on-disk behavior (trailing-space stripping, fixed-width padding, `WRITE ... ADVANCING`'s actual deferred-terminator model) was reverse-engineered from real `cobc` output rather than guessed at.
+
+`ORGANIZATION IS RELATIVE` file I/O then underwent a **full architectural rewrite in round 29** — the single most serious finding of the whole 40-round campaign: the original line-delimited-text storage model silently corrupted any binary field whose bytes happened to contain a `0x0A` (newline) byte, so it was replaced with a real fixed-width raw-byte-chunk model that all later file-I/O work builds on. Real RELATIVE KEY random access, START (round 26), REWRITE/DELETE (rounds 25, 27), OPEN I-O read-iterator initialization (round 25), and LINAGE (`WITH FOOTING AT`, `AT END-OF-PAGE` — rounds 32-34) are all real, oracle-verified implementations. **FILE STATUS lifecycle tracking** was added incrementally across rounds 38-40: OPEN/CLOSE/READ then WRITE/REWRITE/DELETE/START all now correctly report status codes for closed-file and wrong-access-mode conditions instead of crashing or silently misreporting, with the registered DECLARATIVES error handler correctly invoked on these paths (round 40).
+
+The runtime library (`CobolFmt`, `CobolInspect`, `CobolUnstring`, byte-level codecs for packed/binary/zoned/EBCDIC, and real IEEE-754 COMP-1/COMP-2 codecs) is now exercised end-to-end by all 574 oracle-verified corpus programs. **Still OPEN:** `ORGANIZATION IS INDEXED` (true VSAM-style keyed access) remains genuinely unimplemented, and — unlike every other gap in this document — cannot be oracle-verified at all in this project's own sandbox, since the installed GnuCOBOL build has indexed-file support compiled out entirely (round 27).
 
 ---
 
 ## 6. Testing Infrastructure Gaps
 
-> **Update 2026-07-11:** the `cobol-to-scala` engine package's own test suite grew
-> substantially in this window (see §6.1a/§6.2a below). Every other row in this section —
-> frontend, backend API, integration/E2E, performance, security, fuzzing, CI/CD — is
-> unchanged from February: still zero.
+> **Update 2026-07-23:** the `cobol-to-scala` engine package's own test suite grew
+> substantially across the full 40-round campaign (see §6.1a/§6.2a below). Every other row
+> in this section — frontend, backend API, integration/E2E, performance, security, fuzzing,
+> CI/CD — is unchanged from February: still zero.
 
 ### 6.1 Coverage Summary (2026-02-09 baseline — see 6.1a for what changed)
 
@@ -311,28 +338,36 @@ If COBOL has fields named `type`, `class`, `def`, `val`, `var`, `object`, `trait
 | Backend API | ~30 endpoints | 0 | 0% |
 | **Total** | **~13,000+** | **~340** | **~2.6%** |
 
-### 6.1a What changed by 2026-07-11: the engine package only
+### 6.1a What changed by 2026-07-23: the engine package only
 
-The `cobol-to-scala` package (the JS Parser/Generator row above) now has **879/879
-automated tests passing, 0 failing, 0 skipped, 0 todo** (`npm test` inside
+The `cobol-to-scala` package (the JS Parser/Generator row above) now has **~2,017
+automated tests (898 unit + 1,119 oracle), 0 failing** (`npm test` inside
 `Thyraa-COBOL-main/backend/packages/cobol-to-scala/`), up from ~379 at the start of this
-campaign — including parser unit tests, codec property/parity tests, generator tests, JCL/
-DCLGEN/SQL/CICS/BMS corpus tests, a dedicated state-isolation regression suite
-(`tests/state-isolation.test.js`, added round 13), and focused regression tests for each of
-the 110 adversarial-round findings. Critically, this package also now has a **live
-compiler-oracle harness** (`tests/oracle/`) that compiles and runs every corpus program with
-real GnuCOBOL (`cobc -x`) and diffs the generated Scala's compiled-and-run output against it
-byte-for-byte — 209 corpus programs currently pass this way (19 under `tests/corpus/data/`,
-190 under `tests/corpus/proc/`), re-verified from a live `cobc`/`scala-cli` run on every
-`npm test` invocation, not a frozen fixture.
+campaign (and 879 at the round-14 checkpoint reported 2026-07-11) — including parser unit
+tests, codec property/parity tests, generator tests, JCL/DCLGEN/SQL/CICS/BMS corpus tests, a
+dedicated state-isolation regression suite (`tests/state-isolation.test.js`, added round 13),
+and focused regression tests for each of the 241 total adversarial-round findings (110 in
+rounds 1-14, 131 in rounds 15-40) fixed across the whole campaign, plus **45 honestly
+documented `t.todo()` entries**, each individually traced to a specific, still-open gap, never
+a silent pass. Critically, this package also now has a **live compiler-oracle harness**
+(`tests/oracle/`) that compiles and runs every corpus program with real GnuCOBOL (`cobc -x`)
+and diffs the generated Scala's compiled-and-run output against it byte-for-byte — **574
+corpus programs** currently pass this way (563 `.cbl` clean under real GnuCOBOL + 11
+`.cbl.txt` whose correct behavior is a nonzero cobc exit/compile rejection), up from 209 at
+the round-14 checkpoint, re-verified from a live `cobc`/`scala-cli` run on every `npm test`
+invocation, not a frozen fixture. The campaign's own 0-2-findings-for-two-consecutive-rounds
+convergence bar was met exactly once, briefly, at rounds 36-37, before rounds 38-40
+deliberately broadened the search and found bugs again at an increasing rate (6, 7, 8) —
+so this is not adversarially exhausted, even after 40 rounds.
 
 **This is a genuinely large, verified jump in test rigor for one package — but it does not
 change any other row in §6.1's table.** React Frontend, Backend API, and every
 integration/E2E/performance/security category below remain at their February baseline of
-zero. Do not read "the engine has 879 tests" as "the platform has meaningful test coverage" —
-scorecard Test Coverage moved from 1/10 to 4/10 specifically because it's a large local win
-inside a small fraction of the overall codebase, not a platform-wide one (see §1 scorecard
-notes).
+zero. Do not read "the engine has ~2,017 tests" as "the platform has meaningful test
+coverage" — scorecard Test Coverage moved from 1/10 to 4/10 specifically because it's a large
+local win inside a small fraction of the overall codebase, not a platform-wide one (see §1
+scorecard notes), and running the campaign further from round 14 to round 40 did not move
+that scorecard number any further, for the same reason.
 
 ### 6.2 Formal Test Framework (JavaScript) — FIXED for the engine package, unchanged elsewhere
 
@@ -344,12 +379,12 @@ originally: no formal test framework, no assertion library, no test configuratio
 
 ### 6.3 Missing Test Categories
 
-| Test Type | 2026-02-09 status | 2026-07-11 status |
+| Test Type | 2026-02-09 status | 2026-07-23 status |
 |-----------|--------|--------|
 | Unit tests (parser, engine package) | 2 files, minimal | **FIXED for this package** — extensive `node:test` unit coverage across lexer/parser/AST modules |
-| Unit tests (generator, engine package) | 1 file, minimal | **FIXED for this package** — extensive `node:test` unit coverage, plus per-round regression test files (`tests/round3-fixes.test.js` etc.) for every fixed finding |
+| Unit tests (generator, engine package) | 1 file, minimal | **FIXED for this package** — extensive `node:test` unit coverage, plus per-round regression test files (`tests/round3-fixes.test.js` etc.) for every fixed finding across all 40 rounds |
 | Unit tests (frontend) | None | **Still None.** Zero test files for 90+ React source files, unchanged. |
-| Integration tests (engine, COBOL→Scala) | None | **FIXED for this package** — `oracleCompare()` is exactly this: real cobc-compiled-and-run output diffed against the generated-and-compiled Scala's own output, for 209 programs |
+| Integration tests (engine, COBOL→Scala) | None | **FIXED for this package** — `oracleCompare()` is exactly this: real cobc-compiled-and-run output diffed against the generated-and-compiled Scala's own output, for 574 programs |
 | E2E tests (COBOL → Scala, compiler-oracle-verified) | None | **FIXED for this package specifically** — see above. This is the single most significant testing improvement in the whole document: an actual real-compiler oracle, not a hand-written `.expected.txt`. |
 | API integration tests | None | **Still None.** No change to the backend API test posture. |
 | Performance/load tests | None | **Still None.** |
@@ -359,15 +394,15 @@ originally: no formal test framework, no assertion library, no test configuratio
 ### 6.4 No CI/CD Test Automation — Still true, unchanged
 
 No test runs in any pipeline because no pipeline exists (see Section 7 — unchanged since
-2026-02-09). The engine package's 879 tests and oracle harness are run manually
+2026-02-09). The engine package's ~2,017 tests and oracle harness are run manually
 (`npm test`) and are not gated on any commit or PR automatically; nothing about this
-campaign added CI/CD wiring anywhere in the repo.
+campaign, even run to its full 40-round completion, added CI/CD wiring anywhere in the repo.
 
 ---
 
 ## 7. Infrastructure & DevOps Gaps
 
-*Still true as of 2026-07-11 — no work occurred in this area between 2026-02-09 and this update. Everything below is exactly as it was in the original analysis.*
+*Still true as of 2026-07-23 — no work occurred in this area between 2026-02-09 and this update (the engine campaign that ran through 2026-07-23 was scoped entirely to the conversion engine). Everything below is exactly as it was in the original analysis.*
 
 ### 7.1 Containerization: Not Implemented
 
@@ -430,7 +465,7 @@ The architecture plans PostgreSQL for projects, results, and audit. **None of th
 
 ## 8. Observability & Monitoring Gaps
 
-*Still true as of 2026-07-11 — no work occurred in this area between 2026-02-09 and this update. Everything below is exactly as it was in the original analysis.*
+*Still true as of 2026-07-23 — no work occurred in this area between 2026-02-09 and this update (the engine campaign that ran through 2026-07-23 was scoped entirely to the conversion engine). Everything below is exactly as it was in the original analysis.*
 
 ### 8.1 Logging
 
@@ -470,7 +505,7 @@ Not implemented. No Grafana, no PagerDuty, no alerting rules.
 
 ## 9. Frontend Gaps
 
-*Still true as of 2026-07-11 — no frontend work occurred between 2026-02-09 and this update.*
+*Still true as of 2026-07-23 — no frontend work occurred between 2026-02-09 and this update.*
 
 ### 9.1 Strengths
 
@@ -512,7 +547,7 @@ Not implemented. No Grafana, no PagerDuty, no alerting rules.
 
 ## 10. Documentation Gaps
 
-*Operational/ops-guide gaps below are still true as of 2026-07-11 — unchanged since 2026-02-09. What did change: three new, unusually rigorous engineering documents were added by the 2026-07-11 engine-hardening campaign (see 10.1), which is why the Documentation score moved 5 → 6.*
+*Operational/ops-guide gaps below are still true as of 2026-07-23 — unchanged since 2026-02-09. What did change: several new, unusually rigorous engineering documents were added by the engine-hardening campaign (see 10.1), which is why the Documentation score moved 5 → 6; running the campaign on from round 14 to its round-40 completion added more such documents but did not move the score any further.*
 
 ### 10.1 What Exists (Good)
 
@@ -524,9 +559,10 @@ Not implemented. No Grafana, no PagerDuty, no alerting rules.
 | `docs/CODEBASE_ANALYSIS.md` | Comparison of approaches |
 | `cobol-reference/` (8 documents) | Excellent COBOL language reference |
 | `examples/basic-conversion/` | Sample input/output |
-| `docs/ADVERSARIAL_ROUNDS_REPORT.md` (new, 2026-07-11) | Rigorous 14-round verification campaign report — methodology, per-round findings, impact analysis, honest convergence assessment |
-| `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (new/updated, 2026-07-11) | Statement-by-statement capability audit with an explicit "what verified does not mean" section and Known Gaps list |
-| `Thyraa-COBOL-main/backend/packages/cobol-to-scala/tests/oracle/README.md` (new, 2026-07-11) | 1,000+ line verification ledger — every finding/fix/program mapping, regenerated-on-every-run fixture guarantees |
+| `docs/ADVERSARIAL_ROUNDS_REPORT.md` (new, 2026-07-11) | Rigorous 14-round verification campaign report (phase 1 only) — methodology, per-round findings, impact analysis, honest convergence assessment |
+| `docs/PROGRESS_STATUS.md` (new, 2026-07-23) | Closing report for the full 40-round campaign — headline numbers, what got built in rounds 15-40, process lessons, and an honest "not safe to assume works" list |
+| `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` (new 2026-07-11, truth-passed 2026-07-23) | Statement-by-statement capability audit with an explicit "what verified does not mean" section and Known Gaps list, now current through round 40 |
+| `Thyraa-COBOL-main/backend/packages/cobol-to-scala/tests/oracle/README.md` (new 2026-07-11, grown through round 40) | 2,300+ line verification ledger — every finding/fix/program mapping across all 40 rounds, regenerated-on-every-run fixture guarantees |
 
 ### 10.2 What's Missing
 
@@ -575,7 +611,7 @@ The architecture document (`docs/UNIFIED_PLATFORM_ARCHITECTURE.md`) describes a 
 | API Gateway | Auth, rate limit, validation | Express with no middleware |
 | Orchestration (Job Queue) | Bull + workflow engine | Bull only |
 | Processing (Analysis Engine) | Full analysis | Partial |
-| Processing (Conversion Engine) | Full COBOL support | Broad and oracle-verified as of 2026-07-11 (209 GnuCOBOL-verified programs; see §4/§5) — still short of "full": ref-mod codegen, VSAM, SORT USING/GIVING, external CALL, CICS behavior, and SQL wire-in remain open |
+| Processing (Conversion Engine) | Full COBOL support | Broad and oracle-verified as of 2026-07-23, after the full 40-round campaign (574 GnuCOBOL-verified programs; see §4/§5) — still short of "full": reference-modification codegen (the single largest remaining risk), `ORGANIZATION IS INDEXED`/VSAM, SORT/MERGE USING/GIVING, external CALL, `CALL BY REFERENCE` of GROUP+OCCURS into a non-recursive callee, CICS behavior, and SQL wire-in remain open |
 | Processing (Validation Engine) | Dual-run comparison | Not started as a *product feature* — note the engine's own internal test harness (`tests/oracle/`) now does exactly this (real-cobc vs. generated-Scala dual-run comparison) for development/verification purposes, but this capability is not exposed to end users through any API or UI |
 | AI Layer (Claude integration) | Explain, document, extract | Not started |
 | Data Layer (PostgreSQL) | Full persistence | Not implemented |
@@ -614,30 +650,31 @@ The architecture document (`docs/UNIFIED_PLATFORM_ARCHITECTURE.md`) describes a 
 
 ### Phase 2: Testing Foundation (Weeks 3-6)
 
-*Updated 2026-07-11: the `cobol-to-scala` engine package (only) has completed most of
-this phase for itself — see §6. The frontend/backend-API items remain untouched.*
+*Updated 2026-07-23: the `cobol-to-scala` engine package (only) has completed most of
+this phase for itself, across the full 40-round campaign — see §6. The frontend/backend-API
+items remain untouched.*
 
 - [x] Adopt a real test framework (replace console.log tests) — **done for the engine package** (`node:test`); frontend/backend API still untouched
 - [x] Write unit tests for all parser modules — **done for the engine package** (extensive `node:test` coverage); no formal coverage-percentage target tracked
 - [x] Write unit tests for all generator modules — **done for the engine package**, including a live compiler-oracle harness, which exceeds the original ask
-- [x] Create E2E tests: COBOL input → Scala output → compilation check — **done and exceeded**: real `cobc`-vs-generated-Scala oracle comparison for 209 programs, not just a compile check
+- [x] Create E2E tests: COBOL input → Scala output → compilation check — **done and exceeded**: real `cobc`-vs-generated-Scala oracle comparison for 574 programs, not just a compile check
 - [ ] Add API integration tests for all endpoints — still not done
 - [ ] Add negative tests (malformed COBOL, oversized input, injection attempts) — the adversarial-refutation methodology is a targeted red-team process, not systematic negative/fuzz testing; still not done in that sense
 - [ ] Set up test coverage reporting — no formal coverage percentage is tracked even for the engine package (pass/fail counts and oracle-equivalence are tracked instead)
 
 ### Phase 3: Core Parser Gaps (Weeks 6-10)
 
-*Updated 2026-07-11: most items below are now done or substantially done — see §4/§5 for
-full detail and remaining caveats on each.*
+*Updated 2026-07-23: most items below are now done or substantially done, after the full
+40-round campaign — see §4/§5 for full detail and remaining caveats on each.*
 
-- [x] Implement COPY/REPLACE with recursive resolution — done, including nesting, OF/IN, pseudo-text/word REPLACING, cycle safety
+- [x] Implement COPY/REPLACE with recursive resolution — done, including nesting, OF/IN, pseudo-text/word REPLACING, cycle safety, plus standalone `REPLACE` (found unimplemented and fixed in round 40)
 - [ ] Implement OCCURS DEPENDING ON in generator — still open; sized at a fixed max, not the live counter field (visible TODO marker)
-- [~] Implement reference modification in generator — parser corruption bug fixed; actual substring read/write semantics still degrade to a visible `???` marker (documented gap, not done)
-- [x] Wire CALL BY REFERENCE/CONTENT/VALUE to generator — done for same-file multi-program CALL; external/dynamic CALL and GROUP-with-OCCURS marshalling across the boundary remain open
+- [~] Implement reference modification in generator — parser corruption bug fixed; actual substring read/write semantics still degrade to a visible `???`/placeholder almost everywhere (documented gap, not done, and now flagged as the single largest remaining risk in the engine after 40 rounds of searching)
+- [x] Wire CALL BY REFERENCE/CONTENT/VALUE to generator — done for same-file multi-program CALL and for `PROGRAM-ID ... RECURSIVE` callees (real per-leaf GROUP+OCCURS aliasing, rounds 22/39); external/dynamic CALL and GROUP-with-OCCURS marshalling into an ordinary **non-recursive** callee remain open (the latter silently passes empty/default data rather than a visible TODO)
 - [x] Add decimal scale tracking through arithmetic operations — done (ROUNDED/truncation semantics verified directly against `cobc`)
 - [x] Implement SEARCH / SEARCH ALL — done, including VARYING and composite-key forms
-- [x] Implement SORT / MERGE — done for the procedural (INPUT/OUTPUT PROCEDURE) form; the whole-file USING/GIVING form still open
-- [ ] Add parser error recovery and diagnostic reporting — still not done (one specific infinite-loop hang was fixed, which is a narrower reliability fix, not general recovery)
+- [x] Implement SORT / MERGE — done for the procedural (INPUT/OUTPUT PROCEDURE) form, including MERGE (round 18); the whole-file USING/GIVING form for both SORT and MERGE remains open
+- [ ] Add parser error recovery and diagnostic reporting — still not done (two specific infinite-loop hangs were found and fixed across the campaign, rounds 12 and 40, which are narrower reliability fixes, not general recovery)
 - [ ] Escape Scala reserved keywords in generated field names — still not done
 
 ### Phase 4: Infrastructure (Weeks 8-12)
@@ -660,7 +697,7 @@ full detail and remaining caveats on each.*
 - [ ] Add CICS command generation
 - [ ] Add dynamic SQL and cursor support
 - [ ] Complete STRING/UNSTRING and INSPECT generation
-- [ ] Add VSAM/indexed file support
+- [ ] Add `ORGANIZATION IS INDEXED` (true VSAM-style keyed) file support — note: `ORGANIZATION IS RELATIVE` is now done (full storage-model rewrite, round 29; REWRITE/DELETE/START, rounds 25-27) and no longer part of this item; INDEXED also cannot be oracle-verified in this project's own sandbox (GnuCOBOL build has it compiled out)
 - [ ] Create operational runbooks and deployment guides
 
 ### Phase 6: Enterprise Polish (Weeks 20-26)
@@ -678,34 +715,42 @@ full detail and remaining caveats on each.*
 
 ## Estimated Effort to Enterprise Readiness
 
-**Updated 2026-07-11.** Only the "Parser/generator gaps" row changes — the 14-round
-adversarial campaign closed most of Phase 3's original punch list (see §4/§5, and the
-Phase 3 checklist above). The remaining engine work is now narrower and more specialized
-(VSAM/REWRITE/DELETE/START, SQL wire-in, CICS behavioral conversion, general GO TO webs,
-reserved-keyword escaping, reference-modification semantics) — real work, but less of it,
-and arguably harder-won given the plateau described in `docs/ADVERSARIAL_ROUNDS_REPORT.md`.
+**Updated 2026-07-23.** Only the "Parser/generator gaps" row changes — the full 40-round
+adversarial campaign (14 rounds reported 2026-07-11, then resumed and run to completion)
+closed most of Phase 3's original punch list, and then some (see §4/§5, and the Phase 3
+checklist above). The remaining engine work is now narrower and more specialized still
+than it was at the round-14 checkpoint: `ORGANIZATION IS INDEXED`/VSAM (RELATIVE is now
+done), SQL wire-in, CICS behavioral conversion, general GO TO webs, reserved-keyword
+escaping, reference-modification semantics, and `CALL BY REFERENCE` of GROUP+OCCURS into a
+non-recursive callee — real work, but less of it, and arguably harder-won given that the
+campaign's own convergence bar was met only once (rounds 36-37) before broadening the
+search found bugs again at an increasing rate through round 40 (see
+`docs/PROGRESS_STATUS.md` and `docs/CAPABILITY_AUDIT_AND_ROADMAP.md`).
 **Every other row is unchanged**, because no work occurred in those areas.
 
-| Area | Estimated Effort (2026-02-09) | Estimated Effort (2026-07-11) |
+| Area | Estimated Effort (2026-02-09) | Estimated Effort (2026-07-23) |
 |------|-----------------|-----------------|
 | Security hardening | 3 weeks | 3 weeks — unchanged |
 | Testing foundation | 4 weeks | 4 weeks for frontend/API/security tests — unchanged (the engine package's own testing foundation is now done, but that was a subset of this row, not the whole row) |
-| Parser/generator gaps | 5 weeks | ~2-3 weeks — narrowed to VSAM/REWRITE/DELETE/START, SQL wire-in, CICS behavioral conversion, general GO TO webs, reserved-keyword escaping, and reference-modification semantics; IBM Enterprise COBOL dialect verification and closing the remaining Known Gaps would add more |
+| Parser/generator gaps | 5 weeks | ~2-3 weeks — narrowed to `ORGANIZATION IS INDEXED`/VSAM, SQL wire-in, CICS behavioral conversion, general GO TO webs, reserved-keyword escaping, reference-modification semantics, and non-recursive GROUP+OCCURS CALL BY REFERENCE; IBM Enterprise COBOL dialect verification and closing the remaining Known Gaps would add more |
 | Infrastructure/DevOps | 4 weeks | 4 weeks — unchanged |
 | Feature completion | 8 weeks | 8 weeks — unchanged (this row is mostly platform features: auth UI, RBAC, AI layer — not conversion-engine correctness) |
 | Enterprise polish | 6 weeks | 6 weeks — unchanged |
-| **Total** | **~26 weeks (~6 months)** | **~23-24 weeks (~5.5 months)** — a modest reduction, concentrated entirely in one row |
+| **Total** | **~26 weeks (~6 months)** | **~23-24 weeks (~5.5 months)** — a modest reduction, concentrated entirely in one row, unchanged from the round-14 checkpoint's own estimate since the additional rounds 15-40 work narrowed *what specifically* remains more than it narrowed the effort number itself |
 
 ---
 
 ## Conclusion
 
-**Updated 2026-07-11.** The cobol-to-scala platform has strong foundational design — a
+**Updated 2026-07-23.** The cobol-to-scala platform has strong foundational design — a
 well-thought-out architecture document, a modern React frontend, and comprehensive COBOL
 language reference documentation. As of this update, it also has a conversion engine that
-has been adversarially hardened across 14 rounds against a real GnuCOBOL compiler oracle:
-209 verified programs, 879/879 tests, 110 root-cause bugs fixed (see the banner at the top
-of this document, `docs/ADVERSARIAL_ROUNDS_REPORT.md`, and
+has been adversarially hardened across a full 40-round campaign against a real GnuCOBOL
+compiler oracle (an initial 14 rounds reported 2026-07-11, resumed at the owner's request
+and run to completion by 2026-07-23):
+574 verified programs, ~2,017 tests with 0 failures, 241 root-cause bugs fixed (110 in
+rounds 1-14, 131 in rounds 15-40; see the banner at the top of this document,
+`docs/ADVERSARIAL_ROUNDS_REPORT.md`, `docs/PROGRESS_STATUS.md`, and
 `docs/CAPABILITY_AUDIT_AND_ROADMAP.md`). That is real, verified progress on the single
 hardest technical problem this platform has to solve. **The gap between the architectural
 vision and the current implementation remains significant everywhere else** — security,
@@ -715,10 +760,14 @@ infrastructure, CI/CD, observability, and compliance are exactly as absent as th
 **For enterprise use today, the platform is suitable only for:**
 - Demonstrating the conversion concept, now on a substantially broader and more rigorously
   verified set of batch COBOL constructs than in February (see §4/§5) — still against a
-  GnuCOBOL oracle, not IBM Enterprise COBOL, and not adversarially exhausted
-- Processing fixed-format COBOL with data structures, LINE SEQUENTIAL file I/O, and the
-  broad procedure-division statement set in §4.1 — still not VSAM/indexed files, CICS
-  online logic, or SQL wired into the main generator path
+  GnuCOBOL oracle, not IBM Enterprise COBOL, and — even after the full 40-round campaign —
+  not adversarially exhausted (rounds 38-40 found bugs at an increasing rate right through
+  the final round)
+- Processing fixed-format COBOL with data structures, LINE SEQUENTIAL and RELATIVE file
+  I/O, and the broad procedure-division statement set in §4.1 — still not
+  `ORGANIZATION IS INDEXED`/VSAM files, CICS online logic, or SQL wired into the main
+  generator path, and reference modification (a common construct) still degrades to a
+  placeholder rather than real behavior
 - Non-production, non-customer-facing use only — the security, auth, and infrastructure
   gaps below make any customer-facing or production deployment unsafe regardless of how
   correct the conversion engine itself is
@@ -733,11 +782,15 @@ infrastructure, CI/CD, observability, and compliance are exactly as absent as th
 
 **And now requires less of (changed since 2026-02-09):**
 - COBOL language coverage and Scala generation correctness for the batch/procedural
-  constructs this campaign targeted — see §4/§5 for exactly what's fixed and what remains
-  open (reference modification, VSAM, SORT USING/GIVING, external CALL, CICS behavior,
-  SQL wire-in, IBM-dialect verification, and continued adversarial hardening past the
-  current plateau)
+  constructs this campaign targeted — see §4/§5 for exactly what's fixed (including, since
+  the round-14 checkpoint, RECURSIVE programs, a full RELATIVE file I/O rewrite, LINAGE,
+  FILE STATUS lifecycle, and real IEEE-754 COMP-1/COMP-2 codecs) and what remains open
+  (reference modification — the single largest remaining risk, `ORGANIZATION IS INDEXED`/
+  VSAM, non-recursive GROUP+OCCURS CALL BY REFERENCE, SORT/MERGE USING/GIVING, external
+  CALL, CICS behavior, SQL wire-in, IBM-dialect verification)
 
 The remediation roadmap above provides a path from current state to enterprise readiness —
 modestly shorter than in February, concentrated entirely in the parser/generator row, and
-still gated primarily by the untouched security/infrastructure/compliance work.
+still gated primarily by the untouched security/infrastructure/compliance work — a
+conclusion that running the campaign all the way from round 14 to its round-40 completion
+did not change, because every remaining gate is a platform gap the campaign never touched.

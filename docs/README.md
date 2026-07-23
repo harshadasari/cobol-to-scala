@@ -2,21 +2,23 @@
 
 Documentation for the COBOL-to-Scala conversion platform.
 
-> **Status (2026-07-11):** The conversion **engine** has been hardened through a 14-round
-> autonomous adversarial-verification campaign — **209 COBOL programs verified byte-for-byte
-> against real GnuCOBOL**, **879/879 automated tests passing**, **110 silent-divergence bugs
+> **Status (2026-07-23):** The conversion **engine** has been hardened through a **40-round**
+> autonomous adversarial-verification campaign (paused at round 14, then resumed and run to
+> completion) — **574 COBOL programs verified byte-for-byte against real GnuCOBOL**, **~2,017
+> automated tests passing (0 failures, 45 honest/documented todos)**, **241 silent-divergence bugs
 > fixed**. The campaign was **engine-only**: the surrounding platform (UI, API, auth, deployment,
-> CI/CD, observability, compliance) was intentionally out of scope and remains unbuilt. Docs below
-> are grouped by whether they describe **current verified state** or **earlier planning/vision**.
+> CI/CD, observability, compliance) was intentionally out of scope and remains unbuilt — those are
+> now the sole gating production blockers. Docs below are grouped by whether they describe
+> **current verified state** or **earlier planning/vision**.
 
 ---
 
 ## 📊 Current state (2026-07 — start here)
 
-- **[Adversarial Rounds Report](ADVERSARIAL_ROUNDS_REPORT.md)** — the full 14-round verification
-  campaign: methodology, round-by-round narrative, all 110 bugs by class, the 10 most consequential
-  findings, convergence analysis, and the resume plan. *The definitive account of what the engine
-  does and how it was proven.*
+- **[Adversarial Rounds Report](ADVERSARIAL_ROUNDS_REPORT.md)** — the full 40-round verification
+  campaign (phase 1: rounds 1–14; phase 2: rounds 15–40): methodology, round-by-round narrative, all
+  241 bugs by class, the most consequential findings, and convergence analysis. *The definitive
+  account of what the engine does and how it was proven.*
 - **[Progress Status](PROGRESS_STATUS.md)** — the live dashboard: what's completed, what's pending,
   headline numbers.
 - **[Capability Audit & Coverage Roadmap](CAPABILITY_AUDIT_AND_ROADMAP.md)** — statement-by-statement

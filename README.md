@@ -11,6 +11,17 @@ Transform legacy COBOL applications into modern, idiomatic Scala 3 code with the
 
 ---
 
+> ### ✅ Engine status (2026-07-23)
+> The **conversion engine** (`Thyraa-COBOL-main/backend/packages/cobol-to-scala/`) has been hardened through a **40-round autonomous adversarial-verification campaign**: every generated Scala program is diffed byte-for-byte against real GnuCOBOL (`cobc`) output.
+>
+> - **574 COBOL programs** oracle-verified against a real compiler
+> - **~2,017 automated tests**, **0 failures**, 45 honest/documented open-work markers
+> - **241 silent-divergence bugs** found and fixed at root cause across 40 rounds
+>
+> The campaign was **engine-only** — the surrounding *platform* (auth, CI/CD, containerization, observability, compliance, and much of the UI/API) is still aspirational and is the real gating work before production use. The roadmap and feature list below describe the intended full product; see **[docs/PROGRESS_STATUS.md](docs/PROGRESS_STATUS.md)** (closing report) and **[docs/CAPABILITY_AUDIT_AND_ROADMAP.md](docs/CAPABILITY_AUDIT_AND_ROADMAP.md)** for a precise, honest statement of what is *built and verified* today versus *vision*.
+
+---
+
 ## 🎯 Overview
 
 **COBOL-to-Scala** is an enterprise-grade platform that automatically converts COBOL applications to Scala 3, preserving business logic while enabling cloud-native architectures. Unlike existing tools that convert COBOL to Java, we target **Scala 3** - the language already used by major financial institutions for new development.
@@ -118,11 +129,13 @@ npm run dev
 ## 📖 Documentation
 
 - **[Documentation Index](docs/)** - Complete documentation hub
+- **[Progress Status & Closing Report](docs/PROGRESS_STATUS.md)** - The verified engine's current state, headline numbers, and the full 40-round campaign retrospective *(start here)*
+- **[Capability Audit & Coverage Roadmap](docs/CAPABILITY_AUDIT_AND_ROADMAP.md)** - Statement-by-statement audit of what the engine does today, plus the risk-ordered Known Gaps list
+- **[Verification Ledger](Thyraa-COBOL-main/backend/packages/cobol-to-scala/tests/oracle/README.md)** - Every finding → fix → corpus program, round by round (all 40)
 - **[COBOL Reference Guide](cobol-reference/)** - Complete COBOL language reference
-- **[Architecture Overview](docs/UNIFIED_PLATFORM_ARCHITECTURE.md)** - System design and technical decisions
-- **[Integration Guide](Thyraa-COBOL-main/INTEGRATION.md)** - API endpoints and integration patterns
-- **[Efficiency Configuration](claude-efficiency-config/)** - Optimize Claude Code usage
+- **[Architecture Overview](docs/UNIFIED_PLATFORM_ARCHITECTURE.md)** - System design and product vision (annotated built-vs-vision)
 - **[Examples](examples/)** - Sample COBOL programs and conversions
+- **[Runnable demo](demo/)** - `convert-demo.sh`: COBOL in → verified-equivalent Scala out
 
 ---
 
@@ -133,7 +146,8 @@ cobol-to-scala/
 ├── Thyraa-COBOL-main/              # Main application
 │   ├── backend/                    # Node.js backend
 │   │   ├── packages/
-│   │   │   └── cobol-to-scala/     # Core conversion engine
+│   │   │   └── cobol-to-scala/     # ⭐ Core conversion engine (the verified heart)
+│   │   │       └── tests/oracle/   #    Compiler-oracle harness + 40-round ledger
 │   │   ├── routes/                 # API routes
 │   │   └── server.ts               # Express server
 │   └── src/                        # React frontend
@@ -143,16 +157,16 @@ cobol-to-scala/
 │       └── lib/
 │           └── conversion-api.ts   # API client
 ├── docs/                           # Documentation
+│   ├── PROGRESS_STATUS.md          #    Current state + 40-round closing report
+│   ├── CAPABILITY_AUDIT_AND_ROADMAP.md
+│   ├── ADVERSARIAL_ROUNDS_REPORT.md
+│   ├── AUTONOMOUS_BUILD_LOG.md
 │   ├── UNIFIED_PLATFORM_ARCHITECTURE.md
-│   ├── CODEBASE_ANALYSIS.md
-│   ├── MVP_SPRINT_PLAN.md
-│   └── SPRINT_PLAN_FOCUSED.md
+│   └── ...                         #    (market analysis, enterprise gaps, sprint plans)
 ├── examples/                       # Sample conversions
 │   └── basic-conversion/           # Simple example with test script
+├── demo/                           # Runnable demo (convert-demo.sh)
 ├── cobol-reference/                # COBOL language documentation
-├── claude-efficiency-config/       # Claude Code optimization tools
-├── prototypes/                     # Early prototypes
-│   └── scala-prototype/            # Scala-based prototype
 ├── README.md                       # This file
 ├── CONTRIBUTING.md                 # Contribution guidelines
 └── LICENSE                         # MIT License
@@ -216,31 +230,34 @@ object CustomerRecord:
 
 ## 🎯 Roadmap
 
-### ✅ Phase 1: Core Conversion (Completed)
-- [x] COBOL lexer and parser
-- [x] Data structure → case class conversion
-- [x] Basic statement conversion (MOVE, IF, PERFORM, etc.)
-- [x] Web UI with Monaco editor
-- [x] API endpoints
+*Reflects the actual verified state as of the round-40 campaign (2026-07-23). For the precise, statement-level breakdown and the risk-ordered Known Gaps list, see [docs/CAPABILITY_AUDIT_AND_ROADMAP.md](docs/CAPABILITY_AUDIT_AND_ROADMAP.md).*
 
-### 🚧 Phase 2: Enhanced Conversion (In Progress)
-- [ ] Fix PIC clause byte calculation
-- [ ] Improve complex expression handling
-- [ ] Add comprehensive test suite
-- [ ] Dual-run validation framework
+### ✅ Phase 1 — Data-layer truth (verified)
+- [x] COBOL lexer + parser (all 4 divisions, PIC-aware tokenization)
+- [x] Byte-accurate record layouts + `parse`/`format` codecs (packed decimal / binary / zoned / EBCDIC cp037 / IEEE-754 COMP-1/COMP-2)
+- [x] Copybook expansion (COPY REPLACING, nested, cycle-safe) + standalone copybook parse
+- [x] REDEFINES-as-views, byte-verified round-trip test suite
+- [ ] OCCURS DEPENDING ON dynamic sizing — *open, fixed-max only (visibly marked)*
 
-### 📋 Phase 3: Enterprise Features (Planned)
-- [ ] Copybook-first analyzer (standalone tool)
-- [ ] Business rule extraction with AI
-- [ ] Call graph analysis and visualization
-- [ ] Docker containerization
-- [ ] CI/CD integration plugins
+### ✅ Phase 2 — Batch-complete procedure coverage (verified)
+- [x] Control flow, data movement, arithmetic (with real ROUNDED/truncation + multi-target ON SIZE ERROR semantics)
+- [x] STRING/UNSTRING/INSPECT, SEARCH/SEARCH ALL, SORT/MERGE via INPUT/OUTPUT PROCEDURE
+- [x] Real file I/O: LINE SEQUENTIAL + RELATIVE (fixed-width byte-record model), REWRITE/DELETE/START, LINAGE, FILE STATUS lifecycle
+- [x] RECURSIVE programs, multi-`PROGRAM-ID` interop, CALL BY REFERENCE/CONTENT/VALUE
+- [x] **40 rounds of adversarial verification** — 574 corpus programs, ~2,017 tests, 241 bugs fixed
+- [ ] Reference modification, INDEXED/VSAM files, `SORT ... USING/GIVING`, general GO TO webs — *open (see Known Gaps)*
 
-### 🔮 Phase 4: Advanced Features (Future)
-- [ ] CICS transaction support
-- [ ] DB2 stored procedure conversion
-- [ ] JCL → sbt task conversion
-- [ ] Multi-program dependency resolution
+### 🟡 Phase 3 — Database layer (parser/generator done, wiring open)
+- [x] DCLGEN ingestion, EXEC SQL → compile-verified Doobie generation (standalone)
+- [x] JCL structural parse + dataset-lineage JSON
+- [ ] Splice SQL generation into the main output path; JCL → sbt/pipeline skeletons
+
+### 🟡 Phase 4 — Online systems (honest skeleton, not behavioral conversion)
+- [x] EXEC CICS classifier + BMS parser + service-skeleton generator (bodies are explicit `???`, never faked)
+- [ ] Behavioral CICS conversion, IMS DL/I
+
+### ⬜ Platform (not started — the real gating work for production)
+- [ ] Authentication, CI/CD, containerization, observability, compliance, hardened UI/API — see [docs/ENTERPRISE_READINESS_GAP_ANALYSIS.md](docs/ENTERPRISE_READINESS_GAP_ANALYSIS.md)
 
 ---
 

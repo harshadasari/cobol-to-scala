@@ -2105,27 +2105,44 @@ for the identical reason (a deliberately invalid-COBOL probe, cobc itself
 rejects it at compile time) and was never a "finding" at all (honest-out-of-
 scope, matching jj03/kk04/cc04/cc07's own precedent).
 
-Net effect on the whole-suite `todo` count: findings 1-3, 5, and 7 are genuine
-crash-to-fix corrections (oo03/oo04/oo05/oo06 all move from a compile/runtime
-crash to a full, byte-exact oracle pass; oo15 moves from a silent wrong-output
-bug to the CORRECT observable behavior, though it remains a structural `t.todo`
-in the automated suite per the note above, for reasons unrelated to the fix's
-own correctness); finding 4 is a genuine silent-wrong-output-to-fix correction
-(oo13's own `DAY=` line moves from wrong to byte-correct); finding 6 is a
-crash-to-non-crash fix that does NOT convert oo13 to a full pass, since oo13's
-own final `IF WS-DATE4(1:4) = "2026"` comparison still uses the pre-existing,
-documented ref-mod-read honest-decline (an empty-string placeholder, which
-never equals `"2026"`) - oo13 as a WHOLE program is expected to remain a
-`t.todo` entry (`YEAR-UNEXPECTED` instead of the oracle's `YEAR-OK`), exactly
-matching this codebase's own long-standing convention that a known,
-documented gap reached at runtime shows up as an honest todo, not a fabricated
-pass - a NEW todo entry, not a regression (oo13 was previously an unpromoted,
-never-run probe; this round promotes it, and it lands in the todo queue for a
-reason this round's own finding 6 explicitly does not claim to fix). Overall
-dishonest-finding count for round 39: 7 (oo03, oo04, oo05, oo06, oo13 x3, oo15)
-- the widest round yet, across 7 distinct root causes, with oo13 alone
-contributing 3 independent bugs in 3 different code paths (`generateAccept`
-twice, `relationalOperandDescriptor` once) plus one parser-level fix.
+Net effect on the whole-suite `todo` count (CORRECTED - see note below):
+findings 3, 4, and 7 are genuine crash/wrong-output-to-fix corrections that
+reach a full, byte-exact oracle PASS (oo05/oo06 move from a runtime crash to
+a full pass; oo13's own `DAY=` line moves from wrong to byte-correct as part
+of finding 4, though oo13 as a WHOLE program does not fully pass - see
+below; oo15 moves from a silent wrong-output bug to the CORRECT observable
+behavior, though it remains a structural `t.todo` in the automated suite per
+the note above, for reasons unrelated to the fix's own correctness).
+Findings 1 and 2 (oo03, oo04) are crash-to-non-crash fixes that do NOT reach
+a full automated-suite pass, exactly like finding 6 does not for oo13 - each
+compiles and runs correctly now, but each still hits its OWN separate,
+pre-existing, explicitly-documented residual (oo03: this installed cobc's
+own bare-numeric-literal-CALL-argument corruption, orthogonal to the fix;
+oo04: the pre-existing ref-mod-write honest `???`/`NotImplementedError`
+decline, never in scope for this finding) - both remain honest `t.todo`
+entries in `oracle.test.js`'s automated match-or-todo sweep, confirmed by
+direct test-suite inspection during round 40's own independent verification.
+So round 39 promotes exactly THREE new `t.todo` entries overall - oo03,
+oo04, and oo13 (not "oo13 alone" as an earlier version of this paragraph
+said) - taking the whole-suite honest-todo count from round 38's 37 to 40,
+which is the correct baseline round 40's own ledger entry below states.
+Overall dishonest-finding count for round 39: 7 (oo03, oo04, oo05, oo06,
+oo13 x3, oo15) - the widest round yet, across 7 distinct root causes, with
+oo13 alone contributing 3 independent bugs in 3 different code paths
+(`generateAccept` twice, `relationalOperandDescriptor` once) plus one
+parser-level fix.
+
+**Correction note (added during the round-40 wrap-up completeness audit):**
+this section originally overstated the fix's own reach, claiming oo03/oo04
+"move to a full, byte-exact oracle pass" in its summary paragraph while its
+own DETAILED finding write-ups above (1 and 2) correctly and honestly
+documented each one's remaining residual all along - the summary paragraph
+just failed to carry that nuance through into its own todo-count arithmetic.
+No code or fix is affected; this is a documentation-only correction, found
+by an independent completeness-critic audit cross-checking the ledger's own
+internal consistency after round 40, and confirmed against a direct rerun
+of the oracle suite (both oo03 and oo04 show `# TODO` markers, not a clean
+`ok`).
 
 ### Round-40 adversarial-refutation findings (pp02/pp02b, pp04, pp05, pp09, pp09b, pp11, pp12, pp15) and their fixes
 
@@ -2207,6 +2224,26 @@ cobc build's own unrelated, independently-reproduced toolchain quirk.
 **Overall dishonest-finding count for round 40: 8** (pp02/pp02b as one root
 cause, pp04, pp05, pp09, pp09b, pp11, pp12, pp15 - 8 distinct root causes
 across 8 (or effectively 9, counting pp02/pp02b as one) promoted probes).
+
+**Reconciliation note (added during the round-40 wrap-up completeness
+audit):** this section's "44 total" is the round-40 FIX AGENT's own
+untruncated run, committed here. A SEPARATE, independent full run by the
+orchestrator immediately afterward (before committing) found 1074/1119
+passing and 45 todos - one more than this entry's 1075/44 - which is the
+number `docs/PROGRESS_STATUS.md` and `docs/AUTONOMOUS_BUILD_LOG.md` both
+report instead. Both numbers are genuine, correctly-summed results of two
+real, back-to-back test runs of the IDENTICAL, already-committed code (no
+edit happened between them) - the discrepancy is a single transient
+scala-cli infrastructure flake on `v05b-decimalcomma-edited-only.cbl` (a
+long-established, completely unrelated round-8 gap: "generated Scala
+compiled but exited null at runtime: Compiling project..." - consistent
+with an interrupted compile, not a logic error), confirmed by diffing the
+two runs' own todo lists and finding `v05b` as the ONLY difference. The
+dashboard's 1074/45 is the later, more-scrutinized number and should be
+treated as authoritative; this entry's 1075/44 is left as-is (not
+retroactively edited) since it's what the fix agent actually observed at
+the time, and both are self-consistent runs of the same code, not
+conflicting claims about different code.
 
 Independently re-verified end to end after all 8 fixes landed: the fast
 unit-test suite (`node --test $(ls tests/*.test.js)`, run separately from

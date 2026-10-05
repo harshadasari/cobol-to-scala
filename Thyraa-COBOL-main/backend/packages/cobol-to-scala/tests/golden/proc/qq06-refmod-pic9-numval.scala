@@ -814,6 +814,29 @@ object CobolFmt:
     val mod = BigDecimal(10).pow(math.max(intDigits, 0))
     (whole % mod) + frac
 
+  // Oct-2026 (fuzzer class D): COBOL division inside a COMPUTE expression
+  // (libcob cob_decimal_div, cobc 4.0-early default dialect): the quotient
+  // is TRUNCATED toward zero at max(scaleA - scaleB, 0) + 38 decimal places
+  // (shift = 38 + max(scaleB - scaleA, 0); a zero dividend yields 0), and only
+  // the final store truncates/rounds it to the receiver. Scala's own
+  // BigDecimal `/` (MathContext.DECIMAL128 = 34 significant digits, HALF_EVEN)
+  // ROUNDS instead, so (1/3)*3 came out 1 where cobc gives 0.999...9.
+  // Division by zero keeps the plain BigDecimal behaviour.
+  // ex() lifts a value to an UNLIMITED-precision MathContext: Scala's +,-,*
+  // on a default-context BigDecimal also round to 34 significant digits
+  // (cobc keeps every intermediate exact), and the context of the LEFT operand
+  // wins, so a COMPUTE expression containing a division is built from ex() lefts.
+  def ex(v: BigDecimal): BigDecimal = BigDecimal.decimal(v.bigDecimal, java.math.MathContext.UNLIMITED)
+
+  def div(a: BigDecimal, b: BigDecimal): BigDecimal =
+    if b.signum == 0 then a / b
+    else if a.signum == 0 then BigDecimal(0)
+    else
+      val s = a.scale - b.scale
+      val shift = 38 + (if s < 0 then -s else 0)
+      val q = a.bigDecimal.unscaledValue.multiply(java.math.BigInteger.TEN.pow(shift)).divide(b.bigDecimal.unscaledValue)
+      BigDecimal.decimal(new java.math.BigDecimal(q, s + shift), java.math.MathContext.UNLIMITED)
+
   // Arithmetic-assignment store-time semantics for a ROUNDED target
   // (COMPUTE/ADD/SUBTRACT/MULTIPLY/DIVIDE ... ROUNDED): HALF_UP rounding
   // to the target's declared decimal digits (COBOL's ROUNDED clause),
@@ -1167,8 +1190,8 @@ object Qq06:
   // Procedures
   def mainPara(): Unit =
     println("Y=[" + CobolFmt.refModSlice(CobolFmt.digitsOf(BigDecimal(wsDate), 8, 0), (1).toInt, (4).toInt) + "] M=[" + CobolFmt.refModSlice(CobolFmt.digitsOf(BigDecimal(wsDate), 8, 0), (5).toInt, (2).toInt) + "] D=[" + CobolFmt.refModSlice(CobolFmt.digitsOf(BigDecimal(wsDate), 8, 0), (7).toInt, (2).toInt) + "]")
-    wsYear = CobolFmt.truncNumeric(CobolFmt.numval(CobolFmt.refModSlice(CobolFmt.digitsOf(BigDecimal(wsDate), 8, 0), (1).toInt, (4).toInt)), 4, 0).toInt
-    wsMm = CobolFmt.truncNumeric(CobolFmt.numval(CobolFmt.refModSlice(CobolFmt.digitsOf(BigDecimal(wsDate), 8, 0), (5).toInt, (2).toInt)), 2, 0).toInt
+    wsYear = CobolFmt.truncNumeric(CobolFmt.numval(CobolFmt.refModSlice(CobolFmt.digitsOf(BigDecimal(wsDate), 8, 0), (1).toInt, (4).toInt)), 4, 0).abs.toInt
+    wsMm = CobolFmt.truncNumeric(CobolFmt.numval(CobolFmt.refModSlice(CobolFmt.digitsOf(BigDecimal(wsDate), 8, 0), (5).toInt, (2).toInt)), 2, 0).abs.toInt
     println("YEAR=" + CobolFmt.num(BigDecimal(wsYear), 4, 0, false, false) + " MM=" + CobolFmt.num(BigDecimal(wsMm), 2, 0, false, false))
     wsSum = (CobolFmt.truncNumeric((CobolFmt.numval(CobolFmt.refModSlice(CobolFmt.digitsOf(BigDecimal(wsDate), 8, 0), (5).toInt, (4).toInt), false) + BigDecimal("1")), 6, 0).abs).toInt
     println("SUM=" + CobolFmt.num(BigDecimal(wsSum), 6, 0, false, false))

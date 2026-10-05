@@ -7,14 +7,16 @@
 [![React](https://img.shields.io/badge/React-18-blue)](https://reactjs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0-blue)](https://www.typescriptlang.org/)
 
-Transform legacy COBOL applications into modern, idiomatic Scala 3 code with the power of AI-assisted conversion.
+Transform legacy COBOL applications into modern, idiomatic Scala 3 code with a deterministic, auditable conversion engine (no LLM in the translation path) plus an AI-assisted analysis layer around it.
 
 ---
 
 > ### ✅ Engine status (2026-07-23)
-> The **conversion engine** (`Thyraa-COBOL-main/backend/packages/cobol-to-scala/`) has been hardened through a **40-round autonomous adversarial-verification campaign**: every generated Scala program is diffed byte-for-byte against real GnuCOBOL (`cobc`) output.
+> The **conversion engine** (`Thyraa-COBOL-main/backend/packages/cobol-to-scala/`) is a **deterministic, auditable translator (no LLM in the translation path)** whose language semantics are continuously differential-tested against a reference compiler — GnuCOBOL 4.0-early-dev, default dialect — on an adversarially grown corpus of 574 programs. It has been hardened through a **40-round autonomous adversarial-verification campaign**: for each corpus program, the generated Scala's stdout is diffed byte-for-byte against real GnuCOBOL (`cobc`) stdout.
 >
-> - **574 COBOL programs** oracle-verified against a real compiler
+> **Scope caveat:** verified against the GnuCOBOL default dialect, **not IBM Enterprise COBOL**; parity is at the stdout level for self-contained programs (no CICS/DB2/VSAM/JCL/EBCDIC-at-rest system parity). Documented GnuCOBOL-vs-IBM divergences (intermediate arithmetic precision, TRUNC defaults, sign display, sort tie order, EBCDIC) are outside what this oracle can detect. See **[docs/CORPUS_COVERAGE.md](docs/CORPUS_COVERAGE.md)** for what the corpus does and does not exercise.
+>
+> - **574 COBOL programs** (563 `.cbl` + 11 `.cbl.txt`) differential-tested against GnuCOBOL (`cobc`), 0 failures
 > - **~2,017 automated tests**, **0 failures**, 45 honest/documented open-work markers
 > - **241 silent-divergence bugs** found and fixed at root cause across 40 rounds
 >
@@ -50,7 +52,7 @@ Major banks (JPMorgan, Morgan Stanley, Deutsche Bank) already use Scala for new 
 ### 🎯 Core Conversion Engine
 
 - **Full COBOL Parsing**: Supports all 4 divisions (IDENTIFICATION, ENVIRONMENT, DATA, PROCEDURE)
-- **Smart Type Mapping**: PIC clauses → Scala types with COBOL semantics preserved
+- **Smart Type Mapping**: PIC clauses → Scala types with COBOL data semantics implemented and differential-tested against GnuCOBOL
 - **Statement Conversion**: PERFORM → loops, EVALUATE → pattern matching, MOVE → type-safe assignments
 - **File I/O Abstraction**: Sequential files → fs2 Streams, VSAM → key-value abstractions
 - **Database Migration**: EXEC SQL → Doobie/Slick queries
@@ -130,12 +132,15 @@ npm run dev
 
 - **[Documentation Index](docs/)** - Complete documentation hub
 - **[Progress Status & Closing Report](docs/PROGRESS_STATUS.md)** - The verified engine's current state, headline numbers, and the full 40-round campaign retrospective *(start here)*
+- **[Corpus Feature Coverage](docs/CORPUS_COVERAGE.md)** - Enumerated COBOL features exercised by the 574-program corpus (with counts), the oracle definition, and the NOT-covered list
+- **[Viability Report (2026-10)](docs/VIABILITY_REPORT_2026-10.md)** - Independent assessment of where the engine's evidence standard stands against the market, and its limits
+- **[Action Plan (2026-10)](docs/ACTION_PLAN_2026-10.md)** - Sequenced next steps derived from the viability report
 - **[Capability Audit & Coverage Roadmap](docs/CAPABILITY_AUDIT_AND_ROADMAP.md)** - Statement-by-statement audit of what the engine does today, plus the risk-ordered Known Gaps list
 - **[Verification Ledger](Thyraa-COBOL-main/backend/packages/cobol-to-scala/tests/oracle/README.md)** - Every finding → fix → corpus program, round by round (all 40)
-- **[COBOL Reference Guide](cobol-reference/)** - Complete COBOL language reference
+- **[COBOL Reference Guide](cobol-reference/)** - COBOL language reference
 - **[Architecture Overview](docs/UNIFIED_PLATFORM_ARCHITECTURE.md)** - System design and product vision (annotated built-vs-vision)
 - **[Examples](examples/)** - Sample COBOL programs and conversions
-- **[Runnable demo](demo/)** - `convert-demo.sh`: COBOL in → verified-equivalent Scala out
+- **[Runnable demo](demo/)** - `convert-demo.sh`: COBOL in → Scala out, stdout diffed against GnuCOBOL
 
 ---
 

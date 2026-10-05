@@ -145,11 +145,13 @@ before trusting any capability claim in a doc, this one included.
 
 ## Honest capability table
 
-"Oracle-equivalent" below means: converted with this package's own
+"Oracle-equivalent" below is shorthand, not a claim of mainframe equivalence. It means: converted with this package's own
 `convertToScala()`, compiled with `scala-cli`, and its stdout matched real
-`cobc` output byte-for-byte, for every program in the named corpus subset -
-see `tests/oracle/README.md` for the exact, currently-passing count (it
-changes; this table is a snapshot of shape, not of the live number).
+`cobc` output byte-for-byte, for every program in the named corpus subset.
+The oracle is GnuCOBOL (default dialect), not IBM Enterprise COBOL, and the
+bar is stdout of self-contained programs; see `docs/CORPUS_COVERAGE.md` at the
+repo root for what is and is not covered. See `tests/oracle/README.md` for
+the exact, currently-passing count (it changes; this table is a snapshot of shape, not of the live number).
 
 | Area | Status | Notes |
 |---|---|---|

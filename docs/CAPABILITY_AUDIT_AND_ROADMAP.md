@@ -99,7 +99,7 @@ someone converting production COBOL, highest first:
 
 ### 2.0 Strategic reframe (from the market analysis)
 
-The winning product is **not** "a converter." It is an engine that (a) *understands* a COBOL estate completely — every file type — and (b) *proves* its conversions are right. Translation is commoditizing (LLMs); byte-accurate layout truth and behavioral equivalence are not. Every phase below therefore pairs coverage with verification.
+The winning product is **not** "a converter." It is an engine that (a) *understands* a COBOL estate completely — every file type — and (b) *differentially tests* its conversions against a reference compiler and shows the evidence. Translation is commoditizing (LLMs); byte-accurate layout truth and auditable, reference-compiler-checked behavior are not (the reference here is GnuCOBOL, not IBM Enterprise COBOL). Every phase below therefore pairs coverage with verification.
 
 ### What a real mainframe estate contains (the file-type map)
 
@@ -339,6 +339,6 @@ is in `Thyraa-COBOL-main/backend/packages/cobol-to-scala/tests/oracle/README.md`
 
 ### The pitch that falls out of this plan
 
-> "Point us at your repo. We inventory every program, copybook, and JCL job; we compute your record layouts to the byte; we convert your batch logic to Scala that round-trips your data files bit-for-bit — and we hand you the generated tests that prove it."
+> "Point us at your repo. We inventory every program, copybook, and JCL job; we compute your record layouts to the byte; we convert your batch logic to Scala that round-trips your data files bit-for-bit — and we hand you the generated tests that check it against a reference compiler."
 
 That sentence is buildable by a small team on this codebase, it is differentiated from every incumbent (none target Scala; none lead with proof), and each phase ships a standalone sellable artifact.

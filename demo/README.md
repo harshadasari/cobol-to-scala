@@ -1,4 +1,4 @@
-# Demo: convert a COBOL program to Scala and prove they agree
+# Demo: convert a COBOL program to Scala and check that stdout agrees with GnuCOBOL
 
 This is a small, runnable, end-to-end demonstration of this repo's
 conversion engine (`Thyraa-COBOL-main/backend/packages/cobol-to-scala/`) and
@@ -85,7 +85,11 @@ adapt the script's `COPYBOOKS_DIR` variable for your own layout.
 | `convert.mjs` | Minimal Node CLI wrapper around `convertToScala()` - reads the copybook directory, converts, writes the generated Scala to a path given on the command line. |
 | `convert-demo.sh` | Orchestrates all 6 steps above, in scratch directories under `$TMPDIR` (never inside the repo), and cleans up after itself. |
 
-## What this does and doesn't prove
+## What this does and doesn't demonstrate
+
+The oracle is GnuCOBOL (default dialect), not IBM Enterprise COBOL, and the
+comparison is byte-exact stdout of one self-contained program. The script's
+`EQUIVALENT` verdict means exactly that and nothing broader.
 
 This demo is a **single hand-picked program**, chosen to exercise COPY
 expansion, a byte-level COMP-3 codec, and COMPUTE ROUNDED in one small file.

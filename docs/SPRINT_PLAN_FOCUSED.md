@@ -41,7 +41,7 @@ then resumed at the owner's explicit request and run to completion at round
 
 **Bottom line:** the *conversion engine itself* now far exceeds this sprint
 plan's original bar, and — unlike what this plan called for — its
-correctness is actually proven against a real compiler rather than merely
+correctness is actually differential-tested against a real compiler (GnuCOBOL, not IBM Enterprise COBOL) rather than merely
 asserted. But this campaign was **engine-only**. Everything in this plan
 that was about the surrounding "enterprise grade" product — REST API
 integration, frontend wiring, auth, deployment/packaging, CI, containerization,

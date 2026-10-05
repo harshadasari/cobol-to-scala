@@ -120,7 +120,7 @@
 3. **Scala output as the differentiated niche** for Spark-heavy financial-services data platforms, with Java as the planned second target for the mainstream.
 4. **Distribution through SIs and mid-market** (credit unions, regional banks, state agencies) that hyperscaler sales motions ignore.
 
-**Bottom line for this repository:** keep building COBOL→Scala — but position the product as *"the engine that understands COBOL record layouts and proves the conversion is right,"* not *"a converter."* That is the gap the giants have left open.
+**Bottom line for this repository:** keep building COBOL→Scala — but position the product as *"the engine that understands COBOL record layouts and shows its conversion evidence against a reference compiler,"* not *"a converter."* That is the gap the giants have left open.
 
 ---
 

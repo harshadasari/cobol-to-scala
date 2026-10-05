@@ -2,14 +2,19 @@
 
 Documentation for the COBOL-to-Scala conversion platform.
 
-> **Status (2026-07-23):** The conversion **engine** has been hardened through a **40-round**
+> **Status (2026-07-23):** The conversion **engine** — a deterministic translator with no LLM in the
+> translation path — has been hardened through a **40-round**
 > autonomous adversarial-verification campaign (paused at round 14, then resumed and run to
-> completion) — **574 COBOL programs verified byte-for-byte against real GnuCOBOL**, **~2,017
+> completion) — **574 COBOL programs whose stdout is diffed byte-for-byte against real GnuCOBOL (4.0-early-dev, default dialect)**, **~2,017
 > automated tests passing (0 failures, 45 honest/documented todos)**, **241 silent-divergence bugs
 > fixed**. The campaign was **engine-only**: the surrounding platform (UI, API, auth, deployment,
 > CI/CD, observability, compliance) was intentionally out of scope and remains unbuilt — those are
 > now the sole gating production blockers. Docs below are grouped by whether they describe
 > **current verified state** or **earlier planning/vision**.
+>
+> **Scope caveat:** verified against the GnuCOBOL default dialect, **not IBM Enterprise COBOL**; parity is at
+> the stdout level for self-contained programs (no CICS/DB2/VSAM/JCL/EBCDIC-at-rest system parity).
+> See [Corpus Feature Coverage](CORPUS_COVERAGE.md) for the enumerated list of what is and is not exercised.
 
 ---
 
@@ -18,7 +23,13 @@ Documentation for the COBOL-to-Scala conversion platform.
 - **[Adversarial Rounds Report](ADVERSARIAL_ROUNDS_REPORT.md)** — the full 40-round verification
   campaign (phase 1: rounds 1–14; phase 2: rounds 15–40): methodology, round-by-round narrative, all
   241 bugs by class, the most consequential findings, and convergence analysis. *The definitive
-  account of what the engine does and how it was proven.*
+  account of what the engine does and how it was tested against the GnuCOBOL oracle.*
+- **[Corpus Feature Coverage](CORPUS_COVERAGE.md)** — enumerated COBOL features exercised by the
+  574-program corpus (with counts and example programs), the oracle definition, and the explicit
+  NOT-covered list.
+- **[Viability Report (2026-10)](VIABILITY_REPORT_2026-10.md)** — assessment of the engine's evidence
+  standard against the market, including why the oracle is not the mainframe.
+- **[Action Plan (2026-10)](ACTION_PLAN_2026-10.md)** — sequenced next steps from the viability report.
 - **[Progress Status](PROGRESS_STATUS.md)** — the live dashboard: what's completed, what's pending,
   headline numbers.
 - **[Capability Audit & Coverage Roadmap](CAPABILITY_AUDIT_AND_ROADMAP.md)** — statement-by-statement
@@ -62,15 +73,15 @@ Documentation for the COBOL-to-Scala conversion platform.
 - **[Main README](../README.md)** — quick start and overview
 - **[COBOL Reference](../cobol-reference/)** — program structure, data division, copybooks, procedure
   division, file handling, CICS/DB2, enterprise patterns, transpiler considerations
-- **[Runnable demo](../demo/)** — `convert-demo.sh` + `demo/README.md`: COBOL in → verified-equivalent
-  Scala out
+- **[Runnable demo](../demo/)** — `convert-demo.sh` + `demo/README.md`: COBOL in → Scala out, stdout diffed
+  against GnuCOBOL
 
 ---
 
 ## 🎯 Where to start
 
 **Want to know what the engine actually does today?**
-1. [Adversarial Rounds Report](ADVERSARIAL_ROUNDS_REPORT.md) (what's proven)
+1. [Adversarial Rounds Report](ADVERSARIAL_ROUNDS_REPORT.md) (what the campaign established, and what it did not)
 2. [Capability Audit & Coverage Roadmap](CAPABILITY_AUDIT_AND_ROADMAP.md) (what's covered, what's not)
 3. [Progress Status](PROGRESS_STATUS.md) (the dashboard)
 

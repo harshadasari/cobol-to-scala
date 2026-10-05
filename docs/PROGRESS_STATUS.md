@@ -137,7 +137,7 @@ You asked whether Fable, running autonomously with subagents, could take this CO
 | **3 — SQL/JCL** | EXEC SQL → typed Doobie code (compile-verified against the real doobie library), JCL job-step parsing | ✅ MVP done; **SQL generator not yet wired into the main code path** |
 | **4 — CICS** | CICS command classification, BMS screen-map parsing, service-skeleton generation | ✅ Scaffolding done (intentionally not a full behavioral CICS runtime) |
 
-### The verification record (the actual proof of correctness)
+### The verification record (differential testing against GnuCOBOL)
 - **209 real COBOL test programs**, each compiled with genuine GnuCOBOL and diffed byte-for-byte against the generated Scala's output
 - **879 automated tests, all passing** (879/879, 0 fail, 0 todo — independently verified before the round-14 commit)
 - **14 completed adversarial rounds** — dishonest-bug counts per round: `11, 16, 15, 16, 6, 6, 8, 4, 6, 6, 3, 4, 5, 4` = **110 real bugs found and fixed**
@@ -178,5 +178,5 @@ Full 16-item list with precise scope in the report §6. Highlights: reference mo
 | Complete verification ledger (every round, every finding, every fix) | `Thyraa-COBOL-main/backend/packages/cobol-to-scala/tests/oracle/README.md` |
 | Full autonomous run activity log (every cycle) | `docs/AUTONOMOUS_BUILD_LOG.md` |
 | Phase-by-phase capability roadmap | `docs/CAPABILITY_AUDIT_AND_ROADMAP.md` |
-| Runnable demo (COBOL in → verified-equivalent Scala out) | `demo/convert-demo.sh` + `demo/README.md` |
+| Runnable demo (COBOL in → Scala out, stdout diffed against GnuCOBOL) | `demo/convert-demo.sh` + `demo/README.md` |
 | Market analysis (why this matters commercially) | `docs/MARKET_ANALYSIS_COBOL_MODERNIZATION.md` |

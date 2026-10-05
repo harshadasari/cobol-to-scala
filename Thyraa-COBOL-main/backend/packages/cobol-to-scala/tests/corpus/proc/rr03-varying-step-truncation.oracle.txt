@@ -1,0 +1,101 @@
+T1
+I=8
+I=9
+I=0
+I=1
+I=2
+I=3
+I=4
+T1 END I=4 C=07
+T2
+I=8
+I=1
+I=4
+I=7
+I=0
+I=3
+I=6
+T2 END I=6 C=07
+T3
+I=3
+I=1
+I=1
+I=1
+I=1
+I=1
+I=1
+T3 END I=1 C=07
+T4
+S=+7
+S=+8
+S=+9
+S=+0
+S=+1
+S=+2
+S=+3
+T4 END S=+3 C=07
+T5
+S=-7
+S=-8
+S=-9
+S=+0
+S=-1
+S=-2
+S=-3
+T5 END S=-3 C=07
+T6
+D=8.5
+D=9.2
+D=9.9
+D=0.6
+D=1.3
+D=2.0
+D=2.7
+T6 END D=2.7 C=07
+T7
+D=0.5
+D=0.7
+D=0.9
+D=1.1
+T7 END D=1.3 C=04
+T8 AFTER
+I=1 J=8
+I=1 J=9
+I=1 J=0
+I=1 J=1
+I=1 J=2
+I=1 J=3
+I=1 J=4
+I=1 J=5
+I=1 J=6
+T8 END I=1 J=6 C=09
+T9 TEST AFTER
+I=8
+I=9
+I=0
+I=1
+I=2
+I=3
+T9 END I=3 C=06
+T10 BY VARIABLE
+I=5
+I=9
+I=3
+I=7
+I=1
+I=5
+T10 END I=5 C=06
+T11 OUT-OF-LINE
+I=7
+I=9
+I=1
+I=3
+I=5
+I=7
+T11 END I=9 C=06
+T12 NORMAL
+I=1
+I=2
+I=3
+I=4
+T12 END I=5 C=04

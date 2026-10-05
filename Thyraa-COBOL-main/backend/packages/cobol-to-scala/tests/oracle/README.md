@@ -2301,11 +2301,34 @@ Programs that did NOT flip: `f03` (`DISPLAY "NUMVAL=" FUNCTION NUMVAL(WS-SRC(3:4
 - the ref-mod itself is correct (the subscript use on its second line passes), but cobc
 DISPLAYs a bare NUMVAL result in its own fixed-width intrinsic format (`000005678`) while
 this generator prints `5678`; this is independent of ref-mod (a plain-field NUMVAL argument
-differs identically) and is a separate, pre-existing gap. Also fixed in passing: stale,
+differs identically) and was fixed afterwards ("Post-campaign fixes (Oct 2026)" finding 1). Also fixed in passing: stale,
 non-compiling `tests/output/TransProc.scala` fixture deleted (nothing referenced it).
 Note: `oo13`/`pp06` `.oracle.txt` embed the run date (ACCEPT FROM DATE/DAY) and the two
 round-39 date-sanity unit tests (`round39-fixes.test.js`, "oo13 bug A/B") fail on any
 day other than the capture day - pre-existing, unrelated.
+
+### Post-campaign fixes (Oct 2026)
+
+Bounded follow-up to the reference-modification step: the three probes queued in
+`docs/ACTION_PLAN_2026-10.md`'s Findings log were re-run against cobc 4.0-early-dev.0
+(`cobc -x`, default dialect) and fixed only where a divergence was proven. A fourth
+divergence surfaced while probing the PERFORM VARYING step and is fixed with it.
+Every `rr*` `.oracle.txt` below was re-captured fresh from cobc and is byte-identical
+to the committed file.
+
+| # | Finding (cobc evidence) | Fix | Programs |
+|---|---|---|---|
+| 1 | **DISPLAY of a bare `FUNCTION NUMVAL / NUMVAL-C / MOD` result** (`f03`'s non-flip). cobc stores such a result in an anonymous numeric field sized by the VALUE: `NUMVAL("5678")` -> `000005678`, `"12.5"` -> `00000012.5`, `"-3.75"` -> `-0000003.75`, `"2147483647"` -> `147483647` (high-order digit lost: 9-digit field), `"4294967296"` -> `00000000004294967296` (20 digits), `"1234567890123456789012"` -> as wide as the value. Rule: trailing fractional zeros dropped; unscaled magnitude < 2^32 (< 2^31 negative) and scale < 10 -> 9 digits, else <= 64 bits and scale < 19 -> 20 digits, else exact width; `.` only if scale > 0; sign only if negative. `FUNCTION MAX/MIN` return the winning argument and DISPLAY it in ITS OWN format (`MAX(WS-A 9(3), WS-B 9(5))` -> `017` / `00017` by argument order on ties, `S9(3)` winner -> `+017`, literals normalised: `007` -> `7`, `100.50` -> `100.5`, `0.50` -> `.5`) | New `CobolFmt.intrinsicNum` runtime helper; `intrinsicDisplayExpr` in `generator/expression-gen.js`, called from `generateDisplay` for a bare FUNCTION operand (NUMVAL/NUMVAL-C/MOD -> `intrinsicNum`; MAX/MIN over plain numeric items/literals -> winner rendered through `renderDisplayOperand`; anything else keeps the generic path). Arithmetic/MOVE/COMPUTE contexts are untouched | `rr01`, `f03` (now byte-matches) |
+| 2 | **`VALUE ALL <literal>` ignored** (initialised to spaces/zero) and **`MOVE ALL <digits>` into a numeric item** emitted a bare String (Scala compile error). cobc: `PIC X(5) VALUE ALL "AB"` -> `ABABA`, `PIC X(7) VALUE ALL "XYZ"` -> `XYZXYZX`, `PIC 9(4) VALUE ALL "7"` -> `7777`, `PIC 9(3)V9 VALUE ALL "5"` -> `555.5`, `PIC S9(3) VALUE ALL "12"` -> `+121`; `ALL ZEROS/QUOTES` on PIC X fill the whole width (`0000`, `""""`); `MOVE ALL "3" TO PIC 9(3)V9` -> `333.0`. Also `VALUE ALL ZEROS/SPACES/...` left the figurative token unparsed (VALUE silently dropped), and `PIC X(4) VALUE ZEROS` filled one char | `parseValueClause` (`parser/data-division-parser.js`) accepts `ALL <figurative>` (reduced to the bare figurative); `defaultElementaryValue` + `repeatLiteralToWidth` + `ownValueStorageText` (`generator/scala-generator.js`) fill the item for `all`/figurative VALUEs; `renderLiteralForTarget` (`generator/expression-gen.js`) repeats ALL digits across a plain numeric receiver's integer digits and adds `QUOTE` | `rr02` |
+| 3 | **PERFORM VARYING step not truncated to the index PICTURE.** cobc stores `index + BY` with normal arithmetic-store semantics: `PIC 9` FROM 8 BY 1 -> 8,9,0,1,2,... (an `UNTIL WS-I > 12` never fires); BY 3 -> 8,1,4,7,0,...; `PIC S9` 9 -> `+0` (sign kept for signed); `PIC 9V9` 9.9 -> 0.6 (wraps, decimals kept); negative BY on unsigned `3 BY -2` -> 3,1,1,1,... (abs(-1)); same for `AFTER` inner indices, `TEST AFTER` and out-of-line `PERFORM para VARYING` | `varyingStepExpr` (`generator/expression-gen.js`, exported) builds the store through `storeNumericByInfo`, the helper ADD already uses; wired into inline PERFORM (`generatePerform`, TEST BEFORE and AFTER) and `generateVaryingNest` (`generator/method-gen.js`, every level, both tests). Unregistered/non-numeric index keeps the old `v + by` | `rr03` |
+| 4 | **Negative store into an UNSIGNED receiver kept its sign.** cobc stores the absolute value: `PIC 9 VALUE 1`, `ADD -2` -> `1` and `IF WS-I < 0` is FALSE; `COMPUTE WS-I = WS-I - 3` -> 2; `SUBTRACT 9 FROM PIC 99 VALUE 5` -> 04; `PIC 9(3)V9 = 1.5 - 4` -> 002.5; signed `PIC S99` still `-04`/NEG. The old Scala var kept the negative (DISPLAY hid it by printing the absolute value, comparisons saw the sign). Same root cause as finding 3's negative-BY case | `storeNumericByInfo` appends `.abs` when `info.signed === false`, so EVERY arithmetic store (ADD/SUBTRACT/MULTIPLY/DIVIDE/COMPUTE/CORRESPONDING/VARYING) now stores the absolute value for unsigned receivers. Round 4/10/18/24 and phase-2 shape assertions were updated for the added `.abs` / fitted step | `rr04` |
+
+Unit tests: `tests/oct2026-fixes.test.js` (shape tests over generated Scala plus a pure-JS
+mirror of the intrinsic-result width rule pinned to the cobc-captured renderings).
+Not changed and not claimed: a figurative/`ALL` VALUE on a numeric-EDITED item keeps its
+earlier path; MAX/MIN with non-plain arguments (expressions, ref-mod, COMP-1/2) fall back
+to the generic rendering; FUNCTION results other than NUMVAL/NUMVAL-C/MOD/MAX/MIN
+(e.g. SUM, INTEGER, ORD) have not been probed for the same display format.
 
 ### Known gaps
 
@@ -2334,11 +2357,9 @@ day other than the capture day - pre-existing, unrelated.
   BY REFERENCE ref-mod argument only round-trips for String parameters;
   (7) UNSTRING DELIMITED BY a *non-ref-mod* data-name remains unsupported (Known
   gap list elsewhere). Using a ref-mod operand directly as an arithmetic operand
-  is invalid COBOL (cobc rejects it - pp08) and is not modelled. `f03` still
-  differs from cobc for a DIFFERENT, pre-existing reason: cobc DISPLAYs a bare
-  `FUNCTION NUMVAL(...)` result in its own fixed-width intrinsic-result format
-  (e.g. `000005678`), which this generator does not reproduce for any NUMVAL
-  argument, ref-mod or not.
+  is invalid COBOL (cobc rejects it - pp08) and is not modelled. `f03`'s
+  separate bare-`FUNCTION NUMVAL` DISPLAY-format divergence is CLOSED (see
+  "Post-campaign fixes (Oct 2026)" finding 1); `f03` now byte-matches cobc.
 
 - **A bare, UNQUALIFIED out-of-line `PERFORM <paragraph-name>` (or `GO TO`) that
   targets one specific paragraph whose bare name is ambiguous across sections

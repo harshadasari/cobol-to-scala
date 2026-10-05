@@ -429,7 +429,7 @@ test('Finding 5: PERFORM VARYING ... AFTER resets the AFTER variable to FROM aft
   assert.match(code, /wsI = 1\s*\n\s*wsJ = 10\s*\n\s*while !\(wsI > 5\) do/);
   // After the outer level's own increment, the AFTER variable is reset again
   // (unconditionally - even on the outer loop's final, test-failing retest).
-  assert.match(code, /wsI = wsI \+ 2\s*\n\s*wsJ = 10/);
+  assert.match(code, /wsI = \(CobolFmt\.truncNumeric\(BigDecimal\(wsI\) \+ BigDecimal\("2"\), 3, 0\)\)\.toInt\s*\n\s*wsJ = 10/);
 });
 
 // ---------------------------------------------------------------------------

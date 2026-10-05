@@ -1827,6 +1827,31 @@ export function generateCobolFmtHelper() {
     '      if decimalComma then digits.filterNot(_ == \'.\').replace(\',\', \'.\') else digits.filterNot(_ == \',\')',
     '    if normalized.isEmpty then BigDecimal(0) else BigDecimal((if negative then "-" else "") + normalized)',
     '',
+    '  // Oct-2026 (probe 1): DISPLAY of a numeric-valued FUNCTION result computed',
+    '  // at runtime (NUMVAL, NUMVAL-C, MOD) - cobc stores such a result in an',
+    '  // anonymous field sized by the VALUE\'s magnitude, not by any PICTURE',
+    '  // (compiler-verified, oracle programs rr01/rr02): trailing fractional',
+    '  // zeros are dropped (scale = remaining decimals); if the unscaled',
+    '  // magnitude fits 32 bits (31 when negative) and scale < 10 the field is 9',
+    '  // digits wide, else if it fits 64 bits and scale < 19 it is 20 digits',
+    '  // wide, else exactly as wide as the value. High-order digits beyond the',
+    '  // width are lost, a decimal point is shown only for scale > 0, and the',
+    '  // sign is shown only when negative (never "+").',
+    '  def intrinsicNum(v0: BigDecimal): String =',
+    '    val j = if v0.signum == 0 then java.math.BigDecimal.ZERO else v0.bigDecimal.stripTrailingZeros',
+    '    val scale = math.max(j.scale, 0)',
+    '    val neg = j.signum < 0',
+    '    val u = j.abs.setScale(scale).unscaledValue',
+    '    val bits = u.bitLength',
+    '    val ustr = u.toString',
+    '    val width =',
+    '      if scale < 10 && bits < (if neg then 32 else 33) then 9',
+    '      else if scale < 19 && bits <= 64 then 20',
+    '      else math.max(ustr.length, scale)',
+    '    val digits = if ustr.length < width then ("0" * (width - ustr.length)) + ustr else ustr.takeRight(width)',
+    '    val body = if scale > 0 then digits.dropRight(scale) + "." + digits.takeRight(scale) else digits',
+    '    (if neg then "-" else "") + body',
+    '',
     '  // Numeric MOVE truncation to a target\'s declared digit widths: extra',
     '  // low-order decimal digits are dropped (never rounded - MOVE truncates,',
     '  // it does not round), and extra high-order integer digits are dropped',
@@ -2889,10 +2914,39 @@ function storeNumericByInfo(info, bdExpr, rawExpr, rounded) {
   if (!info || !['Int', 'Long', 'BigDecimal'].includes(info.scalaType)) {
     return rawExpr;
   }
-  const stored = `CobolFmt.${fn}(${bdExpr}, ${intDigits}, ${decDigits})`;
+  // Oct-2026 (probe 3): an UNSIGNED numeric receiver never holds a negative
+  // value - cobc stores the absolute value (ADD -2 TO PIC 9 VALUE 1 -> 1, and
+  // `IF item < 0` is then false). Previously the sign survived in the Scala
+  // var (DISPLAY hid it by printing |v|, but comparisons saw the negative).
+  const unsignedAbs = info.signed === false ? '.abs' : '';
+  const stored = `CobolFmt.${fn}(${bdExpr}, ${intDigits}, ${decDigits})${unsignedAbs}`;
   if (info.scalaType === 'BigDecimal') return stored;
   if (info.scalaType === 'Long') return `(${stored}).toLong`;
   return `(${stored}).toInt`;
+}
+
+/**
+ * Oct-2026 (probe 3): the value a PERFORM VARYING / AFTER level stores back
+ * into its index each step. COBOL adds BY to the index and STORES the sum
+ * with ordinary arithmetic-store semantics (high-order truncation to the
+ * index's PICTURE, low-order decimals dropped, unsigned -> absolute value),
+ * so `PIC 9` stepping 8 BY 1 goes 8, 9, 0, 1, ... and an UNTIL that is only
+ * satisfiable above the PIC's range never fires (cobc-verified, rr03/rr04).
+ * Reuses storeNumericByInfo, the same store helper ADD uses. `level` is a
+ * parser VaryingClause ({variable, by}); falls back to the historic unfitted
+ * `var + by` for an unregistered or non-numeric index.
+ */
+export function varyingStepExpr(level) {
+  const variable = level?.variable || 'i';
+  const varName = toCamelCase(typeof variable === 'object' ? variable.name : variable);
+  const byNode = level?.by == null ? { type: 'Literal', literalType: 'numeric', value: '1' } : level.by;
+  const byRaw = varyingOperandExprLocal(level?.by, 1);
+  const info = lookupFieldForRef(typeof variable === 'object' ? variable : String(variable));
+  const rawExpr = `${varName} + ${byRaw}`;
+  if (!info || info.dataType !== 'numeric') return rawExpr;
+  const indexNode = typeof variable === 'object' ? variable : { type: 'VariableReference', name: variable };
+  const bdExpr = `${toBigDecimalOperand(indexNode)} + ${toBigDecimalOperand(byNode)}`;
+  return storeNumericByInfo(info, bdExpr, rawExpr, false);
 }
 
 function storeNumericExpr(targetRef, bdExpr, rawExpr, rounded) {
@@ -3197,6 +3251,7 @@ function renderLiteralForTarget(lit, info) {
       case 'SPACE': return repeatedCharLiteralFor(' ', info);
       case 'HIGH-VALUE': return repeatedCharLiteralFor(String.fromCharCode(255), info);
       case 'LOW-VALUE': return repeatedCharLiteralFor(String.fromCharCode(0), info);
+      case 'QUOTE': return repeatedCharLiteralFor('"', info);
       default: return repeatedCharLiteralFor(' ', info);
     }
   }
@@ -3215,6 +3270,18 @@ function renderLiteralForTarget(lit, info) {
         ? repeatToWidthText(text, info.picLength)
         : fitAlphanumericText(text, info.picLength, info.justified);
       return `"${escapeScalaStringLiteral(filled)}"`;
+    }
+    // Oct-2026 (probe 2): MOVE ALL "<digits>" TO <plain numeric item> repeats
+    // the digits across the item's INTEGER digits (cobc: ALL "3" into
+    // PIC 9(3)V9 stores 333.0) - previously rendered a bare String into an
+    // Int/BigDecimal slot (Scala compile error).
+    if (lit.all && info && info.dataType === 'numeric' && info.scalaType !== 'String' &&
+        info.scalaType !== 'Float' && info.scalaType !== 'Double' &&
+        /^\d+$/.test(text) && info.integerDigits > 0) {
+      return renderLiteralForTarget(
+        { literalType: 'numeric', value: repeatToWidthText(text, info.integerDigits) },
+        info
+      );
     }
     return `"${escapeScalaStringLiteral(text)}"`;
   }
@@ -6629,6 +6696,61 @@ function renderDisplayOperand(ref) {
 }
 
 /**
+ * A numeric literal returned through FUNCTION MAX/MIN DISPLAYs normalized
+ * (compiler-verified): leading integer zeros and trailing fractional zeros
+ * are dropped (`007` -> `7`, `100.50` -> `100.5`, `0.50` -> `.5`, `2.0` ->
+ * `2`), sign kept.
+ */
+function normalizeIntrinsicLiteralText(value) {
+  const m = /^([+-]?)(\d*)(?:\.(\d*))?$/.exec(String(value).trim());
+  if (!m) return escapeScalaStringLiteral(String(value));
+  const intPart = (m[2] || '').replace(/^0+/, '');
+  const frac = (m[3] || '').replace(/0+$/, '');
+  if (!intPart && !frac) return '0';
+  return `${m[1] === '-' ? '-' : ''}${intPart}${frac ? '.' + frac : ''}`;
+}
+
+/**
+ * Oct-2026 (probe 1): DISPLAY of a bare FUNCTION result in cobc's own
+ * intrinsic-result format (compiler-verified; see tests/oracle/README.md's
+ * "Post-campaign fixes (Oct 2026)" and CobolFmt.intrinsicNum):
+ *   - NUMVAL / NUMVAL-C / MOD: value-sized anonymous numeric field
+ *     (CobolFmt.intrinsicNum).
+ *   - MAX / MIN: the winning argument is returned as-is, so it DISPLAYs in
+ *     the winner's own format (its PICTURE width/sign/decimals; a numeric
+ *     literal as written). Ties keep the first argument. Only handled when
+ *     every argument is a plain numeric item or numeric literal; anything
+ *     else returns null and keeps the generic rendering.
+ * Returns null when the call is not one of these. Arithmetic/assignment
+ * contexts never reach this (they use generateFunctionCall directly).
+ */
+function intrinsicDisplayExpr(fc) {
+  const name = String(fc?.name || '').toUpperCase();
+  const args = fc?.arguments || [];
+  if (name === 'NUMVAL' || name === 'NUMVAL-C' || name === 'MOD') {
+    return `CobolFmt.intrinsicNum(${functionCallToBigDecimalOperand(fc)})`;
+  }
+  if ((name === 'MAX' || name === 'MIN') && args.length > 0) {
+    const entries = [];
+    for (const raw of args) {
+      const arg = unwrapSimpleConditionOperand(raw) || raw;
+      if (arg && arg.type === 'Literal' && arg.literalType === 'numeric') {
+        entries.push(`(${toBigDecimalOperand(arg)}, () => "${normalizeIntrinsicLiteralText(arg.value)}")`);
+      } else if (arg && arg.type === 'VariableReference' && !arg.refMod) {
+        const info = lookupFieldForRef(arg);
+        if (!info || info.dataType !== 'numeric' || info.scalaType === 'Float' || info.scalaType === 'Double') return null;
+        entries.push(`(${toBigDecimalOperand(arg)}, () => ${renderDisplayOperand(arg)})`);
+      } else {
+        return null;
+      }
+    }
+    const cmp = name === 'MAX' ? '>' : '<';
+    return `List[(BigDecimal, () => String)](${entries.join(', ')}).reduceLeft((x, y) => if y._1 ${cmp} x._1 then y else x)._2()`;
+  }
+  return null;
+}
+
+/**
  * Generate DISPLAY statement. `WITH NO ADVANCING` (parsed into
  * `statement.noAdvancing` by parser/procedure-parser.js's
  * parseDisplayStatement) suppresses the trailing newline a plain DISPLAY
@@ -6680,6 +6802,8 @@ function generateDisplay(statement, indent = 0) {
           return `CobolFmt.num(BigDecimal(${refModEffectiveLengthExpr(arg0)}), 10, 0, false, false)`;
         }
       }
+      const intrinsicDisplay = intrinsicDisplayExpr(item);
+      if (intrinsicDisplay) return intrinsicDisplay;
     }
     return convertArithmeticExpression(item);
   });
@@ -9312,7 +9436,6 @@ function generatePerform(statement, indent = 0) {
     const varying = statement.varying;
     const varName = toCamelCase(varying?.variable || 'i');
     const from = varyingOperandExprLocal(varying?.from, 1);
-    const by = varyingOperandExprLocal(varying?.by, 1);
     const until = convertCondition(varying?.until);
     const bi = '  '.repeat(indent + 1);
     const bi2 = '  '.repeat(indent + 2);
@@ -9326,7 +9449,7 @@ function generatePerform(statement, indent = 0) {
     if (testBefore) {
       lines.push(`${bi}while !(${until}) do`);
       lines.push(body(indent + 2));
-      lines.push(`${bi2}${varName} = ${varName} + ${by}`);
+      lines.push(`${bi2}${assignExpr(varName, varyingStepExpr(varying))}`);
     } else {
       // WITH TEST AFTER VARYING: the UNTIL test happens *before* the
       // increment, against the still-current value - the increment only
@@ -9339,7 +9462,7 @@ function generatePerform(statement, indent = 0) {
       lines.push(body(indent + 2));
       lines.push(`${bi2}!(${until})`);
       lines.push(`${bi}do`);
-      lines.push(`${bi2}${varName} = ${varName} + ${by}`);
+      lines.push(`${bi2}${assignExpr(varName, varyingStepExpr(varying))}`);
     }
     lines.push(`${indentStr}}`);
   } else if (statement.statements) {

@@ -9,6 +9,7 @@ import {
   convertCondition,
   setAmbiguousParagraphNamesForPerform as setAmbiguousParagraphNamesForPerformExpr,
   assignExpr,
+  varyingStepExpr,
   isRecursiveNestedFlowMode,
 } from './expression-gen.js';
 
@@ -355,7 +356,6 @@ function generateVaryingNest(levels, i, stmt, indent) {
   const level = levels[i];
   const varName = toCamelCase(level.variable || 'i');
   const from = varyingOperandExpr(level.from, 1);
-  const by = varyingOperandExpr(level.by, 1);
   const until = convertConditionToScala(level.until);
   const isInnermost = i === levels.length - 1;
   const body = isInnermost ? performBodyLines(stmt, indent + 1) : generateVaryingNest(levels, i + 1, stmt, indent + 1);
@@ -378,7 +378,7 @@ function generateVaryingNest(levels, i, stmt, indent) {
     return [
       `${indentStr}while !(${until}) do`,
       body,
-      `${bodyIndentStr}${assignExpr(varName, `${varName} + ${by}`)}`,
+      `${bodyIndentStr}${assignExpr(varName, varyingStepExpr(level))}`,
       resetDeeperLines,
     ].filter(Boolean).join('\n');
   }
@@ -400,7 +400,7 @@ ${indentStr}while
 ${body}
 ${bodyIndentStr}!(${until})
 ${indentStr}do
-${bodyIndentStr}${assignExpr(varName, `${varName} + ${by}`)}`;
+${bodyIndentStr}${assignExpr(varName, varyingStepExpr(level))}`;
 }
 
 /**

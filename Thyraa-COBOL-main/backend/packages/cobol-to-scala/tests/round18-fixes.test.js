@@ -111,7 +111,7 @@ describe('round-18 finding 1: a PROCEDURE DIVISION whose very first thing is a s
     const scala = scalaOf(src);
     assert.match(scala, /def implicitMainParagraph\(\): Unit =/);
     assert.match(scala, /println\("MAIN-BEFORE-CALL"\)/);
-    assert.match(scala, /wsX = \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsX\) \+ \(BigDecimal\("5"\)\)\), 3, 0\)\)\.toInt/);
+    assert.match(scala, /wsX = \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsX\) \+ \(BigDecimal\("5"\)\)\), 3, 0\)\.abs\)\.toInt/);
     assert.match(scala, /@main def run\(\): Unit =\s*\n\s*def _step0\(\): Unit =\s*\n\s*implicitMainParagraph\(\)/);
   });
 
@@ -445,11 +445,11 @@ describe('round-18 finding 5: ADD/SUBTRACT CORRESPONDING between two SUBSCRIPTED
     const scala = scalaOf(src);
     assert.match(
       scala,
-      /wsTableBWsRowBAAmt1 = wsTableBWsRowBAAmt1\.updated\(1, \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsTableBWsRowBAAmt1\(1\)\) \+ BigDecimal\(wsTableAWsRowAAAmt1\(0\)\)\), 4, 0\)\)\.toInt\)/
+      /wsTableBWsRowBAAmt1 = wsTableBWsRowBAAmt1\.updated\(1, \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsTableBWsRowBAAmt1\(1\)\) \+ BigDecimal\(wsTableAWsRowAAAmt1\(0\)\)\), 4, 0\)\.abs\)\.toInt\)/
     );
     assert.match(
       scala,
-      /wsTableBWsRowBAAmt2 = wsTableBWsRowBAAmt2\.updated\(1, \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsTableBWsRowBAAmt2\(1\)\) \+ BigDecimal\(wsTableAWsRowAAAmt2\(0\)\)\), 4, 0\)\)\.toInt\)/
+      /wsTableBWsRowBAAmt2 = wsTableBWsRowBAAmt2\.updated\(1, \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsTableBWsRowBAAmt2\(1\)\) \+ BigDecimal\(wsTableAWsRowAAAmt2\(0\)\)\), 4, 0\)\.abs\)\.toInt\)/
     );
     // Never the bare (whole-table) Vector fed straight into BigDecimal(...).
     assert.doesNotMatch(scala, /BigDecimal\(wsTableAWsRowAAAmt1\)\)/);
@@ -470,7 +470,7 @@ describe('round-18 finding 5: ADD/SUBTRACT CORRESPONDING between two SUBSCRIPTED
            STOP RUN.
 `;
     const scala = scalaOf(src);
-    assert.match(scala, /wsGrpBGAmt = \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsGrpBGAmt\) \+ BigDecimal\(wsGrpAGAmt\)\), 4, 0\)\)\.toInt/);
+    assert.match(scala, /wsGrpBGAmt = \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsGrpBGAmt\) \+ BigDecimal\(wsGrpAGAmt\)\), 4, 0\)\.abs\)\.toInt/);
   });
 
   test('SUBTRACT CORRESPONDING gets the identical subscript-propagation fix', () => {
@@ -492,7 +492,7 @@ describe('round-18 finding 5: ADD/SUBTRACT CORRESPONDING between two SUBSCRIPTED
     const scala = scalaOf(src);
     assert.match(
       scala,
-      /wsTableBWsRowBAAmt = wsTableBWsRowBAAmt\.updated\(1, \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsTableBWsRowBAAmt\(1\)\) - BigDecimal\(wsTableAWsRowAAAmt\(0\)\)\), 4, 0\)\)\.toInt\)/
+      /wsTableBWsRowBAAmt = wsTableBWsRowBAAmt\.updated\(1, \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsTableBWsRowBAAmt\(1\)\) - BigDecimal\(wsTableAWsRowAAAmt\(0\)\)\), 4, 0\)\.abs\)\.toInt\)/
     );
   });
 });

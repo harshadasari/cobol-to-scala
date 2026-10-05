@@ -262,7 +262,7 @@ test('Finding 5: PERFORM WITH TEST AFTER VARYING tests before incrementing (matc
   // finding 1) and both ADD targets are stored through the same ROUNDED-or-
   // truncated coercion every arithmetic statement now uses (round-3
   // findings 8/13) instead of a bare `x = x + y`.
-  assert.match(code, /scala\.util\.boundary \{\n\s+wsI = 1\n\s+while\n\s+wsSum = \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsSum\) \+ \(BigDecimal\(wsI\)\)\), 3, 0\)\)\.toInt\n\s+!\(wsI > 3\)\n\s+do\n\s+wsI = wsI \+ 1\n\s+\}/);
+  assert.match(code, /scala\.util\.boundary \{\n\s+wsI = 1\n\s+while\n\s+wsSum = \(CobolFmt\.truncNumeric\(\(BigDecimal\(wsSum\) \+ \(BigDecimal\(wsI\)\)\), 3, 0\)\.abs\)\.toInt\n\s+!\(wsI > 3\)\n\s+do\n\s+wsI = \(CobolFmt\.truncNumeric\(BigDecimal\(wsI\) \+ BigDecimal\("1"\), 3, 0\)\)\.toInt\n\s+\}/);
 });
 
 // ---------------------------------------------------------------------------

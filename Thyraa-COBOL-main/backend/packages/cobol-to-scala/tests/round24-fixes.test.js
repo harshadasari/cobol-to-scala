@@ -180,7 +180,7 @@ describe('round-24 finding 1: centralization-gap audit - every write site now ro
     assert.doesNotMatch(body, /\n\s*lsN = 1\b/);
     assert.doesNotMatch(body, /\n\s*lsN = lsN \+/);
     assert.match(body, /lsN_=\(1\)/);
-    assert.match(body, /lsN_=\(lsN \+/);
+    assert.match(body, /lsN_=\(\(CobolFmt\.truncNumeric\(BigDecimal\(lsN\) \+ BigDecimal\("1"\), 2, 0\)\.abs\)\.toInt\)/);
   });
 
   test('SET condition-name TO TRUE (a level-88 attached to a RECURSIVE LINKAGE scalar) uses the explicit setter form for the parent field', () => {

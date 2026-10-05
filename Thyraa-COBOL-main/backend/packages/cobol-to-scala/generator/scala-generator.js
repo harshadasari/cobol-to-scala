@@ -659,6 +659,38 @@ function defaultElementaryValue(item, scalaType, isFileSection = false) {
 
   const pic = item.pic && typeof item.pic === 'object' ? item.pic : null;
 
+  // Oct-2026 (probe 2): a figurative VALUE (ZEROS/QUOTES/HIGH-VALUES/
+  // LOW-VALUES; also `ALL <figurative>`, which the parser now reduces to
+  // the bare figurative) on an alphanumeric item fills its WHOLE width
+  // (`PIC X(4) VALUE ZEROS` -> "0000"), not one character + padding.
+  if (
+    raw && typeof raw === 'object' && raw.type === 'figurative' && scalaType === 'String' &&
+    !(pic?.dataType === 'edited' && pic?.editPattern) && (pic?.length || 0) > 0
+  ) {
+    const fillChar = { ZERO: '0', QUOTE: '"', 'HIGH-VALUE': '\u00ff', 'LOW-VALUE': '\u0000' }[raw.value];
+    if (fillChar !== undefined) {
+      literalKind = 'string';
+      literalText = fillChar.repeat(pic.length);
+    }
+  }
+
+  // Oct-2026 (probe 2): VALUE ALL <literal> fills the WHOLE item by repeating
+  // the literal, truncating the last repetition (cobc: `PIC X(5) VALUE ALL
+  // "AB"` -> ABABA; `PIC 9(4) VALUE ALL "7"` -> 7777) - it previously
+  // initialised to spaces/zero. An edited receiver keeps its existing path.
+  if (raw && typeof raw === 'object' && raw.type === 'all') {
+    const text = String(raw.value ?? '');
+    if (scalaType === 'String' && !(pic?.dataType === 'edited' && pic?.editPattern)) {
+      literalKind = 'string';
+      literalText = repeatLiteralToWidth(text, pic?.length || 0);
+    } else if (scalaType !== 'String' && /^\d+$/.test(text) && pic) {
+      const dec = Math.max(pic.decimalDigits || 0, 0);
+      const digits = repeatLiteralToWidth(text, (pic.integerDigits || 0) + dec);
+      literalKind = 'numeric';
+      literalText = dec > 0 ? `${digits.slice(0, digits.length - dec) || '0'}.${digits.slice(digits.length - dec)}` : digits;
+    }
+  }
+
   if (scalaType === 'String') {
     // A numeric-edited item's own VALUE clause (or lack of one) must go
     // through the same PICTURE-edit formatting a MOVE into it would apply
@@ -730,6 +762,12 @@ function defaultElementaryValue(item, scalaType, isFileSection = false) {
   return '0';
 }
 
+function repeatLiteralToWidth(text, width) {
+  const s = String(text ?? '');
+  if (!width || width <= 0 || s.length === 0) return s;
+  return s.repeat(Math.ceil(width / s.length)).slice(0, width);
+}
+
 function normalizeIntLiteralText(raw) {
   const m = /^-?\d+/.exec(String(raw));
   return m ? m[0] : '0';
@@ -760,6 +798,7 @@ function ownValueStorageText(item, width) {
   let text = null;
   if (v.type === 'string') text = String(v.value ?? '');
   else if (v.type === 'numeric') text = String(v.value);
+  else if (v.type === 'all') text = repeatLiteralToWidth(String(v.value ?? ''), width);
   else if (v.type === 'figurative') {
     if (v.value === 'SPACE') text = '';
     else if (v.value === 'ZERO') text = '0';

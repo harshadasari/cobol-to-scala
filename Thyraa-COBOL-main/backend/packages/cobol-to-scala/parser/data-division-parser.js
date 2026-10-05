@@ -558,6 +558,19 @@ function parseValueClause(ctx) {
       // ALL followed by a literal
       if (ctx.check(TokenType.STRING_LITERAL)) {
         value = { type: 'all', value: ctx.advance().value };
+      } else if (ctx.matchValue('ZERO', 'ZEROS', 'ZEROES')) {
+        // ALL <figurative> is identical to the bare figurative (Oct-2026:
+        // previously the figurative token was left unconsumed and the VALUE
+        // silently dropped).
+        value = { type: 'figurative', value: 'ZERO' };
+      } else if (ctx.matchValue('SPACE', 'SPACES')) {
+        value = { type: 'figurative', value: 'SPACE' };
+      } else if (ctx.matchValue('HIGH-VALUE', 'HIGH-VALUES')) {
+        value = { type: 'figurative', value: 'HIGH-VALUE' };
+      } else if (ctx.matchValue('LOW-VALUE', 'LOW-VALUES')) {
+        value = { type: 'figurative', value: 'LOW-VALUE' };
+      } else if (ctx.matchValue('QUOTE', 'QUOTES')) {
+        value = { type: 'figurative', value: 'QUOTE' };
       }
     } else if (ctx.check(TokenType.STRING_LITERAL)) {
       value = { type: 'string', value: ctx.advance().value };

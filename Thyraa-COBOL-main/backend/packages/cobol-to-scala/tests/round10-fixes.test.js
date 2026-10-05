@@ -361,6 +361,6 @@ test('Finding 6b: ROUNDED applies only to the target it immediately follows, per
 test('Finding 6c: the generator assigns the expression to every target, rounding/truncating each independently', () => {
   const code = scalaOf(COMPUTE_MULTI_TARGET_SOURCE);
   assert.match(code, /wsA = CobolFmt\.truncNumeric\([\s\S]*?, 3, 2\)/, 'WS-A (unrounded) must truncate to its own 2 decimal digits');
-  assert.match(code, /wsB = \(CobolFmt\.truncNumeric\([\s\S]*?, 3, 0\)\)\.toInt/, 'WS-B (unrounded, 0 decimals) must truncate');
+  assert.match(code, /wsB = \(CobolFmt\.truncNumeric\([\s\S]*?, 3, 0\)(?:\.abs)?\)\.toInt/, 'WS-B (unrounded, 0 decimals) must truncate');
   assert.match(code, /wsC = CobolFmt\.roundNumeric\([\s\S]*?, 3, 1\)/, 'WS-C (ROUNDED) must round HALF_UP to its own 1 decimal digit');
 });

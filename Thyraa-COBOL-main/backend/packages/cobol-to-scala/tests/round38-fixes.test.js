@@ -178,7 +178,7 @@ describe('round-38 finding 2 (nn04): a ref-modified BY REFERENCE operand into a 
     const scala = scalaOf(readCorpus('nn04-call-byref-refmod-recur.cbl'));
     assert.match(
       scala,
-      /Nn04sub\.entry\(\(\) => \{ val _s = \(3 - 1\); val _l = \(4\); wsStr\.substring\(_s, _s \+ _l\) \}, \(v: String\) => \{ val _s = \(3 - 1\); val _l = \(4\); wsStr = wsStr\.substring\(0, _s\) \+ v \+ wsStr\.substring\(_s \+ _l, wsStr\.length\) \}, \(\) => wsDepth, \(v: Int\) => wsDepth = v\)/
+      /Nn04sub\.entry\(\(\) => CobolFmt\.refModSlice\(CobolFmt\.fitLeft\(wsStr, 10\), \(3\)\.toInt, \(4\)\.toInt\), \(v: String\) => \{ wsStr = CobolFmt\.refModPatch\(CobolFmt\.fitLeft\(wsStr, 10\), \(3\)\.toInt, \(4\)\.toInt, v\) \}, \(\) => wsDepth, \(v: Int\) => wsDepth = v\)/
     );
   });
 });

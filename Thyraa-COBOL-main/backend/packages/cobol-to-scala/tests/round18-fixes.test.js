@@ -629,7 +629,8 @@ describe('round-18 finding 8: every dynamic (non-literal) subscript index is def
     const scala = scalaOf(src);
     // The known-gap ref-mod placeholder is still exactly BigDecimal(0) - not
     // this finding's concern to fix.
-    assert.match(scala, /BigDecimal\(0\) \/\* TODO: reference modification/);
+    // (Oct 2026: ref-mod is now real - the numeric MOVE source is the numval of the slice.)
+    assert.match(scala, /CobolFmt\.numval\(CobolFmt\.refModSlice\(/);
     // But the subscript built from it must be defensively clamped so a
     // computed 0-based index of -1 can never reach Vector.apply.
     assert.match(scala, /wsVal\(\(wsIdxnum - 1\)\.toInt\.max\(0\)\)/);

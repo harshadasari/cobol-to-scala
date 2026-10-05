@@ -197,8 +197,8 @@ describe('round-16 finding 2: reference modification as an IF/EVALUATE compariso
 `;
     const scala = scalaOf(src);
     assert.doesNotMatch(scala, /\?\?\?.*\.compareTo/, 'must never emit a Nothing-typed ???.compareTo(...) call');
-    assert.match(scala, /"" \/\* TODO: reference modification not implemented as a comparison operand/);
-    assert.match(scala, /\.compareTo\(/, 'the comparison itself must still compile via .compareTo on a concrete String');
+    // Oct 2026: real reference modification - runtime alphanumeric compare over the slice.
+    assert.match(scala, /CobolFmt\.alnumCompare\(CobolFmt\.refModSlice\(CobolFmt\.fitLeft\(wsSrc, 10\), \(8\)\.toInt, \(3\)\.toInt\), "AAA"\) > 0/);
   });
 
   test('a non-ref-mod relational comparison is completely unaffected (regression guard)', () => {
@@ -254,11 +254,11 @@ describe('round-16 finding 3: reference modification as a CALL argument no longe
     const scala = scalaOf(src);
     // The old silent bug: the callee received the FULL base variable.
     assert.doesNotMatch(scala, /E06sub\.entry\(wsSrc,/);
-    assert.match(scala, /"" \/\* TODO: CALL "E06SUB" USING WS-SRC\(\.\.\.\): reference modification not implemented as a CALL argument/);
-    // The BY REFERENCE writeback must also be a visible no-op, not a write
-    // into the untouched base variable.
-    assert.match(scala, /TODO: CALL \.\.\. USING BY REFERENCE WS-SRC\(\.\.\.\): reference modification not implemented for CALL argument writeback/);
-    assert.doesNotMatch(scala, /\bwsSrc = _callRet/);
+    // Oct 2026: the callee gets exactly the 5-character slice, and the BY
+    // REFERENCE writeback patches only that slice of the base variable.
+    assert.match(scala, /E06sub\.entry\(CobolFmt\.refModSlice\(CobolFmt\.fitLeft\(wsSrc, 10\), \(3\)\.toInt, \(5\)\.toInt\),/);
+    assert.match(scala, /wsSrc = CobolFmt\.refModPatch\(CobolFmt\.fitLeft\(wsSrc, 10\), \(3\)\.toInt, \(5\)\.toInt, /);
+    assert.doesNotMatch(scala, /\bwsSrc = _callRet\b/);
   });
 
   test('a non-ref-mod CALL argument is completely unaffected (regression guard)', () => {

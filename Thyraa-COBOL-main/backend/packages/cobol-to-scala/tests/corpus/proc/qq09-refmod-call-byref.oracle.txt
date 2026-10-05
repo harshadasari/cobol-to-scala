@@ -1,0 +1,7 @@
+BEFORE=[abcdefghijkl]
+IN SUB=[cdef]
+AFTER1=[abc<--ghijkl]
+IN SUB=[ijkl]
+AFTER2=[abc<--ghi<--]
+IN SUB=[abc<]
+AFTER3=[abc<--ghi<--]

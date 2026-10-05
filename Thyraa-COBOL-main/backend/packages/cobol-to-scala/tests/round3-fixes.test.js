@@ -110,7 +110,8 @@ test("Finding 3: reference modification (start:length) parses cleanly (doesn't c
   // substituted in, and not a parse corruption that would have swallowed
   // the rest of the statement (see parser/procedure-parser.js's
   // parseVariableReference fix).
-  assert.match(code, /\?\?\? \/\* TODO: reference modification \(read\) not implemented/);
+  // (Oct 2026: reference modification is now real - a sliced read.)
+  assert.match(code, /CobolFmt\.refModSlice\(CobolFmt\.fitLeft\(wsField, \d+\), \(2\)\.toInt, \(3\)\.toInt\)/);
   // Write path: likewise a visible, compiling TODO - not the mis-dispatch
   // into subscript codegen the pre-fix parser produced. round-39 finding 2:
   // this is now a BLOCK comment (`/* ... */`), not the original's line
@@ -119,7 +120,7 @@ test("Finding 3: reference modification (start:length) parses cleanly (doesn't c
   // doesn't hit a "Reassignment to val" compile crash - see oo04) wraps this
   // value expression inside `<camel>_=( ... )`, and a `//` line comment
   // would have swallowed the closing `)` into the comment too.
-  assert.match(code, /wsField = \?\?\? \/\* TODO: reference modification \(write\) not implemented/);
+  assert.match(code, /wsField = CobolFmt\.refModPatch\(CobolFmt\.fitLeft\(wsField, \d+\), \(4\)\.toInt, \(3\)\.toInt, "XYZ"\)/);
   // The DISPLAY statement (and everything else in the paragraph) must still
   // have parsed correctly - not been swallowed by a corrupted cursor.
   assert.match(code, /println\(\(wsSub\)/);

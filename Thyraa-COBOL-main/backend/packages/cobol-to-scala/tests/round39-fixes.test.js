@@ -185,7 +185,7 @@ describe('round-39 finding 2 (oo04): ref-mod write to a RECURSIVE LINKAGE leaf c
     const scala = scalaOf(readCorpus('oo04-refmod-runtime-recur.cbl'));
     assert.match(
       scala,
-      /lkSlice_=\(\?\?\? \/\* TODO: reference modification \(write\) not implemented - see tests\/oracle\/README\.md known gaps \*\/\)/
+      /lkSlice_=\(CobolFmt\.refModPatch\(CobolFmt\.fitLeft\(lkSlice, 4\), \(1\)\.toInt, \(2\)\.toInt, "ZZ"\)\)/
     );
     // (The SAME program's own ordinary, non-closure-aliased flat-method body -
     // dead code, never actually invoked, since this program is RECURSIVE and
@@ -197,18 +197,18 @@ describe('round-39 finding 2 (oo04): ref-mod write to a RECURSIVE LINKAGE leaf c
     // reachable entry() body must never emit a bare "=" for this name.)
   });
 
-  test('the placeholder is a BLOCK comment, not a line comment - a line comment would swallow the wrapping _=(...) call\'s own closing paren', () => {
+  test('the ref-mod write value is spliced inside the setter call with real semantics (Oct 2026: CobolFmt.refModPatch, not a placeholder)', () => {
     const scala = scalaOf(readCorpus('oo04-refmod-runtime-recur.cbl'));
-    assert.match(scala, /lkSlice_=\(\?\?\? \/\*/);
-    assert.doesNotMatch(scala, /lkSlice_=\(\?\?\? \/\/ /);
+    assert.match(scala, /lkSlice_=\(CobolFmt\.refModPatch\(/);
+    assert.doesNotMatch(scala, /lkSlice_=\(\?\?\?/);
   });
 });
 
 describe('round-39 finding 2 regression: an ordinary (non-RECURSIVE-leaf) ref-mod write target still uses a plain "=" (assignExpr\'s own fallback)', () => {
   test('e04 (ordinary WORKING-STORAGE ref-mod write, not a RECURSIVE LINKAGE leaf) is unaffected', () => {
     const scala = scalaOf(readCorpus('e04-refmod-move.cbl'));
-    assert.match(scala, /wsDest = \?\?\? \/\* TODO: reference modification \(write\) not implemented/);
-    assert.match(scala, /wsSrc = \?\?\? \/\* TODO: reference modification \(write\) not implemented/);
+    assert.match(scala, /wsDest = CobolFmt\.refModPatch\(/);
+    assert.match(scala, /wsSrc = CobolFmt\.refModPatch\(/);
   });
 });
 
@@ -289,8 +289,14 @@ describe('round-39 finding 3 regression: ordinary in-mode WRITE/REWRITE/DELETE a
 describe('round-39 finding 4 (oo13 bug A): ACCEPT FROM DAY is YYDDD (2-digit year + 3-digit day-of-year), not a bare day-of-year', () => {
   const oracleText = readCorpus('oo13-accept-date-day-dow.oracle.txt');
 
-  test('the real cobc oracle capture documents the YYDDD value (sanity)', () => {
-    assert.match(oracleText, /DAY=26201/);
+  test('the real cobc oracle capture documents a YYDDD value (sanity; date-independent - the .oracle.txt is a live artifact rewritten on every run)', () => {
+    const day = oracleText.match(/^DAY=(\d{5})$/m);
+    const date4 = oracleText.match(/^DATE4=(\d{8})$/m);
+    assert.ok(day && date4, 'oracle must contain 5-digit DAY and 8-digit DATE4 lines');
+    // YYDDD: the 2-digit year must agree with DATE4's own year, and DDD must be a real day-of-year.
+    assert.equal(day[1].slice(0, 2), date4[1].slice(2, 4));
+    const ddd = Number(day[1].slice(2));
+    assert.ok(ddd >= 1 && ddd <= 366, `day-of-year out of range: ${ddd}`);
   });
 
   test('generateAccept prepends the 2-digit year to the 3-digit day-of-year', () => {
@@ -305,8 +311,13 @@ describe('round-39 finding 4 (oo13 bug A): ACCEPT FROM DAY is YYDDD (2-digit yea
 describe('round-39 finding 5 (oo13 bug B): ACCEPT FROM DATE YYYYMMDD (4-digit year) parses and generates correctly, no paragraph corruption', () => {
   const oracleText = readCorpus('oo13-accept-date-day-dow.oracle.txt');
 
-  test('the real cobc oracle capture documents the 4-digit-year value (sanity)', () => {
-    assert.match(oracleText, /DATE4=20260720/);
+  test('the real cobc oracle capture documents a 4-digit-year value (sanity; date-independent - the .oracle.txt is a live artifact rewritten on every run)', () => {
+    const date = oracleText.match(/^DATE=(\d{6})$/m);
+    const date4 = oracleText.match(/^DATE4=(\d{8})$/m);
+    assert.ok(date && date4, 'oracle must contain 6-digit DATE and 8-digit DATE4 lines');
+    // DATE4 is DATE with the century prefixed - that is the whole point of YYYYMMDD.
+    assert.equal(date4[1].slice(2), date[1]);
+    assert.match(date4[1], /^20\d{6}$/);
   });
 
   test('parseAcceptStatement consumes the trailing YYYYMMDD keyword (AcceptStatement.fourDigitYear)', async () => {
@@ -347,7 +358,7 @@ describe('round-39 finding 6 (oo13 bug C): a ref-mod\'d operand over a NUMERIC b
     // at runtime.
     assert.match(
       scala,
-      /if \("" \/\* TODO: reference modification not implemented as a comparison operand[^)]*\*\/\) == "2026" then/
+      /if \(CobolFmt\.alnumCompare\(CobolFmt\.refModSlice\(CobolFmt\.digitsOf\(BigDecimal\(wsDate4\), 8, 0\), \(1\)\.toInt, \(4\)\.toInt\), "2026"\) == 0\) then/
     );
     assert.doesNotMatch(scala, /BigDecimal\(\?\?\?/);
   });

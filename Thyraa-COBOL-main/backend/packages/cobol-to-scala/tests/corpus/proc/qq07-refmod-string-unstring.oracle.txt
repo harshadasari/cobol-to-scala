@@ -1,0 +1,5 @@
+OUT=[HELLO/WORLD*********]
+F1=[ONE  ] F2=[TWO  ]
+G1=[TWO  ] G2=[SIX  ]
+BUF=[.ONE...TWO .]
+BUF=[.ONE...TWab.]

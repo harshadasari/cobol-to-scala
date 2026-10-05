@@ -102,6 +102,20 @@ function lookupField(name) {
 function lookupFieldForRef(ref) {
   if (!ref) return null;
   if (typeof ref !== 'object') return lookupField(ref);
+  // Reference modification (`identifier(start:length)`): the reference
+  // denotes an ALPHANUMERIC view of the base item's storage regardless of
+  // the base item's own declared type, so every consumer of this lookup
+  // (MOVE source/target coercion, STRING/UNSTRING widths, DISPLAY padding,
+  // comparison classification, ...) must see a synthetic alphanumeric info,
+  // never the base item's own (possibly numeric) one. See refModViewInfo.
+  if (ref.refMod) return refModViewInfo(ref);
+  return lookupFieldForRefBase(ref);
+}
+
+/** lookupFieldForRef minus the reference-modification view: the BASE item's own registry info. */
+function lookupFieldForRefBase(ref) {
+  if (!ref) return null;
+  if (typeof ref !== 'object') return lookupField(ref);
   if (Array.isArray(ref.qualifiers) && ref.qualifiers.length > 0) {
     const info = lookupQualified(String(ref.name).toUpperCase(), String(ref.qualifiers[0]).toUpperCase());
     if (info) return info;
@@ -1081,57 +1095,214 @@ function targetCamelFor(targetRef) {
   return toCamelCase(name);
 }
 
-/**
- * Shared honest-decline comment text for a reference-modification
- * (`identifier(start:length)`, Known Gap #1) operand reached from any
- * operand-position call site that cannot use the shared `???`-typed
- * placeholder `convertIdentifier`'s own refMod branch returns (that
- * placeholder's static type is `Nothing`, which only unifies safely when
- * passed untouched as an argument to something else - the moment a call site
- * calls a member directly ON it (`.padTo`, `.compareTo`, `.indices`, ...) or
- * feeds it to an overloaded constructor like `BigDecimal(...)`, that's
- * either a hard "Required: ?{member}" compile error or (worse, `BigDecimal`
- * specifically) an "Ambiguous overload" error, since every overload accepts
- * `Nothing`). Every call site below (STRING segment source, relational
- * comparison, CALL argument, MOVE-to-numeric-target, DISPLAY operand) shares
- * this exact wording - "reference modification not implemented as X - see
- * tests/oracle/README.md known gaps" - via this one function, rather than
- * six/seven independent copies of the same sentence (round-17 finding 3's own
- * explicit ask): grep for "reference modification not implemented as" to
- * find every one of them at once. `contextLabel` is call-site-supplied text
- * describing where the placeholder was substituted (e.g. "a DISPLAY
- * operand", "a MOVE numeric target") - ref-mod's own read/write semantics
- * remain entirely out of scope (Known Gap #1); this only stops a *specific*
- * operand position from crashing (or, pre-round-15/16, silently passing the
- * wrong full-variable value) when it happens to receive a ref-mod'd operand.
- */
-function refModGapComment(contextLabel) {
-  return `reference modification not implemented as ${contextLabel} - see tests/oracle/README.md known gaps`;
+// ============================================================================
+// Reference modification (`identifier(start:length)`, `identifier(start:)`)
+// - real semantics (Oct 2026; replaces the round-3..round-17 honest-decline
+// placeholders). COBOL defines a reference-modified item as the `length`
+// characters of the base item's STORAGE starting at the 1-based position
+// `start` - an ALPHANUMERIC view of the underlying DISPLAY bytes regardless
+// of the base item's own declared type (a PIC 9 field yields its digit
+// characters). This generator keeps every elementary item as a typed flat
+// Scala var rather than as raw bytes, so each reference modification is
+// modeled by (1) materializing the base item's full storage text, (2)
+// slicing/patching that text via the CobolFmt.refMod* helpers, and (3) for a
+// write, storing the patched text back through the base item's own ordinary
+// write path (renderAssignment/assignExpr/scatterGroupFromString - so a
+// subscripted element and a RECURSIVE program's getter/setter LINKAGE leaf
+// are both written the way every other write to them already is).
+//
+// Base shapes modeled exactly: alphanumeric/edited String items (scalar or
+// subscripted OCCURS element), unsigned or signed (trailing-overpunch)
+// DISPLAY numeric items, and group items made only of such children.
+// Anything else (a non-DISPLAY USAGE, a group containing a signed/table/
+// non-DISPLAY child, a subscripted group row, COMP-1/COMP-2) degrades to a
+// VISIBLE RUNTIME ERROR (CobolFmt.refModUnsupported) - never silent garbage.
+// ============================================================================
+
+/** The same reference minus its reference-modification clause (the base item). */
+function refModBaseRef(ref) {
+  return { ...ref, refMod: null };
+}
+
+/** Compile-time integer value of a ref-mod start/length operand, or null when not a plain literal. */
+function refModLiteralInt(node) {
+  const text = refModLiteralLengthText(node);
+  return text == null ? null : parseInt(text, 10);
+}
+
+/** Scala Int expression for the ref-mod START operand (1-based). */
+function refModStartScala(refMod) {
+  return `(${convertArithmeticExpression(refMod.start)}).toInt`;
+}
+
+/** Scala Int expression for the ref-mod LENGTH operand; `Int.MinValue` is the "(start:) to the end" sentinel. */
+function refModLengthScala(refMod) {
+  if (refMod.length == null) return 'Int.MinValue';
+  return `(${convertArithmeticExpression(refMod.length)}).toInt`;
 }
 
 /**
- * Concrete, String-typed honest placeholder for a ref-mod'd operand reaching
- * a call site that needs to call a String member directly on its operand
- * (`.padTo`/`.take`, `.compareTo`, `.indices`/`.length`, ...) - `""` compiles
- * and runs cleanly against every one of those (contributing "nothing"/
- * comparing-empty/zero-length, all visibly wrong but never a crash) where
- * the shared `Nothing`-typed `???` placeholder would not.
+ * Synthetic registry info describing the ALPHANUMERIC view a reference
+ * modification denotes (see lookupFieldForRef). `picLength` is the view's
+ * compile-time width when its length operand is a literal (or `(start:)`
+ * over a base of known width with a literal start), else 0 (unknown - every
+ * runtime consumer fits/pads dynamically, see CobolFmt.refModPatch).
  */
-function refModStringPlaceholder(contextLabel) {
-  return `"" /* TODO: ${refModGapComment(contextLabel)} */`;
+function refModViewInfo(ref) {
+  const baseInfo = lookupFieldForRefBase(ref);
+  let picLength = 0;
+  const lit = refModLiteralInt(ref.refMod.length);
+  if (lit != null) {
+    picLength = lit;
+  } else if (ref.refMod.length == null && baseInfo) {
+    const start = refModLiteralInt(ref.refMod.start);
+    const baseWidth = baseInfo.scalaType === 'String'
+      ? baseInfo.picLength
+      : (baseInfo.integerDigits || 0) + (baseInfo.decimalDigits || 0);
+    if (start != null && baseWidth > 0) picLength = Math.max(baseWidth - start + 1, 0);
+  }
+  return {
+    camel: baseInfo ? baseInfo.camel : toCamelCase(ref.name || ''),
+    scalaType: 'String',
+    dataType: 'alphanumeric',
+    integerDigits: 0,
+    decimalDigits: 0,
+    signed: false,
+    editPattern: null,
+    occursDepth: 0,
+    picLength,
+    justified: false,
+    blankWhenZero: false,
+    usage: 'DISPLAY',
+    refModView: true,
+  };
 }
 
 /**
- * Concrete, numeric honest placeholder for a ref-mod'd operand reaching a
- * numeric-context call site (round-17 finding 1: MOVE into a numeric
- * target) - `BigDecimal(???)` is an AMBIGUOUS OVERLOAD in Scala 3 (every one
- * of `BigDecimal.apply`'s 7 overloads accepts `Nothing`), a hard compile
- * error the String-typed placeholder above doesn't have to deal with (no
- * overload resolution happens for a String literal). `BigDecimal(0)` is a
- * concrete, unambiguous, honestly-wrong (always zero) stand-in.
+ * Describe the BASE item of a reference modification: the Scala expression
+ * for its full storage text, its width (when statically known), and how to
+ * store a new full storage text back. Returns `{ unsupported: reason }` for a
+ * base shape this model does not represent exactly.
  */
-function refModNumericPlaceholder(contextLabel) {
-  return `BigDecimal(0) /* TODO: ${refModGapComment(contextLabel)} */`;
+function refModBase(ref) {
+  const baseRef = refModBaseRef(ref);
+  const info = lookupFieldForRefBase(baseRef);
+  const subscripts = Array.isArray(baseRef.subscripts) ? baseRef.subscripts : [];
+
+  if (info) {
+    if (isNonDisplayUsage(info.usage)) {
+      return { unsupported: `base item ${ref.name} has a non-DISPLAY USAGE (${info.usage})` };
+    }
+    const readExpr = convertIdentifier(baseRef);
+    if (info.scalaType === 'String') {
+      const width = info.picLength || 0;
+      return {
+        width,
+        textExpr: width > 0 ? `CobolFmt.fitLeft(${readExpr}, ${width})` : readExpr,
+        storeLines: (textExpr) => renderAssignment(baseRef, textExpr),
+      };
+    }
+    if (info.scalaType === 'Int' || info.scalaType === 'Long' || info.scalaType === 'BigDecimal') {
+      const intDigits = info.integerDigits || 0;
+      const decDigits = info.decimalDigits || 0;
+      if (intDigits + decDigits <= 0 || decDigits < 0) {
+        return { unsupported: `base item ${ref.name} has no plain DISPLAY digit width` };
+      }
+      const asBD = info.scalaType === 'BigDecimal' ? readExpr : `BigDecimal(${readExpr})`;
+      const toType = info.scalaType === 'Int' ? '.toInt' : info.scalaType === 'Long' ? '.toLong' : '';
+      return {
+        width: intDigits + decDigits,
+        textExpr: info.signed
+          ? `CobolFmt.zonedText(${asBD}, ${intDigits}, ${decDigits})`
+          : `CobolFmt.digitsOf(${asBD}, ${intDigits}, ${decDigits})`,
+        storeLines: (textExpr) =>
+          renderAssignment(baseRef, `CobolFmt.refModToNumeric(${textExpr}, ${decDigits}, ${info.signed})${toType}`),
+      };
+    }
+    return { unsupported: `base item ${ref.name} is a floating-point item` };
+  }
+
+  // Group item (no flat Scala var of its own - only its children have one).
+  const nameUpper = String(ref.name || '').toUpperCase();
+  if (nameUpper && isRegisteredGroupName(nameUpper)) {
+    if (subscripts.length > 0) {
+      return { unsupported: `subscripted group row ${ref.name}(...) is not modeled` };
+    }
+    const groupKey = resolveGroupKey(nameUpper);
+    const width = GROUP_BYTE_LENGTH_REGISTRY.get(nameUpper);
+    if (
+      width == null ||
+      groupContainsNonDisplay(groupKey) ||
+      groupContainsTable(groupKey) ||
+      groupContainsSignedDisplay(groupKey)
+    ) {
+      return { unsupported: `group ${ref.name} contains a signed, OCCURS or non-DISPLAY child` };
+    }
+    const groupExpr = groupDisplayValueExpr(groupKey);
+    if (!groupExpr) return { unsupported: `group ${ref.name} has no flat display text` };
+    return {
+      width,
+      textExpr: `(${groupExpr})`,
+      storeLines: (textExpr) => {
+        const scattered = scatterGroupFromString(groupKey, '_rmSrc', 1);
+        if (scattered == null) return `CobolFmt.refModUnsupported("group ${ref.name} cannot be scattered")`;
+        return ['{', `  val _rmSrc = ${textExpr}`, ...scattered, '}'].join('\n');
+      },
+    };
+  }
+
+  return { unsupported: `base item ${ref.name} is not in the field registry` };
+}
+
+/** Scala String expression for a reference-modified READ: the sliced characters. */
+function refModReadExpr(ref) {
+  const base = refModBase(ref);
+  if (base.unsupported) return `CobolFmt.refModUnsupported("${escapeScalaStringLiteral(base.unsupported)}")`;
+  return `CobolFmt.refModSlice(${base.textExpr}, ${refModStartScala(ref.refMod)}, ${refModLengthScala(ref.refMod)})`;
+}
+
+/** Scala Int expression for the effective LENGTH (in characters) a reference modification denotes. */
+function refModEffectiveLengthExpr(ref) {
+  const lit = refModLiteralInt(ref.refMod.length);
+  if (lit != null) return String(lit);
+  const base = refModBase(ref);
+  if (base.unsupported) return `CobolFmt.refModUnsupported("${escapeScalaStringLiteral(base.unsupported)}")`;
+  return `CobolFmt.refModLen(${base.textExpr}, ${refModStartScala(ref.refMod)}, ${refModLengthScala(ref.refMod)})`;
+}
+
+/**
+ * Statement(s) writing `valueExpr` (a Scala String expression) into a
+ * reference-modified target: exactly `length` positions of the base item's
+ * storage are replaced (alphanumeric MOVE rules inside the slice -
+ * left-justify, space-pad, truncate); the rest of the base item is untouched.
+ */
+function refModWriteStatement(ref, valueExpr) {
+  const base = refModBase(ref);
+  if (base.unsupported) return `CobolFmt.refModUnsupported("${escapeScalaStringLiteral(base.unsupported)}")`;
+  const patched =
+    `CobolFmt.refModPatch(${base.textExpr}, ${refModStartScala(ref.refMod)}, ${refModLengthScala(ref.refMod)}, ${valueExpr})`;
+  return base.storeLines(patched);
+}
+
+/** Normalize a figurative-constant MOVE source (string name or Literal node) to its singular key, else null. */
+function figurativeSourceKey(source) {
+  let raw = null;
+  if (typeof source === 'string') raw = source;
+  else if (source && typeof source === 'object' && source.type === 'Literal' && source.literalType === 'figurative') raw = String(source.value);
+  if (raw == null) return null;
+  const u = raw.toUpperCase();
+  if (u === 'SPACE' || u === 'SPACES') return 'SPACE';
+  if (u === 'ZERO' || u === 'ZEROS' || u === 'ZEROES') return 'ZERO';
+  if (u === 'HIGH-VALUE' || u === 'HIGH-VALUES') return 'HIGH-VALUE';
+  if (u === 'LOW-VALUE' || u === 'LOW-VALUES') return 'LOW-VALUE';
+  if (u === 'QUOTE' || u === 'QUOTES') return 'QUOTE';
+  return null;
+}
+
+/** Scala String of the figurative character repeated across a ref-mod'd target's own (runtime) length. */
+function refModFigurativeFillExpr(ref, figKey) {
+  const code = figurativeFillChar(figKey).charCodeAt(0).toString(16).padStart(4, '0');
+  return `("\\u${code}" * CobolFmt.refModFillLen(${refModEffectiveLengthExpr(ref)}))`;
 }
 
 /**
@@ -1170,43 +1341,13 @@ function renderAssignment(targetRef, valueExpr) {
   }
 
   if (targetRef.refMod) {
-    // Reference modification write (`MOVE ... TO WS-FIELD(start:length)`) -
-    // round-3 finding 3, a documented gap: this generator has no byte-level
-    // substring-patch model for a WORKING-STORAGE flat var, so rather than
-    // (the pre-fix behavior) silently mis-dispatching into the ordinary
-    // subscript codegen path above and emitting invalid Scala (a stray
-    // dangling `:length)` the parser previously failed to consume at all -
-    // see parser/procedure-parser.js's parseVariableReference), this
-    // degrades to a visible, compiling `???` marker: it throws only if this
-    // exact assignment is ever actually reached at runtime, never at
-    // declaration/compile time, and is grep-able as an honest, undone gap
-    // rather than a silent wrong write.
-    //
-    // oo04 (round 39, finding 2): this line used to build the assignment
-    // with a hardcoded bare `=` instead of going through assignExpr - every
-    // OTHER write path in this generator already routes through assignExpr/
-    // renderAssignment's ordinary branches specifically to dodge Scala 3's
-    // refusal to desugar `x = v` into a setter call (`x_=(v)`) for a
-    // LOCALLY-NESTED def/def _= pair (round-23's RECURSIVE_LEAF_NAMES
-    // detour - see assignExpr's own doc comment) - only true object/class
-    // members support assignment-sugar desugaring. A ref-mod write TARGET
-    // that happens to name a RECURSIVE program's own LINKAGE leaf (oo04's
-    // LK-SLICE) hit that exact "Reassignment to val" compile crash because
-    // this one spot never checked RECURSIVE_LEAF_NAMES at all. assignExpr
-    // already falls back to a plain `=` for any name NOT in
-    // RECURSIVE_LEAF_NAMES, so this is a pure compile-crash fix with zero
-    // behavior change for the ordinary (non-RECURSIVE-leaf) case - the
-    // ref-mod write itself is still the same honest `???` decline/no-op.
-    // NOTE: a block comment (`/* ... */`), not the original bare form's
-    // line comment (`// ...`) - assignExpr's RECURSIVE_LEAF_NAMES branch
-    // wraps this value expression inside `<camel>_=( ... )`; a `//` line
-    // comment here would swallow the closing `)` into the comment too,
-    // an unclosed-paren compile error. A block comment is safe in both the
-    // wrapped-call form and the plain `<camel> = ...` fallback form.
-    return assignExpr(
-      targetCamelFor(targetRef),
-      '??? /* TODO: reference modification (write) not implemented - see tests/oracle/README.md known gaps */'
-    );
+    // Reference modification write: patch exactly `length` positions of the
+    // base item's storage text and store it back through the base item's own
+    // ordinary write path (assignExpr for a scalar - which routes a
+    // RECURSIVE program's getter/setter LINKAGE leaf through `x_=(...)` -,
+    // `.updated(...)` for a subscripted element, scatterGroupFromString for a
+    // group). `valueExpr` is the (String) alphanumeric source text.
+    return refModWriteStatement(targetRef, valueExpr);
   }
 
   const camel = targetCamelFor(targetRef);
@@ -1248,12 +1389,8 @@ function convertIdentifier(cobolId) {
     const name = cobolId.name || '';
 
     if (cobolId.refMod) {
-      // Reference modification read (`WS-FIELD(start:length)`) - round-3
-      // finding 3, a documented gap (see renderAssignment's mirror-image
-      // comment for the write side): degrades to a visible, compiling `???`
-      // marker rather than silently ignoring the (start:length) and reading
-      // the whole field instead.
-      return `??? /* TODO: reference modification (read) not implemented - ${toCamelCase(name)}(...) - see tests/oracle/README.md known gaps */`;
+      // Reference modification read: the sliced characters (a String).
+      return refModReadExpr(cobolId);
     }
 
     // Resolve the base (unsubscripted) identifier FIRST - honoring OF/IN
@@ -1602,6 +1739,51 @@ export function generateCobolFmtHelper() {
     '    if width <= 0 then s',
     '    else if s.length >= width then s.substring(s.length - width)',
     '    else (" " * (width - s.length)) + s',
+    '',
+    '  // ---- Reference modification (identifier(start:length) / identifier(start:)) ----',
+    '  // `text` is the base item\'s full storage text; `start` is 1-based and `len`',
+    '  // is Int.MinValue for the open-ended (start:) form (runs to the end).',
+    '  // cobc (no -debug) does NOT range-check at runtime - an out-of-range',
+    '  // reference reads/writes adjacent memory (undefined). That is surfaced here',
+    '  // as a visible runtime error instead. A zero length is accepted (empty',
+    '  // slice), matching cobc.',
+    '  def refModLen(text: String, start: Int, len: Int): Int =',
+    '    if len == Int.MinValue then text.length - start + 1 else len',
+    '  def refModFillLen(len: Int): Int = if len < 0 then 0 else len',
+    '  private def refModCheck(text: String, start: Int, len: Int): Unit =',
+    '    if start < 1 || len < 0 || start - 1 + len > text.length then',
+    '      throw new IndexOutOfBoundsException(s"reference modification ($start:$len) is out of range for a ${text.length}-character item")',
+    '  def refModSlice(text: String, start: Int, len: Int): String =',
+    '    val l = refModLen(text, start, len)',
+    '    refModCheck(text, start, l)',
+    '    text.substring(start - 1, start - 1 + l)',
+    '  def refModPatch(text: String, start: Int, len: Int, value: String): String =',
+    '    val l = refModLen(text, start, len)',
+    '    refModCheck(text, start, l)',
+    '    text.substring(0, start - 1) + fitLeft2(value, l) + text.substring(start - 1 + l)',
+    '  private def fitLeft2(s: String, width: Int): String =',
+    '    if s.length >= width then s.substring(0, width) else s + (" " * (width - s.length))',
+    '  def refModUnsupported(what: String): Nothing =',
+    '    throw new UnsupportedOperationException("reference modification not supported for this item: " + what)',
+    '  // Alphanumeric comparison: the shorter operand is space-padded.',
+    '  def alnumCompare(a: String, b: String): Int =',
+    '    val n = math.max(a.length, b.length)',
+    '    fitLeft2(a, n).compareTo(fitLeft2(b, n))',
+    '  // Storage text of a SIGNED DISPLAY numeric (default trailing overpunch: a',
+    '  // negative value\'s last digit is stored as \'p\'..\'y\').',
+    '  def zonedText(v: BigDecimal, intDigits: Int, decDigits: Int): String =',
+    '    val d = digitsOf(v, intDigits, decDigits)',
+    '    if v.signum < 0 && d.nonEmpty then d.init + (d.last - \'0\' + \'p\').toChar else d',
+    '  // Inverse of digitsOf/zonedText: storage text -> numeric value (a non-digit',
+    '  // character contributes 0, like a space in cobc\'s DISPLAY decode).',
+    '  def refModToNumeric(text: String, decDigits: Int, signed: Boolean): BigDecimal =',
+    '    var neg = false',
+    '    val sb = new StringBuilder',
+    '    for (c, i) <- text.zipWithIndex do',
+    '      if signed && i == text.length - 1 && c >= \'p\' && c <= \'y\' then { neg = true; sb.append((c - \'p\' + \'0\').toChar) }',
+    '      else sb.append(if c >= \'0\' && c <= \'9\' then c else \'0\')',
+    '    val mag = BigDecimal(BigInt(if sb.isEmpty then "0" else sb.toString), decDigits)',
+    '    if neg then -mag else mag',
     '',
     '  // Unsigned display-digit text of a numeric value, zero-padded to',
     '  // intDigits+decDigits with no decimal point character (COBOL\'s implied',
@@ -2399,9 +2581,7 @@ function functionLength(arg) {
       // comment) - generateDisplay special-cases exactly that shape
       // separately (see its own FunctionCall/LENGTH branch) rather than
       // baking display-only formatting into this shared value.
-      const literalLength = refModLiteralLengthText(arg.refMod.length);
-      if (literalLength != null) return literalLength;
-      return `(0 /* TODO: FUNCTION LENGTH of a reference-modified argument whose length operand is not a literal - not implemented - see tests/oracle/README.md known gaps */)`;
+      return `(${refModEffectiveLengthExpr(arg)})`;
     }
     const info = lookupFieldForRef(arg);
     if (info && info.picLength) return String(info.picLength);
@@ -3266,9 +3446,7 @@ function renderVariableMoveSource(source, info) {
     // the shared, concrete `BigDecimal(0)` honest placeholder instead - ref-
     // mod's own slicing semantics stay exactly as out of scope as
     // everywhere else this gap surfaces.
-    const asBD = (source && typeof source === 'object' && source.refMod)
-      ? refModNumericPlaceholder('a MOVE numeric target')
-      : sourceInfo?.scalaType === 'BigDecimal'
+    const asBD = sourceInfo?.scalaType === 'BigDecimal'
         ? rawExpr
         : sourceInfo?.scalaType === 'String'
           ? `CobolFmt.numval(${rawExpr})`
@@ -3307,6 +3485,7 @@ function renderVariableMoveSource(source, info) {
  */
 function groupRefNameUpper(ref) {
   if (!ref || typeof ref !== 'object') return null;
+  if (ref.refMod) return null;
   if (Array.isArray(ref.subscripts) && ref.subscripts.length > 0) return null;
   const nameUpper = String(ref.name || '').toUpperCase();
   return GROUP_REGISTRY.has(nameUpper) ? nameUpper : null;
@@ -3699,6 +3878,15 @@ export function generateMove(statement, indent = 0) {
         'value left unchanged'
       );
       continue;
+    }
+
+    if (target && typeof target === 'object' && target.refMod) {
+      // A figurative constant fills the slice's own (runtime) length.
+      const figKey = figurativeSourceKey(source);
+      if (figKey) {
+        lines.push(`${indentStr}${renderAssignment(target, refModFigurativeFillExpr(target, figKey))}`);
+        continue;
+      }
     }
 
     const info = lookupFieldForRef(target);
@@ -4096,7 +4284,11 @@ function relationalOperandDescriptor(node) {
     // honest-decline site in this codebase, which stays a safe (if
     // honestly-wrong) string comparison.
     if (simple.refMod) {
-      return { scalaClass: 'string', semantic: 'alphanumeric' };
+      // Width is a runtime quantity in general (see refModViewInfo) - the
+      // comparison therefore uses CobolFmt.alnumCompare (runtime space-pad)
+      // whenever a ref-mod'd operand is involved. `refModRef` lets a
+      // figurative operand on the other side size itself against the slice.
+      return { scalaClass: 'string', semantic: 'alphanumeric', refMod: true, refModRef: simple };
     }
     const info = lookupFieldForRef(simple);
     if (info) {
@@ -4159,6 +4351,11 @@ function figurativeFillChar(figKind) {
  */
 function figurativeCompareText(literalNode, otherDescriptor) {
   const ch = figurativeFillChar(literalNode.value);
+  if (otherDescriptor?.refModRef) {
+    // Sized against a reference-modified operand's own (runtime) length.
+    const code = ch.charCodeAt(0).toString(16).padStart(4, '0');
+    return `("\\u${code}" * CobolFmt.refModFillLen(${refModEffectiveLengthExpr(otherDescriptor.refModRef)}))`;
+  }
   const width =
     otherDescriptor?.info?.picLength ||
     (otherDescriptor?.literalText != null ? otherDescriptor.literalText.length : 0) ||
@@ -4176,26 +4373,6 @@ function relationalOperandExpr(node, otherDescriptor) {
   const simple = unwrapSimpleConditionOperand(node);
   if (simple && simple.type === 'Literal' && simple.literalType === 'figurative') {
     return figurativeCompareText(simple, otherDescriptor);
-  }
-  if (simple && simple.type === 'VariableReference' && simple.refMod) {
-    // round-16 finding 2: reference modification (`identifier(start:length)`,
-    // Known Gap #1) used as a relational-comparison operand (IF/EVALUATE).
-    // convertArithmeticExpression routes a VariableReference through
-    // convertIdentifier, whose shared ref-mod placeholder is `Nothing`-typed
-    // (`???`) - harmless for `==`/`!=` (defined on Any), but renderComparisonExpr's
-    // own `cmp` helper (above) renders every OTHER relational operator as
-    // `<left>.compareTo(<right>)`, and `Nothing` has no `compareTo` member -
-    // a hard compile error ("Found: Nothing, Required: ?{compareTo}") instead
-    // of an honest, compiling gap. Same fix shape as round-15 finding 8's
-    // stringSegmentValueExpr: substitute a concrete, String-typed empty
-    // placeholder - `"".compareTo(...)`/`"" == ...` both compile and run
-    // (comparing against an empty string - visibly wrong result, never a
-    // crash) - rather than implementing real ref-mod slicing here, which
-    // stays exactly as out of scope as everywhere else this gap surfaces.
-    // round-17: now routed through the shared refModStringPlaceholder
-    // helper (see its own doc comment) instead of a standalone literal -
-    // same text, same behavior, one shared source of truth.
-    return `(${refModStringPlaceholder('a comparison operand')})`;
   }
   return convertArithmeticExpression(node);
 }
@@ -4297,6 +4474,9 @@ function renderComparisonExpr(subjectNode, objectNode, rawOp) {
     // the bare comparison) when either side's width can't be determined at
     // all (e.g. a FunctionCall operand, whose result length is unknown at
     // generation time) - not this fix's concern, and safer than guessing.
+    if (subj.refMod || obj.refMod) {
+      return `(CobolFmt.alnumCompare(${leftExpr}, ${rightExpr}) ${op} 0)`;
+    }
     const leftWidth = stringOperandWidth(subj);
     const rightWidth = stringOperandWidth(obj);
     if (leftWidth != null && rightWidth != null && leftWidth !== rightWidth) {
@@ -4323,6 +4503,22 @@ function renderComparisonExpr(subjectNode, objectNode, rawOp) {
   const numericDesc = numericIsSubject ? subj : obj;
   const stringDesc = numericIsSubject ? obj : subj;
   const stringExpr = numericIsSubject ? rightExpr : leftExpr;
+
+  if (stringDesc.refMod) {
+    // A reference-modified (alphanumeric, runtime-width) operand against a
+    // numeric one: the numeric operand contributes its own digit text and
+    // the shorter text is space-padded at runtime.
+    let numText;
+    if (numericDesc.info) {
+      numText = numericDigitsExpr(numericIsSubject ? leftExpr : rightExpr, numericDesc.info);
+    } else {
+      const digits = String(numericDesc.literalText ?? '0').replace(/^[+-]/, '');
+      numText = `"${escapeScalaStringLiteral(digits)}"`;
+    }
+    return numericIsSubject
+      ? `(CobolFmt.alnumCompare(${numText}, ${stringExpr}) ${op} 0)`
+      : `(CobolFmt.alnumCompare(${stringExpr}, ${numText}) ${op} 0)`;
+  }
 
   let numericText, numericWidth;
   if (numericDesc.info) {
@@ -4809,26 +5005,6 @@ function stringSegmentValueExpr(node) {
   }
 
   if (node && node.type === 'VariableReference') {
-    if (node.refMod) {
-      // round-15 finding 8: reference modification (`identifier(start:
-      // length)`, Known Gap #1) used as a STRING segment source. Ref-mod
-      // itself stays unimplemented (out of scope - see convertIdentifier's
-      // own `???`-typed placeholder, used everywhere else a ref-mod read
-      // appears), but that placeholder's static type is `Nothing`, and
-      // STRING's own per-character copy loop (generateString, below) calls
-      // `.indices`/`.length` directly on this segment's value - `Nothing`
-      // has neither member, so this combination was a HARD COMPILE ERROR
-      // ("Found: Nothing, Required: ?{indices}") instead of an honest,
-      // compiling gap. A concrete, STRING-typed empty-string placeholder
-      // fixes that: `"".indices`/`"".length` both compile and evaluate to
-      // "contributes zero characters, never advances `_ptr`" - visibly
-      // wrong output (the segment's real content is simply missing), but a
-      // compiling, running honest decline rather than a crash. Do NOT
-      // implement real ref-mod slicing here - that's a separate, larger,
-      // deliberately out-of-scope fix (see the known-gaps note). round-17:
-      // now routed through the shared refModStringPlaceholder helper.
-      return refModStringPlaceholder('a STRING source');
-    }
     const info = lookupFieldForRef(node);
     if (info && info.scalaType !== 'String') {
       return numericDigitsExpr(rawExpr, info);
@@ -4899,14 +5075,18 @@ function stringSourceSegmentExpr(source) {
 export function generateString(statement, indent = 0) {
   const indentStr = '  '.repeat(indent);
   const bi = '  '.repeat(indent + 1);
+  const intoIsRefMod = !!(statement.into && typeof statement.into === 'object' && statement.into.refMod);
   const targetInfo = lookupFieldForRef(statement.into);
-  const width = targetInfo?.picLength || 0;
+  // A reference-modified INTO item is just its slice: the receiving width is
+  // the slice's own (runtime) length, bound once as `_w`.
+  const width = intoIsRefMod ? '_w' : (targetInfo?.picLength || 0);
   const targetExpr = convertIdentifier(statement.into);
   const initialPtr = statement.pointer ? convertIdentifier(statement.pointer) : '1';
   const hasOverflowClauses = (statement.onOverflow && statement.onOverflow.length > 0) ||
     (statement.notOnOverflow && statement.notOnOverflow.length > 0);
 
   const lines = [`${indentStr}{`];
+  if (intoIsRefMod) lines.push(`${bi}val _w = (${targetExpr}).length`);
   lines.push(`${bi}val _base = (${targetExpr}).padTo(${width}, ' ').take(${width})`);
   lines.push(`${bi}val _sb = new StringBuilder(_base)`);
   lines.push(`${bi}var _ptr = ${initialPtr}`);
@@ -5038,13 +5218,14 @@ export function generateUnstring(statement, indent = 0) {
   const targets = statement.into || [];
 
   const delimEntries = statement.delimiters || [];
-  const delimiterTexts = delimEntries.map(e => unstringDelimiterLiteralText(e && e.node));
+  const isRefModDelim = (e) => !!(e && e.node && typeof e.node === 'object' && e.node.type === 'VariableReference' && e.node.refMod);
+  const delimiterTexts = delimEntries.map(e => (isRefModDelim(e) ? '' : unstringDelimiterLiteralText(e && e.node)));
   if (delimiterTexts.length === 0 || delimiterTexts.some(t => t === null)) {
     return `${indentStr}// UNSTRING ${source}: DELIMITED BY clause missing or not a compile-time-resolvable literal - not supported (no corpus target exercises this shape)`;
   }
 
   const delimsScala = delimEntries
-    .map((e, i) => `("${escapeScalaStringLiteral(delimiterTexts[i])}", ${e.all ? 'true' : 'false'})`)
+    .map((e, i) => `(${isRefModDelim(e) ? convertIdentifier(e.node) : `"${escapeScalaStringLiteral(delimiterTexts[i])}"`}, ${e.all ? 'true' : 'false'})`)
     .join(', ');
   const initialPtr = statement.pointer ? convertIdentifier(statement.pointer) : '1';
 
@@ -6393,20 +6574,8 @@ export function flattenGroupLeaves(groupKey, groupRegistry = GROUP_REGISTRY, tab
  */
 function renderDisplayOperand(ref) {
   if (ref && typeof ref === 'object' && ref.refMod) {
-    // round-17 finding 3: reference modification (`identifier(start:
-    // length)`, Known Gap #1) used as a plain DISPLAY operand - a hard
-    // "Found: Nothing, Required: ?{padTo}" compile error. `expr` below would
-    // be convertIdentifier's shared `Nothing`-typed `???` placeholder, and
-    // EVERY branch further down this function calls a member directly on it
-    // (`.padTo`/`.take` for alphanumeric, `BigDecimal(...)` for numeric,
-    // `CobolFmt.floatDisplay(...)` for Float/Double) - `Nothing` has none of
-    // those members, so this crashed regardless of which branch the
-    // field's own declared type would otherwise route through. Same
-    // honest-decline shape as every other operand-position call site (see
-    // refModStringPlaceholder's own doc comment) - substitute a concrete
-    // String placeholder up front, before any type-specific branch below
-    // ever sees the ref-mod'd expr at all.
-    return refModStringPlaceholder('a DISPLAY operand');
+    // Reference modification: the sliced characters, exactly `length` wide.
+    return refModReadExpr(ref);
   }
   const expr = convertIdentifier(ref);
   const info = lookupFieldForRef(ref);
@@ -6508,10 +6677,7 @@ function generateDisplay(statement, indent = 0) {
       if (fnName === 'LENGTH' || fnName === 'LENGTH-OF') {
         const arg0 = (item.arguments || [])[0];
         if (arg0 && arg0.type === 'VariableReference' && arg0.refMod) {
-          const literalLength = refModLiteralLengthText(arg0.refMod.length);
-          if (literalLength != null) {
-            return `CobolFmt.num(BigDecimal(${literalLength}), 10, 0, false, false)`;
-          }
+          return `CobolFmt.num(BigDecimal(${refModEffectiveLengthExpr(arg0)}), 10, 0, false, false)`;
         }
       }
     }
@@ -9351,25 +9517,14 @@ function generateCall(statement, indent = 0) {
     const name = param.value?.name;
     const hasSubscripts = Array.isArray(param.value?.subscripts) && param.value.subscripts.length > 0;
     if (name && param.value?.refMod) {
-      // round-16 finding 3: reference modification (`identifier(start:
-      // length)`, Known Gap #1) used as a CALL ... USING argument. Before
-      // this fix, this branch fell straight through to the plain
-      // `if (name) return toCamelCase(name)` case below, which passes the
-      // callee the FULL base variable - silently ignoring the (start:length)
-      // clause entirely rather than the slice the COBOL source actually
-      // names. Unlike the "not found" compile crashes ref-mod hits
-      // elsewhere, this compiled and ran - just with the WRONG value handed
-      // to the callee, no marker at all (e06: E06SUB received all of
-      // WS-SRC's 10 characters instead of the 5-character slice
-      // WS-SRC(3:5) names). Ref-mod's own slicing semantics stay exactly as
-      // out of scope as everywhere else this gap surfaces (see Known Gap
-      // #1) - the fix is only to stop passing a silently-wrong value: a
-      // concrete, String-typed, visibly-marked placeholder instead, the same
-      // honest-decline shape round-15 finding 8/round-16 finding 2 already
-      // use for a ref-mod'd STRING-segment/comparison operand. round-17:
-      // the shared refModGapComment helper supplies the common suffix text;
-      // this call site prepends its own CALL-specific context.
-      return `("" /* TODO: CALL "${rawProgramName}" USING ${name}(...): ${refModGapComment('a CALL argument')} */)`;
+      // Reference modification as a CALL ... USING argument: the callee
+      // receives exactly the `length`-character slice (an alphanumeric view).
+      const sliceExpr = refModReadExpr(param.value);
+      const calleeType = target.paramTypes?.[i] || 'String';
+      if (calleeType === 'Int') return `CobolFmt.numval(${sliceExpr}).toInt`;
+      if (calleeType === 'Long') return `CobolFmt.numval(${sliceExpr}).toLong`;
+      if (calleeType === 'BigDecimal') return `CobolFmt.numval(${sliceExpr})`;
+      return sliceExpr;
     }
     if (name && !hasSubscripts && isRegisteredGroupName(String(name).toUpperCase())) {
       const groupExpr = groupDisplayValueExpr(resolveGroupKey(String(name).toUpperCase()));
@@ -9509,7 +9664,7 @@ function generateCall(statement, indent = 0) {
       const isPlainRefVar = name && !param.value?.refMod && !hasSubscripts && !isNamedGroup;
       const isSubscriptedRefVar = name && !param.value?.refMod && hasSubscripts &&
         !isNamedGroup && !isSubscriptedNamedGroup;
-      const isRefModRefVar = name && param.value?.refMod && !hasSubscripts;
+      const isRefModRefVar = name && param.value?.refMod;
 
       if (isPlainRefVar) {
         const camel = toCamelCase(name);
@@ -9618,33 +9773,13 @@ function generateCall(statement, indent = 0) {
       }
 
       if (isRefModRefVar && mode === 'REFERENCE') {
-        // Only attempted for the narrow, unambiguous shape this can model
-        // exactly - a plain alphanumeric (String-typed) base field, so a
-        // direct character-splice read/write is a byte-for-byte-correct
-        // COBOL ref-mod (no sign/decimal-point nuance to lose, matching
-        // round-35 finding 5/kk12's own "unsigned, whole-number" narrow-
-        // shape precedent for a different REDEFINES gap). Any other base
-        // shape (e.g. a numeric ref-mod, or one lookupFieldForRef can't
-        // resolve at all) falls through to the pre-existing snapshot
-        // fallback rather than guessing at a wrong write - ref-mod's own
-        // general read/write semantics remain out of scope everywhere else
-        // in this generator (see tests/oracle/README.md known gaps); this is
-        // a call-site-local special case, not a change to that broader gap.
-        const baseInfo = lookupFieldForRef(param.value);
-        if (baseInfo && baseInfo.scalaType === 'String') {
-          const baseCamel = toCamelCase(name);
-          const startExpr = `(${convertArithmeticExpression(param.value.refMod.start)} - 1)`;
-          const lengthExpr = param.value.refMod.length != null
-            ? `(${convertArithmeticExpression(param.value.refMod.length)})`
-            : `(${baseCamel}.length - (${startExpr}))`;
-          const getterExpr =
-            `{ val _s = ${startExpr}; val _l = ${lengthExpr}; ${baseCamel}.substring(_s, _s + _l) }`;
-          const setterStmt =
-            `{ val _s = ${startExpr}; val _l = ${lengthExpr}; ` +
-            `${baseCamel} = ${baseCamel}.substring(0, _s) + v + ${baseCamel}.substring(_s + _l, ${baseCamel}.length) }`;
-          closureArgs.push(`() => ${getterExpr}, (v: String) => ${setterStmt}`);
-          return;
-        }
+        // BY REFERENCE ref-mod'd operand: the callee's getter/setter alias the
+        // slice - a write in the callee lands back in the base item's own
+        // storage (read through refModReadExpr, write through the base item's
+        // ordinary write path - assignExpr/`.updated`/scatter - see
+        // refModWriteStatement).
+        closureArgs.push(`() => ${refModReadExpr(param.value)}, (v: String) => { ${renderAssignment(param.value, 'v')} }`);
+        return;
       }
 
       if (isNamedGroup) {
@@ -9714,16 +9849,11 @@ function generateCall(statement, indent = 0) {
     if (mode !== 'REFERENCE') return null;
     const name = param.value?.name;
     if (!name) return null;
-    // round-16 finding 3: a ref-mod'd BY REFERENCE argument has no real
-    // caller-side slice to write back into either (see the argExprs branch
-    // above) - writing the callee's returned value into the FULL base
-    // variable (the pre-fix behavior, since this only ever matched the plain
-    // `{ kind: 'scalar', camel: toCamelCase(name) }` case below) would
-    // silently corrupt the base variable's untouched bytes outside the
-    // named slice. Route through a dedicated writer kind that renders a
-    // visible, compiling no-op marker instead (see renderWriteback below).
+    // A ref-mod'd BY REFERENCE argument writes the callee's returned value
+    // back into exactly its slice of the base item (see renderWriteback) -
+    // never the full base variable.
     if (param.value?.refMod) {
-      return { kind: 'refmod-unsupported', name };
+      return { kind: 'refmod', ref: param.value };
     }
     const hasSubscripts = Array.isArray(param.value?.subscripts) && param.value.subscripts.length > 0;
     const nameUpperParam = String(name).toUpperCase();
@@ -9759,12 +9889,7 @@ function generateCall(statement, indent = 0) {
     // reason.
     if (writer.kind === 'scalar') return [`${indentStr}${assignExpr(writer.camel, sourceExpr)}`];
     if (writer.kind === 'scalar-subscripted') return [`${indentStr}${renderAssignment(writer.ref, sourceExpr)}`];
-    if (writer.kind === 'refmod-unsupported') {
-      return [
-        `${indentStr}() // TODO: CALL ... USING BY REFERENCE ${writer.name}(...): reference modification not ` +
-          'implemented for CALL argument writeback - see tests/oracle/README.md known gaps',
-      ];
-    }
+    if (writer.kind === 'refmod') return [`${indentStr}${refModWriteStatement(writer.ref, sourceExpr)}`];
     const scattered = scatterGroupFromString(writer.groupKey, sourceExpr, indent);
     if (scattered == null) {
       return [
@@ -10211,6 +10336,24 @@ function generateInitialize(statement, indent = 0) {
   const lines = [];
 
   for (const target of targets) {
+    if (target && typeof target === 'object' && target.refMod) {
+      // A reference-modified INITIALIZE target is an alphanumeric slice:
+      // SPACES (or the REPLACING ALPHANUMERIC value) across its own length.
+      const viewInfo = lookupFieldForRef(target);
+      const replMatch = (statement.replacing || []).find(r => initializeCategoryMatches('alphanumeric', r.category));
+      let valueExpr;
+      if (replMatch) {
+        const figKey = figurativeSourceKey(replMatch.value);
+        valueExpr = figKey ? refModFigurativeFillExpr(target, figKey) : renderMoveSource(replMatch.value, viewInfo);
+      } else if (statement.replacing && statement.replacing.length > 0) {
+        lines.push(`${indentStr}() // INITIALIZE ${target.name}(...): REPLACING present, ALPHANUMERIC category not mentioned - left untouched`);
+        continue;
+      } else {
+        valueExpr = refModFigurativeFillExpr(target, 'SPACE');
+      }
+      lines.push(`${indentStr}${renderAssignment(target, valueExpr)}`);
+      continue;
+    }
     const nameUpper = String(target?.name || target || '').toUpperCase();
     const groupKey = resolveGroupKey(nameUpper);
     const subscripts = target && typeof target === 'object' && Array.isArray(target.subscripts) && target.subscripts.length > 0

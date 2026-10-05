@@ -145,7 +145,7 @@ describe('round-17 finding 1: reference modification as a MOVE numeric-target so
     const scala = scalaOf(src);
     assert.match(
       scala,
-      /wsNum = CobolFmt\.truncNumeric\(BigDecimal\(0\) \/\* TODO: reference modification not implemented as a MOVE numeric target/
+      /wsNum = CobolFmt\.truncNumeric\(CobolFmt\.numval\(CobolFmt\.refModSlice\(/
     );
     assert.doesNotMatch(scala, /BigDecimal\(\?\?\?/, 'must never feed the shared ??? placeholder directly to BigDecimal(...)');
   });
@@ -165,7 +165,7 @@ describe('round-17 finding 1: reference modification as a MOVE numeric-target so
     const scala = scalaOf(src);
     assert.match(
       scala,
-      /wsDec = CobolFmt\.truncNumeric\(BigDecimal\(0\) \/\* TODO: reference modification not implemented as a MOVE numeric target - see tests\/oracle\/README\.md known gaps \*\/, 3, 2\)/
+      /wsDec = CobolFmt\.truncNumeric\(CobolFmt\.numval\(CobolFmt\.refModSlice\(.*\), 3, 2\)/
     );
   });
 
@@ -216,11 +216,11 @@ describe('round-17 finding 2: FUNCTION LENGTH of a ref-mod\'d argument returns t
     assert.match(scala, /println\("SUBLEN=" \+ CobolFmt\.num\(BigDecimal\(4\), 10, 0, false, false\)\)/);
     // Ref-mod'd argument fed into a MOVE: a bare numeric literal (5), not
     // pre-formatted display text.
-    assert.match(scala, /wsLen = 5/);
+    assert.match(scala, /wsLen = .*\b5\b/);
     assert.doesNotMatch(scala, /TODO: FUNCTION LENGTH of a reference-modified argument/);
   });
 
-  test('a ref-mod\'d FUNCTION LENGTH argument whose length operand is a variable (not a literal) honestly declines instead of guessing', () => {
+  test('a ref-mod\'d FUNCTION LENGTH argument whose length operand is a variable (not a literal) is computed at runtime (Oct 2026)', () => {
     const src = `       IDENTIFICATION DIVISION.
        PROGRAM-ID. R17F02VAR.
        DATA DIVISION.
@@ -233,10 +233,7 @@ describe('round-17 finding 2: FUNCTION LENGTH of a ref-mod\'d argument returns t
            STOP RUN.
 `;
     const scala = scalaOf(src);
-    assert.match(
-      scala,
-      /TODO: FUNCTION LENGTH of a reference-modified argument whose length operand is not a literal - not implemented - see tests\/oracle\/README\.md known gaps/
-    );
+    assert.match(scala, /CobolFmt\.refModLen\(CobolFmt\.fitLeft\(wsSrc, 10\), \(3\)\.toInt, \(wsLenVar\)\.toInt\)/);
   });
 });
 
@@ -258,11 +255,8 @@ describe('round-17 finding 3: reference modification as a plain DISPLAY operand 
            STOP RUN.
 `;
     const scala = scalaOf(src);
-    assert.match(
-      scala,
-      /println\("OUTER=" \+ "" \/\* TODO: reference modification not implemented as a DISPLAY operand - see tests\/oracle\/README\.md known gaps \*\/\)/
-    );
-    assert.doesNotMatch(scala, /\?\?\?.*\.padTo/, 'must never call .padTo directly on the shared Nothing-typed ??? placeholder');
+    assert.match(scala, /println\("OUTER=" \+ CobolFmt\.refModSlice\(CobolFmt\.fitLeft\(wsSrc, 10\), /);
+    assert.doesNotMatch(scala, /\?\?\?.*\.padTo/, 'must never call .padTo directly on a Nothing-typed ??? placeholder');
   });
 
   test('a non-ref-mod DISPLAY operand is completely unaffected (regression guard)', () => {
@@ -615,7 +609,7 @@ describe('round-17 shared helper refactor: refModGapComment/refModStringPlacehol
            STOP RUN.
 `;
     const scala = scalaOf(src);
-    assert.match(scala, /"" \/\* TODO: reference modification not implemented as a comparison operand - see tests\/oracle\/README\.md known gaps \*\//);
+    assert.match(scala, /CobolFmt\.alnumCompare\(CobolFmt\.refModSlice\(/);
   });
 
   test('round-16 finding 3 shape (CALL argument) still produces the same placeholder text after being routed through the shared helper', () => {
@@ -641,10 +635,7 @@ describe('round-17 shared helper refactor: refModGapComment/refModStringPlacehol
        END PROGRAM R17SHARED2.
 `;
     const scala = scalaOf(src);
-    assert.match(
-      scala,
-      /"" \/\* TODO: CALL "R17SHARED2SUB" USING WS-SRC\(\.\.\.\): reference modification not implemented as a CALL argument - see tests\/oracle\/README\.md known gaps \*\//
-    );
+    assert.match(scala, /R17shared2sub\.entry\(CobolFmt\.refModSlice\(/);
   });
 
   test('round-15 finding 8 shape (STRING segment source) still produces the same placeholder text after being routed through the shared helper', () => {
@@ -660,6 +651,6 @@ describe('round-17 shared helper refactor: refModGapComment/refModStringPlacehol
            STOP RUN.
 `;
     const scala = scalaOf(src);
-    assert.match(scala, /"" \/\* TODO: reference modification not implemented as a STRING source - see tests\/oracle\/README\.md known gaps \*\//);
+    assert.match(scala, /val _seg0 = CobolFmt\.refModSlice\(/);
   });
 });

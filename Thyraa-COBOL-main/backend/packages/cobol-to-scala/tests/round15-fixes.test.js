@@ -463,8 +463,9 @@ describe('round-15 finding 8: reference modification as a STRING segment source 
     assert.doesNotMatch(scala, /val _seg1 = \?\?\?/);
     // Replaced by a concrete, STRING-compatible ("".indices/"".length both
     // compile and run) placeholder that still visibly documents the gap.
-    assert.match(scala, /val _seg0 = "" \/\* TODO: reference modification/);
-    assert.match(scala, /val _seg1 = "" \/\* TODO: reference modification/);
+    // Oct 2026: the placeholder was replaced by REAL reference modification.
+    assert.match(scala, /val _seg0 = CobolFmt\.refModSlice\(CobolFmt\.fitLeft\(wsSrc, 10\), \(1\)\.toInt, \(5\)\.toInt\)/);
+    assert.match(scala, /val _seg1 = CobolFmt\.refModSlice\(CobolFmt\.fitLeft\(wsSrc, 10\), \(6\)\.toInt, \(5\)\.toInt\)/);
   });
 
   test('a non-ref-mod STRING source is completely unaffected (regression guard)', () => {

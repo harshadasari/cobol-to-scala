@@ -2273,38 +2273,72 @@ Every fix across all 40 rounds remains independently verified against real
 GnuCOBOL and scala-cli, not merely self-consistent; the full round-by-round
 ledger above is the complete, auditable record of that process.
 
+### Reference-modification implementation (Oct 2026)
+
+Plan step 2 of `docs/ACTION_PLAN_2026-10.md` ("fix reference modification before
+any external demo"). Baseline (fresh run, cobc 4.0-early-dev.0, scala-cli 1.9.1,
+pristine HEAD): 1119 tests, 0 fail, 44 `t.todo`, 16 of them reference-
+modification programs. After: 1143 tests, 0 fail, 29 `t.todo` (the 12 new
+`qq*` programs all pass `oracleCompare()`; 15 of the 16 ref-mod todos flipped).
+
+| # | Finding | Fix | Programs |
+|---|---|---|---|
+| 1 | Every ref-mod READ (`convertIdentifier`) was a `Nothing`-typed `???`, and each operand position (STRING source, comparison, DISPLAY, CALL argument, MOVE-to-numeric, UNSTRING DELIMITED BY) had its own empty-string/`BigDecimal(0)` placeholder - ref-mod output was wrong or threw `NotImplementedError` almost everywhere | New ref-mod core in `generator/expression-gen.js`: `refModBase` materializes the base item's full DISPLAY storage text (String: `fitLeft` to its PIC width; unsigned numeric: `digitsOf`; signed numeric: trailing-overpunch `zonedText`; group: `groupDisplayValueExpr`; subscripted element: through its own subscript) and `CobolFmt.refModSlice(text, s, l)` slices it (`(s:)` uses an `Int.MinValue` sentinel). `convertIdentifier` returns that String for any ref-mod'd reference, and `lookupFieldForRef` now reports a synthetic ALPHANUMERIC info (`refModViewInfo`) for a ref-mod'd reference so MOVE/STRING/UNSTRING/DISPLAY/comparison coercion all treat it as alphanumeric regardless of the base type. All the placeholder helpers were deleted | d12 e04 e05 f01 f04 f05 g02 g03; qq01 qq02 qq06 qq12 |
+| 2 | Every ref-mod WRITE was `x = ??? /* TODO */` | `renderAssignment` routes to `refModWriteStatement`: `CobolFmt.refModPatch(text, s, l, value)` replaces exactly `l` positions (left-justify, space-pad, truncate) and the whole text goes back through the base item's ORDINARY write path - `assignExpr` for a scalar (so a RECURSIVE LINKAGE leaf uses `x_=(...)`, round-39 finding 2), `.updated(...)` for a subscripted element, `scatterGroupFromString` for a group, `refModToNumeric` for a numeric base. A figurative source (`MOVE ZEROS/SPACES/... TO X(s:l)`) fills the slice's own runtime length (`refModFillLen`) | e04 h06 h07 oo04 pp03; qq03 qq04 qq05 qq10 |
+| 3 | Comparisons, UNSTRING DELIMITED BY, CALL arguments, FUNCTION LENGTH | Comparison with a ref-mod operand uses the runtime space-padding `CobolFmt.alnumCompare` (widths are runtime values), numeric-vs-slice compares digit text, figurative operands size themselves against the slice; UNSTRING accepts a ref-mod delimiter expression; CALL passes the exact slice and BY REFERENCE writes the callee's result back into only those bytes (ordinary callee via `refmod` writeback, RECURSIVE callee via closure getter/setter); FUNCTION LENGTH of a runtime-length slice is computed (`refModLen`) | e05 e06 g01 oo13 f02; qq07 qq08 qq09 qq12 |
+| 4 | INSPECT / STRING INTO / UNSTRING INTO / INITIALIZE on a slice | These already read via `convertIdentifier` and write via `renderAssignment`, so they inherit the semantics; STRING INTO a slice binds the slice length as its receiving width; INITIALIZE of a slice writes SPACES (or the REPLACING ALPHANUMERIC value) across the slice's length | d12 h06; qq07 qq11 qq12 |
+| 5 | Out-of-range `s`/`l` | cobc without `-debug` does no runtime check and touches adjacent memory (verified: reads return unrelated bytes) - undefined, so `CobolFmt.refMod*` raise `IndexOutOfBoundsException` (zero length accepted, as in cobc); an unsupported BASE shape (non-DISPLAY USAGE, group with signed/OCCURS/non-DISPLAY child, subscripted group row, COMP-1/2) raises `CobolFmt.refModUnsupported` - a visible runtime error | none exercise it (undefined in COBOL) |
+
+New corpus (`tests/corpus/proc/`, oracle-captured, all passing): `qq01-refmod-literal-read`,
+`qq02-refmod-runtime-bounds`, `qq03-refmod-write-middle`, `qq04-refmod-group-slice`,
+`qq05-refmod-table-element`, `qq06-refmod-pic9-numval`, `qq07-refmod-string-unstring`,
+`qq08-refmod-compare-evaluate`, `qq09-refmod-call-byref`, `qq10-refmod-recursive-link`,
+`qq11-refmod-inspect-slice`, `qq12-refmod-init-length-search`. Unit tests:
+`tests/refmod-fixes.test.js`; the round-3/15/16/17/18/38/39 tests that asserted the old
+placeholders were updated to assert the real shapes.
+
+Programs that did NOT flip: `f03` (`DISPLAY "NUMVAL=" FUNCTION NUMVAL(WS-SRC(3:4))`)
+- the ref-mod itself is correct (the subscript use on its second line passes), but cobc
+DISPLAYs a bare NUMVAL result in its own fixed-width intrinsic format (`000005678`) while
+this generator prints `5678`; this is independent of ref-mod (a plain-field NUMVAL argument
+differs identically) and is a separate, pre-existing gap. Also fixed in passing: stale,
+non-compiling `tests/output/TransProc.scala` fixture deleted (nothing referenced it).
+Note: `oo13`/`pp06` `.oracle.txt` embed the run date (ACCEPT FROM DATE/DAY) and the two
+round-39 date-sanity unit tests (`round39-fixes.test.js`, "oo13 bug A/B") fail on any
+day other than the capture day - pre-existing, unrelated.
+
 ### Known gaps
 
-- **Reference modification (`identifier(start:length)`), round-3 finding 3** - read
-  and write both degrade to a visible, compiling `??? ` marker (see
-  `generator/expression-gen.js`'s `convertIdentifier`/`renderAssignment`) rather than
-  actually slicing/patching the field's display representation. The parser itself is
-  fixed (see the table above - `identifier(start:length)` no longer mis-parses and
-  corrupts the rest of the statement), so this is purely a codegen gap, not a
-  crash-or-corruption risk. Not promoted into this corpus (no `n03*.cbl`) - a program
-  actually exercising reference modification would hit the `???` marker at runtime and
-  fail `oracleCompare()` by design, which would misrepresent a *known, intentional*
-  gap as a regression. Revisit by implementing substring-read / splice-write against
-  the field's own display text (its own declared width is already known via the field
-  registry) if a future pass has time for it. **Round-15 update**: `d12` IS now
-  promoted (deliberately, unlike every other program exercising this gap) - it
-  exists specifically to regression-test round-15 finding 8 (STRING no longer
-  hard-crashes when a segment source is a ref-mod expression - see the round-15
-  table above), not to exercise ref-mod's own semantics. `d12` still shows as the
-  Phase 2 suite's one `t.todo(...)` entry, exactly as this note predicts for any
-  program that reaches the `???` placeholder at runtime (its own UNSTRING-INTO-
-  ref-mod-target and INSPECT-of-a-ref-mod'd-substring both still do) - this is
-  expected, by design, and not a regression. **Round-16 update**: `e04`/`e05`/
-  `e06` are now promoted too (see the round-16 table above), each regression-
-  testing a DIFFERENT operand position this round stopped from crashing/
-  silently-corrupting - `e05` (relational comparison, finding 2) and `e06`
-  (CALL argument, finding 3) both now degrade to a visible, compiling,
-  String-typed placeholder instead of a `Nothing`-typed `???`/a silent full-
-  variable pass-through; `e04` (a plain MOVE ref-mod source/target, not
-  touched by this round at all) still hits the pre-existing `???` placeholder
-  and throws `NotImplementedError` at runtime, exactly as this note has always
-  predicted - all three still show up as `t.todo(...)` entries, by design, not
-  regressions.
+- **Reference modification (`identifier(start:length)`), round-3 finding 3 -
+  IMPLEMENTED (Oct 2026; see "Reference-modification implementation (Oct 2026)"
+  below).** Real semantics now exist for reads and writes of `X(s:l)` / `X(s:)`
+  with literal or runtime-computed `s`/`l`, on scalar PIC X / edited items,
+  unsigned and signed (trailing-overpunch) DISPLAY numeric items, group items
+  made only of such children, and subscripted OCCURS elements `T(i)(s:l)`, in
+  every statement position: MOVE source/target, DISPLAY, comparisons/EVALUATE/
+  SEARCH WHEN, STRING sources and INTO, UNSTRING source/DELIMITED BY/INTO,
+  INSPECT, INITIALIZE, CALL arguments (BY REFERENCE aliases the slice, including
+  into a RECURSIVE callee and from a RECURSIVE program's own LINKAGE leaves via
+  the `x_=(...)` setter), FUNCTION LENGTH/NUMVAL arguments. The honest-decline
+  placeholders (`refModStringPlaceholder` et al.) are gone. **Residual
+  limitations (all surface as a visible runtime error, never silent garbage):**
+  (1) a base item with a non-DISPLAY USAGE (COMP/COMP-3/COMP-1/COMP-2/BINARY...);
+  (2) a group containing a signed, OCCURS, or non-DISPLAY child; (3) a
+  subscripted GROUP row `T(i)(s:l)` where `T` is an OCCURS group (elementary
+  OCCURS elements are supported); (4) signed DISPLAY items assume the default
+  trailing-overpunch sign (no SIGN LEADING/SEPARATE modelling); (5) an
+  out-of-range `s`/`l` (`s < 1`, `l < 0`, or `s+l-1` past the item) raises
+  `IndexOutOfBoundsException` - real cobc without `-debug` does no runtime
+  range check and reads/writes adjacent memory (undefined), a zero length is
+  accepted like cobc; (6) a non-String-typed callee parameter receiving a
+  BY REFERENCE ref-mod argument only round-trips for String parameters;
+  (7) UNSTRING DELIMITED BY a *non-ref-mod* data-name remains unsupported (Known
+  gap list elsewhere). Using a ref-mod operand directly as an arithmetic operand
+  is invalid COBOL (cobc rejects it - pp08) and is not modelled. `f03` still
+  differs from cobc for a DIFFERENT, pre-existing reason: cobc DISPLAYs a bare
+  `FUNCTION NUMVAL(...)` result in its own fixed-width intrinsic-result format
+  (e.g. `000005678`), which this generator does not reproduce for any NUMVAL
+  argument, ref-mod or not.
 
 - **A bare, UNQUALIFIED out-of-line `PERFORM <paragraph-name>` (or `GO TO`) that
   targets one specific paragraph whose bare name is ambiguous across sections

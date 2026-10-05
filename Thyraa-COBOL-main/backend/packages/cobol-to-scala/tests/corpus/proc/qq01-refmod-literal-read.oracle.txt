@@ -1,0 +1,7 @@
+A=[ABC]
+B=[EFGH]
+C=[L]
+D=[IJKL]
+E=[ABCDEFGHIJKL]
+SHORT=[CD]
+LONG=[CDEFG   ]

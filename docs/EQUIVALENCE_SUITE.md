@@ -102,7 +102,7 @@ It is evidence about language semantics. It does not replace dual-running on pro
 | `ORACLE_ALLOW_SKIP=1` | Only way to turn a missing/wrong toolchain into a skip. Without it the test `oracle toolchain present and pinned (...)` FAILS (cobc missing, cobc version not the pin, or scala-cli missing) and the heavy tests skip, so a run can never be green because the oracle did not run. |
 | `npm run oracle:dialect` (`ORACLE_DIALECT=ibm` or `ibm-strict`) | In addition to the default capture, runs cobc with `-std=<dialect>` over every program and reports per program whether cobc's own stdout/exit status differs ("dialect-sensitive"); summary diagnostic plus JSON at `ORACLE_DIALECT_REPORT` (default `<tmpdir>/oracle-dialect-<dialect>.json`). Diagnostics only, never changes a verdict. `ORACLE_SKIP_SCALA=1` (set by the script) skips the translator comparison. |
 | `npm run golden` / `npm run golden:update` | Golden-snapshot gate (section 5.1). |
-| `npm run oracle:fuzz -- --seed S --count N` | Seeded grammar-based program generator (section 5.2); not part of the default suite. |
+| `npm run oracle:fuzz -- --seed S --count N` | Seeded grammar-based program generator (section 5.2); not part of the default suite. Flags: `--seed --count --start --index --jobs --usage --reduce --out --print --quirks`. |
 
 **Sidecars next to a corpus program.** `<base>.copybooks.json` (above); `<base>.stdin.txt` is fed to stdin of BOTH cobc and the translated program (and used when capturing `.oracle.txt`); for the negative probes `<base>.cbl.txt` + `<base>.expect.json` = `{"outcome": "compile-error" | "exit-nonzero", "exitCode": 1, "stderrIncludes": ["..."], "stdout": "..."}` where `stdout` (exit-nonzero only) is the exact output before the abort. The probe passes only if cobc still behaves that way; any change FAILS (never todo).
 
@@ -114,7 +114,32 @@ It is evidence about language semantics. It does not replace dual-running on pro
 
 ### 5.2 Grammar-based generator
 
-`tests/oracle/fuzz.js`: seeded (no LLM) programs over PIC 9(n)/S9(n)V9(m)/X(n) items with MOVE, COMPUTE/ADD/SUBTRACT (ROUNDED, SIZE ERROR), IF, PERFORM VARYING and DISPLAY, each run through `oracleCompare`. Mismatches are classified by signature and delta-reduced to minimal reproducers. `--print` shows programs without running anything; the same `--seed`/`--index` always regenerates the same program.
+`tests/oracle/fuzz.js`: seeded (no LLM) programs over PIC 9(n)/S9(n)V9(m)/X(n) items with MOVE, COMPUTE/ADD/SUBTRACT (ROUNDED, SIZE ERROR), IF, PERFORM VARYING and DISPLAY, each run through `oracleCompare`. Program `i` of seed `S` is a pure function of `(S, i)`. Mismatches are classified by signature and a few per signature are statement-level delta-reduced to minimal reproducers. A program cobc itself rejects is reported INVALID (a generator defect, not an engine finding). The tool never edits engine code. Opt-in: not part of `npm test` or `npm run oracle`.
+
+```
+npm run oracle:fuzz -- --seed 1 --count 200
+npm run oracle:fuzz -- --seed 1 --index 17 --print      # show program 17 of seed 1
+```
+
+| Flag | Meaning |
+|---|---|
+| `--seed S` | PRNG seed (default 1). |
+| `--count N` | Number of programs (default 50). |
+| `--start I` | First program index (default 0). |
+| `--index I` | Run/print exactly program `I` (same as `--start I --count 1`). |
+| `--jobs J` | Parallel `oracleCompare` runs (default 4). |
+| `--usage` | Also give numeric items COMP-3 / COMP usage (default: DISPLAY only). |
+| `--reduce K` | Delta-debug up to `K` mismatching programs per mismatch signature (default 3; 0 = off). |
+| `--out DIR` | Where programs and reports are written (default `<os.tmpdir()>/oracle-fuzz-<seed>`). |
+| `--print` | Print the generated program(s) and exit; needs neither cobc nor scala-cli. |
+| `--quirks` | Re-enable the two excluded cobc-quirk shapes below (default off), so the exclusions stay auditable. |
+
+A 200-program run takes a long time: start it detached (`setsid nohup node tests/oracle/fuzz.js --seed S --count 200 > log 2>&1 < /dev/null &`).
+
+**Excluded shapes (GnuCOBOL quirks, not engine bugs).** Two classes of mismatch come from GnuCOBOL 4.0-early-dev behaviour that contradicts ISO/IBM semantics; the engine deliberately follows the standard, so the generator no longer emits them (the grammar and every other random draw are unchanged, so earlier seeds stay comparable apart from the rewritten shapes). `--quirks` restores them.
+
+- **Class B, negative literal wider than the field.** `IF <numeric item> <relop> <negative literal>` where the literal has more integer digits than the item's PICTURE (`N2 PIC 9(2)` vs `-3470`, `S9(1)` vs `-86.19`). cobc's compile-time literal range check ignores the sign (`literal '-3470' has more digits than 'N2'`, `expression is always TRUE`), identical under every `-std`; ISO/IBM compare algebraically. Generator: such a literal is cut to its last `n` integer digits (`n` = the item's integer digits); positive literals are unconstrained because cobc handles them correctly. Ledger: `tests/oracle/README.md`, "Post-campaign fixes (Oct 2026)", row 8.
+- **Class E, all-integer COMPUTE beyond 2^31.** cobc evaluates an all-integer COMPUTE in 32-bit C ints and wraps when an exact intermediate exceeds 2^31 (`N3 PIC S9(6) VALUE 213044`, `COMPUTE N1 = N3 * 50000`); decimal operands are evaluated exactly. Generator: a conservative bound is computed per COMPUTE expression (item picture maxima and literal values; `+`/`-` add, `*` multiplies); if there is no decimal operand and no `/`, and the bound reaches 2^31, the expression gets a trailing ` + 0.0` so cobc evaluates it in exact decimal. Ledger: `docs/ACTION_PLAN_2026-10.md` Findings log, entry "2026-10-05 Fuzzer fix pass landed" (class E has no README row).
 
 **Known harness limitations.** The Scala compile-failure test is a stderr heuristic. The `.cbl.txt` probes check cobc's behaviour only; they do not check that a translator also rejects them, so a new adapter must wire that itself. Stdin is a single text blob fed to both sides.
 

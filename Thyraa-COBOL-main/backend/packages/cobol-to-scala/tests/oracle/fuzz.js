@@ -17,6 +17,7 @@
  *   --reduce K      delta-debug up to K mismatching programs per mismatch signature (default 3, 0 = off)
  *   --out DIR       where to write programs/reports (default <os.tmpdir()>/oracle-fuzz-<seed>)
  *   --print         print the generated program(s) and exit (no cobc / scala-cli needed)
+ *   --quirks        re-enable the two excluded cobc-quirk shapes (below); default OFF
  *
  * Generated subset (every program is well-formed fixed-format COBOL):
  *   WORKING-STORAGE items PIC 9(n) | S9(n) | 9(n)V9(m) | S9(n)V9(m) | X(n)
@@ -24,6 +25,29 @@
  *   ON SIZE ERROR), IF (numeric and alphanumeric compares, optional ELSE),
  *   PERFORM VARYING ... UNTIL (always terminating: the index cannot wrap),
  *   DISPLAY. No LLM involved: the same seed always yields the same programs.
+ *
+ * Excluded shapes (GnuCOBOL 4.0-early-dev quirks that contradict ISO/IBM
+ * semantics; the engine deliberately follows the standard, so reporting them
+ * would only bury genuine divergences). `--quirks` turns the exclusions off so
+ * they stay auditable. All other generator draws are unchanged, so programs
+ * differ from earlier seeds only where a shape was rewritten.
+ *   B  `IF <numeric item> <relop> <NEGATIVE literal>` whose literal has MORE
+ *      integer digits than the item's PICTURE (`N2 PIC 9(2)` vs `-3470`,
+ *      `S9(1)` vs `-86.19`): cobc's compile-time literal range check ignores
+ *      the sign ("literal '-3470' has more digits than 'N2'" / "expression is
+ *      always TRUE"), so the answer is as if the literal were +3470. Fix:
+ *      the literal is cut to its LAST n integer digits (n = item integer
+ *      digits). Positive literals are left alone (cobc handles them right).
+ *      Ledger: tests/oracle/README.md "Post-campaign fixes (Oct 2026)" row 8.
+ *   E  all-integer COMPUTE expressions whose exact magnitude could exceed
+ *      2^31 (`N3 PIC S9(6) = 213044`, `COMPUTE N1 = N3 * 50000`): cobc
+ *      evaluates all-integer expressions in 32-bit C ints and wraps. A
+ *      conservative bound (picture maxima / literal values; + - add, * multiplies)
+ *      is taken per expression; with no decimal operand and no '/' and a
+ *      bound >= 2^31 the expression gets a trailing ` + 0.0` so cobc
+ *      evaluates it exactly in decimal. Not a separate README ledger row: it
+ *      is recorded in docs/ACTION_PLAN_2026-10.md Findings log, entry
+ *      "2026-10-05 Fuzzer fix pass landed" (class E).
  *
  * Each program is run through oracleCompare() (cobc vs generated Scala). A
  * program cobc itself rejects is reported as INVALID (a generator defect, not
@@ -123,6 +147,51 @@ function genExpr(rng, vars, depth) {
   return rng.chance(0.4) ? `(${e})` : e;
 }
 
+// Class E guard (see header). Conservative magnitude bound of an expression
+// string, and whether it contains any decimal operand or a division.
+const INT32 = 2 ** 31;
+function exprBound(expr, vars) {
+  const toks = [];
+  for (const w of expr.split(/\s+/).filter(Boolean)) {
+    const m = w.match(/^(\(*)(.*?)(\)*)$/);
+    for (const c of m[1]) toks.push(c);
+    if (m[2]) toks.push(m[2]);
+    for (const c of m[3]) toks.push(c);
+  }
+  let pos = 0;
+  const atom = () => {
+    const t = toks[pos++];
+    if (t === '(') { const r = sum(); pos++; return r; }
+    const v = vars.find((x) => x.name === t);
+    if (v) return { b: 10 ** v.n, dec: v.m > 0 };
+    return { b: Math.abs(Number(t)), dec: t.includes('.') };
+  };
+  const prod = () => {
+    let l = atom();
+    while (toks[pos] === '*' || toks[pos] === '/') {
+      const op = toks[pos++];
+      const r = atom();
+      l = op === '*' ? { b: l.b * r.b, dec: l.dec || r.dec } : { b: l.b * 4, dec: true };
+    }
+    return l;
+  };
+  const sum = () => {
+    let l = prod();
+    while (toks[pos] === '+' || toks[pos] === '-') {
+      pos++;
+      const r = prod();
+      l = { b: l.b + r.b, dec: l.dec || r.dec };
+    }
+    return l;
+  };
+  return sum();
+}
+function guardInt32(expr, vars, opts) {
+  if (opts.quirks) return expr;
+  const { b, dec } = exprBound(expr, vars);
+  return !dec && b >= INT32 ? `${expr} + 0.0` : expr;
+}
+
 function genSimple(rng, vars, ctx) {
   const k = rng.pick(['move', 'move', 'compute', 'compute', 'add', 'sub', 'display']);
   const targets = numVars(vars).filter((v) => !ctx.locked.has(v.name));
@@ -139,7 +208,7 @@ function genSimple(rng, vars, ctx) {
     }
     case 'compute': {
       if (!targets.length) return { t: 'display', items: [rng.pick(vars).name] };
-      return { t: 'compute', dst: rng.pick(targets).name, expr: genExpr(rng, vars, 2), rounded: rng.chance(0.4), sizeError: rng.chance(0.15) };
+      return { t: 'compute', dst: rng.pick(targets).name, expr: guardInt32(genExpr(rng, vars, 2), vars, ctx.opts), rounded: rng.chance(0.4), sizeError: rng.chance(0.15) };
     }
     case 'add':
     case 'sub': {
@@ -156,10 +225,16 @@ function genSimple(rng, vars, ctx) {
   }
 }
 
-function genCond(rng, vars) {
+function genCond(rng, vars, opts) {
   if (rng.chance(0.65)) {
-    const a = rng.pick(numVars(vars)).name;
-    const b = rng.chance(0.5) ? rng.pick(numVars(vars)).name : numLiteral(rng, null);
+    const av = rng.pick(numVars(vars));
+    const a = av.name;
+    let b = rng.chance(0.5) ? rng.pick(numVars(vars)).name : numLiteral(rng, null);
+    if (!opts.quirks && b[0] === '-') {
+      // class B (see header): keep a negative literal's integer digits <= the item's
+      const [ip, fp] = b.slice(1).split('.');
+      if (ip.length > av.n) b = `-${ip.slice(-av.n)}${fp === undefined ? '' : `.${fp}`}`;
+    }
     return `${a} ${rng.pick(['>', '<', '=', '>=', '<=', 'NOT ='])} ${b}`;
   }
   const a = rng.pick(alVars(vars)).name;
@@ -174,7 +249,7 @@ function genBlock(rng, vars, ctx, depth, count) {
     if (depth > 0 && r < 0.2) {
       out.push({
         t: 'if',
-        cond: genCond(rng, vars),
+        cond: genCond(rng, vars, ctx.opts),
         then: genBlock(rng, vars, ctx, depth - 1, rng.int(1, 2)),
         else: rng.chance(0.5) ? genBlock(rng, vars, ctx, depth - 1, rng.int(1, 2)) : [],
       });
@@ -199,7 +274,7 @@ function genBlock(rng, vars, ctx, depth, count) {
 export function generateProgram(seed, index, opts = {}) {
   const rng = new Rng((Math.imul(seed >>> 0, 1000003) + index * 7919 + 12345) >>> 0);
   const vars = genVars(rng, opts);
-  const ctx = { locked: new Set(), nextIdx: 1, inLoop: false, indexVars: [] };
+  const ctx = { locked: new Set(), nextIdx: 1, inLoop: false, indexVars: [], opts };
   const body = genBlock(rng, vars, ctx, 2, rng.int(4, 10));
   // final dump of every variable so end state is always compared
   body.push({ t: 'display', items: vars.map((v) => v.name), dump: true });
@@ -400,7 +475,7 @@ function fingerprint(prog) {
 
 // ----------------------------------------------------------------- main
 function parseArgs(argv) {
-  const o = { seed: 1, count: 50, start: 0, jobs: 4, usage: false, reduce: 3, out: null, print: false };
+  const o = { seed: 1, count: 50, start: 0, jobs: 4, usage: false, quirks: false, reduce: 3, out: null, print: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const val = () => argv[++i];
@@ -413,6 +488,7 @@ function parseArgs(argv) {
     else if (a === '--out') o.out = val();
     else if (a === '--usage') o.usage = true;
     else if (a === '--print') o.print = true;
+    else if (a === '--quirks') o.quirks = true;
     else throw new Error(`unknown option ${a}`);
   }
   return o;
@@ -421,7 +497,7 @@ function parseArgs(argv) {
 async function main() {
   const o = parseArgs(process.argv.slice(2));
   const progs = [];
-  for (let i = o.start; i < o.start + o.count; i++) progs.push(generateProgram(o.seed, i, { usage: o.usage }));
+  for (let i = o.start; i < o.start + o.count; i++) progs.push(generateProgram(o.seed, i, { usage: o.usage, quirks: o.quirks }));
 
   if (o.print) {
     for (const p of progs) console.log(renderProgram(p));
@@ -435,7 +511,7 @@ async function main() {
   }
   const dir = o.out ?? path.join(os.tmpdir(), `oracle-fuzz-${o.seed}`);
   await fs.mkdir(dir, { recursive: true });
-  console.log(`fuzz: seed=${o.seed} programs=${o.start}..${o.start + o.count - 1} jobs=${o.jobs} usage=${o.usage} out=${dir}\n${tc.summary}`);
+  console.log(`fuzz: seed=${o.seed} programs=${o.start}..${o.start + o.count - 1} jobs=${o.jobs} usage=${o.usage} quirks=${o.quirks} out=${dir}\n${tc.summary}`);
   await warmupScala();
 
   const results = new Array(progs.length);

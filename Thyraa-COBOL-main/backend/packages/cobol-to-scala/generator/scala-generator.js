@@ -733,6 +733,15 @@ function defaultElementaryValue(item, scalaType, isFileSection = false) {
       const width = pic?.length || 0;
       return `"${'\\u0000'.repeat(Math.max(width, 0))}"`;
     }
+    // Oct-2026 (fuzzer class A): an alphanumeric/alphabetic WORKING-STORAGE
+    // item with no VALUE clause starts as `width` SPACES in cobc, so
+    // `IF A1 = SPACES` / `IF A1 = ""` (a zero-length literal is one space)
+    // is TRUE before any write. Declared at its full width (like a VALUE
+    // SPACES item already is) so the compile-time width-padded comparisons
+    // see the same bytes cobc does; DISPLAY output is unchanged (it pads).
+    if ((pic?.dataType === 'alphanumeric' || pic?.dataType === 'alphabetic') && (pic?.length || 0) > 0) {
+      return `"${' '.repeat(pic.length)}"`;
+    }
     return '""';
   }
   if (scalaType === 'BigDecimal') {

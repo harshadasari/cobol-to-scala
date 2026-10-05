@@ -389,6 +389,16 @@ class Lexer {
     return this.isAlpha(char) || this.isDigit(char) || char === '-';
   }
 
+  /** True while scanning between `EXEC` and `END-EXEC` (SQL/CICS text keeps '' as an empty string). */
+  insideExecBlock() {
+    for (let i = this.tokens.length - 1; i >= 0; i--) {
+      const v = String(this.tokens[i].value).toUpperCase();
+      if (v === 'END-EXEC') return false;
+      if (v === 'EXEC') return true;
+    }
+    return false;
+  }
+
   scanString(quoteChar) {
     const startLine = this.currentLine;
     const startColumn = this.currentColumn;
@@ -433,6 +443,12 @@ class Lexer {
     }
 
     const tokenType = isHex ? TokenType.HEX_LITERAL : TokenType.STRING_LITERAL;
+    // Oct-2026 (fuzzer class A): cobc treats a zero-length alphanumeric
+    // literal ("" / '') as ONE SPACE everywhere ("alphanumeric literal has
+    // zero length; a SPACE will be assumed"): `IF A2 = ""` on blanks is
+    // TRUE, `MOVE "" TO X` blanks X, `DISPLAY ""` prints one space,
+    // `FUNCTION LENGTH("")` is 1, STRING/UNSTRING/INSPECT use " ".
+    if (value === '' && !isHex && !this.insideExecBlock()) value = ' ';
     this.addTokenAt(tokenType, value, startLine, startColumn, startPosition);
   }
 

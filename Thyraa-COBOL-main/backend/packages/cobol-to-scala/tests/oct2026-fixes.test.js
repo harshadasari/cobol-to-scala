@@ -174,3 +174,138 @@ describe('probe 3: PERFORM VARYING step is stored with arithmetic-store truncati
     assert.match(s, /wsS = \(CobolFmt\.truncNumeric\([^\n]*, 2, 0\)\)\.toInt/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fuzzer fix pass (first fuzzer run, seed 1): classes A, C, D (class B is a
+// cobc compiler quirk and deliberately NOT matched - see the ledger).
+// ---------------------------------------------------------------------------
+describe('fuzzer class A: a zero-length literal is ONE SPACE (cobc)', () => {
+  test('"" / \'\' lex as a single space; hex and EXEC text are untouched', () => {
+    const s = scalaOf(prog(
+      '       01 A2 PIC X(2).\n       01 A4 PIC X(4) VALUE "xy".',
+      '           IF A2 = ""\n             DISPLAY "T"\n           END-IF.\n           MOVE "" TO A4.\n           DISPLAY "[" "" "]".'
+    ));
+    // The comparison literal is the single space, padded to the field width.
+    assert.match(s, /if a2 == \(" " \+ " "\) then/);
+    assert.match(s, /a4 = " {4}"/);
+    assert.match(s, /println\("\[" \+ " " \+ "\]"\)/);
+  });
+
+  test('a PIC X item with no VALUE starts as full-width SPACES (not the empty string)', () => {
+    const s = scalaOf(prog(
+      '       01 A1 PIC X(4).\n       01 T  PIC X(2) OCCURS 3 TIMES.\n       01 N1 PIC 9(2).',
+      '           IF A1 = SPACES DISPLAY "T" END-IF.'
+    ));
+    assert.match(s, /var a1: String = " {4}"/);
+    assert.match(s, /Vector\.fill\(3\)\(" {2}"\)/);
+    assert.match(s, /var n1: Int = 0/);
+    assert.doesNotMatch(s, /var a1: String = ""/);
+  });
+
+  test('rr05 corpus program generates the space-literal forms', () => {
+    const s = corpusScala('rr05-zero-length-literal.cbl');
+    assert.doesNotMatch(s, /== \(""/);
+    assert.match(s, /var u1: String = " {4}"/);
+  });
+});
+
+describe('fuzzer class C: MOVE into an UNSIGNED numeric item stores |value|', () => {
+  test('variable sources (signed DISPLAY/COMP/COMP-3) get .abs after the digit truncation', () => {
+    const s = scalaOf(prog(
+      '       01 S6 PIC S9(6) VALUE -481.\n       01 SC PIC S9(4) COMP VALUE -37.\n       01 SP3 PIC S9(5) COMP-3 VALUE -906.\n       01 U2 PIC 9(2).\n       01 UC PIC 9(4) COMP.\n       01 U5 PIC 9(5) COMP-3.\n       01 SS PIC S9(3).',
+      '           MOVE S6 TO U2.\n           MOVE SC TO UC.\n           MOVE SP3 TO U5.\n           MOVE S6 TO SS.'
+    ));
+    assert.match(s, /u2 = CobolFmt\.truncNumeric\(BigDecimal\(s6\), 2, 0\)\.abs\.toInt/);
+    assert.match(s, /uc = CobolFmt\.truncNumeric\(BigDecimal\(sc\), 4, 0\)\.abs\.toInt/);
+    assert.match(s, /u5 = CobolFmt\.truncNumeric\(sp3, 5, 0\)\.abs/);
+    // signed receiver unchanged
+    assert.match(s, /ss = CobolFmt\.truncNumeric\(BigDecimal\(s6\), 3, 0\)\.toInt/);
+  });
+
+  test('an unsigned SOURCE needs no .abs (shape churn stays minimal)', () => {
+    const s = scalaOf(prog(
+      '       01 U5 PIC 9(5) VALUE 12345.\n       01 U3 PIC 9(3).',
+      '           MOVE U5 TO U3.'
+    ));
+    assert.match(s, /u3 = CobolFmt\.truncNumeric\(BigDecimal\(u5\), 3, 0\)\.toInt/);
+    assert.doesNotMatch(s, /u3 = [^\n]*\.abs/);
+  });
+
+  test('negative literals (incl. INITIALIZE REPLACING NUMERIC BY) keep only the magnitude', () => {
+    const s = scalaOf(prog(
+      '       01 U3 PIC 9(3).\n       01 U4 PIC 9(3)V9.\n       01 S3 PIC S9(3).',
+      '           MOVE -536 TO U3.\n           MOVE -12.75 TO U4.\n           MOVE -536 TO S3.\n           INITIALIZE U3 REPLACING NUMERIC BY -5.'
+    ));
+    assert.match(s, /u3 = 536\b/);
+    assert.match(s, /u4 = BigDecimal\("12\.7"\)/);
+    assert.match(s, /s3 = -536\b/);
+    assert.match(s, /u3 = 5\b/);
+  });
+
+  test('a period-less INITIALIZE ... REPLACING no longer loops forever in the parser', () => {
+    const s = scalaOf(prog(
+      '       01 U3 PIC 9(3).',
+      '           INITIALIZE U3 REPLACING NUMERIC BY -5\n           DISPLAY "X"'
+    ));
+    assert.match(s, /println\("X"\)/);
+  });
+
+  test('rr06 corpus program', () => {
+    const s = corpusScala('rr06-move-unsigned-abs.cbl');
+    assert.match(s, /u2 = CobolFmt\.truncNumeric\(BigDecimal\(s6\), 2, 0\)\.abs\.toInt/);
+    assert.match(s, /u3 = 536\b/);
+  });
+});
+
+describe('fuzzer class D: COMPUTE division keeps cobc intermediate precision', () => {
+  test('an expression with "/" is built from CobolFmt.div and exact (ex) left operands', () => {
+    const s = scalaOf(prog(
+      '       01 N3 PIC 9(4)V9(1) VALUE 832.\n       01 R1 PIC 9(3)V9(1).\n       01 R2 PIC 9(3)V9(1).',
+      '           COMPUTE R1 = ((1 + N3) / 3).\n           COMPUTE R2 = (N3 / 3) * 3.'
+    ));
+    assert.match(s, /r1 = CobolFmt\.truncNumeric\(CobolFmt\.div\(\(CobolFmt\.ex\(BigDecimal\("1"\)\) \+ n3\), BigDecimal\("3"\)\), 3, 1\)\.abs/);
+    assert.match(s, /r2 = CobolFmt\.truncNumeric\(\(CobolFmt\.div\(n3, BigDecimal\("3"\)\) \* BigDecimal\("3"\)\), 3, 1\)\.abs/);
+  });
+
+  test('expressions without a division are untouched (no ex/div noise)', () => {
+    const s = scalaOf(prog(
+      '       01 A PIC 9(3) VALUE 2.\n       01 R PIC 9(5).',
+      '           COMPUTE R = (A + 1) * 3.'
+    ));
+    assert.doesNotMatch(s, /r = [^\n]*CobolFmt\.(div|ex)\(/);
+  });
+
+  test('a later operation on the quotient is exact: ex() on the left operand of + - * and **', () => {
+    const s = scalaOf(prog(
+      '       01 A PIC 9(3) VALUE 7.\n       01 R PIC 9(3)V9(3).',
+      '           COMPUTE R = A + A / 3 - 1.'
+    ));
+    assert.match(s, /CobolFmt\.ex\(\(CobolFmt\.ex\(BigDecimal\(a\)\) \+ CobolFmt\.div\(BigDecimal\(a\), BigDecimal\("3"\)\)\)\)/);
+  });
+
+  test('pure-JS mirror of CobolFmt.div pinned to cobc-captured values (rr07)', () => {
+    // quotient scale = max(sa - sb, 0) + 38, truncated toward zero
+    const div = (aUnscaled, aScale, bUnscaled, bScale) => {
+      const s = aScale - bScale;
+      const shift = 38 + (s < 0 ? -s : 0);
+      return { unscaled: (aUnscaled * 10n ** BigInt(shift)) / bUnscaled, scale: s + shift };
+    };
+    const q = div(1n, 0, 3n, 0);
+    assert.equal(q.scale, 38);
+    assert.equal(q.unscaled.toString(), '3'.repeat(38));
+    // (1/3)*3 is 0.999...9 (38 nines), which truncates to 0.999 at V9(3): cobc +000.999
+    assert.equal((q.unscaled * 3n).toString(), '9'.repeat(38));
+    // 1/3/3 keeps scale 76
+    const q2 = div(q.unscaled, q.scale, 3n, 0);
+    assert.equal(q2.scale, 76);
+    // dividend scale 3, divisor scale 2 -> scale 39 ; dividend scale 0, divisor scale 2 -> scale 38
+    assert.equal(div(1000n, 3, 300n, 2).scale, 39);
+    assert.equal(div(1n, 0, 300n, 2).scale, 38);
+  });
+
+  test('rr07 corpus program uses div for every quotient', () => {
+    const s = corpusScala('rr07-compute-div-intermediate.cbl');
+    assert.doesNotMatch(s, /BigDecimal\([^)]*\) \/ BigDecimal/);
+    assert.match(s, /CobolFmt\.div\(/);
+  });
+});

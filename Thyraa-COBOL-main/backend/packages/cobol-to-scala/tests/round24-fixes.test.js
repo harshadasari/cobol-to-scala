@@ -416,7 +416,9 @@ describe('round-24 finding 4 (m08): an FD record\'s own alphanumeric field with 
        END PROGRAM T24WSMAIN.
 `;
     const scala = scalaOf(src);
-    assert.match(scala, /var wsRec: String = ""/);
+    // Oct-2026 (fuzzer class A): the no-VALUE default is now the full-width
+    // run of spaces (cobc: `IF WS-REC = SPACES` is TRUE before any write).
+    assert.match(scala, /var wsRec: String = " {10}"/);
     assert.doesNotMatch(scala, /var wsRec: String = "\\u0000/);
   });
 });

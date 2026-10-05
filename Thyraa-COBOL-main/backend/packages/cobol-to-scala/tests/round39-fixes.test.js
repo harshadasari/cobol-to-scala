@@ -156,7 +156,7 @@ describe('round-39 finding 1 (oo03): subscripted GROUP-table row BY REFERENCE in
     // The group's own per-leaf Vectors exist; a flat "wsItem" Vector never
     // gets declared (there is nothing to alias under that bare name).
     assert.match(scala, /var wsItemVal: Vector\[Int\] = Vector\.fill\(3\)\(0\)/);
-    assert.match(scala, /var wsItemTag: Vector\[String\] = Vector\.fill\(3\)\(""\)/);
+    assert.match(scala, /var wsItemTag: Vector\[String\] = Vector\.fill\(3\)\(" +"\)/); // Oct-2026: full-width spaces
   });
 });
 

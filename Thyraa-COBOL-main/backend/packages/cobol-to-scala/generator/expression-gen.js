@@ -1864,6 +1864,29 @@ export function generateCobolFmtHelper() {
     '    val mod = BigDecimal(10).pow(math.max(intDigits, 0))',
     '    (whole % mod) + frac',
     '',
+    '  // Oct-2026 (fuzzer class D): COBOL division inside a COMPUTE expression',
+    '  // (libcob cob_decimal_div, cobc 4.0-early default dialect): the quotient',
+    '  // is TRUNCATED toward zero at max(scaleA - scaleB, 0) + 38 decimal places',
+    '  // (shift = 38 + max(scaleB - scaleA, 0); a zero dividend yields 0), and only',
+    '  // the final store truncates/rounds it to the receiver. Scala\'s own',
+    '  // BigDecimal `/` (MathContext.DECIMAL128 = 34 significant digits, HALF_EVEN)',
+    '  // ROUNDS instead, so (1/3)*3 came out 1 where cobc gives 0.999...9.',
+    '  // Division by zero keeps the plain BigDecimal behaviour.',
+    '  // ex() lifts a value to an UNLIMITED-precision MathContext: Scala\'s +,-,*',
+    '  // on a default-context BigDecimal also round to 34 significant digits',
+    '  // (cobc keeps every intermediate exact), and the context of the LEFT operand',
+    '  // wins, so a COMPUTE expression containing a division is built from ex() lefts.',
+    '  def ex(v: BigDecimal): BigDecimal = BigDecimal.decimal(v.bigDecimal, java.math.MathContext.UNLIMITED)',
+    '',
+    '  def div(a: BigDecimal, b: BigDecimal): BigDecimal =',
+    '    if b.signum == 0 then a / b',
+    '    else if a.signum == 0 then BigDecimal(0)',
+    '    else',
+    '      val s = a.scale - b.scale',
+    '      val shift = 38 + (if s < 0 then -s else 0)',
+    '      val q = a.bigDecimal.unscaledValue.multiply(java.math.BigInteger.TEN.pow(shift)).divide(b.bigDecimal.unscaledValue)',
+    '      BigDecimal.decimal(new java.math.BigDecimal(q, s + shift), java.math.MathContext.UNLIMITED)',
+    '',
     '  // Arithmetic-assignment store-time semantics for a ROUNDED target',
     '  // (COMPUTE/ADD/SUBTRACT/MULTIPLY/DIVIDE ... ROUNDED): HALF_UP rounding',
     '  // to the target\'s declared decimal digits (COBOL\'s ROUNDED clause),',
@@ -2783,6 +2806,33 @@ function functionCallToBigDecimalOperand(fc) {
   return /^BigDecimal\(/.test(rendered) ? rendered : `BigDecimal(${rendered})`;
 }
 
+// Oct-2026 (fuzzer class D): while rendering a COMPUTE expression that
+// contains a division, every binary operation is built from an UNLIMITED-
+// precision left operand (CobolFmt.ex) and every `/` goes through
+// CobolFmt.div, so intermediates stay exact like libcob's cob_decimal.
+let EXACT_ARITH = false;
+
+function expressionHasDivision(node) {
+  if (!node || typeof node !== 'object') return false;
+  if (node.type === 'ArithmeticExpression') {
+    if (node.unaryMinus) return expressionHasDivision(node.right);
+    if (node.operator && node.left != null && node.right != null) {
+      return node.operator === '/' || expressionHasDivision(node.left) || expressionHasDivision(node.right);
+    }
+  }
+  return false;
+}
+
+function toBigDecimalExpression(node) {
+  const prev = EXACT_ARITH;
+  EXACT_ARITH = prev || expressionHasDivision(node);
+  try {
+    return toBigDecimalOperand(node);
+  } finally {
+    EXACT_ARITH = prev;
+  }
+}
+
 function toBigDecimalOperand(node) {
   if (node === null || node === undefined) return 'BigDecimal(0)';
 
@@ -2831,9 +2881,11 @@ function toBigDecimalOperand(node) {
     if (node.operator && node.left != null && node.right != null) {
       const left = toBigDecimalOperand(node.left);
       const right = toBigDecimalOperand(node.right);
-      if (node.operator === '**') return `${left}.pow((${right}).toInt)`;
+      if (node.operator === '/' && EXACT_ARITH) return `CobolFmt.div(${left}, ${right})`;
+      const exactLeft = EXACT_ARITH && !left.startsWith('CobolFmt.div(') ? `CobolFmt.ex(${left})` : left;
+      if (node.operator === '**') return `${exactLeft}.pow((${right}).toInt)`;
       const op = ARITHMETIC_OPERATORS[node.operator] || node.operator;
-      return `(${left} ${op} ${right})`;
+      return `(${exactLeft} ${op} ${right})`;
     }
     if (node.variable) return toBigDecimalOperand(node.variable);
     if (node.value !== null && node.value !== undefined) return `BigDecimal("${node.value}")`;
@@ -3079,7 +3131,7 @@ export function generateCompute(statement, indent = 0) {
   // target with no ROUNDED of its own truncates, even though
   // `statement.rounded` (true if ANY target in the statement had ROUNDED)
   // is also true in that case.
-  const resultBD = toBigDecimalOperand(statement.expression);
+  const resultBD = toBigDecimalExpression(statement.expression);
   const rawExpr = convertArithmeticExpression(statement.expression);
   const keyword = statement.isNew ? 'val ' : '';
   const entries = targets.map(target => ({
@@ -3342,7 +3394,9 @@ function truncateNumericLiteralTextForMove(raw, info) {
     intPart = intPart.slice(intPart.length - integerDigits);
   }
 
-  const sign = neg ? '-' : '';
+  // Oct-2026 (fuzzer class C): a negative literal moved into an UNSIGNED
+  // receiver keeps only its magnitude (cobc: "ignoring sign").
+  const sign = neg && info?.signed !== false ? '-' : '';
   return decPart.length > 0 ? `${sign}${intPart || '0'}.${decPart}` : `${sign}${intPart || '0'}`;
 }
 
@@ -3536,7 +3590,13 @@ function renderVariableMoveSource(source, info) {
     // documented four instances of.
     if (info.scalaType === 'Float') return `(${asBD}).toFloat`;
     if (info.scalaType === 'Double') return `(${asBD}).toDouble`;
-    const truncated = `CobolFmt.truncNumeric(${asBD}, ${intDigits}, ${decDigits})`;
+    // Oct-2026 (fuzzer class C): an UNSIGNED numeric receiver stores the
+    // absolute value of whatever is moved into it (cobc: MOVE -481 (S9(6))
+    // TO PIC 9(2) -> 81) - same rule storeNumericByInfo applies to every
+    // arithmetic store. Truncation first, then |v|, exactly like cobc.
+    // (An UNSIGNED numeric source cannot be negative, so it needs no .abs.)
+    const sourceNeverNegative = sourceInfo?.signed === false && sourceInfo.dataType === 'numeric' && sourceInfo.scalaType !== 'String';
+    const truncated = `CobolFmt.truncNumeric(${asBD}, ${intDigits}, ${decDigits})${info.signed === false && !sourceNeverNegative ? '.abs' : ''}`;
     if (info.scalaType === 'BigDecimal') return truncated;
     if (info.scalaType === 'Long') return `${truncated}.toLong`;
     return `${truncated}.toInt`;

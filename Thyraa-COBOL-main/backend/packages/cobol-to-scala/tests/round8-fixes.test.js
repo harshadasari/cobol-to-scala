@@ -312,6 +312,6 @@ test('Finding 4f regression guard: an ordinary group with NO group-level VALUE c
            STOP RUN.
 `;
   const code = scalaOf(source);
-  assert.match(code, /var wsCode: String = ""/);
+  assert.match(code, /var wsCode: String = "  "/); // Oct-2026: full-width spaces
   assert.match(code, /var wsNum: Int = 0/);
 });

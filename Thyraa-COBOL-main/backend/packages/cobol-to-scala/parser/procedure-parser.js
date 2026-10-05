@@ -2887,7 +2887,13 @@ function parseInitializeStatement(ctx) {
 
   // Parse REPLACING
   if (ctx.matchValue('REPLACING')) {
-    while (!ctx.isAtEnd() && !ctx.check(TokenType.PERIOD)) {
+    // Oct-2026: stop at the first token that cannot start another
+    // `<category> [DATA] BY <value>` phrase - without this a period-less
+    // INITIALIZE ... REPLACING (the next statement's verb follows) looped
+    // forever in parseOperand.
+    while (!ctx.isAtEnd() && !ctx.check(TokenType.PERIOD) &&
+      (ctx.checkValue('ALPHABETIC') || ctx.checkValue('ALPHANUMERIC') || ctx.checkValue('NUMERIC') ||
+        ctx.checkValue('DATA') || ctx.checkValue('BY'))) {
       const category = [];
       if (ctx.matchValue('ALPHABETIC')) category.push('ALPHABETIC');
       if (ctx.matchValue('ALPHANUMERIC')) category.push('ALPHANUMERIC');

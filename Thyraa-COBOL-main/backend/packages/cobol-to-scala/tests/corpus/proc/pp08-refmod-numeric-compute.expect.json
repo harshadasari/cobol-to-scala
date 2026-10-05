@@ -1,0 +1,7 @@
+{
+  "outcome": "compile-error",
+  "exitCode": 1,
+  "stderrIncludes": [
+    "'WS-DATE8 (5:4)' is not a numeric value"
+  ]
+}

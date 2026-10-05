@@ -1,0 +1,7 @@
+{
+  "outcome": "compile-error",
+  "exitCode": 1,
+  "stderrIncludes": [
+    "compiler is not configured to support ORGANIZATION INDEXED"
+  ]
+}

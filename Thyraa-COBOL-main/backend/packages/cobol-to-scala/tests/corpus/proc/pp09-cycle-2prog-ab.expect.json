@@ -1,0 +1,8 @@
+{
+  "outcome": "exit-nonzero",
+  "exitCode": 1,
+  "stderrIncludes": [
+    "recursive CALL from PP09PB to PP09MAIN which is NOT RECURSIVE"
+  ],
+  "stdout": "MAIN CALLING A\nIN A N=1\nIN B N=1"
+}

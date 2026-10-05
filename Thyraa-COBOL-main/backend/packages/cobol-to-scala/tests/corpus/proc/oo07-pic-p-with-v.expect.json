@@ -1,0 +1,7 @@
+{
+  "outcome": "compile-error",
+  "exitCode": 1,
+  "stderrIncludes": [
+    "V cannot follow a P which is after the decimal point"
+  ]
+}

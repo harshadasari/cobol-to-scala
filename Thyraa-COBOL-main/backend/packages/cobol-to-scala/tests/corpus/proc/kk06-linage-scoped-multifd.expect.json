@@ -1,0 +1,8 @@
+{
+  "outcome": "exit-nonzero",
+  "exitCode": 1,
+  "stderrIncludes": [
+    "LINAGE values invalid (status = 57) for file BAD-FILE"
+  ],
+  "stdout": "GOOD-FILE-DONE"
+}

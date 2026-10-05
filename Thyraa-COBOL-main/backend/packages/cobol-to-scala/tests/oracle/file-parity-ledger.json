@@ -1,0 +1,21 @@
+{
+  "proc/bb03-delete-already-deleted.cbl": "relative-delete-compacts-slots",
+  "proc/bb11-redefines-occurs-lowvalues.cbl": "sequential-record-gets-trailing-newline",
+  "proc/bb14-delete-alternating-valid.cbl": "relative-delete-compacts-slots",
+  "proc/cc06-delete-notinvalidkey.cbl": "relative-delete-compacts-slots",
+  "proc/d09-nondisplay-occurs-write.cbl": "sequential-nondisplay-occurs-record-not-written",
+  "proc/dd06-rewrite-delete-rewrite-seq.cbl": "relative-delete-compacts-slots",
+  "proc/dd07-delete-then-sort-input.cbl": "relative-delete-compacts-slots",
+  "proc/dd11-odo-relative-file.cbl": "relative-odo-variable-length-image",
+  "proc/dd12-delete-recursive.cbl": "relative-delete-compacts-slots",
+  "proc/ee12-odo-relative-key-random.cbl": "relative-odo-variable-length-image",
+  "proc/ff01-odo-comp2-newline-byte.cbl": "relative-odo-variable-length-image",
+  "proc/ff13-relative-allzero-rec.cbl": "relative-allzero-record-treated-as-empty",
+  "proc/gg02-odo-rewrite-varycount.cbl": "relative-odo-variable-length-image",
+  "proc/gg04-negzero-file-roundtrip.cbl": "signed-display-overpunch-not-stored",
+  "proc/gg12-odo-rewrite-sequential.cbl": "relative-odo-variable-length-image",
+  "proc/ii02-linage-top-bottom.cbl": "linage-page-layout-bytes",
+  "proc/kk01-linage-topbot-combo.cbl": "linage-page-layout-bytes",
+  "proc/o02-delete-record.cbl": "relative-delete-compacts-slots",
+  "proc/ss04-linseq-signed-write.cbl": "signed-display-overpunch-not-stored"
+}

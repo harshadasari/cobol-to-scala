@@ -1,0 +1,8 @@
+{
+  "outcome": "exit-nonzero",
+  "exitCode": 1,
+  "stderrIncludes": [
+    "recursive CALL from OO15PC to OO15PA which is NOT RECURSIVE"
+  ],
+  "stdout": "MAIN CALLING A\nIN A N=1\nIN B N=1\nIN C N=1"
+}

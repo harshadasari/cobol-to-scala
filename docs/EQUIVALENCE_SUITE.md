@@ -20,7 +20,7 @@ Composition of the 574 (per `CORPUS_COVERAGE.md`):
 | `data/` `.cbl` | 19 | stdout diff against live `cobc` output (COMP-3, binary, zoned, OCCURS, REDEFINES, editing, rounding, truncation) |
 | `proc/` `.cbl` | 539 | stdout diff against live `cobc` output (procedure-division probes, the bulk of the adversarial rounds) |
 | `sql/` `.cbl` | 5 | no `cobc` oracle (EXEC SQL is not compilable by plain cobc); golden-file and compile-verified generation checks only |
-| `proc/` `.cbl.txt` | 11 | negative probes: the correct behaviour is that `cobc` rejects the program; they are never run |
+| `proc/` `.cbl.txt` | 11 | negative probes: `cobc` must reject (or abort) the program exactly as recorded in a `.expect.json` sidecar; executed by the suite, and a change in cobc's behaviour fails |
 | **Total** | **574** | 563 `.cbl` + 11 `.cbl.txt` |
 
 So 558 programs have a live cobc stdout oracle (19 + 539). The "563" figure counts the 5 SQL programs, which have none. Be exact about this when quoting numbers.
@@ -48,7 +48,7 @@ Everything on side 1, and the comparison rule, is independent of the target. In 
 |---|---|---|
 | `convertToScala(source, { generateMain: true, copybooks })` call inside `oracleCompare` | Calls this repo's translator in-process | A call (in-process, CLI, or API) to the other translator, passing COBOL source and copybooks, returning target source |
 | `runScala(source, opts)` | Writes `Main.scala`, runs `scala-cli run`, 120 s timeout, strips the `JAVA_TOOL_OPTIONS` banner and ANSI codes, detects compile failure by scanning stderr for `Error compiling` / `[error]` / `error:` | Write target source, build and run with `javac`/`java`, `dotnet`, etc.; return `{phase, stdout, stderr, exitCode, timedOut}`; define its own compile-failure detection |
-| `warmupScala`, `checkScalaCliAvailable` | Warm the Scala dependency cache; skip tests if `scala-cli` is missing | Equivalent toolchain checks for the target |
+| `warmupScala`, `inspectToolchain` | Warm the Scala dependency cache; check the toolchain is present and pinned | Equivalent toolchain checks for the target |
 | The `//> using scala 3.7.3` pin and `JAVA_TOOL_OPTIONS` filtering | Sandbox-specific | Not needed |
 
 Unchanged for any target: `runCobol`, `normalizeOutput`, `lineDiff`, the corpus and sidecar conventions, the pass/todo/fail scoring, and the `cobc` capture sweep. Phase-wise, `oracle.test.js` runs the comparison over `tests/corpus/data/` and `tests/corpus/proc/`; swapping in another translator is a change to the adapter plus one import.
@@ -79,7 +79,7 @@ It is evidence about language semantics. It does not replace dual-running on pro
 **What happens per program.**
 1. `runCobol`: copy source to an OS-temp scratch directory, `cobc -x -o <exe> <src>` (default dialect, no `-std` flag), run the executable. Returns `{phase: 'compile'|'run', stdout, stderr, exitCode, timedOut}`. The scratch directory is deleted afterwards unless `keepTmp` is set. A live `<base>.oracle.txt` is rewritten from the result.
 2. Translate and run the target (this is the part you replace).
-3. `oracleCompare` accepts only if both sides have `phase 'run'`, `exitCode 0` and no timeout; then it compares `normalizeOutput(stdout)` on each side. `normalizeOutput` converts CRLF to LF, strips trailing spaces/tabs per line and trailing blank lines. Nothing else is compared (not stderr, not files, not timing).
+3. `oracleCompare` accepts only if both sides have `phase 'run'`, `exitCode 0` and no timeout; then it compares `normalizeOutput(stdout)` on each side. `normalizeOutput` converts CRLF to LF, strips trailing spaces/tabs per line and trailing blank lines. Written files are then compared as well (see below); stderr and timing are not.
 4. Result: `{cobolResult, scalaResult, scalaSource, conversionError, match, diff}`. A translator exception becomes `match: false` with the stack in `diff`; a mismatch yields a per-line diff.
 
 **Scoring.**
@@ -89,20 +89,43 @@ It is evidence about language semantics. It does not replace dual-running on pro
 | **pass** | Both sides ran cleanly and normalized stdout is byte-identical | test passes |
 | **todo** | Mismatch, translator exception, target failed to build, or target exited nonzero; the reason string is recorded (`t.todo`) | non-failing, listed as a work-queue item; this is a known-unsupported marker, not a pass |
 | **fail** | The corpus itself is broken: cobc fails to compile or exits nonzero on a `.cbl`, or live cobc output differs from a present `.expected.txt` | test fails, runner exits nonzero |
-| **skip** | `cobc` or `scala-cli` missing | non-failing; the whole comparison silently reports skipped. Always confirm the toolchain first (see `toolchain-status.md`) |
+| **toolchain fail** | `cobc` missing or not the pinned version, or `scala-cli` missing | the test `oracle toolchain present and pinned` FAILS and the heavy tests skip; only `ORACLE_ALLOW_SKIP=1` makes it a skip |
 
 **Exit codes.** There is no harness-specific exit code. `node --test` exits 0 when there are no failing tests (todo and skip do not fail) and nonzero otherwise. A green run therefore means "no corpus breakage"; read the todo count to see how much the translator does not yet match. Treat any unexplained change in the todo count as a signal to investigate.
 
-**Known harness limitations to be aware of.** `runCobol` accepts a `stdin` option but the underlying `execFile` call does not feed it, so stdin-driven programs are not supported (the corpus programs are self-contained). The Scala compile-failure test is a stderr heuristic. The `.cbl.txt` negative probes are not discovered by the sweep (it walks `.cbl` only); they are an agreement check that the translator should also reject them, and a new adapter must wire that check itself.
+**Switches and scripts (run from `Thyraa-COBOL-main/backend/packages/cobol-to-scala`).**
+
+| Command / env | Effect |
+|---|---|
+| `npm run oracle` | The full oracle suite (about an hour; run it detached). |
+| `ORACLE_COBC_VERSION=<v>` | The pinned reference compiler version (default `4.0-early-dev.0`, defined once as `PINNED_COBC_VERSION` in `harness.js`). |
+| `ORACLE_ALLOW_SKIP=1` | Only way to turn a missing/wrong toolchain into a skip. Without it the test `oracle toolchain present and pinned (...)` FAILS (cobc missing, cobc version not the pin, or scala-cli missing) and the heavy tests skip, so a run can never be green because the oracle did not run. |
+| `npm run oracle:dialect` (`ORACLE_DIALECT=ibm` or `ibm-strict`) | In addition to the default capture, runs cobc with `-std=<dialect>` over every program and reports per program whether cobc's own stdout/exit status differs ("dialect-sensitive"); summary diagnostic plus JSON at `ORACLE_DIALECT_REPORT` (default `<tmpdir>/oracle-dialect-<dialect>.json`). Diagnostics only, never changes a verdict. `ORACLE_SKIP_SCALA=1` (set by the script) skips the translator comparison. |
+| `npm run golden` / `npm run golden:update` | Golden-snapshot gate (section 5.1). |
+| `npm run oracle:fuzz -- --seed S --count N` | Seeded grammar-based program generator (section 5.2); not part of the default suite. |
+
+**Sidecars next to a corpus program.** `<base>.copybooks.json` (above); `<base>.stdin.txt` is fed to stdin of BOTH cobc and the translated program (and used when capturing `.oracle.txt`); for the negative probes `<base>.cbl.txt` + `<base>.expect.json` = `{"outcome": "compile-error" | "exit-nonzero", "exitCode": 1, "stderrIncludes": ["..."], "stdout": "..."}` where `stdout` (exit-nonzero only) is the exact output before the abort. The probe passes only if cobc still behaves that way; any change FAILS (never todo).
+
+**Written-file parity.** Each side runs in its own empty scratch directory. After the run the set of created files (by name, recursively) and their bytes are compared; a mismatch is reported with the first differing offset and the lengths, and classified with the stdout result (a mismatch is a todo). RELATIVE files (detected from `ORGANIZATION IS RELATIVE` on a literal `ASSIGN TO`) are compared as logical record images (same live slot numbers, same record bytes) because cobc writes an 8-byte header per slot and the Scala runtime does not. `tests/oracle/file-parity-ledger.json` lists corpus programs whose stdout matches but whose written files are known to differ; they pass with a per-run diagnostic, a program not in the ledger with a file mismatch is a todo, and an entry whose files now match fails as stale.
+
+### 5.1 Golden snapshots
+
+`tests/golden/<corpus path>.scala` is what `convertToScala(source, {generateMain: true, copybooks})` emits for every corpus `.cbl`. `tests/golden/golden.test.js` regenerates in memory (about a second, no cobc/scala-cli) and fails on any difference. An engine change that alters generated output must update the golden on purpose: `npm run golden:update`, review `git diff tests/golden`, commit with the engine change. The golden says "the output changed", not "the output is wrong"; correctness is still decided by the cobc oracle.
+
+### 5.2 Grammar-based generator
+
+`tests/oracle/fuzz.js`: seeded (no LLM) programs over PIC 9(n)/S9(n)V9(m)/X(n) items with MOVE, COMPUTE/ADD/SUBTRACT (ROUNDED, SIZE ERROR), IF, PERFORM VARYING and DISPLAY, each run through `oracleCompare`. Mismatches are classified by signature and delta-reduced to minimal reproducers. `--print` shows programs without running anything; the same `--seed`/`--index` always regenerates the same program.
+
+**Known harness limitations.** The Scala compile-failure test is a stderr heuristic. The `.cbl.txt` probes check cobc's behaviour only; they do not check that a translator also rejects them, so a new adapter must wire that itself. Stdin is a single text blob fed to both sides.
 
 ## 6. Honest limits
 
 - **Reference compiler.** GnuCOBOL 4.0-early-dev (an early 4.0 build, not 3.2 stable), default dialect. Not IBM Enterprise COBOL. Documented divergence classes: intermediate arithmetic precision (one reported case: 100 on IBM, 188 under GnuCOBOL), binary truncation defaults (TRUNC), sign display and sign-nibble conventions, SORT tie order, EBCDIC collating, and GnuCOBOL being more permissive than IBM in places (so a program can pass here and fail on z/OS). The suite cannot detect any of these. See `docs/ORACLE_DIVERGENCE_REGISTER.md` where available, and the calibration step in `ACTION_PLAN_2026-10.md`.
-- **Dialect.** Only the default dialect is exercised; no `-std=ibm`, `-std=mf`.
-- **Stdout only.** Files written, return codes beyond the harness check, abends and stderr are not compared. The round-29 bug class (file-side corruption) is only caught where a program reads data back and displays it.
+- **Dialect.** Pass/todo is decided on the default dialect only. The opt-in `ORACLE_DIALECT=ibm` run reports which programs' cobc output changes under `-std=ibm` (diagnostics only); `-std=mf` is not exercised.
+- **Stdout plus written files.** The set of files each side creates and their contents are compared (LINE SEQUENTIAL/SEQUENTIAL byte for byte; RELATIVE files as logical record images, because cobc and the Scala runtime use different physical slot layouts). Return codes beyond the harness check, abends and stderr are not compared. Programs with known file-image divergences are recorded in `tests/oracle/file-parity-ledger.json` (visible on every run, ratcheted).
 - **Scope.** Self-contained batch-style programs. No CICS, DB2, VSAM/indexed (the installed build has indexed support compiled out), JCL, IMS, MQ, or EBCDIC at rest. Fixed-format source only.
 - **No coverage guarantee.** The corpus is authored by an AI refuter. Features never exercised are listed in `CORPUS_COVERAGE.md` section 7 (for example LOCAL-STORAGE, PIC A, class conditions, OPEN EXTEND, most intrinsic functions: only 8 distinct functions appear).
-- **Programs without a cobc stdout oracle.** The 11 `.cbl.txt` probes (compile-rejection agreement) and the 5 `sql/` programs (golden/compile checks) are not stdout-compared.
+- **Programs without a cobc stdout oracle.** The 11 `.cbl.txt` probes are checked against cobc's own recorded rejection/abort (not stdout-compared against a translation) and the 5 `sql/` programs get golden/compile checks only.
 - **Gaps in the translator the suite reveals.** Reference modification (19 `t.todo` programs), INDEXED files, group-with-OCCURS CALL, and others per `CAPABILITY_AUDIT_AND_ROADMAP.md` section 1.3. The corpus is not adversarially exhausted.
 - **Repeatability.** The oracle runs on a specific toolchain (cobc 4.0-early-dev, scala-cli 1.9.1 / Scala 3.7.3, Ubuntu 24.04). Other cobc versions may produce different `.oracle.txt` and have not been tested.
 - **Packaging.** Today the suite lives inside this repository and is wired to the in-repo translator. It is not yet a standalone package with a CLI; that is work, not a given.

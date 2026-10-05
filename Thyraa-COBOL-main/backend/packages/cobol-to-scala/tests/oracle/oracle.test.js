@@ -9,9 +9,13 @@
  *
  * Three things happen here:
  *
- *  1. Toolchain availability is checked up front. If cobc or scala-cli is
- *     missing, the relevant tests report via t.skip() (not a failure) so the
- *     suite stays green on machines without the toolchain installed.
+ *  1. The toolchain is checked up front and HARD-FAILS: a single test,
+ *     "oracle toolchain present and pinned (...)", fails loudly when cobc is
+ *     missing, when `cobc --version` is not the pinned version
+ *     (harness.js PINNED_COBC_VERSION, default 4.0-early-dev.0, override with
+ *     env ORACLE_COBC_VERSION), or when scala-cli is missing. A green run can
+ *     therefore never mean "the oracle silently didn't run". Only the explicit
+ *     opt-out env ORACLE_ALLOW_SKIP=1 turns that into a skip.
  *
  *  2. Every *.cbl file found anywhere under tests/corpus/ is compiled and run
  *     with cobc. Actual stdout is captured to a sibling `<name>.oracle.txt`
@@ -32,15 +36,18 @@
  */
 
 import { before, describe, test } from 'node:test';
+import os from 'node:os';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  checkCobcAvailable,
-  checkScalaCliAvailable,
+  PINNED_COBC_VERSION,
+  allowSkip,
+  inspectToolchain,
   lineDiff,
+  loadStdinSidecar,
   normalizeOutput,
   oracleCompare,
   runCobol,
@@ -83,7 +90,7 @@ async function loadCopybooksFor(cblPath) {
   return JSON.parse(await fs.readFile(copybooksPath, 'utf-8'));
 }
 
-async function walkCblFiles(dir) {
+async function walkCblFiles(dir, suffix = '.cbl') {
   let entries;
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
@@ -96,8 +103,8 @@ async function walkCblFiles(dir) {
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      found.push(...(await walkCblFiles(full)));
-    } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.cbl')) {
+      found.push(...(await walkCblFiles(full, suffix)));
+    } else if (entry.isFile() && entry.name.toLowerCase().endsWith(suffix)) {
       found.push(full);
     }
   }
@@ -120,14 +127,26 @@ function summarizeMismatch(result) {
   if (result.scalaResult && result.scalaResult.exitCode !== 0) {
     return `generated Scala compiled but exited ${result.scalaResult.exitCode} at runtime: ${result.scalaResult.stderr.slice(0, 200)}`;
   }
-  return `stdout mismatch:\n${result.diff}`;
+  const parts = [];
+  if (result.stdoutMatch === false) parts.push(`stdout mismatch:\n${result.stdoutDiff}`);
+  if (result.fileMatch === false) parts.push(result.fileDiff);
+  return parts.length > 0 ? parts.join('\n') : `stdout mismatch:\n${result.diff}`;
 }
 
 // --- one-time toolchain checks + corpus discovery (this file is ESM, so
 // top-level await is available; test registration below is synchronous and
 // depends on these results, same pattern as any other data-driven suite). ---
-const cobcAvailable = await checkCobcAvailable();
-const scalaCliAvailable = await checkScalaCliAvailable();
+const toolchain = await inspectToolchain();
+// Heavy tests run only on a good toolchain. If it is bad, the "toolchain
+// present and pinned" test below FAILS (loud); the heavy tests are then
+// skipped rather than burning an hour against the wrong oracle. With the
+// explicit opt-out ORACLE_ALLOW_SKIP=1, a present-but-unpinned tool is used
+// anyway (a deliberate re-baseline) and a missing one skips.
+const gateOpen = toolchain.ok || allowSkip();
+const cobcAvailable = toolchain.cobc.available && gateOpen;
+const scalaCliAvailable = toolchain.scalaCli.available && gateOpen;
+const DIALECT = /^[a-z0-9][a-z0-9-]*$/.test(process.env.ORACLE_DIALECT ?? '') ? process.env.ORACLE_DIALECT : null;
+const SKIP_SCALA = process.env.ORACLE_SKIP_SCALA === '1';
 // tests/corpus/sql/ programs contain EXEC SQL ... END-EXEC blocks, which
 // plain GnuCOBOL cannot compile (they require a database precompiler such as
 // ocesql/DB2's coprocessor, neither of which is part of this repo's oracle
@@ -147,20 +166,22 @@ const procCblFiles = allCblFiles.filter(
 );
 
 describe('toolchain availability', () => {
-  test('cobc (GnuCOBOL) is on PATH and responds to --version', (t) => {
-    if (!cobcAvailable) {
-      t.skip('cobc not found on PATH - install GnuCOBOL (see docs/toolchain-status.md); all cobc-dependent tests below will skip');
+  test(`oracle toolchain present and pinned (${toolchain.summary})`, (t) => {
+    t.diagnostic(`observed: ${toolchain.summary}`);
+    if (toolchain.ok) {
+      assert.ok(true);
       return;
     }
-    assert.ok(cobcAvailable);
-  });
-
-  test('scala-cli is on PATH and responds to version', (t) => {
-    if (!scalaCliAvailable) {
-      t.skip('scala-cli not found on PATH; all scala-cli-dependent tests below will skip');
+    const msg =
+      `ORACLE TOOLCHAIN NOT USABLE: ${toolchain.problems.join('; ')}. ` +
+      `Observed ${toolchain.summary}. The oracle is only valid on cobc ${PINNED_COBC_VERSION} ` +
+      '(override: env ORACLE_COBC_VERSION) plus an installed scala-cli (see docs/toolchain-status.md). ' +
+      'Set ORACLE_ALLOW_SKIP=1 to knowingly skip instead of fail.';
+    if (allowSkip()) {
+      t.skip(`ORACLE_ALLOW_SKIP=1: ${msg}`);
       return;
     }
-    assert.ok(scalaCliAvailable);
+    assert.fail(msg);
   });
 });
 
@@ -176,6 +197,34 @@ describe('corpus discovery', () => {
   });
 });
 
+// Known written-file divergences (see docs/EQUIVALENCE_SUITE.md section 5):
+// corpus programs whose STDOUT matches cobc but whose written FILE image does
+// not, recorded when file parity was introduced (ledger value = divergence
+// class). They stay visible (diagnostic on every run) and are ratcheted: a
+// program NOT in the ledger with a file mismatch is a todo like any other
+// mismatch, and a ledger entry whose files now match FAILS ("stale") so the
+// ledger can only shrink.
+const fileParityLedger = JSON.parse(
+  await fs.readFile(path.join(__dirname, 'file-parity-ledger.json'), 'utf-8').catch(() => '{}')
+);
+
+function assertParity(t, label, rel, result) {
+  const known = fileParityLedger[rel];
+  if (result.match) {
+    assert.ok(!known, `${rel} is listed in tests/oracle/file-parity-ledger.json (${known}) but its written files now match cobc - remove the stale ledger entry`);
+    return;
+  }
+  if (result.stdoutMatch === true && result.fileMatch === false && known) {
+    t.diagnostic(`KNOWN written-file divergence (ledger: ${known}) - ${rel}: ${result.fileDiff.split('\n')[1]?.trim() ?? ''}`);
+    return;
+  }
+  t.todo(`${label} - ${rel}: ${summarizeMismatch(result)}`);
+}
+
+// rel path -> runCobol result of the default-dialect capture (reused by the
+// opt-in dialect-sensitivity run so the baseline is not recompiled).
+const baselineCaptures = new Map();
+
 describe('cobc oracle capture: every tests/corpus/**/*.cbl', () => {
   for (const cblPath of allCblFiles) {
     const rel = path.relative(CORPUS_ROOT, cblPath);
@@ -187,7 +236,12 @@ describe('cobc oracle capture: every tests/corpus/**/*.cbl', () => {
       }
 
       const copybooks = await loadCopybooksFor(cblPath);
-      const result = await runCobol(cblPath, copybooks ? { copybooks } : undefined);
+      const stdin = await loadStdinSidecar(cblPath);
+      const result = await runCobol(cblPath, {
+        ...(copybooks ? { copybooks } : {}),
+        ...(stdin !== undefined ? { stdin } : {}),
+      });
+      baselineCaptures.set(rel, result);
       const dir = path.dirname(cblPath);
       const base = path.basename(cblPath, '.cbl');
       const oraclePath = path.join(dir, `${base}.oracle.txt`);
@@ -238,7 +292,120 @@ describe('cobc oracle capture: every tests/corpus/**/*.cbl', () => {
   }
 });
 
-describe('Phase 1 oracle compare: cobc vs generated Scala (tests/corpus/data only)', () => {
+// Negative probes: tests/corpus/**/*.cbl.txt are programs that cobc itself
+// REJECTS (compile error) or ABORTS at run time. They are deliberately not
+// *.cbl so the capture/compare sweeps above never see them. Each has a
+// sidecar `<base>.expect.json` recording cobc's own documented outcome:
+//   { "outcome": "compile-error" | "exit-nonzero",
+//     "exitCode": 1,
+//     "stderrIncludes": ["substring of cobc/libcob stderr", ...],
+//     "stdout": "exact normalized stdout before the abort"   // exit-nonzero only
+//   }
+// compile-error  -> cobc must fail to compile (phase 'compile', that exit code)
+// exit-nonzero   -> cobc must compile, run, exit with that nonzero code and
+//                   print exactly `stdout` first.
+// Any change in cobc's behaviour FAILS (never todo); a probe without a
+// sidecar fails too. The sibling `.oracle.txt` stays as human documentation.
+const probeFiles = (await walkCblFiles(CORPUS_ROOT, '.cbl.txt')).sort();
+
+describe('negative probes: tests/corpus/**/*.cbl.txt (cobc must reject / abort as documented)', () => {
+  test('negative probes are discoverable', () => {
+    assert.ok(probeFiles.length > 0, 'expected at least one tests/corpus/**/*.cbl.txt negative probe');
+  });
+
+  for (const probePath of probeFiles) {
+    const rel = path.relative(CORPUS_ROOT, probePath);
+    const base = path.basename(probePath, '.cbl.txt');
+    const expectPath = path.join(path.dirname(probePath), `${base}.expect.json`);
+
+    test(`negative probe: ${rel}`, { timeout: COBOL_TEST_TIMEOUT_MS }, async (t) => {
+      if (!cobcAvailable) {
+        t.skip('cobc unavailable');
+        return;
+      }
+      assert.ok(await fileExists(expectPath), `${rel} has no sidecar ${base}.expect.json (see header comment in oracle.test.js)`);
+      const expect = JSON.parse(await fs.readFile(expectPath, 'utf-8'));
+      assert.ok(['compile-error', 'exit-nonzero'].includes(expect.outcome), `${base}.expect.json: unknown outcome ${expect.outcome}`);
+
+      const result = await runCobol(probePath);
+      const detail = `\ncobc phase=${result.phase} exitCode=${result.exitCode} timedOut=${result.timedOut}\nstdout: ${JSON.stringify(result.stdout)}\nstderr: ${result.stderr}`;
+      const changed = `cobc's behaviour on negative probe ${rel} CHANGED vs ${base}.expect.json`;
+
+      assert.equal(result.timedOut, false, `${changed}: timed out${detail}`);
+      if (expect.outcome === 'compile-error') {
+        assert.equal(result.phase, 'compile', `${changed}: expected a compile error, cobc compiled it${detail}`);
+      } else {
+        assert.equal(result.phase, 'run', `${changed}: expected cobc to compile it and abort at run time, but it failed to compile${detail}`);
+        assert.equal(normalizeOutput(result.stdout), normalizeOutput(expect.stdout ?? ''), `${changed}: stdout before the abort differs${detail}`);
+      }
+      assert.equal(result.exitCode, expect.exitCode, `${changed}: exit code${detail}`);
+      for (const needle of expect.stderrIncludes ?? []) {
+        assert.ok(result.stderr.includes(needle), `${changed}: stderr no longer contains ${JSON.stringify(needle)}${detail}`);
+      }
+    });
+  }
+});
+
+// Opt-in dialect-sensitivity run (env ORACLE_DIALECT=ibm | ibm-strict | ...).
+// Runs cobc with `-std=<dialect>` IN ADDITION to the default capture above and
+// reports, per program, whether cobc's OWN stdout/exit status differs between
+// dialects ("dialect-sensitive"). Diagnostics only: it never changes the
+// default oracle, the .oracle.txt files, or any pass/todo verdict, and these
+// tests do not fail on a difference. See docs/ORACLE_DIVERGENCE_REGISTER.md
+// section 6.2. Summary JSON goes to env ORACLE_DIALECT_REPORT (default:
+// <tmpdir>/oracle-dialect-<dialect>.json).
+describe(`dialect sensitivity: cobc default vs -std=${DIALECT} (diagnostics only)`, { skip: DIALECT === null && 'set ORACLE_DIALECT=ibm (or ibm-strict) to enable' }, () => {
+  const rows = [];
+
+  for (const cblPath of allCblFiles) {
+    const rel = path.relative(CORPUS_ROOT, cblPath);
+    test(`dialect: ${rel}`, { timeout: COBOL_TEST_TIMEOUT_MS * 2 }, async (t) => {
+      if (!cobcAvailable) {
+        t.skip('cobc unavailable');
+        return;
+      }
+      const copybooks = await loadCopybooksFor(cblPath);
+      const stdin = await loadStdinSidecar(cblPath);
+      const common = { ...(copybooks ? { copybooks } : {}), ...(stdin !== undefined ? { stdin } : {}) };
+      const baseline = baselineCaptures.get(rel) ?? (await runCobol(cblPath, common));
+      const alt = await runCobol(cblPath, { ...common, std: DIALECT });
+
+      let verdict;
+      if (baseline.phase !== 'run') verdict = 'baseline-did-not-run';
+      else if (alt.phase !== 'run') verdict = 'uncompilable-under-dialect';
+      else if (alt.exitCode !== baseline.exitCode) verdict = 'dialect-sensitive';
+      else if (alt.stdout !== baseline.stdout) verdict = 'dialect-sensitive';
+      else verdict = 'same';
+
+      rows.push({ program: rel, verdict });
+      if (verdict !== 'same') t.diagnostic(`${rel}: ${verdict}`);
+    });
+  }
+
+  test('dialect sensitivity summary', async (t) => {
+    const count = (v) => rows.filter((r) => r.verdict === v).length;
+    const sensitive = rows.filter((r) => r.verdict === 'dialect-sensitive').map((r) => r.program);
+    const summary = {
+      dialect: DIALECT,
+      cobc: toolchain.cobc.version,
+      programs: rows.length,
+      'dialect-sensitive': sensitive.length,
+      'uncompilable-under-dialect': count('uncompilable-under-dialect'),
+      'baseline-did-not-run': count('baseline-did-not-run'),
+      same: count('same'),
+      sensitivePrograms: sensitive,
+    };
+    const reportPath = process.env.ORACLE_DIALECT_REPORT || path.join(os.tmpdir(), `oracle-dialect-${DIALECT}.json`);
+    await fs.writeFile(reportPath, JSON.stringify(summary, null, 2) + '\n', 'utf-8');
+    t.diagnostic(
+      `DIALECT SENSITIVITY -std=${DIALECT}: ${summary['dialect-sensitive']} of ${rows.length} programs dialect-sensitive, ` +
+        `${summary['uncompilable-under-dialect']} uncompilable under the dialect, ${summary.same} identical (report: ${reportPath})`
+    );
+    assert.ok(rows.length === 0 || Array.isArray(sensitive));
+  });
+});
+
+describe('Phase 1 oracle compare: cobc vs generated Scala (tests/corpus/data only)', { skip: SKIP_SCALA && 'ORACLE_SKIP_SCALA=1' }, () => {
   before(async () => {
     if (cobcAvailable && scalaCliAvailable && dataCblFiles.length > 0) {
       await warmupScala();
@@ -260,20 +427,12 @@ describe('Phase 1 oracle compare: cobc vs generated Scala (tests/corpus/data onl
         ...(copybooks ? { convertOptions: { copybooks } } : {}),
       });
 
-      if (!result.match) {
-        // This is the Phase 1 work queue: currently-failing conversions are
-        // marked todo (visible, non-failing) with the exact mismatch reason
-        // rather than having their assertion removed or weakened.
-        t.todo(`Phase 1 work queue - ${rel}: ${summarizeMismatch(result)}`);
-        return;
-      }
-
-      assert.ok(result.match, `COBOL and generated Scala output should match for ${rel}`);
+      assertParity(t, 'Phase 1 work queue', rel, result);
     });
   }
 });
 
-describe('Phase 2 oracle compare: cobc vs generated Scala (tests/corpus/proc)', () => {
+describe('Phase 2 oracle compare: cobc vs generated Scala (tests/corpus/proc)', { skip: SKIP_SCALA && 'ORACLE_SKIP_SCALA=1' }, () => {
   before(async () => {
     if (cobcAvailable && scalaCliAvailable && procCblFiles.length > 0) {
       await warmupScala();
@@ -295,18 +454,7 @@ describe('Phase 2 oracle compare: cobc vs generated Scala (tests/corpus/proc)', 
         ...(copybooks ? { convertOptions: { copybooks } } : {}),
       });
 
-      if (!result.match) {
-        // Same data-driven pattern as the Phase 1 (data/) suite above: a
-        // currently-failing proc/ program is a visible (non-failing) todo
-        // with the exact mismatch reason, never a silently weakened/removed
-        // assertion. As of this writing every tests/corpus/proc/*.cbl
-        // program matches, so this only fires for a *new* proc/ program
-        // added ahead of the generator work needed to support it.
-        t.todo(`Phase 2 work queue - ${rel}: ${summarizeMismatch(result)}`);
-        return;
-      }
-
-      assert.ok(result.match, `COBOL and generated Scala output should match for ${rel}`);
+      assertParity(t, 'Phase 2 work queue', rel, result);
     });
   }
 });

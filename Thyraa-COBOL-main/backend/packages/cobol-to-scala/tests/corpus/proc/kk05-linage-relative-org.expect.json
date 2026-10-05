@@ -1,0 +1,7 @@
+{
+  "outcome": "compile-error",
+  "exitCode": 1,
+  "stderrIncludes": [
+    "LINAGE clause with wrong file type"
+  ]
+}

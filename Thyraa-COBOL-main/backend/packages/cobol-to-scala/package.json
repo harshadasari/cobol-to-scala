@@ -10,6 +10,11 @@
     "./generator": "./generator/index.js"
   },
   "scripts": {
-    "test": "node --test 'tests/**/*.test.js'"
+    "test": "node --test 'tests/**/*.test.js'",
+    "oracle": "node --test tests/oracle/oracle.test.js",
+    "oracle:dialect": "ORACLE_DIALECT=${ORACLE_DIALECT:-ibm} ORACLE_SKIP_SCALA=1 node --test tests/oracle/oracle.test.js",
+    "oracle:fuzz": "node tests/oracle/fuzz.js",
+    "golden": "node --test tests/golden/golden.test.js",
+    "golden:update": "node tests/golden/update.js"
   }
 }

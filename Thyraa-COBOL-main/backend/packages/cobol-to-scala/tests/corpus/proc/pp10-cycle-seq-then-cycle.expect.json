@@ -1,0 +1,8 @@
+{
+  "outcome": "exit-nonzero",
+  "exitCode": 1,
+  "stderrIncludes": [
+    "recursive CALL from PP10PB to PP10PA which is NOT RECURSIVE"
+  ],
+  "stdout": "CALL1\nIN A MODE=0\nA DONE\nCALL1 DONE\nCALL2\nIN A MODE=0\nA DONE\nCALL2 DONE\nCALL3-CYCLE\nIN A MODE=1\nIN B MODE=1"
+}

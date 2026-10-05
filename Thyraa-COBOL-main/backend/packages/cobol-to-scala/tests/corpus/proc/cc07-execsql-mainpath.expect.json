@@ -1,0 +1,7 @@
+{
+  "outcome": "compile-error",
+  "exitCode": 1,
+  "stderrIncludes": [
+    "unknown statement 'EXEC'"
+  ]
+}

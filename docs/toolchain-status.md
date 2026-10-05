@@ -2,6 +2,8 @@
 
 Generated: 2026-07-11 · **Re-confirmed still current 2026-07-23** (unchanged through the full 40-round campaign: `cobc (GnuCOBOL) 4.0-early-dev.0` and `scala-cli 1.9.1` / Scala 3.7.3 are exactly the versions the 40-round oracle harness ran against). Sandboxed Ubuntu 24.04.4 LTS container, kernel 6.18.5, x86_64.
 
+> **Operational note (2026-10-05):** after the sandbox was rebuilt during an idle period, `scala-cli` was absent while `cobc`, `node` and the JDK survived. The procedure in §2 below restored it exactly (bootstrapped jar from Maven Central, SHA1 `9091116d5708b3c8daee006c4ef8929c3b45af00` re-verified, same `/usr/local/bin/scala-cli` wrapper). One gotcha: immediately after the ~114 MB jar download, Maven Central answered **HTTP 429** to coursier's first Bloop/compiler resolution, which surfaces as `Error getting Bloop class path`; the accompanying 403s are only coursier's fallback mirrors (sonatype/scala-lang nightlies), which this sandbox blocks. Waiting ~40–60 s and re-running `scala-cli run` succeeded on the second attempt. The oracle harness was not changed. **Always confirm `scala-cli version` before trusting any oracle-suite result** — with scala-cli absent the harness quietly reports every comparison as skipped.
+
 Summary: **both GnuCOBOL (`cobc`) and Scala CLI (`scala-cli`) are installed system-wide and
 verified working**, including COMP-3 packed-decimal handling in COBOL and case-class /
 `Array[Byte]` manipulation in Scala 3.
